@@ -12,6 +12,7 @@ use crate::auth::{AuthStore, Principal};
 use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
 use crate::locks::{LockStore, ResourceLock};
+use crate::notes::NoteStore;
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
@@ -35,6 +36,7 @@ pub struct Server {
     locks: LockStore,
     projects: ProjectStore,
     wakes: WakeManager,
+    notes: NoteStore,
     inner: Arc<Mutex<ServerInner>>,
 }
 
@@ -111,6 +113,7 @@ impl Server {
             locks: LockStore::new(db.clone()),
             projects: ProjectStore::new(db.clone()),
             wakes: WakeManager::new(db.clone()),
+            notes: NoteStore::new(db.clone()),
             db,
             inner: Arc::new(Mutex::new(ServerInner::default())),
         }
@@ -138,6 +141,10 @@ impl Server {
 
     pub fn gits(&self) -> &GitRepoStore {
         &self.gits
+    }
+
+    pub fn notes(&self) -> &NoteStore {
+        &self.notes
     }
 
     pub fn wakes(&self) -> &WakeManager {
@@ -1509,14 +1516,196 @@ impl Server {
             .is_some_and(|role| MANAGER_ROLES.contains(&role.as_str())))
     }
 
+    /// The project manager first, then the other leaders and coordinators.
     fn project_managers(&self, channel: &str) -> Result<Vec<String>> {
-        Ok(self
+        let mut out: Vec<String> = self
             .projects
-            .members(channel)?
+            .get(channel)?
+            .and_then(|project| project.pm)
             .into_iter()
-            .filter(|m| MANAGER_ROLES.contains(&m.role.as_str()))
-            .map(|m| m.principal_id)
+            .collect();
+        for member in self.projects.members(channel)? {
+            if MANAGER_ROLES.contains(&member.role.as_str()) && !out.contains(&member.principal_id)
+            {
+                out.push(member.principal_id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The owner: a global leader, op or admin.
+    pub fn is_owner(actor: &Principal) -> bool {
+        matches!(actor.role.as_str(), "leader" | "op" | "admin")
+    }
+
+    fn owner_ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .auth
+            .list_principals()?
+            .into_iter()
+            .filter(Self::is_owner)
+            .map(|p| p.id)
             .collect())
+    }
+
+    /// Post a server notice in a channel and notify whoever it mentions.
+    fn announce(&self, channel: &str, actor: &Principal, body: String) -> Result<()> {
+        let message = self.history.append(channel, &actor.id, &body)?;
+        let tag_str = format_message_tags(&[
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+        ]);
+        self.broadcast_message(
+            channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {channel} :{body}"),
+            message.seq,
+        )?;
+        self.emit_webhook(WebhookEvent {
+            event: "role".to_string(),
+            channel: channel.to_string(),
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id),
+            from: actor.id.clone(),
+            to: None,
+            message: body,
+            created_at: message.created_at,
+            report: None,
+            task: None,
+            git: None,
+            lock: None,
+        });
+        Ok(())
+    }
+
+    /// Owner only: choose the one project manager of a project. The PM gets
+    /// the coordinator role; a replaced PM steps back to member.
+    pub fn set_project_pm_api(
+        &self,
+        actor: &Principal,
+        raw_channel: &str,
+        target_name: &str,
+    ) -> Result<Project> {
+        if !Self::is_owner(actor) {
+            return Err(anyhow!("only the owner can choose a project manager"));
+        }
+        let channel = normalize_channel(raw_channel);
+        let project = self.require_project(&channel)?;
+        let target = self
+            .auth
+            .resolve_by_name(target_name.trim().trim_start_matches('@'))?
+            .ok_or_else(|| anyhow!("unknown account '{target_name}'"))?;
+
+        if let Some(previous) = project.pm.as_deref() {
+            if previous != target.id
+                && self.projects.role_of(&channel, previous)?.as_deref() == Some("coordinator")
+            {
+                self.projects.set_role(&channel, previous, "member")?;
+            }
+        }
+        self.projects.set_pm(&channel, Some(&target.id))?;
+        self.projects.set_role(&channel, &target.id, "coordinator")?;
+        self.join_channels(&target, std::slice::from_ref(&channel))?;
+        self.join_channels(actor, std::slice::from_ref(&channel))?;
+        self.announce(
+            &channel,
+            actor,
+            format!(
+                "PM of {channel} is now @{} (set by @{})",
+                target.nick, actor.nick
+            ),
+        )?;
+        self.require_project(&channel)
+    }
+
+    // ---- questions -----------------------------------------------------
+
+    /// The assignee cannot continue without a decision: park the task and
+    /// ask the project manager.
+    pub fn ask_task_api(&self, actor: &Principal, task_id: &str, question: &str) -> Result<Task> {
+        let question = question.trim();
+        if question.is_empty() {
+            return Err(anyhow!("a question is required"));
+        }
+        let current = self.get_task_api(task_id)?;
+        if current.assignee.as_deref() != Some(actor.id.as_str()) {
+            return Err(anyhow!("only the task's assignee can ask a question on it"));
+        }
+        let (task, _) = self.tasks.ask(&current.id, &actor.id, question)?;
+        let mut text = format!(
+            "TASK {} blocked - @{} asks: {}",
+            task.id, actor.nick, question
+        );
+        let cc: Vec<String> = self
+            .project_managers(&task.channel)?
+            .into_iter()
+            .filter(|id| id != &actor.id)
+            .map(|id| format!("@{id}"))
+            .collect();
+        if !cc.is_empty() {
+            text.push_str(&format!(" | cc {}", cc.join(" ")));
+        }
+        self.broadcast_task_event(&task, "ask", "success", &actor.nick, text)?;
+        Ok(task)
+    }
+
+    /// A project manager, or the owner, answers the pending question; the
+    /// task returns to where it was and the asker is notified.
+    pub fn answer_task_api(&self, actor: &Principal, task_id: &str, answer: &str) -> Result<Task> {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Err(anyhow!("an answer is required"));
+        }
+        let current = self.get_task_api(task_id)?;
+        if !self.is_project_manager(actor, &current.channel)? {
+            return Err(anyhow!(
+                "only a leader or coordinator of {} or the owner can answer",
+                current.channel
+            ));
+        }
+        let (task, question) = self.tasks.answer(&current.id, &actor.id, answer)?;
+        let text = format!(
+            "TASK {} answered by @{} for @{}: {}",
+            task.id, actor.nick, question.asked_by, answer
+        );
+        self.broadcast_task_event(&task, "answer", "success", &actor.nick, text)?;
+        Ok(task)
+    }
+
+    /// A project manager passes a question it cannot decide up to the owner.
+    pub fn escalate_task_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        note: Option<&str>,
+    ) -> Result<Task> {
+        let current = self.get_task_api(task_id)?;
+        if !self.is_project_manager(actor, &current.channel)? {
+            return Err(anyhow!(
+                "only a leader or coordinator of {} can escalate",
+                current.channel
+            ));
+        }
+        let note = note.map(str::trim).filter(|n| !n.is_empty());
+        let question = self.tasks.escalate(&current.id, &actor.id, note)?;
+        let mut text = format!(
+            "TASK {} needs the owner - @{} escalates @{}'s question: {}",
+            current.id, actor.nick, question.asked_by, question.question
+        );
+        if let Some(note) = note {
+            text.push_str(&format!(" ({note})"));
+        }
+        let cc: Vec<String> = self
+            .owner_ids()?
+            .into_iter()
+            .filter(|id| id != &actor.id)
+            .map(|id| format!("@{id}"))
+            .collect();
+        if !cc.is_empty() {
+            text.push_str(&format!(" | cc {}", cc.join(" ")));
+        }
+        self.broadcast_task_event(&current, "escalate", "success", &actor.nick, text)?;
+        Ok(current)
     }
 
     pub fn create_project_api(
@@ -1765,6 +1954,7 @@ impl Server {
 
         let mut projects = Vec::new();
         let mut review_count = 0usize;
+        let mut question_count = 0usize;
         for channel in channels {
             let my_role = roles.get(&channel).cloned();
             let tasks: Vec<&Task> = mine.iter().filter(|t| t.channel == channel).collect();
@@ -1776,26 +1966,48 @@ impl Server {
             } else {
                 Vec::new()
             };
-            if tasks.is_empty() && to_review.is_empty() {
+            let is_manager = my_role
+                .as_deref()
+                .is_some_and(|role| MANAGER_ROLES.contains(&role));
+            // Questions from blocked workers that this account should answer.
+            let questions = if is_manager {
+                self.tasks.questions(Some(&channel), "open")?
+            } else {
+                Vec::new()
+            };
+            if tasks.is_empty() && to_review.is_empty() && questions.is_empty() {
                 continue;
             }
             review_count += to_review.len();
+            question_count += questions.len();
             let channel_repos: Vec<&GitRepo> =
                 repos.iter().filter(|r| r.channel == channel).collect();
+            let project = self.projects.get(&channel)?;
             projects.push(serde_json::json!({
                 "channel": channel,
-                "project": self.projects.get(&channel)?.map(|p| p.name),
+                "project": project.as_ref().map(|p| p.name.clone()),
+                "pm": project.and_then(|p| p.pm),
                 "my_role": my_role,
                 "repos": channel_repos,
                 "tasks": tasks,
                 "to_review": to_review,
+                "questions": questions,
             }));
         }
+
+        // What only the owner can decide, across every project.
+        let needs_you = if Self::is_owner(actor) {
+            self.tasks.questions(None, "escalated")?
+        } else {
+            Vec::new()
+        };
 
         Ok(serde_json::json!({
             "account": actor.id,
             "task_count": mine.len(),
             "review_count": review_count,
+            "question_count": question_count,
+            "needs_you": needs_you,
             "projects": projects,
         }))
     }
@@ -2278,6 +2490,7 @@ impl Server {
                 nick: self
                     .display_name(&principal_id)
                     .unwrap_or_else(|_| principal_id.clone()),
+                is_pm: self.is_pm_of(&event.channel, &principal_id),
                 principal_id,
                 reason: format!(
                     "{} in {} from @{}: {}",
@@ -2302,19 +2515,38 @@ impl Server {
             .map(|r| r.local_path.clone())
     }
 
-    /// Owner-triggered launch, used to check an account's wake configuration.
-    pub fn wake_account_api(&self, target_name: &str, reason: &str) -> Result<bool> {
+    fn is_pm_of(&self, channel: &str, principal_id: &str) -> bool {
+        self.projects
+            .get(channel)
+            .ok()
+            .flatten()
+            .and_then(|project| project.pm)
+            .is_some_and(|pm| pm.eq_ignore_ascii_case(principal_id))
+    }
+
+    /// Owner-triggered launch, used to check an account's wake configuration
+    /// or to hand it an instruction. `channel` launches it in that project.
+    pub fn wake_account_api(
+        &self,
+        target_name: &str,
+        reason: &str,
+        channel: Option<&str>,
+    ) -> Result<bool> {
         let target = self
             .auth
             .resolve_by_name(target_name.trim().trim_start_matches('@'))?
             .ok_or_else(|| anyhow!("unknown account '{target_name}'"))?;
+        let channel = channel
+            .map(normalize_channel)
+            .unwrap_or_else(|| CHAT_ONLY_CHANNEL.to_string());
         self.wakes.request(WakeContext {
+            is_pm: self.is_pm_of(&channel, &target.id),
+            repo_path: self.repo_path_for(&channel, None),
             principal_id: target.id,
             nick: target.nick,
             reason: reason.to_string(),
-            channel: CHAT_ONLY_CHANNEL.to_string(),
+            channel,
             task_id: None,
-            repo_path: None,
         })
     }
 

@@ -16,6 +16,7 @@ pub const ALL_STATUSES: &[&str] = &[
     "claimed",
     "assigned",
     "in_progress",
+    "blocked",
     "review",
     "changes_requested",
     "merged",
@@ -70,6 +71,29 @@ pub struct TaskEvent {
     pub note: Option<String>,
     pub created_at: i64,
 }
+
+/// A question that stops a task until someone answers it.
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskQuestion {
+    pub id: String,
+    pub task_id: String,
+    pub channel: String,
+    pub asked_by: String,
+    pub question: String,
+    /// `open` (waiting for the project manager), `escalated` (waiting for the
+    /// owner) or `answered`.
+    pub status: String,
+    /// The task status to return to once the question is answered.
+    pub resume_status: String,
+    pub answer: Option<String>,
+    pub answered_by: Option<String>,
+    pub escalation_note: Option<String>,
+    pub created_at: i64,
+    pub answered_at: Option<i64>,
+}
+
+const QUESTION_COLUMNS: &str = "id, task_id, channel, asked_by, question, status, \
+     resume_status, answer, answered_by, escalation_note, created_at, answered_at";
 
 #[derive(Clone)]
 pub struct TaskStore {
@@ -295,6 +319,167 @@ impl TaskStore {
             now,
         )?;
         Self::get_locked(&db, task_id)
+    }
+
+    /// The assignee is stuck: record the question and park the task.
+    pub fn ask(&self, task_id: &str, actor_id: &str, question: &str) -> Result<(Task, TaskQuestion)> {
+        let now = unix_timestamp();
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let current = Self::get_locked(&db, task_id)?;
+        if !matches!(
+            current.status.as_str(),
+            "assigned" | "in_progress" | "changes_requested"
+        ) {
+            return Err(anyhow!(
+                "a question can only be asked on work in progress (task is {})",
+                current.status
+            ));
+        }
+        let id = format!("q_{}", Uuid::new_v4().simple());
+        db.execute(
+            "INSERT INTO task_questions
+               (id, task_id, channel, asked_by, question, status, resume_status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
+            params![id, task_id, current.channel, actor_id, question, current.status, now],
+        )
+        .context("record task question")?;
+        db.execute(
+            "UPDATE tasks SET status = 'blocked', updated_at = ?1 WHERE id = ?2",
+            params![now, task_id],
+        )
+        .context("block task")?;
+        Self::log_event_locked(
+            &db,
+            task_id,
+            actor_id,
+            "ask",
+            Some(&current.status),
+            Some("blocked"),
+            Some(question),
+            now,
+        )?;
+        Ok((Self::get_locked(&db, task_id)?, Self::question_locked(&db, &id)?))
+    }
+
+    /// The unanswered question on a task, if any.
+    pub fn pending_question(&self, task_id: &str) -> Result<Option<TaskQuestion>> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        Self::pending_question_locked(&db, task_id)
+    }
+
+    /// Answer the pending question and put the task back where it was.
+    pub fn answer(&self, task_id: &str, actor_id: &str, answer: &str) -> Result<(Task, TaskQuestion)> {
+        let now = unix_timestamp();
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let question = Self::pending_question_locked(&db, task_id)?
+            .ok_or_else(|| anyhow!("task has no unanswered question"))?;
+        db.execute(
+            "UPDATE task_questions
+             SET status = 'answered', answer = ?1, answered_by = ?2, answered_at = ?3
+             WHERE id = ?4",
+            params![answer, actor_id, now, question.id],
+        )
+        .context("answer task question")?;
+        db.execute(
+            "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'blocked'",
+            params![question.resume_status, now, task_id],
+        )
+        .context("unblock task")?;
+        Self::log_event_locked(
+            &db,
+            task_id,
+            actor_id,
+            "answer",
+            Some("blocked"),
+            Some(&question.resume_status),
+            Some(answer),
+            now,
+        )?;
+        Ok((
+            Self::get_locked(&db, task_id)?,
+            Self::question_locked(&db, &question.id)?,
+        ))
+    }
+
+    /// Hand an open question up to the owner.
+    pub fn escalate(&self, task_id: &str, actor_id: &str, note: Option<&str>) -> Result<TaskQuestion> {
+        let now = unix_timestamp();
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let question = Self::pending_question_locked(&db, task_id)?
+            .filter(|q| q.status == "open")
+            .ok_or_else(|| anyhow!("task has no open question to escalate"))?;
+        db.execute(
+            "UPDATE task_questions SET status = 'escalated', escalation_note = ?1 WHERE id = ?2",
+            params![note, question.id],
+        )
+        .context("escalate task question")?;
+        Self::log_event_locked(
+            &db,
+            task_id,
+            actor_id,
+            "escalate",
+            Some("blocked"),
+            Some("blocked"),
+            note,
+            now,
+        )?;
+        Self::question_locked(&db, &question.id)
+    }
+
+    /// Questions with `status`, in one channel or everywhere.
+    pub fn questions(&self, channel: Option<&str>, status: &str) -> Result<Vec<TaskQuestion>> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut statement = db
+            .prepare(&format!(
+                "SELECT {QUESTION_COLUMNS} FROM task_questions
+                 WHERE status = ?1 AND (?2 IS NULL OR channel = ?2)
+                 ORDER BY created_at ASC"
+            ))
+            .context("prepare task questions")?;
+        let rows = statement
+            .query_map(params![status, channel], Self::question_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn pending_question_locked(db: &Connection, task_id: &str) -> Result<Option<TaskQuestion>> {
+        db.query_row(
+            &format!(
+                "SELECT {QUESTION_COLUMNS} FROM task_questions
+                 WHERE task_id = ?1 AND status IN ('open', 'escalated')
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            ),
+            params![task_id],
+            Self::question_from_row,
+        )
+        .optional()
+        .context("load pending question")
+    }
+
+    fn question_locked(db: &Connection, id: &str) -> Result<TaskQuestion> {
+        db.query_row(
+            &format!("SELECT {QUESTION_COLUMNS} FROM task_questions WHERE id = ?1"),
+            params![id],
+            Self::question_from_row,
+        )
+        .context("load task question")
+    }
+
+    fn question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskQuestion> {
+        Ok(TaskQuestion {
+            id: row.get(0)?,
+            task_id: row.get(1)?,
+            channel: row.get(2)?,
+            asked_by: row.get(3)?,
+            question: row.get(4)?,
+            status: row.get(5)?,
+            resume_status: row.get(6)?,
+            answer: row.get(7)?,
+            answered_by: row.get(8)?,
+            escalation_note: row.get(9)?,
+            created_at: row.get(10)?,
+            answered_at: row.get(11)?,
+        })
     }
 
     pub fn list(&self, channel: &str) -> Result<Vec<Task>> {

@@ -262,6 +262,7 @@ def cmd_owner_wake(args: argparse.Namespace) -> int:
         payload["limit"] = args.limit
     if args.wake_cmd == "test":
         payload["message"] = args.message
+        payload["channel"] = args.channel
     data = http_json(server, "POST", "/v1/owner/wake", payload=payload)
 
     lines: list[str] = []
@@ -276,9 +277,9 @@ def cmd_owner_wake(args: argparse.Namespace) -> int:
                 f"cwd={wake.get('cwd') or '{repo_path}'} cooldown={wake['cooldown_seconds']}s "
                 f"timeout={wake['timeout_seconds']}s max/hour={wake['max_runs_per_hour']}"
             )
-            if wake.get("session_mode") == "resume":
+            if wake.get("session_mode") in ("resume", "pm"):
                 lines.append(
-                    f"session=resume (per {wake['session_scope']}) marker={wake.get('session_marker')!r} "
+                    f"session={wake['session_mode']} (per {'project' if wake['session_mode'] == 'pm' else wake['session_scope']}) marker={wake.get('session_marker')!r} "
                     f"resume args: {' '.join(wake.get('resume_args') or [])}"
                 )
     elif args.wake_cmd == "reset":
@@ -655,6 +656,20 @@ def cmd_task(args: argparse.Namespace) -> int:
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (branch={t.get('branch') or '-'})"])
         return 0
+    if args.task_cmd in ("ask", "answer", "escalate"):
+        text = " ".join(args.text or []).strip()
+        field = {"ask": "question", "answer": "answer", "escalate": "note"}[args.task_cmd]
+        data = http_json(
+            server,
+            "POST",
+            f"/v1/tasks/{urllib.parse.quote(args.id)}/{args.task_cmd}",
+            token=token,
+            payload={field: text or None},
+        )
+        t = data["task"]
+        done = {"ask": "asked; task is", "answer": "answered; task is", "escalate": "escalated to the owner; task is"}
+        print_out(args, data, [f"Task {t['id']} {done[args.task_cmd]} {t['status']}"])
+        return 0
     if args.task_cmd == "show":
         data = http_json(server, "GET", f"/v1/tasks/{urllib.parse.quote(args.id)}", token=token)
         t = data["task"]
@@ -665,6 +680,10 @@ def cmd_task(args: argparse.Namespace) -> int:
         ]
         if t.get("body"):
             lines.append(t["body"])
+        q = data.get("question")
+        if q:
+            waiting = "the owner" if q["status"] == "escalated" else "the project manager"
+            lines.append(f"WAITING on {waiting}: @{q['asked_by']} asks: {q['question']}")
         for ev in data.get("events", []):
             note = f" - {ev['note']}" if ev.get("note") else ""
             lines.append(
@@ -718,12 +737,47 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             lines.append(
                 f"  REVIEW {t['id']} by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
             )
+        for q in proj.get("questions", []):
+            lines.append(f"  QUESTION {q['task_id']} from @{q['asked_by']}: {q['question']}")
+    for q in inbox.get("needs_you", []):
+        note = f" ({q['escalation_note']})" if q.get("escalation_note") else ""
+        lines.append(f"NEEDS YOU {q['channel']} {q['task_id']} from @{q['asked_by']}: {q['question']}{note}")
     print_out(args, data, lines)
+    return 0
+
+
+def cmd_notes(args: argparse.Namespace) -> int:
+    """An account's lasting memory on the hub."""
+    server, token, _prof = require_token(args)
+    if args.notes_cmd == "show":
+        qs = f"?{urllib.parse.urlencode({'nick': args.nick})}" if args.nick else ""
+        data = http_json(server, "GET", f"/v1/notes{qs}", token=token)
+    else:
+        data = http_json(
+            server,
+            "POST",
+            "/v1/notes",
+            token=token,
+            payload={"body": " ".join(args.text), "append": args.notes_cmd == "add"},
+        )
+    notes = data["notes"]
+    print_out(args, data, [notes["body"] or f"@{notes['principal_id']} has no notes yet."])
     return 0
 
 
 def cmd_project(args: argparse.Namespace) -> int:
     server, token, _prof = require_token(args)
+    if args.project_cmd == "pm":
+        data = http_json(
+            server,
+            "POST",
+            "/v1/projects/pm",
+            token=token,
+            payload={"channel": args.channel, "nick": args.nick},
+        )
+        p = data["project"]
+        print_out(args, data, [f"PM of {p['channel']} is now @{p['pm']}"])
+        return 0
     if args.project_cmd == "create":
         data = http_json(
             server,
@@ -737,7 +791,10 @@ def cmd_project(args: argparse.Namespace) -> int:
         return 0
     if args.project_cmd == "list":
         data = http_json(server, "GET", "/v1/projects", token=token)
-        lines = [f"{p['channel']}: {p['name']}" for p in data.get("projects", [])]
+        lines = [
+            f"{p['channel']}: {p['name']} (PM: {'@' + p['pm'] if p.get('pm') else 'none'})"
+            for p in data.get("projects", [])
+        ]
         print_out(args, data, lines or ["No projects yet."])
         return 0
     if args.project_cmd == "add":
@@ -1310,9 +1367,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_wset.add_argument("--max-per-hour", type=int, help="Launch limit per hour (default 12, 0 = unlimited)")
     p_wset.add_argument(
         "--session",
-        choices=["fresh", "resume"],
+        choices=["fresh", "resume", "pm"],
         default="fresh",
-        help="fresh: new conversation per launch (workers). resume: continue one conversation (coordinators)",
+        help="fresh: new conversation per launch. resume: always continue one. pm: continue a per-project conversation only when woken as that project's manager",
     )
     p_wset.add_argument("--resume-arg", action="append", help="Argument template used once a conversation is stored; {session_id} is its id")
     p_wset.add_argument("--session-marker", help="Text that precedes the conversation id in the agent's output")
@@ -1327,6 +1384,7 @@ def build_parser() -> argparse.ArgumentParser:
         wake_sub_parser = wake_sub.add_parser(name, help=text)
         if name == "test":
             wake_sub_parser.add_argument("--message", help="Reason or instruction handed to the agent")
+            wake_sub_parser.add_argument("--channel", help="Launch it in this project channel")
         wake_parsers.append(wake_sub_parser)
     p_wruns = wake_sub.add_parser("runs", help="List recent launches")
     p_wruns.add_argument("--limit", type=int, default=20)
@@ -1447,6 +1505,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_tst.add_argument("--branch")
     p_tst.set_defaults(func=cmd_task)
 
+    for name, text in (
+        ("ask", "Assignee: park the task and ask the project manager a question"),
+        ("answer", "PM or owner: answer the pending question; the task resumes"),
+        ("escalate", "PM: pass the pending question up to the owner"),
+    ):
+        p_tq = task_sub.add_parser(name, help=text)
+        p_tq.add_argument("id")
+        p_tq.add_argument("text", nargs="*")
+        p_tq.set_defaults(func=cmd_task)
+
     p_tsh = task_sub.add_parser("show", help="Show a task with its history")
     p_tsh.add_argument("id")
     p_tsh.set_defaults(func=cmd_task)
@@ -1459,6 +1527,18 @@ def build_parser() -> argparse.ArgumentParser:
         p_ta = task_sub.add_parser(action)
         p_ta.add_argument("id")
         p_ta.set_defaults(func=cmd_task)
+
+    p_notes = sub.add_parser("notes", help="Your account's lasting notes on the hub")
+    notes_sub = p_notes.add_subparsers(dest="notes_cmd", required=True)
+    p_ns = notes_sub.add_parser("show")
+    p_ns.add_argument("--nick", help="Owner only: read another account's notes")
+    p_ns.set_defaults(func=cmd_notes)
+    p_nset = notes_sub.add_parser("set", help="Replace your notes")
+    p_nset.add_argument("text", nargs="+")
+    p_nset.set_defaults(func=cmd_notes)
+    p_nadd = notes_sub.add_parser("add", help="Add a line to your notes")
+    p_nadd.add_argument("text", nargs="+")
+    p_nadd.set_defaults(func=cmd_notes)
 
     p_inbox = sub.add_parser("inbox", help="Show your tasks and reviews across all projects")
     p_inbox.set_defaults(func=cmd_inbox)
@@ -1477,6 +1557,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_pa.add_argument("nick")
     p_pa.add_argument("--role", default="member")
     p_pa.set_defaults(func=cmd_project)
+    p_ppm = proj_sub.add_parser("pm", help="Owner: choose the project manager of a project")
+    p_ppm.add_argument("channel")
+    p_ppm.add_argument("nick")
+    p_ppm.set_defaults(func=cmd_project)
     p_pm = proj_sub.add_parser("members")
     p_pm.add_argument("channel")
     p_pm.set_defaults(func=cmd_project)

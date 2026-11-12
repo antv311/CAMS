@@ -273,6 +273,30 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_wake_runs_principal
               ON wake_runs (principal_id, started_at);
 
+            CREATE TABLE IF NOT EXISTS task_questions (
+              id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              channel TEXT NOT NULL,
+              asked_by TEXT NOT NULL,
+              question TEXT NOT NULL,
+              status TEXT NOT NULL,
+              resume_status TEXT NOT NULL,
+              answer TEXT,
+              answered_by TEXT,
+              escalation_note TEXT,
+              created_at INTEGER NOT NULL,
+              answered_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_task_questions_status
+              ON task_questions (status, channel);
+
+            CREATE TABLE IF NOT EXISTS account_notes (
+              principal_id TEXT PRIMARY KEY,
+              body TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS wake_sessions (
               principal_id TEXT NOT NULL,
               scope_key TEXT NOT NULL,
@@ -288,6 +312,7 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
     migrate_channel_memberships(connection)?;
     migrate_tasks(connection)?;
     migrate_wake_configs(connection)?;
+    migrate_projects(connection)?;
 
     if seed_demo {
         for (id, token, team) in DEMO_PRINCIPALS {
@@ -299,6 +324,18 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
 
     backfill_principal_tokens(connection)?;
 
+    Ok(())
+}
+
+fn migrate_projects(connection: &Connection) -> Result<()> {
+    let exists: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'pm'",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        connection.execute("ALTER TABLE projects ADD COLUMN pm TEXT", [])?;
+    }
     Ok(())
 }
 

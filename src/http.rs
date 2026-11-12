@@ -199,6 +199,11 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/status", post(set_task_status))
+        .route("/v1/tasks/{id}/ask", post(ask_task))
+        .route("/v1/tasks/{id}/answer", post(answer_task))
+        .route("/v1/tasks/{id}/escalate", post(escalate_task))
+        .route("/v1/notes", get(get_notes).post(write_notes))
+        .route("/v1/projects/pm", post(set_project_pm))
         .route("/v1/inbox", get(get_inbox))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -437,6 +442,8 @@ struct OwnerWakeReq {
     limit: Option<i64>,
     /// For `test`: the reason handed to the agent, such as an instruction.
     message: Option<String>,
+    /// For `test`: launch the account in this project channel.
+    channel: Option<String>,
     #[serde(flatten)]
     config: crate::wake::WakeConfigInput,
 }
@@ -511,6 +518,7 @@ async fn owner_wake(
                         .map(str::trim)
                         .filter(|m| !m.is_empty())
                         .unwrap_or("manual test by the owner"),
+                    req.channel.as_deref(),
                 )
                 .map_err(|err| ApiError::bad_request(err.to_string()))?;
             json!({ "ok": true, "started": started })
@@ -1139,10 +1147,15 @@ async fn get_task(
         .tasks()
         .events(&task.id)
         .map_err(ApiError::internal)?;
+    let question = state
+        .server
+        .tasks()
+        .pending_question(&task.id)
+        .map_err(ApiError::internal)?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
-        Json(json!({ "ok": true, "task": task, "events": events })),
+        Json(json!({ "ok": true, "task": task, "events": events, "question": question })),
     ))
 }
 
@@ -1252,6 +1265,157 @@ async fn list_project_members(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "channel": channel, "members": members })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct TaskTextReq {
+    question: Option<String>,
+    answer: Option<String>,
+    note: Option<String>,
+}
+
+async fn ask_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TaskTextReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .ask_task_api(&actor, &id, req.question.as_deref().unwrap_or_default())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+async fn answer_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TaskTextReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .answer_task_api(&actor, &id, req.answer.as_deref().unwrap_or_default())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+async fn escalate_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TaskTextReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .escalate_task_api(&actor, &id, req.note.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct NotesQuery {
+    nick: Option<String>,
+}
+
+/// An account reads its own notes; the owner may read anyone's.
+async fn get_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NotesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let target_id = match q.nick.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(nick) if !nick.trim_start_matches('@').eq_ignore_ascii_case(&actor.id) => {
+            if !Server::is_owner(&actor) {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "only the owner can read another account's notes",
+                ));
+            }
+            state
+                .server
+                .auth()
+                .resolve_by_name(nick)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found(format!("no agent named '{nick}'")))?
+                .id
+        }
+        _ => actor.id.clone(),
+    };
+    let notes = state
+        .server
+        .notes()
+        .get(&target_id)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "notes": notes })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct WriteNotesReq {
+    body: String,
+    append: Option<bool>,
+}
+
+async fn write_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<WriteNotesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let notes = state
+        .server
+        .notes()
+        .write(&actor.id, &req.body, req.append.unwrap_or(false))
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "notes": notes })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ProjectPmReq {
+    channel: String,
+    nick: String,
+}
+
+async fn set_project_pm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ProjectPmReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let channel = normalize_http_channel(&req.channel);
+    let project = state
+        .server
+        .set_project_pm_api(&actor, &channel, &req.nick)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "project": project })),
     ))
 }
 
@@ -2676,6 +2840,214 @@ mod tests {
         assert!(logs[0].contains("fresh"), "{logs:?}");
         assert!(logs[1].contains("resumed-conv-777"), "{logs:?}");
         assert!(logs[2].contains("fresh"), "{logs:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocked_questions_go_to_the_pm_then_the_owner_and_notes_persist() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let mut tokens = std::collections::HashMap::new();
+        for (nick, role) in [
+            ("owner", "leader"),
+            ("worker", "member"),
+            ("pm1", "member"),
+            ("pm2", "member"),
+        ] {
+            let res: Value = client
+                .post(format!("{base}/v1/register"))
+                .json(&json!({"nick": nick, "role": role}))
+                .send()
+                .await?
+                .json()
+                .await?;
+            tokens.insert(nick, res["token"].as_str().unwrap().to_string());
+        }
+        let (owner, worker, pm1, pm2) = (
+            tokens["owner"].as_str(),
+            tokens["worker"].as_str(),
+            tokens["pm1"].as_str(),
+            tokens["pm2"].as_str(),
+        );
+
+        call(&client, "POST", format!("{base}/v1/projects"), owner,
+            json!({"channel": "#quest"})).await?;
+        call(&client, "POST", format!("{base}/v1/projects/members"), owner,
+            json!({"channel": "#quest", "nick": "worker"})).await?;
+
+        // Only the owner chooses the PM; there is one per project.
+        let pm_url = format!("{base}/v1/projects/pm");
+        let (status, _) = call(&client, "POST", pm_url.clone(), worker,
+            json!({"channel": "#quest", "nick": "worker"})).await?;
+        assert_eq!(status, 400);
+        let (status, body) = call(&client, "POST", pm_url.clone(), owner,
+            json!({"channel": "#quest", "nick": "pm1"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["project"]["pm"], "pm1");
+        let (_, body) = call(&client, "POST", pm_url.clone(), owner,
+            json!({"channel": "#quest", "nick": "pm2"})).await?;
+        assert_eq!(body["project"]["pm"], "pm2");
+        let (_, body) = call(&client, "GET",
+            format!("{base}/v1/projects/members?channel=%23quest"), owner, Value::Null).await?;
+        let role_of = |nick: &str| {
+            body["members"].as_array().unwrap().iter()
+                .find(|m| m["principal_id"] == nick).map(|m| m["role"].clone())
+        };
+        assert_eq!(role_of("pm2"), Some(json!("coordinator")));
+        assert_eq!(role_of("pm1"), Some(json!("member")), "a replaced PM steps back");
+
+        let (_, body) = call(&client, "POST", format!("{base}/v1/tasks"), owner,
+            json!({"channel": "#quest", "title": "Pick a codec", "assignee": "worker"})).await?;
+        let id = body["task"]["id"].as_str().unwrap().to_string();
+        let task_url = |action: &str| format!("{base}/v1/tasks/{id}/{action}");
+        call(&client, "POST", task_url("status"), worker, json!({"status": "in_progress"})).await?;
+
+        // Only the assignee asks; the task is parked as blocked.
+        let (status, _) = call(&client, "POST", task_url("ask"), pm2,
+            json!({"question": "?"})).await?;
+        assert_eq!(status, 400);
+        let (status, body) = call(&client, "POST", task_url("ask"), worker,
+            json!({"question": "H.264 or AV1?"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["task"]["status"], "blocked");
+
+        // The PM sees the question; a plain member does not answer it.
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), pm2, Value::Null).await?;
+        assert_eq!(body["inbox"]["question_count"], 1);
+        assert_eq!(body["inbox"]["projects"][0]["questions"][0]["question"], "H.264 or AV1?");
+        assert_eq!(body["inbox"]["projects"][0]["pm"], "pm2");
+        let (status, _) = call(&client, "POST", task_url("answer"), pm1,
+            json!({"answer": "AV1"})).await?;
+        assert_eq!(status, 400);
+
+        // The PM answers: the task goes back to where it was.
+        let (status, body) = call(&client, "POST", task_url("answer"), pm2,
+            json!({"answer": "H.264 for now"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["task"]["status"], "in_progress");
+
+        // A second question the PM cannot decide goes up to the owner.
+        call(&client, "POST", task_url("ask"), worker,
+            json!({"question": "May I buy a licence?"})).await?;
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), owner, Value::Null).await?;
+        assert_eq!(body["inbox"]["needs_you"].as_array().unwrap().len(), 0);
+        let (status, _) = call(&client, "POST", task_url("escalate"), pm2,
+            json!({"note": "budget decision"})).await?;
+        assert_eq!(status, 200);
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), owner, Value::Null).await?;
+        assert_eq!(body["inbox"]["needs_you"][0]["question"], "May I buy a licence?");
+        assert_eq!(body["inbox"]["needs_you"][0]["escalation_note"], "budget decision");
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), pm2, Value::Null).await?;
+        assert_eq!(body["inbox"]["question_count"], 0, "escalated questions leave the PM's list");
+        let (status, body) = call(&client, "POST", task_url("answer"), owner,
+            json!({"answer": "Yes, up to $50"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["task"]["status"], "in_progress");
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), owner, Value::Null).await?;
+        assert_eq!(body["inbox"]["needs_you"].as_array().unwrap().len(), 0);
+
+        // Notes: an account's own memory; only the owner reads someone else's.
+        let notes_url = format!("{base}/v1/notes");
+        call(&client, "POST", notes_url.clone(), worker, json!({"body": "Codec: H.264"})).await?;
+        let (_, body) = call(&client, "POST", notes_url.clone(), worker,
+            json!({"body": "Licence budget $50", "append": true})).await?;
+        assert_eq!(body["notes"]["body"], "Codec: H.264\nLicence budget $50");
+        let (_, body) = call(&client, "GET", notes_url.clone(), worker, Value::Null).await?;
+        assert_eq!(body["notes"]["body"], "Codec: H.264\nLicence budget $50");
+        let (status, _) = call(&client, "GET", format!("{notes_url}?nick=worker"), pm2, Value::Null).await?;
+        assert_eq!(status, 403);
+        let (status, body) = call(&client, "GET", format!("{notes_url}?nick=worker"), owner, Value::Null).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["notes"]["principal_id"], "worker");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pm_launcher_resumes_only_when_woken_as_the_project_manager() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some("owner-key".to_string());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let mut tokens = std::collections::HashMap::new();
+        for (nick, role) in [("owner", "leader"), ("flex", "member")] {
+            let res: Value = client
+                .post(format!("{base}/v1/register"))
+                .json(&json!({"nick": nick, "role": role, "invite": "owner-key"}))
+                .send()
+                .await?
+                .json()
+                .await?;
+            tokens.insert(nick, res["token"].as_str().unwrap().to_string());
+        }
+        let owner = tokens["owner"].as_str();
+        for channel in ["#managed", "#other"] {
+            call(&client, "POST", format!("{base}/v1/projects"), owner,
+                json!({"channel": channel})).await?;
+        }
+        call(&client, "POST", format!("{base}/v1/projects/pm"), owner,
+            json!({"channel": "#managed", "nick": "flex"})).await?;
+
+        let wake_url = format!("{base}/v1/owner/wake");
+        let (command, fresh, resumed) = if cfg!(windows) {
+            (
+                "cmd",
+                json!(["/C", "echo", "fresh-{role}", "session_id:", "conv-9"]),
+                json!(["/C", "echo", "resumed-{session_id}"]),
+            )
+        } else {
+            (
+                "echo",
+                json!(["fresh-{role}", "session_id:", "conv-9"]),
+                json!(["resumed-{session_id}"]),
+            )
+        };
+        call(&client, "POST", wake_url.clone(), "", json!({
+            "invite": "owner-key", "nick": "flex", "command": command, "args": fresh,
+            "resume_args": resumed, "session_mode": "pm",
+            "session_marker": "session_id:", "cooldown_seconds": 0,
+        })).await?;
+
+        let mut logs = Vec::new();
+        for (round, channel) in ["#managed", "#managed", "#other"].into_iter().enumerate() {
+            call(&client, "POST", wake_url.clone(), "", json!({
+                "invite": "owner-key", "action": "test", "nick": "flex", "channel": channel,
+            })).await?;
+            let mut done = None;
+            for _ in 0..100 {
+                let (_, body) = call(&client, "POST", wake_url.clone(), "",
+                    json!({"invite": "owner-key", "action": "runs", "nick": "flex"})).await?;
+                let runs = body["runs"].as_array().cloned().unwrap_or_default();
+                if runs.len() == round + 1 && runs.iter().all(|r| r["status"] != "running") {
+                    done = runs.first().cloned();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let run = done.expect("the wake run should finish");
+            logs.push(run["log_tail"].as_str().unwrap().to_string());
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        assert!(logs[0].contains("fresh-project"), "first PM launch starts the conversation: {logs:?}");
+        assert!(logs[1].contains("resumed-conv-9"), "second PM launch resumes it: {logs:?}");
+        assert!(logs[2].contains("fresh-member"), "as a plain member it starts fresh: {logs:?}");
 
         Ok(())
     }

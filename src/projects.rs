@@ -23,6 +23,9 @@ pub struct Project {
     pub description: Option<String>,
     pub created_by: String,
     pub created_at: i64,
+    /// The project manager: the one account that keeps a continuous
+    /// conversation for this project and is asked first.
+    pub pm: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -87,7 +90,7 @@ impl ProjectStore {
         let db = self.db.lock().expect("sqlite mutex poisoned");
         let mut statement = db
             .prepare(
-                "SELECT channel, name, description, created_by, created_at
+                "SELECT channel, name, description, created_by, created_at, pm
                  FROM projects ORDER BY channel ASC",
             )
             .context("prepare project list")?;
@@ -95,6 +98,20 @@ impl ProjectStore {
             .query_map([], Self::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(projects)
+    }
+
+    pub fn set_pm(&self, channel: &str, principal_id: Option<&str>) -> Result<()> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let changed = db
+            .execute(
+                "UPDATE projects SET pm = ?1 WHERE channel = ?2",
+                params![principal_id, channel],
+            )
+            .context("set project manager")?;
+        if changed != 1 {
+            return Err(anyhow!("{channel} is not a project"));
+        }
+        Ok(())
     }
 
     pub fn set_role(&self, channel: &str, principal_id: &str, role: &str) -> Result<()> {
@@ -157,7 +174,7 @@ impl ProjectStore {
 
     fn get_locked(db: &Connection, channel: &str) -> Result<Option<Project>> {
         db.query_row(
-            "SELECT channel, name, description, created_by, created_at
+            "SELECT channel, name, description, created_by, created_at, pm
              FROM projects WHERE channel = ?1",
             params![channel],
             Self::from_row,
@@ -173,6 +190,7 @@ impl ProjectStore {
             description: row.get(2)?,
             created_by: row.get(3)?,
             created_at: row.get(4)?,
+            pm: row.get(5)?,
         })
     }
 }
