@@ -436,7 +436,8 @@ fn require_owner(
 #[derive(Deserialize)]
 struct OwnerWakeReq {
     invite: Option<String>,
-    /// `set` (default), `show`, `delete`, `runs`, `test` or `reset`.
+    /// `set` (default), `show`, `list`, `enable`, `disable`, `delete`,
+    /// `runs`, `test` or `reset`.
     action: Option<String>,
     nick: Option<String>,
     limit: Option<i64>,
@@ -458,6 +459,15 @@ async fn owner_wake(
     require_owner(&state, &headers, req.invite.as_deref())?;
     let action = req.action.as_deref().unwrap_or("set").to_ascii_lowercase();
     let wakes = state.server.wakes();
+
+    if action == "list" {
+        let launchers = wakes.list().map_err(ApiError::internal)?;
+        return Ok((
+            StatusCode::OK,
+            with_cors_headers(),
+            Json(json!({ "ok": true, "launchers": launchers })),
+        ));
+    }
 
     if action == "runs" && req.nick.is_none() {
         let runs = wakes
@@ -502,6 +512,19 @@ async fn owner_wake(
                 .map_err(ApiError::internal)?;
             json!({ "ok": true, "runs": runs })
         }
+        "enable" | "disable" => {
+            let enabled = action == "enable";
+            let found = wakes
+                .set_enabled(&principal.id, enabled)
+                .map_err(ApiError::internal)?;
+            if !found {
+                return Err(ApiError::not_found(format!(
+                    "@{} has no launcher configured",
+                    principal.nick
+                )));
+            }
+            json!({ "ok": true, "nick": principal.nick, "enabled": enabled })
+        }
         "reset" => {
             let removed = wakes
                 .clear_sessions(&principal.id, None)
@@ -525,7 +548,7 @@ async fn owner_wake(
         }
         other => {
             return Err(ApiError::bad_request(format!(
-                "unknown action '{other}': use set, show, delete, runs, test or reset"
+                "unknown action '{other}': use set, show, list, enable, disable, delete, runs, test or reset"
             )))
         }
     };

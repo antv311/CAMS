@@ -341,6 +341,35 @@ impl WakeManager {
         Ok(removed)
     }
 
+    /// Every configured launcher.
+    pub fn list(&self) -> Result<Vec<WakeConfig>> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut statement = db
+            .prepare(
+                "SELECT principal_id, command, args_json, cwd, env_json, prompt, enabled,
+                        cooldown_seconds, timeout_seconds, max_runs_per_hour, updated_at,
+                        session_mode, resume_args_json, session_marker, session_scope
+                 FROM wake_configs ORDER BY principal_id ASC",
+            )
+            .context("prepare wake config list")?;
+        let rows = statement
+            .query_map([], Self::config_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Switch an account's launcher on or off without touching its settings.
+    pub fn set_enabled(&self, principal_id: &str, enabled: bool) -> Result<bool> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let changed = db
+            .execute(
+                "UPDATE wake_configs SET enabled = ?1, updated_at = ?2 WHERE principal_id = ?3",
+                params![enabled as i64, unix_timestamp(), principal_id],
+            )
+            .context("toggle wake config")?;
+        Ok(changed > 0)
+    }
+
     /// Accounts that currently have an enabled launcher.
     pub fn enabled_principals(&self) -> Result<Vec<String>> {
         let db = self.db.lock().expect("sqlite mutex poisoned");
