@@ -3,6 +3,7 @@ mod gits;
 mod history;
 mod http;
 mod locks;
+mod projects;
 mod protocol;
 mod reports;
 mod server;

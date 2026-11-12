@@ -180,6 +180,15 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}/claim", post(claim_task))
         .route("/v1/tasks/{id}/done", post(done_task))
         .route("/v1/tasks/{id}/release", post(release_task))
+        .route("/v1/tasks/{id}", get(get_task))
+        .route("/v1/tasks/{id}/assign", post(assign_task))
+        .route("/v1/tasks/{id}/status", post(set_task_status))
+        .route("/v1/inbox", get(get_inbox))
+        .route("/v1/projects", get(list_projects).post(create_project))
+        .route(
+            "/v1/projects/members",
+            get(list_project_members).post(set_project_member),
+        )
         .route("/v1/git/event", post(post_git_event))
         .route("/v1/git/webhook", post(github_webhook_query))
         .route("/v1/git/webhook/{repo}", post(github_webhook_repo))
@@ -833,6 +842,12 @@ async fn list_tasks(
 struct CreateTaskReq {
     channel: Option<String>,
     title: String,
+    body: Option<String>,
+    kind: Option<String>,
+    assignee: Option<String>,
+    repo: Option<String>,
+    branch: Option<String>,
+    issue_url: Option<String>,
 }
 
 async fn create_task(
@@ -841,15 +856,216 @@ async fn create_task(
     Json(req): Json<CreateTaskReq>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = authenticate_request(&state, &headers)?;
-    let channel = normalize_http_channel(req.channel.as_deref().unwrap_or("#general"));
+    let raw_channel = req.channel.as_deref().ok_or_else(|| {
+        ApiError::bad_request("channel is required: name the project channel this task belongs to")
+    })?;
+    let channel = normalize_http_channel(raw_channel);
     let task = state
         .server
-        .create_task_api(&actor, &channel, &req.title)
+        .create_task_full_api(
+            &actor,
+            crate::tasks::NewTask {
+                channel,
+                title: req.title,
+                body: req.body,
+                kind: req.kind,
+                assignee: req.assignee,
+                created_by: None,
+                repo: req.repo,
+                branch: req.branch,
+                issue_url: req.issue_url,
+            },
+        )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
         StatusCode::CREATED,
         with_cors_headers(),
         Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AssignTaskReq {
+    assignee: Option<String>,
+}
+
+async fn assign_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AssignTaskReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .assign_task_api(&actor, &id, req.assignee.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct TaskStatusReq {
+    status: String,
+    note: Option<String>,
+    branch: Option<String>,
+}
+
+async fn set_task_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TaskStatusReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .set_task_status_api(
+            &actor,
+            &id,
+            &req.status,
+            req.note.as_deref(),
+            req.branch.as_deref(),
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+async fn get_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let events = state
+        .server
+        .tasks()
+        .events(&task.id)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task, "events": events })),
+    ))
+}
+
+async fn get_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let inbox = state
+        .server
+        .inbox_api(&actor)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "inbox": inbox })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CreateProjectReq {
+    channel: String,
+    name: Option<String>,
+    description: Option<String>,
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateProjectReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let channel = normalize_http_channel(&req.channel);
+    let name = req
+        .name
+        .clone()
+        .unwrap_or_else(|| channel.trim_start_matches('#').to_string());
+    let project = state
+        .server
+        .create_project_api(&actor, &channel, &name, req.description.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "project": project })),
+    ))
+}
+
+async fn list_projects(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_request(&state, &headers)?;
+    let projects = state
+        .server
+        .projects()
+        .list()
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "projects": projects })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ProjectMemberReq {
+    channel: String,
+    nick: String,
+    role: Option<String>,
+}
+
+async fn set_project_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ProjectMemberReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let channel = normalize_http_channel(&req.channel);
+    let member = state
+        .server
+        .set_project_member_api(&actor, &channel, &req.nick, req.role.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "channel": channel, "member": member })),
+    ))
+}
+
+async fn list_project_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ChannelQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_request(&state, &headers)?;
+    let raw = q
+        .channel
+        .ok_or_else(|| ApiError::bad_request("channel is required"))?;
+    let channel = normalize_http_channel(&raw);
+    let members = state
+        .server
+        .projects()
+        .members(&channel)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "channel": channel, "members": members })),
     ))
 }
 
@@ -1951,6 +2167,165 @@ mod tests {
             .send()
             .await?;
         assert_eq!(gh_bad.status(), StatusCode::UNAUTHORIZED);
+
+        Ok(())
+    }
+
+    /// POST/GET helper for the project and task flow test.
+    async fn call(
+        client: &reqwest::Client,
+        method: &str,
+        url: String,
+        token: &str,
+        body: Value,
+    ) -> Result<(u16, Value)> {
+        let request = match method {
+            "GET" => client.get(url),
+            _ => client.post(url).json(&body),
+        };
+        let response = request.bearer_auth(token).send().await?;
+        let status = response.status().as_u16();
+        Ok((status, response.json().await.unwrap_or(Value::Null)))
+    }
+
+    #[tokio::test]
+    async fn project_tasks_stay_in_their_project_and_go_through_review() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let mut tokens = std::collections::HashMap::new();
+        for (nick, role) in [
+            ("owner", "leader"),
+            ("worker", "member"),
+            ("coord", "member"),
+            ("outsider", "member"),
+        ] {
+            let res: Value = client
+                .post(format!("{base}/v1/register"))
+                .json(&json!({"nick": nick, "role": role}))
+                .send()
+                .await?
+                .json()
+                .await?;
+            tokens.insert(nick, res["token"].as_str().unwrap().to_string());
+        }
+        let (owner, worker, coord, outsider) = (
+            tokens["owner"].as_str(),
+            tokens["worker"].as_str(),
+            tokens["coord"].as_str(),
+            tokens["outsider"].as_str(),
+        );
+
+        // #general is chat only: no project, no tasks.
+        let (status, _) = call(&client, "POST", format!("{base}/v1/projects"), owner,
+            json!({"channel": "#general"})).await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(&client, "POST", format!("{base}/v1/tasks"), owner,
+            json!({"channel": "#general", "title": "nope"})).await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(&client, "POST", format!("{base}/v1/tasks"), owner,
+            json!({"title": "no channel"})).await?;
+        assert_eq!(status, 400);
+
+        // Only a leader or coordinator creates a project.
+        let (status, _) = call(&client, "POST", format!("{base}/v1/projects"), worker,
+            json!({"channel": "#quest"})).await?;
+        assert_eq!(status, 400);
+        let (status, body) = call(&client, "POST", format!("{base}/v1/projects"), owner,
+            json!({"channel": "quest", "name": "Quest player"})).await?;
+        assert_eq!(status, 201);
+        assert_eq!(body["project"]["channel"], "#quest");
+
+        for (nick, role) in [("worker", "member"), ("coord", "coordinator")] {
+            let (status, _) = call(&client, "POST", format!("{base}/v1/projects/members"), owner,
+                json!({"channel": "#quest", "nick": nick, "role": role})).await?;
+            assert_eq!(status, 200);
+        }
+
+        // Work cannot be assigned to an account outside the project,
+        // and a plain member cannot assign work to someone else.
+        let (status, body) = call(&client, "POST", format!("{base}/v1/tasks"), owner,
+            json!({"channel": "#quest", "title": "t", "assignee": "outsider"})).await?;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("not a member"));
+        let (status, _) = call(&client, "POST", format!("{base}/v1/tasks"), worker,
+            json!({"channel": "#quest", "title": "t", "assignee": "coord"})).await?;
+        assert_eq!(status, 400);
+
+        let (status, body) = call(&client, "POST", format!("{base}/v1/tasks"), owner, json!({
+            "channel": "#quest", "title": "Fix seek bar", "kind": "bug",
+            "body": "Seek bar jumps back after scrubbing.", "assignee": "@worker",
+            "repo": "quest-player",
+        })).await?;
+        assert_eq!(status, 201);
+        let task = &body["task"];
+        assert_eq!(task["status"], "assigned");
+        assert_eq!(task["assignee"], "worker");
+        assert_eq!(task["kind"], "bug");
+        let id = task["id"].as_str().unwrap().to_string();
+
+        // The assignee's inbox names the project the task belongs to.
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), worker, Value::Null).await?;
+        assert_eq!(body["inbox"]["task_count"], 1);
+        assert_eq!(body["inbox"]["projects"][0]["channel"], "#quest");
+        assert_eq!(body["inbox"]["projects"][0]["tasks"][0]["id"], id.as_str());
+
+        // Only the assignee moves work forward; only a manager decides review.
+        let status_url = format!("{base}/v1/tasks/{id}/status");
+        let (status, _) = call(&client, "POST", status_url.clone(), outsider,
+            json!({"status": "in_progress"})).await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(&client, "POST", status_url.clone(), worker,
+            json!({"status": "in_progress"})).await?;
+        assert_eq!(status, 200);
+        let (status, body) = call(&client, "POST", status_url.clone(), worker,
+            json!({"status": "review", "branch": "fix/seek-bar"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["task"]["branch"], "fix/seek-bar");
+        let (status, _) = call(&client, "POST", status_url.clone(), worker,
+            json!({"status": "merged"})).await?;
+        assert_eq!(status, 400);
+
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), coord, Value::Null).await?;
+        assert_eq!(body["inbox"]["review_count"], 1);
+
+        let (status, _) = call(&client, "POST", status_url.clone(), coord,
+            json!({"status": "changes-requested", "note": "add a test"})).await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(&client, "POST", status_url.clone(), worker,
+            json!({"status": "review"})).await?;
+        assert_eq!(status, 200);
+        let (status, body) = call(&client, "POST", status_url.clone(), coord,
+            json!({"status": "merged"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["task"]["status"], "merged");
+
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), worker, Value::Null).await?;
+        assert_eq!(body["inbox"]["task_count"], 0);
+        let (_, body) = call(&client, "GET", format!("{base}/v1/tasks/{id}"), worker, Value::Null).await?;
+        assert_eq!(body["events"].as_array().unwrap().len(), 5);
+
+        // Reassignment moves the task to the new account's inbox.
+        let (_, body) = call(&client, "POST", format!("{base}/v1/tasks"), owner,
+            json!({"channel": "#quest", "title": "Second", "assignee": "worker"})).await?;
+        let second = body["task"]["id"].as_str().unwrap().to_string();
+        let (status, body) = call(&client, "POST", format!("{base}/v1/tasks/{second}/assign"), coord,
+            json!({"assignee": "coord"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["task"]["assignee"], "coord");
+        assert_eq!(body["task"]["status"], "assigned");
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), worker, Value::Null).await?;
+        assert_eq!(body["inbox"]["task_count"], 0);
+        let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), coord, Value::Null).await?;
+        assert_eq!(body["inbox"]["task_count"], 1);
 
         Ok(())
     }

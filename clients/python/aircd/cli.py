@@ -511,10 +511,60 @@ def cmd_task(args: argparse.Namespace) -> int:
             "POST",
             "/v1/tasks",
             token=token,
-            payload={"channel": args.channel, "title": " ".join(args.title)},
+            payload={
+                "channel": args.channel,
+                "title": " ".join(args.title),
+                "body": args.body,
+                "kind": args.kind,
+                "assignee": args.assign,
+                "repo": args.repo,
+                "branch": args.branch,
+                "issue_url": args.issue,
+            },
         )
         t = data["task"]
-        print_out(args, data, [f"Created task {t['id']} in {t['channel']}: {t['title']}"])
+        owner = f" -> @{t['assignee']}" if t.get("assignee") else ""
+        print_out(args, data, [f"Created {t['kind']} {t['id']} in {t['channel']}{owner}: {t['title']}"])
+        return 0
+    if args.task_cmd == "assign":
+        data = http_json(
+            server,
+            "POST",
+            f"/v1/tasks/{urllib.parse.quote(args.id)}/assign",
+            token=token,
+            payload={"assignee": args.nick},
+        )
+        t = data["task"]
+        print_out(args, data, [f"Task {t['id']} -> {t['status']} (assignee={t.get('assignee') or '-'})"])
+        return 0
+    if args.task_cmd == "status":
+        data = http_json(
+            server,
+            "POST",
+            f"/v1/tasks/{urllib.parse.quote(args.id)}/status",
+            token=token,
+            payload={"status": args.status, "note": args.note, "branch": args.branch},
+        )
+        t = data["task"]
+        print_out(args, data, [f"Task {t['id']} -> {t['status']} (branch={t.get('branch') or '-'})"])
+        return 0
+    if args.task_cmd == "show":
+        data = http_json(server, "GET", f"/v1/tasks/{urllib.parse.quote(args.id)}", token=token)
+        t = data["task"]
+        lines = [
+            f"{t['id']} [{t['kind']}/{t['status']}] {t['channel']}: {t['title']}",
+            f"assignee={t.get('assignee') or '-'} repo={t.get('repo') or '-'} "
+            f"branch={t.get('branch') or '-'} issue={t.get('issue_url') or '-'}",
+        ]
+        if t.get("body"):
+            lines.append(t["body"])
+        for ev in data.get("events", []):
+            note = f" - {ev['note']}" if ev.get("note") else ""
+            lines.append(
+                f"  {ev['action']} {ev.get('from_status') or '-'} -> {ev.get('to_status') or '-'} "
+                f"by @{ev['actor_id']}{note}"
+            )
+        print_out(args, data, lines)
         return 0
     if args.task_cmd == "list":
         qs = urllib.parse.urlencode({"channel": args.channel})
@@ -536,6 +586,71 @@ def cmd_task(args: argparse.Namespace) -> int:
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (claimed_by={t.get('claimed_by') or '-'})"])
         return 0
     raise CliError("Unsupported task subcommand")
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    """Everything this account has to do, grouped by project."""
+    server, token, _prof = require_token(args)
+    data = http_json(server, "GET", "/v1/inbox", token=token)
+    inbox = data["inbox"]
+    lines = [
+        f"@{inbox['account']}: {inbox['task_count']} task(s), "
+        f"{inbox['review_count']} waiting for your review"
+    ]
+    for proj in inbox.get("projects", []):
+        label = proj.get("project") or proj["channel"]
+        role = f" (you: {proj['my_role']})" if proj.get("my_role") else ""
+        lines.append(f"{proj['channel']} - {label}{role}")
+        for repo in proj.get("repos", []):
+            lines.append(f"  repo {repo['name']}: {repo['local_path']}")
+        for t in proj.get("tasks", []):
+            lines.append(
+                f"  {t['id']} [{t['kind']}/{t['status']}] branch={t.get('branch') or '-'}: {t['title']}"
+            )
+        for t in proj.get("to_review", []):
+            lines.append(
+                f"  REVIEW {t['id']} by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
+            )
+    print_out(args, data, lines)
+    return 0
+
+
+def cmd_project(args: argparse.Namespace) -> int:
+    server, token, _prof = require_token(args)
+    if args.project_cmd == "create":
+        data = http_json(
+            server,
+            "POST",
+            "/v1/projects",
+            token=token,
+            payload={"channel": args.channel, "name": args.name, "description": args.description},
+        )
+        p = data["project"]
+        print_out(args, data, [f"Created project {p['channel']}: {p['name']}"])
+        return 0
+    if args.project_cmd == "list":
+        data = http_json(server, "GET", "/v1/projects", token=token)
+        lines = [f"{p['channel']}: {p['name']}" for p in data.get("projects", [])]
+        print_out(args, data, lines or ["No projects yet."])
+        return 0
+    if args.project_cmd == "add":
+        data = http_json(
+            server,
+            "POST",
+            "/v1/projects/members",
+            token=token,
+            payload={"channel": args.channel, "nick": args.nick, "role": args.role},
+        )
+        m = data["member"]
+        print_out(args, data, [f"@{m['principal_id']} is {m['role']} in {data['channel']}"])
+        return 0
+    if args.project_cmd == "members":
+        qs = urllib.parse.urlencode({"channel": args.channel})
+        data = http_json(server, "GET", f"/v1/projects/members?{qs}", token=token)
+        lines = [f"@{m['principal_id']}: {m['role']}" for m in data.get("members", [])]
+        print_out(args, data, lines or [f"No members in {args.channel}."])
+        return 0
+    raise CliError("Unsupported project subcommand")
 
 
 def cmd_webhook(args: argparse.Namespace) -> int:
@@ -1144,7 +1259,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc = task_sub.add_parser("create")
     p_tc.add_argument("channel")
     p_tc.add_argument("title", nargs="+")
+    p_tc.add_argument("--body", help="Full description; enough that a new assignee need not read the chat")
+    p_tc.add_argument("--kind", choices=["task", "bug", "feature"], default="task")
+    p_tc.add_argument("--assign", metavar="NICK", help="Project member to give the task to")
+    p_tc.add_argument("--repo")
+    p_tc.add_argument("--branch")
+    p_tc.add_argument("--issue", metavar="URL", help="Linked GitHub issue")
     p_tc.set_defaults(func=cmd_task)
+
+    p_tas = task_sub.add_parser("assign", help="Assign or reassign a task; omit NICK to return it to the pool")
+    p_tas.add_argument("id")
+    p_tas.add_argument("nick", nargs="?")
+    p_tas.set_defaults(func=cmd_task)
+
+    p_tst = task_sub.add_parser("status", help="Move a task: in_progress, review, changes_requested, merged, cancelled")
+    p_tst.add_argument("id")
+    p_tst.add_argument("status")
+    p_tst.add_argument("--note")
+    p_tst.add_argument("--branch")
+    p_tst.set_defaults(func=cmd_task)
+
+    p_tsh = task_sub.add_parser("show", help="Show a task with its history")
+    p_tsh.add_argument("id")
+    p_tsh.set_defaults(func=cmd_task)
 
     p_tl = task_sub.add_parser("list")
     p_tl.add_argument("channel", nargs="?", default="#general")
@@ -1154,6 +1291,27 @@ def build_parser() -> argparse.ArgumentParser:
         p_ta = task_sub.add_parser(action)
         p_ta.add_argument("id")
         p_ta.set_defaults(func=cmd_task)
+
+    p_inbox = sub.add_parser("inbox", help="Show your tasks and reviews across all projects")
+    p_inbox.set_defaults(func=cmd_inbox)
+
+    p_proj = sub.add_parser("project", help="Create projects and manage their members")
+    proj_sub = p_proj.add_subparsers(dest="project_cmd", required=True)
+    p_pc = proj_sub.add_parser("create")
+    p_pc.add_argument("channel")
+    p_pc.add_argument("--name")
+    p_pc.add_argument("--description")
+    p_pc.set_defaults(func=cmd_project)
+    p_pl = proj_sub.add_parser("list")
+    p_pl.set_defaults(func=cmd_project)
+    p_pa = proj_sub.add_parser("add", help="Add an account to a project or change its role")
+    p_pa.add_argument("channel")
+    p_pa.add_argument("nick")
+    p_pa.add_argument("--role", default="member")
+    p_pa.set_defaults(func=cmd_project)
+    p_pm = proj_sub.add_parser("members")
+    p_pm.add_argument("channel")
+    p_pm.set_defaults(func=cmd_project)
 
     # Webhook subcommands
     p_wh = sub.add_parser("webhook", help="Configure, test & listen for signed agent webhooks")

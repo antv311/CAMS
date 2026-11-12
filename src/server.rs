@@ -12,10 +12,11 @@ use crate::auth::{AuthStore, Principal};
 use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
 use crate::locks::{LockStore, ResourceLock};
+use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
 use crate::store::SharedConnection;
-use crate::tasks::{Task, TaskStore};
+use crate::tasks::{NewTask, Task, TaskStore, TERMINAL_STATUSES};
 use crate::webhooks::{WebhookEvent, WebhookStore};
 
 const SERVER_NAME: &str = "aircd";
@@ -31,6 +32,7 @@ pub struct Server {
     reports: ReportStore,
     gits: GitRepoStore,
     locks: LockStore,
+    projects: ProjectStore,
     inner: Arc<Mutex<ServerInner>>,
 }
 
@@ -105,6 +107,7 @@ impl Server {
             reports: ReportStore::new(db.clone()),
             gits: GitRepoStore::new(db.clone()),
             locks: LockStore::new(db.clone()),
+            projects: ProjectStore::new(db.clone()),
             db,
             inner: Arc::new(Mutex::new(ServerInner::default())),
         }
@@ -132,6 +135,10 @@ impl Server {
 
     pub fn gits(&self) -> &GitRepoStore {
         &self.gits
+    }
+
+    pub fn projects(&self) -> &ProjectStore {
+        &self.projects
     }
 
     pub fn locks(&self) -> &LockStore {
@@ -717,6 +724,13 @@ impl Server {
         if title.trim().is_empty() {
             session.send(format!(
                 ":{SERVER_NAME} NOTICE {} :TASK CREATE failed: title is required",
+                principal.nick
+            ));
+            return Ok(());
+        }
+        if channel.eq_ignore_ascii_case(CHAT_ONLY_CHANNEL) {
+            session.send(format!(
+                ":{SERVER_NAME} NOTICE {} :TASK CREATE failed: {CHAT_ONLY_CHANNEL} is chat only; create the task in a project channel",
                 principal.nick
             ));
             return Ok(());
@@ -1468,30 +1482,315 @@ impl Server {
         Ok(report)
     }
 
-    pub fn create_task_api(
+    // ---- projects ------------------------------------------------------
+
+    fn require_project(&self, channel: &str) -> Result<Project> {
+        self.projects.get(channel)?.ok_or_else(|| {
+            anyhow!("{channel} is not a project; create it with POST /v1/projects first")
+        })
+    }
+
+    /// Project leaders and coordinators manage a project's work. A global
+    /// leader, op or admin (the owner) manages every project.
+    pub fn is_project_manager(&self, actor: &Principal, channel: &str) -> Result<bool> {
+        if matches!(actor.role.as_str(), "leader" | "op" | "admin") {
+            return Ok(true);
+        }
+        Ok(self
+            .projects
+            .role_of(channel, &actor.id)?
+            .is_some_and(|role| MANAGER_ROLES.contains(&role.as_str())))
+    }
+
+    fn project_managers(&self, channel: &str) -> Result<Vec<String>> {
+        Ok(self
+            .projects
+            .members(channel)?
+            .into_iter()
+            .filter(|m| MANAGER_ROLES.contains(&m.role.as_str()))
+            .map(|m| m.principal_id)
+            .collect())
+    }
+
+    pub fn create_project_api(
         &self,
         actor: &Principal,
         raw_channel: &str,
-        raw_title: &str,
-    ) -> Result<Task> {
-        let title = raw_title.trim();
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Project> {
+        if !matches!(
+            actor.role.as_str(),
+            "leader" | "coordinator" | "op" | "admin"
+        ) {
+            return Err(anyhow!(
+                "only a leader or coordinator can create a project"
+            ));
+        }
+        let channel = normalize_channel(raw_channel);
+        let project = self
+            .projects
+            .create(&channel, name, description, &actor.id)?;
+        self.projects.set_role(&channel, &actor.id, "leader")?;
+        self.join_channels(actor, std::slice::from_ref(&channel))?;
+        Ok(project)
+    }
+
+    /// Add an account to a project (joining its channel) or change its role.
+    pub fn set_project_member_api(
+        &self,
+        actor: &Principal,
+        raw_channel: &str,
+        target_name: &str,
+        raw_role: Option<&str>,
+    ) -> Result<ProjectMember> {
+        let channel = normalize_channel(raw_channel);
+        self.require_project(&channel)?;
+        if !self.is_project_manager(actor, &channel)? {
+            return Err(anyhow!(
+                "only a leader or coordinator of {channel} can change its members"
+            ));
+        }
+        let target = self
+            .auth
+            .resolve_by_name(target_name.trim().trim_start_matches('@'))?
+            .ok_or_else(|| anyhow!("unknown account '{target_name}'"))?;
+        let role = crate::auth::normalize_role(raw_role.unwrap_or("member"))?;
+        self.projects.set_role(&channel, &target.id, &role)?;
+        self.join_channels(&target, std::slice::from_ref(&channel))?;
+        Ok(ProjectMember {
+            principal_id: target.id,
+            role,
+        })
+    }
+
+    // ---- tasks ---------------------------------------------------------
+
+    /// Resolve who a task may be given to. Assignment only exists inside a
+    /// project, and only to an account that is a member of that project.
+    fn resolve_assignee(&self, actor: &Principal, channel: &str, name: &str) -> Result<String> {
+        self.require_project(channel)?;
+        let target = self
+            .auth
+            .resolve_by_name(name.trim().trim_start_matches('@'))?
+            .ok_or_else(|| anyhow!("unknown account '{name}'"))?;
+        if target.id != actor.id && !self.is_project_manager(actor, channel)? {
+            return Err(anyhow!(
+                "only a leader or coordinator of {channel} can assign work to someone else"
+            ));
+        }
+        if self.projects.role_of(channel, &target.id)?.is_none() {
+            return Err(anyhow!(
+                "@{} is not a member of {channel}; add them with POST /v1/projects/members first",
+                target.nick
+            ));
+        }
+        Ok(target.id)
+    }
+
+    pub fn create_task_full_api(&self, actor: &Principal, mut new: NewTask) -> Result<Task> {
+        let title = new.title.trim().to_string();
         if title.is_empty() {
             return Err(anyhow!("task title is required"));
         }
-        let channel = normalize_channel(raw_channel);
+        let channel = normalize_channel(&new.channel);
+        if channel.eq_ignore_ascii_case(CHAT_ONLY_CHANNEL) {
+            return Err(anyhow!(
+                "{CHAT_ONLY_CHANNEL} is chat only; create the task in a project channel"
+            ));
+        }
+        let assignee_id = match new
+            .assignee
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => Some(self.resolve_assignee(actor, &channel, name)?),
+            None => None,
+        };
+        new.channel = channel.clone();
+        new.title = title;
+        new.assignee = assignee_id.clone();
+        new.created_by = Some(actor.id.clone());
+
         self.join_channels(actor, std::slice::from_ref(&channel))?;
-        let task = self.tasks.create(&channel, title)?;
-        self.broadcast_task_event(
-            &task,
-            "create",
-            "success",
-            &actor.nick,
-            format!(
+        let task = self.tasks.create_full(new)?;
+        let text = match &assignee_id {
+            Some(assignee) => format!(
+                "TASK {} created by @{} and assigned to @{}: {}",
+                task.id, actor.nick, assignee, task.title
+            ),
+            None => format!(
                 "TASK {} created by @{}: {}",
                 task.id, actor.nick, task.title
             ),
-        )?;
+        };
+        self.broadcast_task_event(&task, "create", "success", &actor.nick, text)?;
         Ok(task)
+    }
+
+    pub fn get_task_api(&self, task_id: &str) -> Result<Task> {
+        self.tasks
+            .get(task_id.trim())?
+            .ok_or_else(|| anyhow!("task '{}' not found", task_id.trim()))
+    }
+
+    /// Assign, reassign or (with `None`) return a task to the pool.
+    pub fn assign_task_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        assignee: Option<&str>,
+    ) -> Result<Task> {
+        let current = self.get_task_api(task_id)?;
+        let assignee_id = match assignee.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => Some(self.resolve_assignee(actor, &current.channel, name)?),
+            None => {
+                let is_owner = current.assignee.as_deref() == Some(actor.id.as_str());
+                if !is_owner && !self.is_project_manager(actor, &current.channel)? {
+                    return Err(anyhow!(
+                        "only the assignee or a project leader/coordinator can unassign a task"
+                    ));
+                }
+                None
+            }
+        };
+        let task = self
+            .tasks
+            .assign(&current.id, assignee_id.as_deref(), &actor.id)?;
+        let text = match &task.assignee {
+            Some(assignee) => format!(
+                "TASK {} assigned to @{} by @{}: {}",
+                task.id, assignee, actor.nick, task.title
+            ),
+            None => format!(
+                "TASK {} returned to the pool by @{}: {}",
+                task.id, actor.nick, task.title
+            ),
+        };
+        self.broadcast_task_event(&task, "assign", "success", &actor.nick, text)?;
+        Ok(task)
+    }
+
+    /// Move a task through its review workflow.
+    ///
+    /// The assignee starts work and asks for review; a project leader or
+    /// coordinator merges it, asks for changes, or cancels it.
+    pub fn set_task_status_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        raw_to: &str,
+        note: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<Task> {
+        let current = self.get_task_api(task_id)?;
+        let to = raw_to.trim().to_ascii_lowercase().replace('-', "_");
+        let from = current.status.clone();
+        let is_assignee = current.assignee.as_deref() == Some(actor.id.as_str());
+        let is_manager = self.is_project_manager(actor, &current.channel)?;
+
+        let allowed = match (from.as_str(), to.as_str()) {
+            ("assigned" | "changes_requested", "in_progress") => is_assignee,
+            ("assigned" | "in_progress" | "changes_requested", "review") => is_assignee,
+            ("review", "in_progress") => is_assignee,
+            ("review", "merged" | "changes_requested") => is_manager,
+            (current_status, "cancelled") if !TERMINAL_STATUSES.contains(&current_status) => {
+                is_manager
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(anyhow!(
+                "cannot move task from {from} to {to}: the assignee moves work to in_progress and review; a project leader or coordinator moves review to merged or changes_requested"
+            ));
+        }
+
+        let note = note.map(str::trim).filter(|n| !n.is_empty());
+        let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+        let task = self
+            .tasks
+            .set_status(&current.id, &from, &to, &actor.id, note, branch)?;
+
+        let mut cc = String::new();
+        match to.as_str() {
+            "review" => {
+                for manager in self.project_managers(&task.channel)? {
+                    if manager != actor.id {
+                        cc.push_str(&format!(" @{manager}"));
+                    }
+                }
+            }
+            "changes_requested" | "merged" | "cancelled" => {
+                if let Some(assignee) = task.assignee.as_deref() {
+                    if assignee != actor.id {
+                        cc.push_str(&format!(" @{assignee}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut text = format!(
+            "TASK {} {} -> {} by @{}: {}",
+            task.id, from, to, actor.nick, task.title
+        );
+        if let Some(note) = note {
+            text.push_str(&format!(" - {note}"));
+        }
+        if !cc.is_empty() {
+            text.push_str(&format!(" | cc{cc}"));
+        }
+        self.broadcast_task_event(&task, "status", "success", &actor.nick, text)?;
+        Ok(task)
+    }
+
+    /// Everything an account has to do, grouped by project, with the repo
+    /// each task belongs to. This is the one call an agent makes on wake-up.
+    pub fn inbox_api(&self, actor: &Principal) -> Result<serde_json::Value> {
+        let mine = self.tasks.inbox(&actor.id)?;
+        let roles: HashMap<String, String> =
+            self.projects.projects_of(&actor.id)?.into_iter().collect();
+        let repos = self.gits.list()?;
+
+        let mut channels: std::collections::BTreeSet<String> =
+            mine.iter().map(|t| t.channel.clone()).collect();
+        channels.extend(roles.keys().cloned());
+
+        let mut projects = Vec::new();
+        let mut review_count = 0usize;
+        for channel in channels {
+            let my_role = roles.get(&channel).cloned();
+            let tasks: Vec<&Task> = mine.iter().filter(|t| t.channel == channel).collect();
+            let to_review = if my_role
+                .as_deref()
+                .is_some_and(|role| MANAGER_ROLES.contains(&role))
+            {
+                self.tasks.review_queue(&channel)?
+            } else {
+                Vec::new()
+            };
+            if tasks.is_empty() && to_review.is_empty() {
+                continue;
+            }
+            review_count += to_review.len();
+            let channel_repos: Vec<&GitRepo> =
+                repos.iter().filter(|r| r.channel == channel).collect();
+            projects.push(serde_json::json!({
+                "channel": channel,
+                "project": self.projects.get(&channel)?.map(|p| p.name),
+                "my_role": my_role,
+                "repos": channel_repos,
+                "tasks": tasks,
+                "to_review": to_review,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "account": actor.id,
+            "task_count": mine.len(),
+            "review_count": review_count,
+            "projects": projects,
+        }))
     }
 
     pub fn claim_task_api(&self, actor: &Principal, task_id: &str) -> Result<Task> {
@@ -1904,9 +2203,31 @@ impl Server {
         } else {
             Vec::new()
         };
-        if let Err(err) = self.webhooks.enqueue_for_event(&event, &online, &members) {
+        let role_mentions = self.role_mentions(&event.channel, &event.message);
+        if let Err(err) =
+            self.webhooks
+                .enqueue_for_event(&event, &online, &members, &role_mentions)
+        {
             eprintln!("enqueue webhook error ({}): {err:#}", event.event);
         }
+    }
+
+    /// `@coordinator` or `@leader` in a project channel addresses whoever
+    /// holds that role in that project.
+    fn role_mentions(&self, channel: &str, message: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let words = crate::webhooks::extract_mentions(message);
+        if words.is_empty() {
+            return out;
+        }
+        if let Ok(members) = self.projects.members(channel) {
+            for member in members {
+                if words.contains(&member.role) {
+                    out.insert(member.principal_id.to_ascii_lowercase());
+                }
+            }
+        }
+        out
     }
 
     fn online_principal_ids(&self) -> HashSet<String> {
@@ -2188,6 +2509,24 @@ mod tests {
     fn test_server() -> Result<Server> {
         let db = crate::store::open(":memory:")?;
         Ok(Server::new(db))
+    }
+
+    #[test]
+    fn role_words_in_a_project_channel_address_the_role_holders() -> Result<()> {
+        let server = test_server()?;
+        let (owner, _) = server
+            .auth()
+            .register_principal("boss", Some("leader"), None)?;
+        let (reviewer, _) = server.auth().register_principal("rev", None, None)?;
+        server.create_project_api(&owner, "#quest", "Quest", None)?;
+        server.set_project_member_api(&owner, "#quest", "rev", Some("coordinator"))?;
+
+        let hit = server.role_mentions("#quest", "ready for review @coordinator");
+        assert!(hit.contains(&reviewer.id));
+        assert!(hit.len() == 1, "the project leader is not a coordinator");
+        assert!(server.role_mentions("#general", "@coordinator").is_empty());
+        assert!(server.role_mentions("#quest", "no mention here").is_empty());
+        Ok(())
     }
 
     fn test_session(token: &str, nick: &str) -> Session {

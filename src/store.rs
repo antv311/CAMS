@@ -212,12 +212,43 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
 
             CREATE INDEX IF NOT EXISTS idx_resource_locks_channel
               ON resource_locks (channel, expires_at);
+
+            CREATE TABLE IF NOT EXISTS projects (
+              channel TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              description TEXT,
+              created_by TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_roles (
+              channel TEXT NOT NULL,
+              principal_id TEXT NOT NULL,
+              role TEXT NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY (channel, principal_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              task_id TEXT NOT NULL,
+              actor_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              from_status TEXT,
+              to_status TEXT,
+              note TEXT,
+              created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_task_events_task
+              ON task_events (task_id, id);
             ",
         )
         .context("initialize sqlite schema")?;
 
     migrate_principals(connection)?;
     migrate_channel_memberships(connection)?;
+    migrate_tasks(connection)?;
 
     if seed_demo {
         for (id, token, team) in DEMO_PRINCIPALS {
@@ -228,6 +259,40 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
     }
 
     backfill_principal_tokens(connection)?;
+
+    Ok(())
+}
+
+fn migrate_tasks(connection: &Connection) -> Result<()> {
+    let columns = [
+        ("body", "TEXT"),
+        ("kind", "TEXT NOT NULL DEFAULT 'task'"),
+        ("assignee", "TEXT"),
+        ("created_by", "TEXT"),
+        ("repo", "TEXT"),
+        ("branch", "TEXT"),
+        ("issue_url", "TEXT"),
+    ];
+
+    for (column, definition) in columns {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?;
+
+        if exists == 0 {
+            connection.execute(
+                &format!("ALTER TABLE tasks ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks (assignee, status)",
+        [],
+    )?;
 
     Ok(())
 }

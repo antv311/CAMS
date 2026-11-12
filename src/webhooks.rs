@@ -22,6 +22,8 @@ const DEFAULT_EVENTS: &[&str] = &[
     "message", "mention", "dm", "report", "task", "git", "role", "lock",
 ];
 const ALLOWED_NOTIFY_WHEN: &[&str] = &["always", "offline", "mentions"];
+/// Mentions that address every member of the channel.
+const GROUP_MENTIONS: &[&str] = &["here", "everyone", "all", "channel"];
 const MAX_DELIVERY_ATTEMPTS: i64 = 5;
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,8 +191,11 @@ impl WebhookStore {
         event: &WebhookEvent,
         online_principals: &HashSet<String>,
         channel_members: &[String],
+        role_mentions: &HashSet<String>,
     ) -> Result<usize> {
         let mentions = extract_mentions(&event.message);
+        // `@here` and friends address everyone in the channel.
+        let everyone = GROUP_MENTIONS.iter().any(|tag| mentions.contains(*tag));
         let member_set: HashSet<&str> = channel_members.iter().map(String::as_str).collect();
 
         let configs = {
@@ -215,8 +220,11 @@ impl WebhookStore {
                 continue;
             }
 
-            let is_mentioned = mentions.contains(&cfg.principal_id.to_ascii_lowercase());
             let in_channel = member_set.contains(cfg.principal_id.as_str());
+            let lowered_id = cfg.principal_id.to_ascii_lowercase();
+            let is_mentioned = mentions.contains(&lowered_id)
+                || role_mentions.contains(&lowered_id)
+                || (everyone && in_channel);
 
             if !is_dm_recipient && !is_mentioned && !in_channel {
                 continue;
