@@ -56,11 +56,15 @@ already in history, and `git add -f` can override them.
   `git diff --check` passed. No application code changed, so application tests
   were not needed for this ignore-rule and documentation change.
 
-## Remaining decision
+## Approved history cleanup
 
-The historical personal path is already published on `origin/main`. Purging it
-requires a separate, coordinated history rewrite that changes commit IDs and
-updates the shared remote. This audit does not rewrite or force-push history.
-The project manager/owner must decide whether to prepare that cleanup. Existing
-upstream author attribution should be considered separately from the accidental
-test-fixture path.
+On 2026-11-12 the owner authorized rewriting the published history and
+force-pushing it under task `task_ac358a96fabf4c649024f27d2f993053` (hub message
+126). The cleanup replaces only the accidental test-fixture path with a generic
+path. It preserves contributor attribution, commit messages, merge topology,
+and the merged privacy-ignore and worker-template storage changes.
+
+See [history cleanup and clone recovery](history-cleanup.md) for the procedure,
+verification requirements, and instructions for existing clones. The original
+findings above describe the pre-cleanup history; old commit hashes may no longer
+be reachable from published branches after the rewrite.
