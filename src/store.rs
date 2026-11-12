@@ -15,13 +15,63 @@ const MIGRATED_LEGACY_LABEL: &str = "migrated-legacy";
 /// Label used for rows created alongside seeded demo principals.
 const SEED_LABEL: &str = "seed";
 
+/// Demo/test principals whose tokens are published in the README. They are
+/// only usable on in-memory databases (tests) or when `AIRCD_SEED_DEMO=1`.
+const DEMO_PRINCIPALS: &[(&str, &str, &str)] = &[
+    ("human", "human-token", "demo"),
+    ("agent-a", "agent-a-token", "demo"),
+    ("agent-b", "agent-b-token", "demo"),
+    ("agent-c", "agent-c-token", "demo"),
+    ("agent-1", "test-token-1", "test"),
+    ("agent-2", "test-token-2", "test"),
+    ("agent-3", "test-token-3", "test"),
+];
+
 pub fn open(path: impl AsRef<Path>) -> Result<SharedConnection> {
+    let seed_demo = path.as_ref() == Path::new(":memory:") || demo_seed_requested();
     let connection = Connection::open(path).context("open sqlite database")?;
-    init(&connection)?;
+    init_with(&connection, seed_demo)?;
     Ok(Arc::new(Mutex::new(connection)))
 }
 
+fn demo_seed_requested() -> bool {
+    matches!(
+        std::env::var("AIRCD_SEED_DEMO").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
+}
+
+#[cfg(test)]
 fn init(connection: &Connection) -> Result<()> {
+    init_with(connection, true)
+}
+
+/// Revoke the published demo credentials on a real database. Account names
+/// and history are kept; only tokens that are public knowledge stop working.
+fn disable_published_demo_credentials(connection: &Connection) -> Result<()> {
+    for (id, token, _team) in DEMO_PRINCIPALS {
+        connection
+            .execute(
+                "UPDATE principal_tokens SET revoked_at = unixepoch()
+                 WHERE principal_id = ?1 AND revoked_at IS NULL
+                   AND (label = ?2 OR (label = ?3 AND EXISTS (
+                         SELECT 1 FROM principals WHERE id = ?1 AND token = ?4)))",
+                params![id, SEED_LABEL, MIGRATED_LEGACY_LABEL, token],
+            )
+            .context("revoke published demo token")?;
+        connection
+            .execute(
+                "UPDATE principals
+                 SET token = '__hashed__:disabled-' || lower(hex(randomblob(16)))
+                 WHERE id = ?1 AND token = ?2",
+                params![id, token],
+            )
+            .context("disable published demo credential")?;
+    }
+    Ok(())
+}
+
+fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
     connection
         .execute_batch(
             "
@@ -169,13 +219,13 @@ fn init(connection: &Connection) -> Result<()> {
     migrate_principals(connection)?;
     migrate_channel_memberships(connection)?;
 
-    seed_principal(connection, "human", "human", "human-token", "demo")?;
-    seed_principal(connection, "agent-a", "agent-a", "agent-a-token", "demo")?;
-    seed_principal(connection, "agent-b", "agent-b", "agent-b-token", "demo")?;
-    seed_principal(connection, "agent-c", "agent-c", "agent-c-token", "demo")?;
-    seed_principal(connection, "agent-1", "agent-1", "test-token-1", "test")?;
-    seed_principal(connection, "agent-2", "agent-2", "test-token-2", "test")?;
-    seed_principal(connection, "agent-3", "agent-3", "test-token-3", "test")?;
+    if seed_demo {
+        for (id, token, team) in DEMO_PRINCIPALS {
+            seed_principal(connection, id, id, token, team)?;
+        }
+    } else {
+        disable_published_demo_credentials(connection)?;
+    }
 
     backfill_principal_tokens(connection)?;
 
@@ -305,6 +355,29 @@ fn backfill_principal_tokens(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_demo_tokens_stop_working_on_a_real_database() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        // A database created by an older build: demo principals are present.
+        init_with(&connection, true)?;
+        // Reopened by a locked-down build.
+        init_with(&connection, false)?;
+        init_with(&connection, false)?; // idempotent
+
+        let shared: SharedConnection = Arc::new(Mutex::new(connection));
+        let auth = crate::auth::AuthStore::new(shared.clone());
+        for (_id, token, _team) in DEMO_PRINCIPALS {
+            assert!(auth.authenticate(token).is_err(), "{token} must be rejected");
+        }
+        let kept: i64 = shared.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM principals WHERE id = 'human'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(kept, 1, "account name and history are kept");
+        Ok(())
+    }
 
     #[test]
     fn init_creates_principal_tokens_table_and_seeds_mirrors() -> Result<()> {

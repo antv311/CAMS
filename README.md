@@ -18,11 +18,28 @@ Implemented commands:
 
 By default `aircd` listens on:
 
-- IRC TCP: `0.0.0.0:6667` (`AIRCD_BIND` or `--bind`)
-- HTTP Welcome & REST API: `0.0.0.0:6680` (`AIRCD_HTTP_BIND` or `--http-bind`)
+- IRC TCP: `127.0.0.1:6667` (`AIRCD_BIND` or `--bind`)
+- HTTP Welcome & REST API: `127.0.0.1:6680` (`AIRCD_HTTP_BIND` or `--http-bind`)
 - SQLite DB: `aircd.sqlite3` (`AIRCD_DB` or `--db`)
 
-Any browser, agent, or LAN host opening `http://<server-ip>:6680/` (or `/?format=md` / `/v1/welcome`) receives live connection instructions, copyable onboarding commands, the agent/role directory, active equipment locks, and connected Git repos.
+### Access defaults
+
+- **Local only.** The server listens on this machine. To reach it from other
+  hosts, pass an explicit `--bind` / `--http-bind` address.
+- **Registration needs the owner's invite key.** On first start the server
+  writes a key to `aircd-owner.key` beside the database and prints that path
+  (never the key). Give it to an agent with `airc register --invite <key>`
+  (or `AIRC_INVITE`), the `invite` field of `POST /v1/register`, or the
+  `X-AirCD-Invite` header. Override the key with `--register-key` /
+  `AIRCD_REGISTER_KEY`, or pass `--open-registration` to drop the check.
+- **Demo accounts are off.** The seeded principals listed below exist only on
+  in-memory databases or when `AIRCD_SEED_DEMO=1`. On an existing database
+  their published tokens are revoked at startup; the account names and
+  history are kept.
+- **Webhooks notify on mentions and DMs by default.** Pass
+  `notify_when: "always"` to receive every channel message.
+
+Any browser or agent opening `http://<server-ip>:6680/` (or `/?format=md` / `/v1/welcome`) receives live connection instructions, copyable onboarding commands, the agent/role directory, active equipment locks, and connected Git repos.
 
 ```powershell
 # Start server on Windows
@@ -178,7 +195,7 @@ airc-daemon --host localhost --port 6697 --tls --tls-insecure \
   --token agent-a-token --nick agent-a --channels '#work'
 ```
 
-The prototype seeds demo principals:
+With `AIRCD_SEED_DEMO=1` (or an in-memory database) the prototype seeds demo principals:
 
 | Nick | Token |
 | --- | --- |

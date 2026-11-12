@@ -24,6 +24,9 @@ pub struct HttpRuntimeInfo {
     pub http_port: u16,
     pub tls_port: Option<u16>,
     pub detected_hosts: Vec<String>,
+    /// Owner invite key. When set, `POST /v1/register` must present it.
+    #[serde(skip)]
+    pub register_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -90,7 +93,15 @@ pub fn build_runtime_info(
         http_port: parse_port(http_bind, 6680),
         tls_port,
         detected_hosts: detect_local_ips(),
+        register_key: None,
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub fn detect_local_ips() -> Vec<String> {
@@ -306,6 +317,7 @@ struct RegisterReq {
     role: Option<String>,
     team: Option<String>,
     channels: Option<Vec<String>>,
+    invite: Option<String>,
 }
 
 async fn register_agent(
@@ -313,6 +325,20 @@ async fn register_agent(
     headers: HeaderMap,
     Json(req): Json<RegisterReq>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(expected) = state.info.register_key.as_deref() {
+        let supplied = headers
+            .get("x-aircd-invite")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| req.invite.clone())
+            .unwrap_or_default();
+        if !constant_time_eq(supplied.trim().as_bytes(), expected.as_bytes()) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "registration requires the owner's invite key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
+            ));
+        }
+    }
     let (principal, token) = state
         .server
         .auth()
@@ -1318,7 +1344,7 @@ fn build_welcome_payload(state: &AppState, base_host: &str) -> Result<Value, Api
         },
         "onboarding": {
             "step_1_register": format!("curl -sX POST {base_http}/v1/register -H \"Content-Type: application/json\" -d '{{\"nick\":\"codex\",\"role\":\"leader\",\"channels\":[\"#general\"]}}'"),
-            "step_2_set_webhook": format!("curl -sX POST {base_http}/v1/webhooks -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" -d '{{\"url\":\"http://127.0.0.1:8787/hook\",\"events\":[\"message\",\"mention\",\"dm\",\"report\",\"task\",\"git\",\"role\",\"lock\"],\"notify_when\":\"always\"}}'"),
+            "step_2_set_webhook": format!("curl -sX POST {base_http}/v1/webhooks -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" -d '{{\"url\":\"http://127.0.0.1:8787/hook\",\"events\":[\"message\",\"mention\",\"dm\",\"report\",\"task\",\"git\",\"role\",\"lock\"],\"notify_when\":\"mentions\"}}'"),
             "step_3_test_webhook": format!("curl -sX POST {base_http}/v1/webhooks/test -H \"Authorization: Bearer $TOKEN\""),
             "step_4_send_message": format!("curl -sX POST {base_http}/v1/messages -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" -d '{{\"target\":\"#general\",\"body\":\"@claude ready for PR review\"}}'"),
             "step_5_submit_report": format!("curl -sX POST {base_http}/v1/reports -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\" -d '{{\"channel\":\"#general\",\"title\":\"Build green\",\"status\":\"completed\",\"body\":\"All tests pass.\"}}'"),
@@ -1543,7 +1569,7 @@ curl -sX POST {http}/v1/register -H "Content-Type: application/json" \
 # Register signed webhook callback (HMAC-SHA256)
 curl -sX POST {http}/v1/webhooks -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{{"url":"http://127.0.0.1:8787/hook","notify_when":"always"}}'</pre>
+  -d '{{"url":"http://127.0.0.1:8787/hook","notify_when":"mentions"}}'</pre>
       <p class="muted">Verify inbound webhook signatures via header <code>X-AirCD-Signature-256: sha256=&lt;hmac&gt;</code> over raw JSON body.</p>
     </div>
   </div>
@@ -1562,6 +1588,7 @@ curl -sX POST {http}/v1/webhooks -H "Authorization: Bearer $TOKEN" \
           <option value="member" selected>member</option>
         </select>
         <input id="regChannels" value="#general" placeholder="#general,#repo">
+        <input id="regInvite" type="password" placeholder="owner invite key">
         <button onclick="doRegister()">Register</button>
       </div>
       <pre id="regOut">Click Register to issue a new agent token and load it into the browser console below.</pre>
@@ -1616,7 +1643,8 @@ async function doRegister() {{
     body: JSON.stringify({{
       nick: document.getElementById('regNick').value,
       role: document.getElementById('regRole').value,
-      channels: document.getElementById('regChannels').value.split(',').map(s => s.trim()).filter(Boolean)
+      channels: document.getElementById('regChannels').value.split(',').map(s => s.trim()).filter(Boolean),
+      invite: document.getElementById('regInvite').value || undefined
     }})
   }});
   const data = await res.json();
@@ -1780,6 +1808,7 @@ mod tests {
             http_port: api_addr.port(),
             tls_port: None,
             detected_hosts: vec!["127.0.0.1".to_string()],
+            register_key: None,
         };
         tokio::spawn(async move {
             let _ = axum::serve(api_listener, router(server, info)).await;
@@ -1922,6 +1951,53 @@ mod tests {
             .send()
             .await?;
         assert_eq!(gh_bad.status(), StatusCode::UNAUTHORIZED);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_requires_the_invite_key_when_one_is_set() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some("owner-key-123".to_string());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/register");
+
+        let missing = client
+            .post(&url)
+            .json(&json!({"nick": "intruder", "role": "leader"}))
+            .send()
+            .await?;
+        assert_eq!(missing.status().as_u16(), 403);
+
+        let wrong = client
+            .post(&url)
+            .json(&json!({"nick": "intruder", "invite": "guess"}))
+            .send()
+            .await?;
+        assert_eq!(wrong.status().as_u16(), 403);
+
+        let body_ok = client
+            .post(&url)
+            .json(&json!({"nick": "worker-1", "invite": "owner-key-123"}))
+            .send()
+            .await?;
+        assert_eq!(body_ok.status().as_u16(), 201);
+
+        let header_ok = client
+            .post(&url)
+            .header("X-AirCD-Invite", "owner-key-123")
+            .json(&json!({"nick": "worker-2"}))
+            .send()
+            .await?;
+        assert_eq!(header_ok.status().as_u16(), 201);
 
         Ok(())
     }

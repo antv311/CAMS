@@ -39,7 +39,7 @@ echo "  Server built."
 
 # Step 2: Start server
 echo "[2/4] Starting server..."
-AIRCD_DB="$AIRCD_DB" ./target/release/aircd &
+AIRCD_SEED_DEMO=1 AIRCD_OPEN_REGISTRATION=1 AIRCD_DB="$AIRCD_DB" ./target/release/aircd &
 AIRCD_PID=$!
 sleep 1
 

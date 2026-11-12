@@ -32,6 +32,9 @@ def _free_port() -> int:
 
 
 def _binary_path() -> Path:
+    override = os.environ.get("AIRCD_BIN")
+    if override:
+        return Path(override)
     candidates = [
         REPO_ROOT / "target" / "debug" / ("aircd.exe" if os.name == "nt" else "aircd"),
         REPO_ROOT / "target" / "release" / ("aircd.exe" if os.name == "nt" else "aircd"),
@@ -75,8 +78,10 @@ class AircdCliE2ETest(unittest.TestCase):
                 f"127.0.0.1:{cls.http_port}",
                 "--db",
                 str(db_path),
+                "--open-registration",
             ],
             cwd=str(REPO_ROOT),
+            env={**os.environ, "AIRCD_SEED_DEMO": "1"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

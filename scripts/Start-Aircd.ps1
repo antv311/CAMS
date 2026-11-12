@@ -1,6 +1,6 @@
 param(
-    [string]$Bind = "0.0.0.0:6667",
-    [string]$HttpBind = "0.0.0.0:6680",
+    [string]$Bind = "127.0.0.1:6667",
+    [string]$HttpBind = "127.0.0.1:6680",
     [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3",
     [switch]$Background
 )

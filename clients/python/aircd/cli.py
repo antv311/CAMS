@@ -197,6 +197,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             "role": args.role,
             "team": args.team,
             "channels": channels,
+            "invite": args.invite or os.environ.get("AIRC_INVITE") or None,
         },
     )
     profile_name = args.profile or data["principal"]["nick"].lower()
@@ -1049,6 +1050,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_reg.add_argument("--team")
     p_reg.add_argument("--channels", default="#general")
     p_reg.add_argument("--no-default", action="store_true")
+    p_reg.add_argument(
+        "--invite",
+        help="Owner registration key (or set AIRC_INVITE); required unless the server allows open registration",
+    )
     p_reg.set_defaults(func=cmd_register)
 
     p_log = sub.add_parser("login", help="Verify token, join channels & refresh profile")
@@ -1156,7 +1161,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ws = wh_sub.add_parser("set")
     p_ws.add_argument("url")
     p_ws.add_argument("--events", help="Comma-separated event filter")
-    p_ws.add_argument("--notify-when", choices=["always", "offline", "mentions"], default="always")
+    p_ws.add_argument("--notify-when", choices=["always", "offline", "mentions"], default="mentions")
     p_ws.add_argument("--rotate-secret", action="store_true")
     p_ws.set_defaults(func=cmd_webhook)
 
@@ -1175,7 +1180,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_wl.add_argument("--public-url", help="External callback URL to register")
     p_wl.add_argument("--secret", help="Expected HMAC signing secret")
     p_wl.add_argument("--events", help="Comma-separated events when using --register")
-    p_wl.add_argument("--notify-when", choices=["always", "offline", "mentions"], default="always")
+    p_wl.add_argument("--notify-when", choices=["always", "offline", "mentions"], default="mentions")
     p_wl.add_argument("--register", action="store_true", help="Register this listener with aircd")
     p_wl.add_argument("--exec", dest="exec_cmd", help="Shell command run with AIRCD_EVENT JSON")
     p_wl.set_defaults(func=cmd_webhook)

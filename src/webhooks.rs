@@ -743,7 +743,7 @@ fn normalize_events(events: Option<Vec<String>>) -> Vec<String> {
 }
 
 fn normalize_notify_when(when: Option<&str>) -> Result<String> {
-    let clean = when.unwrap_or("always").trim().to_ascii_lowercase();
+    let clean = when.unwrap_or("mentions").trim().to_ascii_lowercase();
     if ALLOWED_NOTIFY_WHEN.contains(&clean.as_str()) {
         Ok(clean)
     } else {

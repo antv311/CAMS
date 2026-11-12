@@ -39,16 +39,74 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<tokio_rustls::TlsA
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Decide which invite key guards `POST /v1/register`. The key itself is
+/// never printed; only where it came from.
+fn resolve_register_key(
+    explicit: Option<String>,
+    open_registration: bool,
+    db_path: &str,
+) -> Result<(Option<String>, String)> {
+    if open_registration {
+        return Ok((
+            None,
+            "OPEN - anyone who can reach this server can register".to_string(),
+        ));
+    }
+    if let Some(key) = explicit {
+        return Ok((
+            Some(key.trim().to_string()),
+            "invite key required (from flag/env)".to_string(),
+        ));
+    }
+    if db_path == ":memory:" {
+        return Ok((None, "OPEN - in-memory database".to_string()));
+    }
+
+    let key_path = std::path::Path::new(db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("aircd-owner.key");
+    if let Ok(existing) = std::fs::read_to_string(&key_path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Ok((
+                Some(existing),
+                format!("invite key required (stored in {})", key_path.display()),
+            ));
+        }
+    }
+
+    use rand::RngCore;
+    let mut raw = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let key: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(&key_path, format!("{key}\n"))
+        .with_context(|| format!("write owner invite key: {}", key_path.display()))?;
+    Ok((
+        Some(key),
+        format!("invite key required (new key written to {})", key_path.display()),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut bind_addr = std::env::var("AIRCD_BIND").unwrap_or_else(|_| "0.0.0.0:6667".to_string());
+    let mut bind_addr = std::env::var("AIRCD_BIND").unwrap_or_else(|_| "127.0.0.1:6667".to_string());
     let mut http_bind =
-        std::env::var("AIRCD_HTTP_BIND").unwrap_or_else(|_| "0.0.0.0:6680".to_string());
+        std::env::var("AIRCD_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:6680".to_string());
     let mut db_path = std::env::var("AIRCD_DB").unwrap_or_else(|_| "aircd.sqlite3".to_string());
     let mut tls_cert = std::env::var("AIRCD_TLS_CERT").ok();
     let mut tls_key = std::env::var("AIRCD_TLS_KEY").ok();
     let mut tls_bind =
-        std::env::var("AIRCD_TLS_BIND").unwrap_or_else(|_| "0.0.0.0:6697".to_string());
+        std::env::var("AIRCD_TLS_BIND").unwrap_or_else(|_| "127.0.0.1:6697".to_string());
+
+    let mut register_key = std::env::var("AIRCD_REGISTER_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    let mut open_registration = matches!(
+        std::env::var("AIRCD_OPEN_REGISTRATION").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    );
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -71,16 +129,25 @@ async fn main() -> Result<()> {
             "--tls-bind" => {
                 tls_bind = args.next().context("--tls-bind requires host:port")?;
             }
+            "--register-key" => {
+                register_key = Some(args.next().context("--register-key requires a key")?);
+            }
+            "--open-registration" => {
+                open_registration = true;
+            }
             "-h" | "--help" => {
                 println!(
                     "aircd - Lightweight IRC + Webhook + Roles + Equipment Locks + Git server\n\
                      Flags:\n  \
-                       --bind <host:port>       IRC TCP listen address (env AIRCD_BIND, default 0.0.0.0:6667)\n  \
-                       --http-bind <host:port>  HTTP welcome & REST API (env AIRCD_HTTP_BIND, default 0.0.0.0:6680)\n  \
+                       --bind <host:port>       IRC TCP listen address (env AIRCD_BIND, default 127.0.0.1:6667)\n  \
+                       --http-bind <host:port>  HTTP welcome & REST API (env AIRCD_HTTP_BIND, default 127.0.0.1:6680)\n  \
                        --db <path>              SQLite database path (env AIRCD_DB, default aircd.sqlite3)\n  \
                        --tls-cert <path>        Optional PEM certificate for IRC TLS\n  \
                        --tls-key <path>         Optional PEM key for IRC TLS\n  \
-                       --tls-bind <host:port>   IRC TLS listen address (default 0.0.0.0:6697)"
+                       --tls-bind <host:port>   IRC TLS listen address (default 127.0.0.1:6697)\n  \
+                       --register-key <key>     Invite key required to register (env AIRCD_REGISTER_KEY;\n  \
+                                                default: generated once in aircd-owner.key beside the DB)\n  \
+                       --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)"
                 );
                 return Ok(());
             }
@@ -90,6 +157,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    let (register_key, register_note) =
+        resolve_register_key(register_key, open_registration, &db_path)?;
     let db = store::open(db_path)?;
     let server = Server::new(db);
     let _webhook_worker = server.webhooks().spawn_worker();
@@ -101,7 +170,9 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let runtime_info = http::build_runtime_info(&bind_addr, &http_bind, tls_port);
+    let mut runtime_info = http::build_runtime_info(&bind_addr, &http_bind, tls_port);
+    runtime_info.register_key = register_key;
+    println!("  registration: {register_note}");
     for host in &runtime_info.detected_hosts {
         println!(
             "  welcome/API: http://{}:{}   IRC: {}:{}",
