@@ -9,6 +9,7 @@ argon2 = "0.5"
 axum = "0.8"
 hmac = "0.12"
 rand = "0.8"
+ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls-pemfile = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }

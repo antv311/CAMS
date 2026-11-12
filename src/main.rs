@@ -11,6 +11,7 @@ mod server;
 mod store;
 mod tasks;
 mod tokens;
+mod tui;
 mod wake;
 mod webhooks;
 
@@ -94,6 +95,12 @@ fn resolve_register_key(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `aircd tui` attaches a dashboard to a hub that is already running.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("tui") {
+        return tui::run(argv[1..].to_vec()).await;
+    }
+
     let mut bind_addr = std::env::var("AIRCD_BIND").unwrap_or_else(|_| "127.0.0.1:6667".to_string());
     let mut http_bind =
         std::env::var("AIRCD_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:6680".to_string());
@@ -141,6 +148,7 @@ async fn main() -> Result<()> {
             "-h" | "--help" => {
                 println!(
                     "aircd - Lightweight IRC + Webhook + Roles + Equipment Locks + Git server\n\
+                     Run `aircd tui` to open the dashboard and chat for a running hub.\n\
                      Flags:\n  \
                        --bind <host:port>       IRC TCP listen address (env AIRCD_BIND, default 127.0.0.1:6667)\n  \
                        --http-bind <host:port>  HTTP welcome & REST API (env AIRCD_HTTP_BIND, default 127.0.0.1:6680)\n  \
