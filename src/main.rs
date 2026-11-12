@@ -7,6 +7,7 @@ mod notes;
 mod projects;
 mod protocol;
 mod reports;
+mod rooms;
 mod server;
 mod store;
 mod tasks;

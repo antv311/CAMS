@@ -13,6 +13,7 @@ use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
 use crate::locks::{LockStore, ResourceLock};
 use crate::notes::NoteStore;
+use crate::rooms::{Room, RoomStore};
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
@@ -37,6 +38,7 @@ pub struct Server {
     projects: ProjectStore,
     wakes: WakeManager,
     notes: NoteStore,
+    rooms: RoomStore,
     inner: Arc<Mutex<ServerInner>>,
 }
 
@@ -114,6 +116,7 @@ impl Server {
             projects: ProjectStore::new(db.clone()),
             wakes: WakeManager::new(db.clone()),
             notes: NoteStore::new(db.clone()),
+            rooms: RoomStore::new(db.clone()),
             db,
             inner: Arc::new(Mutex::new(ServerInner::default())),
         }
@@ -141,6 +144,10 @@ impl Server {
 
     pub fn gits(&self) -> &GitRepoStore {
         &self.gits
+    }
+
+    pub fn rooms(&self) -> &RoomStore {
+        &self.rooms
     }
 
     pub fn notes(&self) -> &NoteStore {
@@ -881,7 +888,8 @@ impl Server {
         actor: &str,
         body: String,
     ) -> Result<()> {
-        let message = self.history.append(&task.channel, SERVER_NAME, &body)?;
+        let room = task.sprint.clone().unwrap_or_else(|| task.channel.clone());
+        let message = self.history.append(&room, SERVER_NAME, &body)?;
         let mut tags = vec![
             ("seq", message.seq.to_string()),
             ("msg-id", message.msg_id.clone()),
@@ -901,14 +909,14 @@ impl Server {
                 .collect::<Vec<_>>(),
         );
         self.broadcast_message(
-            &task.channel,
-            format!("{tag_str} :{SERVER_NAME} NOTICE {} :{body}", task.channel),
+            &room,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {room} :{body}"),
             message.seq,
         )?;
         let task_json = serde_json::to_value(task).ok();
         self.emit_webhook(WebhookEvent {
             event: "task".to_string(),
-            channel: task.channel.clone(),
+            channel: room,
             seq: Some(message.seq),
             msg_id: Some(message.msg_id),
             from: actor.to_string(),
@@ -1499,6 +1507,8 @@ impl Server {
     // ---- projects ------------------------------------------------------
 
     fn require_project(&self, channel: &str) -> Result<Project> {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
         self.projects.get(channel)?.ok_or_else(|| {
             anyhow!("{channel} is not a project; create it with POST /v1/projects first")
         })
@@ -1507,6 +1517,8 @@ impl Server {
     /// Project leaders and coordinators manage a project's work. A global
     /// leader, op or admin (the owner) manages every project.
     pub fn is_project_manager(&self, actor: &Principal, channel: &str) -> Result<bool> {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
         if matches!(actor.role.as_str(), "leader" | "op" | "admin") {
             return Ok(true);
         }
@@ -1518,6 +1530,8 @@ impl Server {
 
     /// The project manager first, then the other leaders and coordinators.
     fn project_managers(&self, channel: &str) -> Result<Vec<String>> {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
         let mut out: Vec<String> = self
             .projects
             .get(channel)?
@@ -1606,6 +1620,7 @@ impl Server {
         self.projects.set_pm(&channel, Some(&target.id))?;
         self.projects.set_role(&channel, &target.id, "coordinator")?;
         self.join_channels(&target, std::slice::from_ref(&channel))?;
+        self.join_rooms(&target, &channel)?;
         self.join_channels(actor, std::slice::from_ref(&channel))?;
         self.announce(
             &channel,
@@ -1616,6 +1631,84 @@ impl Server {
             ),
         )?;
         self.require_project(&channel)
+    }
+
+    // ---- sprint rooms --------------------------------------------------
+
+    /// The project a channel belongs to: a sprint room maps to its project,
+    /// anything else is returned unchanged.
+    pub fn project_of(&self, channel: &str) -> String {
+        self.rooms
+            .get(channel)
+            .ok()
+            .flatten()
+            .map(|room| room.project)
+            .unwrap_or_else(|| channel.to_string())
+    }
+
+    /// Everyone on a project is in every one of its rooms.
+    fn join_rooms(&self, principal: &Principal, project: &str) -> Result<()> {
+        let rooms: Vec<String> = self
+            .rooms
+            .list(Some(project))?
+            .into_iter()
+            .map(|room| room.channel)
+            .collect();
+        if !rooms.is_empty() {
+            self.join_channels(principal, &rooms)?;
+        }
+        Ok(())
+    }
+
+    /// Open the project's next sprint room. Rooms are never closed; the
+    /// newest one is the current sprint, where new tasks go by default.
+    pub fn open_room_api(
+        &self,
+        actor: &Principal,
+        raw_project: &str,
+        title: Option<&str>,
+    ) -> Result<Room> {
+        let project = self.project_of(&normalize_channel(raw_project));
+        self.require_project(&project)?;
+        if !self.is_project_manager(actor, &project)? {
+            return Err(anyhow!(
+                "only the owner or a leader or coordinator of {project} can open a sprint"
+            ));
+        }
+        let room = self.rooms.open(&project, title, &actor.id)?;
+
+        let mut people = vec![actor.clone()];
+        for member in self.projects.members(&project)? {
+            if let Some(principal) = self.auth.resolve_by_name(&member.principal_id)? {
+                people.push(principal);
+            }
+        }
+        for person in &people {
+            self.join_channels(person, std::slice::from_ref(&room.channel))?;
+        }
+
+        let name = room
+            .title
+            .as_deref()
+            .map(|title| format!(": {title}"))
+            .unwrap_or_default();
+        self.announce(
+            &project,
+            actor,
+            format!(
+                "Sprint {} opened by {}{name} - room {}",
+                room.label, actor.nick, room.channel
+            ),
+        )?;
+        self.announce(
+            &room.channel,
+            actor,
+            format!(
+                "Sprint {} of {project}{name}. New tasks go here; this room is the record of the sprint.",
+                room.label
+            ),
+        )?;
+        Ok(room)
     }
 
     // ---- questions -----------------------------------------------------
@@ -1754,6 +1847,7 @@ impl Server {
         let role = crate::auth::normalize_role(raw_role.unwrap_or("member"))?;
         self.projects.set_role(&channel, &target.id, &role)?;
         self.join_channels(&target, std::slice::from_ref(&channel))?;
+        self.join_rooms(&target, &channel)?;
         Ok(ProjectMember {
             principal_id: target.id,
             role,
@@ -1765,6 +1859,8 @@ impl Server {
     /// Resolve who a task may be given to. Assignment only exists inside a
     /// project, and only to an account that is a member of that project.
     fn resolve_assignee(&self, actor: &Principal, channel: &str, name: &str) -> Result<String> {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
         self.require_project(channel)?;
         let target = self
             .auth
@@ -1789,7 +1885,15 @@ impl Server {
         if title.is_empty() {
             return Err(anyhow!("task title is required"));
         }
-        let channel = normalize_channel(&new.channel);
+        // A task named for a sprint room belongs to that room's project.
+        // Otherwise it goes into the project's current sprint, if it has one.
+        let requested = normalize_channel(&new.channel);
+        let channel = self.project_of(&requested);
+        new.sprint = if requested != channel {
+            Some(requested)
+        } else {
+            self.rooms.current(&channel)?.map(|room| room.channel)
+        };
         if channel.eq_ignore_ascii_case(CHAT_ONLY_CHANNEL) {
             return Err(anyhow!(
                 "{CHAT_ONLY_CHANNEL} is chat only; create the task in a project channel"
@@ -2515,6 +2619,8 @@ impl Server {
 
     /// The local folder of the task's repo, or of the project's first repo.
     fn repo_path_for(&self, channel: &str, repo_name: Option<&str>) -> Option<String> {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
         let repos = self.gits.list().ok()?;
         repo_name
             .and_then(|name| repos.iter().find(|r| r.name.eq_ignore_ascii_case(name)))
@@ -2523,6 +2629,8 @@ impl Server {
     }
 
     fn is_pm_of(&self, channel: &str, principal_id: &str) -> bool {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
         self.projects
             .get(channel)
             .ok()
@@ -2560,6 +2668,8 @@ impl Server {
     /// `@coordinator` or `@leader` in a project channel addresses whoever
     /// holds that role in that project.
     fn role_mentions(&self, channel: &str, message: &str) -> HashSet<String> {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
         let mut out = HashSet::new();
         let words = crate::webhooks::extract_mentions(message);
         if words.is_empty() {
@@ -2871,6 +2981,40 @@ mod tests {
         assert!(hit.len() == 1, "the project leader is not a coordinator");
         assert!(server.role_mentions("#general", "@coordinator").is_empty());
         assert!(server.role_mentions("#quest", "no mention here").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_sprint_room_acts_as_its_project_for_roles_and_the_project_manager() -> Result<()> {
+        let server = test_server()?;
+        let (owner, _) = server
+            .auth()
+            .register_principal("boss2", Some("leader"), None)?;
+        let (manager, _) = server.auth().register_principal("pm", None, None)?;
+        server.create_project_api(&owner, "#proj", "Proj", None)?;
+        server.set_project_pm_api(&owner, "#proj", "pm")?;
+
+        // Only a manager of the project opens a sprint.
+        let (outsider, _) = server.auth().register_principal("visitor", None, None)?;
+        assert!(server.open_room_api(&outsider, "#proj", None).is_err());
+
+        let room = server.open_room_api(&owner, "#proj", Some("First playable"))?;
+        assert_eq!(room.channel, "#proj-s1");
+        assert_eq!(room.label, "s1");
+        assert_eq!(server.project_of(&room.channel), "#proj");
+        assert_eq!(server.project_of("#general"), "#general");
+        // The PM is the PM in the room too, so it keeps a conversation per room.
+        assert!(server.is_pm_of(&room.channel, &manager.id));
+        assert!(server
+            .role_mentions(&room.channel, "ready @coordinator")
+            .contains(&manager.id));
+        // Members of the project were put in the room; later members join it too.
+        assert!(server.is_member(&manager.id, &room.channel)?);
+        server.set_project_member_api(&owner, "#proj", "visitor", None)?;
+        assert!(server.is_member(&outsider.id, &room.channel)?);
+
+        let second = server.open_room_api(&manager, "#proj-s1", None)?;
+        assert_eq!(second.channel, "#proj-s2", "opening from inside a room opens the project's next one");
         Ok(())
     }
 

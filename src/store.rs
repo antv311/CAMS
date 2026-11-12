@@ -273,6 +273,17 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_wake_runs_principal
               ON wake_runs (principal_id, started_at);
 
+            CREATE TABLE IF NOT EXISTS rooms (
+              channel TEXT PRIMARY KEY,
+              project TEXT NOT NULL,
+              label TEXT NOT NULL,
+              title TEXT,
+              opened_by TEXT NOT NULL,
+              opened_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_rooms_project ON rooms (project, opened_at);
+
             CREATE TABLE IF NOT EXISTS task_questions (
               id TEXT PRIMARY KEY,
               task_id TEXT NOT NULL,
@@ -374,6 +385,7 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         ("repo", "TEXT"),
         ("branch", "TEXT"),
         ("issue_url", "TEXT"),
+        ("sprint", "TEXT"),
     ];
 
     for (column, definition) in columns {

@@ -49,6 +49,7 @@ const HELP: &[&str] = &[
     "  up/down     move between projects and tasks",
     "  Enter       show the selected task with its history",
     "  n           new task in the selected project",
+    "  o           open the project's next sprint room",
     "  a           assign or reassign the selected task",
     "  s           move the selected task to another status",
     "  p           choose the selected project's manager (owner)",
@@ -96,6 +97,16 @@ pub struct TaskView {
     pub status: String,
     pub assignee: String,
     pub title: String,
+    /// The sprint room the task belongs to.
+    pub sprint: Option<String>,
+}
+
+/// A sprint room under a project.
+#[derive(Clone, Debug, Default)]
+pub struct RoomView {
+    pub channel: String,
+    pub label: String,
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -112,6 +123,7 @@ pub struct ProjectView {
     pub tasks: Vec<TaskView>,
     pub members: Vec<Member>,
     pub repos: Vec<RepoView>,
+    pub rooms: Vec<RoomView>,
 }
 
 /// A question that is stopping a task until this user answers it.
@@ -206,6 +218,7 @@ pub enum Flow {
     NewProjectName,
     NewProjectRepo { name: String },
     TestAgent,
+    OpenSprint { channel: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -259,6 +272,13 @@ impl Default for App {
             scroll: 0,
         }
     }
+}
+
+/// The project a room belongs to: its own channel or one of its sprint rooms.
+fn project_for<'a>(snap: &'a Snapshot, channel: &str) -> Option<&'a ProjectView> {
+    snap.projects
+        .iter()
+        .find(|p| p.channel == channel || p.rooms.iter().any(|r| r.channel == channel))
 }
 
 /// The projects-and-tasks list, flattened in display order.
@@ -511,6 +531,7 @@ async fn refresh(
 
     let projects = get(client, cfg, "/v1/projects").await?;
     let gits = get(client, cfg, "/v1/gits").await?;
+    let rooms = get(client, cfg, "/v1/rooms").await?;
     let mut views = Vec::new();
     for project in projects["projects"].as_array().into_iter().flatten() {
         let channel = text(&project["channel"]);
@@ -534,6 +555,7 @@ async fn refresh(
                         .unwrap_or("-")
                         .to_string(),
                     title: text(&t["title"]),
+                    sprint: t["sprint"].as_str().map(str::to_owned),
                 })
                 .collect(),
             members: members["members"]
@@ -551,6 +573,17 @@ async fn refresh(
                 .flatten()
                 .filter(|repo| repo["channel"].as_str() == Some(channel.as_str()))
                 .map(repo_view)
+                .collect(),
+            rooms: rooms["rooms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|room| room["project"].as_str() == Some(channel.as_str()))
+                .map(|room| RoomView {
+                    channel: text(&room["channel"]),
+                    label: text(&room["label"]),
+                    title: room["title"].as_str().map(str::to_owned),
+                })
                 .collect(),
             channel,
         });
@@ -575,7 +608,13 @@ async fn refresh(
     // Channels: #general first, then every project and any other channel.
     let listed = get(client, cfg, "/v1/channels").await?;
     // Order: #general and other hub rooms first, then each project's rooms.
-    let project_channels: Vec<String> = snap.projects.iter().map(|p| p.channel.clone()).collect();
+    let project_channels: Vec<String> = snap
+        .projects
+        .iter()
+        .flat_map(|p| {
+            std::iter::once(p.channel.clone()).chain(p.rooms.iter().map(|r| r.channel.clone()))
+        })
+        .collect();
     let mut channels = vec!["#general".to_string()];
     for name in listed["channels"]
         .as_array()
@@ -961,6 +1000,11 @@ fn advance(app: &mut App, flow: Flow, value: String, snap: &Snapshot) -> Option<
                 "Answer sent",
             )
         }
+        Flow::OpenSprint { channel } => api(
+            "/v1/rooms".to_string(),
+            json!({"project": channel, "title": optional(&value)}),
+            "Sprint opened",
+        ),
         Flow::NewProjectName => {
             if !value.trim().is_empty() {
                 app.modal = prompt(
@@ -1222,6 +1266,19 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
                 );
             }
         }
+        KeyCode::Char('o') => {
+            if let Some(project) = selected_project(app, snap) {
+                app.modal = prompt(
+                    format!(
+                        "Open the next sprint of {}: title (optional)",
+                        project.channel
+                    ),
+                    Flow::OpenSprint {
+                        channel: project.channel.clone(),
+                    },
+                );
+            }
+        }
         KeyCode::Char('w') => {
             app.modal = picker(
                 "Answer which question?",
@@ -1400,8 +1457,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("n", "new project"),
             ("m", "member"),
             ("p", "PM"),
+            ("o", "sprint"),
             ("t", "test"),
-            ("l", "launcher"),
             ("w", "answer"),
             ("c", "chat"),
             ("?", "help"),
@@ -1413,7 +1470,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("a", "assign"),
             ("s", "status"),
             ("w", "answer"),
-            ("l", "launcher"),
+            ("o", "sprint"),
             ("c", "chat"),
             ("Esc", "home"),
             ("?", "help"),
@@ -1494,6 +1551,13 @@ fn project_line(project: &ProjectView) -> Line<'static> {
                 None => "no PM".to_string(),
             },
             Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            match project.rooms.last() {
+                Some(room) => format!("  sprint {}", room.label),
+                None => String::new(),
+            },
+            Style::default().fg(Color::Magenta),
         ),
         Span::styled(format!("   {summary}"), Style::default().fg(Color::Gray)),
     ])
@@ -1587,12 +1651,18 @@ fn channel_tree(app: &mut App, snap: &Snapshot, area: Rect) -> Vec<Line<'static>
     let mut number = 0usize;
     let mut last_group: Option<String> = None;
     for (index, name) in snap.channels.iter().enumerate() {
-        let title = snap
-            .projects
-            .iter()
-            .find(|p| &p.channel == name)
+        let project = project_for(snap, name);
+        let title = project
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "Hub".to_string());
+        // A sprint room is listed by its label and title, indented.
+        let shown: String = project
+            .and_then(|p| p.rooms.iter().find(|r| &r.channel == name))
+            .map(|r| format!("  {} {}", r.label, r.title.as_deref().unwrap_or_default()))
+            .unwrap_or_else(|| name.clone())
+            .chars()
+            .take(width.saturating_sub(9))
+            .collect();
         if last_group.as_deref() != Some(title.as_str()) {
             number += 1;
             lines.push(Line::from(Span::styled(
@@ -1623,7 +1693,7 @@ fn channel_tree(app: &mut App, snap: &Snapshot, area: Rect) -> Vec<Line<'static>
         } else {
             String::new()
         };
-        let label = format!("{number:>2}   {name:<w$}{count:>4}", w = width.saturating_sub(9));
+        let label = format!("{number:>2}   {shown:<w$}{count:>4}", w = width.saturating_sub(9));
         app.channel_rows
             .push((area.y + 1 + lines.len() as u16, index));
         lines.push(if index == app.channel_idx {
@@ -1640,18 +1710,20 @@ fn channel_tree(app: &mut App, snap: &Snapshot, area: Rect) -> Vec<Line<'static>
 /// What an account is doing in `channel`, from its tasks there: the dot
 /// colour and a word. `None` means it is standing by.
 pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color, &'static str)> {
-    let is_project = snap.projects.iter().any(|p| p.channel == channel);
+    // In a project's own room: all its tasks. In a sprint room: that
+    // sprint's tasks. Anywhere else: every project.
+    let home = project_for(snap, channel);
+    let in_sprint_room = home.is_some_and(|p| p.channel != channel);
     let mut best: Option<(u8, Color, &'static str)> = None;
     for project in snap
         .projects
         .iter()
-        .filter(|p| !is_project || p.channel == channel)
+        .filter(|p| home.is_none_or(|h| h.channel == p.channel))
     {
-        for task in project
-            .tasks
-            .iter()
-            .filter(|t| t.assignee.eq_ignore_ascii_case(nick))
-        {
+        for task in project.tasks.iter().filter(|t| {
+            t.assignee.eq_ignore_ascii_case(nick)
+                && (!in_sprint_room || t.sprint.as_deref() == Some(channel))
+        }) {
             let escalated = snap
                 .waiting
                 .iter()
@@ -1679,7 +1751,7 @@ pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color
 
 /// Who is working in this room (above the line) and who is standing by.
 fn draw_people(frame: &mut Frame, snap: &Snapshot, channel: &str, area: Rect) {
-    let names: Vec<String> = match snap.projects.iter().find(|p| p.channel == channel) {
+    let names: Vec<String> = match project_for(snap, channel) {
         Some(project) => project.members.iter().map(|m| m.nick.clone()).collect(),
         None => snap.accounts.iter().map(|a| a.nick.clone()).collect(),
     };
@@ -1830,36 +1902,15 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
         app.task_rows
             .push((bottom.y + 1 + (index - app.scroll) as u16, index));
         let mut line = match row {
-            Row::Project(p) => {
-                let project = &snap.projects[*p];
-                let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-                for task in &project.tasks {
-                    *counts.entry(task.status.as_str()).or_default() += 1;
-                }
-                let summary = if counts.is_empty() {
-                    "no open tasks".to_string()
-                } else {
-                    counts
-                        .iter()
-                        .map(|(status, n)| format!("{status} {n}"))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                };
-                Line::from(vec![
-                    Span::styled(project.channel.clone(), bold().fg(Color::Cyan)),
-                    Span::raw(format!("  {}  ", project.name)),
-                    Span::styled(
-                        match &project.pm {
-                            Some(pm) => format!("PM @{pm}"),
-                            None => "no PM".to_string(),
-                        },
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(format!("   {summary}"), Style::default().fg(Color::Gray)),
-                ])
-            }
+            Row::Project(p) => project_line(&snap.projects[*p]),
             Row::Task(p, t) => {
                 let task = &snap.projects[*p].tasks[*t];
+                let sprint = task
+                    .sprint
+                    .as_deref()
+                    .and_then(|room| snap.projects[*p].rooms.iter().find(|r| r.channel == room))
+                    .map(|r| r.label.clone())
+                    .unwrap_or_default();
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -1867,6 +1918,7 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
                         Style::default().fg(status_color(&task.status)),
                     ),
                     Span::styled(format!("@{:<14}", task.assignee), bold()),
+                    Span::styled(format!("{sprint:<4}"), Style::default().fg(Color::Magenta)),
                     Span::raw(format!("[{}] {}", task.kind, task.title)),
                     Span::styled(
                         format!("  {}", task.id.chars().take(13).collect::<String>()),
@@ -2233,6 +2285,7 @@ mod tests {
                     status: "blocked".into(),
                     assignee: "codex".into(),
                     title: "Fix seek bar".into(),
+                    sprint: Some("#quest-video-s1".into()),
                 }],
                 members: vec![
                     Member {
@@ -2251,6 +2304,11 @@ mod tests {
                     branch: None,
                     remote: Some("https://github.com/antv311/quest-video-workspace.git".into()),
                 }],
+                rooms: vec![RoomView {
+                    channel: "#quest-video-s1".into(),
+                    label: "s1".into(),
+                    title: Some("Local playback".into()),
+                }],
             }],
             waiting: vec![Waiting {
                 task_id: "task_abc123".into(),
@@ -2265,7 +2323,11 @@ mod tests {
                 mode: "fresh".into(),
             }],
             runs: vec!["ok       @flash3.8  role in #quest-video".into()],
-            channels: vec!["#general".into(), "#quest-video".into()],
+            channels: vec![
+                "#general".into(),
+                "#quest-video".into(),
+                "#quest-video-s1".into(),
+            ],
             messages,
             detail: None,
             notice: None,
@@ -2750,8 +2812,64 @@ mod tests {
     #[test]
     fn key_hints_are_bracketed_letters() {
         let screen = render(&mut App::default(), &fixture());
-        for expected in ["[n] new", "[a] assign", "[Esc] home", "[q] quit"] {
+        for expected in ["[n] new", "[a] assign", "[o] sprint", "[Esc] home", "[q] quit"] {
             assert!(screen.contains(expected), "hints are missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn sprint_rooms_show_in_the_tree_on_tasks_and_filter_the_people_pane() {
+        let mut snap = fixture();
+        // The tree lists the room under its project, by label and title.
+        let mut app = App {
+            view: View::Chat,
+            channel_idx: 2,
+            ..App::default()
+        };
+        let screen = render(&mut app, &snap);
+        for expected in ["[-] Quest player", "#quest-video", "s1 Local play", "Message #quest-video-s1"] {
+            assert!(screen.contains(expected), "chat is missing {expected:?}");
+        }
+        // The project line names the current sprint and the task row its sprint.
+        let dashboard = render(&mut App::default(), &snap);
+        assert!(dashboard.contains("sprint s1"), "project line has no sprint");
+        assert!(dashboard.contains("s1  [bug] Fix seek bar"), "task row has no sprint");
+
+        // In a sprint room the dots come from that sprint's tasks only.
+        assert_eq!(
+            member_state(&snap, "#quest-video-s1", "codex"),
+            Some((Color::Red, "needs you"))
+        );
+        snap.projects[0].tasks[0].sprint = Some("#quest-video-s2".into());
+        assert_eq!(member_state(&snap, "#quest-video-s1", "codex"), None);
+        assert!(member_state(&snap, "#quest-video", "codex").is_some());
+    }
+
+    #[test]
+    fn o_opens_the_next_sprint_of_the_selected_project() {
+        let snap = fixture();
+        for mut app in [home(), App::default()] {
+            press(&mut app, &snap, &[KeyCode::Char('o')]);
+            assert!(render(&mut app, &snap).contains("Open the next sprint of #quest-video"));
+            type_text(&mut app, &snap, "Subtitles");
+            assert_eq!(
+                press(&mut app, &snap, &[KeyCode::Enter]),
+                sent(
+                    "/v1/rooms",
+                    json!({"project": "#quest-video", "title": "Subtitles"}),
+                    "Sprint opened"
+                )
+            );
+        }
+        // The title is optional.
+        let mut app = home();
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Char('o'), KeyCode::Enter]),
+            sent(
+                "/v1/rooms",
+                json!({"project": "#quest-video", "title": null}),
+                "Sprint opened"
+            )
+        );
     }
 }

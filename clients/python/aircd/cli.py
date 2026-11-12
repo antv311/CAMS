@@ -676,7 +676,7 @@ def cmd_task(args: argparse.Namespace) -> int:
         lines = [
             f"{t['id']} [{t['kind']}/{t['status']}] {t['channel']}: {t['title']}",
             f"assignee={t.get('assignee') or '-'} repo={t.get('repo') or '-'} "
-            f"branch={t.get('branch') or '-'} issue={t.get('issue_url') or '-'}",
+            f"branch={t.get('branch') or '-'} issue={t.get('issue_url') or '-'} sprint={t.get('sprint') or '-'}",
         ]
         if t.get("body"):
             lines.append(t["body"])
@@ -731,7 +731,7 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             lines.append(f"  repo {repo['name']}: {repo['local_path']}")
         for t in proj.get("tasks", []):
             lines.append(
-                f"  {t['id']} [{t['kind']}/{t['status']}] branch={t.get('branch') or '-'}: {t['title']}"
+                f"  {t['id']} [{t['kind']}/{t['status']}] sprint={t.get('sprint') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
             )
         for t in proj.get("to_review", []):
             lines.append(
@@ -743,6 +743,31 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         note = f" ({q['escalation_note']})" if q.get("escalation_note") else ""
         lines.append(f"NEEDS YOU {q['channel']} {q['task_id']} from @{q['asked_by']}: {q['question']}{note}")
     print_out(args, data, lines)
+    return 0
+
+
+def cmd_room(args: argparse.Namespace) -> int:
+    """Sprint rooms: numbered rooms under a project, opened and never closed."""
+    server, token, _prof = require_token(args)
+    if args.room_cmd == "open":
+        data = http_json(
+            server,
+            "POST",
+            "/v1/rooms",
+            token=token,
+            payload={"project": args.project, "title": " ".join(args.title) or None},
+        )
+        r = data["room"]
+        title = f": {r['title']}" if r.get("title") else ""
+        print_out(args, data, [f"Opened sprint {r['label']} of {r['project']}{title} - room {r['channel']}"])
+        return 0
+    qs = f"?{urllib.parse.urlencode({'channel': args.project})}" if args.project else ""
+    data = http_json(server, "GET", f"/v1/rooms{qs}", token=token)
+    lines = [
+        f"{r['project']} {r['label']}  {r['channel']}  {r.get('title') or ''}".rstrip()
+        for r in data.get("rooms", [])
+    ]
+    print_out(args, data, lines or ["No sprint rooms yet."])
     return 0
 
 
@@ -1527,6 +1552,16 @@ def build_parser() -> argparse.ArgumentParser:
         p_ta = task_sub.add_parser(action)
         p_ta.add_argument("id")
         p_ta.set_defaults(func=cmd_task)
+
+    p_room = sub.add_parser("room", help="Sprint rooms under a project (opened, never closed)")
+    room_sub = p_room.add_subparsers(dest="room_cmd", required=True)
+    p_ro = room_sub.add_parser("open", help="Open the project's next sprint room; new tasks go there")
+    p_ro.add_argument("project")
+    p_ro.add_argument("title", nargs="*")
+    p_ro.set_defaults(func=cmd_room)
+    p_rl = room_sub.add_parser("list")
+    p_rl.add_argument("project", nargs="?")
+    p_rl.set_defaults(func=cmd_room)
 
     p_notes = sub.add_parser("notes", help="Your account's lasting notes on the hub")
     notes_sub = p_notes.add_subparsers(dest="notes_cmd", required=True)

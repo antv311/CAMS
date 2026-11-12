@@ -124,6 +124,37 @@ place is the task: it names its project channel, repo and branch.
 | `POST /v1/tasks/{id}/status` | Move through the workflow (`status`, `note`, `branch`) |
 | `GET /v1/inbox` | The caller's tasks and reviews, grouped by project |
 
+## Sprint rooms
+
+A project can have numbered rooms, one per sprint: `s1`, `s2`, `s3`. They are
+opened and never closed, so each one stays as the record of that sprint.
+
+- `airc room open #quest-video Local playback` opens the project's next room
+  (here `#quest-video-s1`). The owner or a leader or coordinator of the
+  project can open one. `airc room list [project]` lists them.
+- **The newest room is the current sprint.** A task created in the project
+  goes into it; naming a room as the task's channel puts it in that sprint
+  instead. Every task shows its sprint.
+- **The room is the record.** Task notices (created, assigned, status
+  changes, questions, answers) are written into the task's sprint room, next
+  to the discussion. Workers put the task id in their commit messages, which
+  gives the chain commit -> task -> sprint -> room: to find out why something
+  was done, read that room with `airc messages --channel <room>`.
+- **A room acts as its project.** Everyone on the project is in all of its
+  rooms, `@coordinator` and `@here` work there, and the project manager is
+  the manager there too. A PM launcher in `pm` mode keeps a separate
+  conversation per room. The lasting memory is still the room's history on
+  the hub, not that conversation.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /v1/rooms[?channel=<project>]` | List sprint rooms |
+| `POST /v1/rooms` | Open the next room (`project`, optional `title`) |
+
+In the TUI, rooms appear under their project in the chat tree, the dashboard
+shows each project's current sprint and each task's sprint, and `o` opens the
+next sprint of the selected project.
+
 ## Project managers, questions and notes
 
 - **One project manager per project**, chosen by the owner:

@@ -26,7 +26,7 @@ pub const ALL_STATUSES: &[&str] = &[
 ];
 
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
-     body, kind, assignee, created_by, repo, branch, issue_url, created_at, updated_at";
+     body, kind, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Task {
@@ -47,6 +47,8 @@ pub struct Task {
     pub issue_url: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The sprint room this task belongs to, such as `#quest-video-s2`.
+    pub sprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -60,6 +62,7 @@ pub struct NewTask {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub issue_url: Option<String>,
+    pub sprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,8 +147,8 @@ impl TaskStore {
         db.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, assignee, created_by, repo, branch, issue_url,
-                                created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+                                created_at, updated_at, sprint)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
             params![
                 id,
                 new.channel,
@@ -158,7 +161,8 @@ impl TaskStore {
                 clean_opt(new.repo),
                 clean_opt(new.branch),
                 clean_opt(new.issue_url),
-                now
+                now,
+                clean_opt(new.sprint)
             ],
         )
         .context("insert task")?;
@@ -608,6 +612,7 @@ impl TaskStore {
             issue_url: row.get(12)?,
             created_at: row.get(13)?,
             updated_at: row.get(14)?,
+            sprint: row.get(15)?,
         })
     }
 }

@@ -204,6 +204,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}/escalate", post(escalate_task))
         .route("/v1/notes", get(get_notes).post(write_notes))
         .route("/v1/projects/pm", post(set_project_pm))
+        .route("/v1/rooms", get(list_rooms).post(open_room))
         .route("/v1/inbox", get(get_inbox))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -1101,6 +1102,7 @@ async fn create_task(
                 repo: req.repo,
                 branch: req.branch,
                 issue_url: req.issue_url,
+                sprint: None,
             },
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -1234,6 +1236,50 @@ async fn create_project(
         StatusCode::CREATED,
         with_cors_headers(),
         Json(json!({ "ok": true, "project": project })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct OpenRoomReq {
+    project: String,
+    title: Option<String>,
+}
+
+async fn open_room(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OpenRoomReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let project = normalize_http_channel(&req.project);
+    let room = state
+        .server
+        .open_room_api(&actor, &project, req.title.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "room": room })),
+    ))
+}
+
+/// Sprint rooms of one project (`?channel=`), or of every project.
+async fn list_rooms(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ChannelQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_request(&state, &headers)?;
+    let project = q.channel.as_deref().map(normalize_http_channel);
+    let rooms = state
+        .server
+        .rooms()
+        .list(project.as_deref())
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "rooms": rooms })),
     ))
 }
 
@@ -3096,6 +3142,100 @@ mod tests {
         assert!(logs[0].contains("fresh-project"), "first PM launch starts the conversation: {logs:?}");
         assert!(logs[1].contains("resumed-conv-9"), "second PM launch resumes it: {logs:?}");
         assert!(logs[2].contains("fresh-member"), "as a plain member it starts fresh: {logs:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tasks_belong_to_a_sprint_room_and_its_history_records_them() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let mut tokens = std::collections::HashMap::new();
+        for (nick, role) in [("owner", "leader"), ("worker", "member")] {
+            let res: Value = client
+                .post(format!("{base}/v1/register"))
+                .json(&json!({"nick": nick, "role": role}))
+                .send()
+                .await?
+                .json()
+                .await?;
+            tokens.insert(nick, res["token"].as_str().unwrap().to_string());
+        }
+        let (owner, worker) = (tokens["owner"].as_str(), tokens["worker"].as_str());
+        call(&client, "POST", format!("{base}/v1/projects"), owner,
+            json!({"channel": "#quest"})).await?;
+        call(&client, "POST", format!("{base}/v1/projects/members"), owner,
+            json!({"channel": "#quest", "nick": "worker"})).await?;
+        let tasks_url = format!("{base}/v1/tasks");
+        let rooms_url = format!("{base}/v1/rooms");
+
+        // Before any sprint is opened a task has no sprint.
+        let (_, body) = call(&client, "POST", tasks_url.clone(), owner,
+            json!({"channel": "#quest", "title": "Before sprints"})).await?;
+        assert_eq!(body["task"]["sprint"], Value::Null);
+
+        // A plain member cannot open a sprint; the owner can.
+        let (status, _) = call(&client, "POST", rooms_url.clone(), worker,
+            json!({"project": "#quest"})).await?;
+        assert_eq!(status, 400);
+        let (status, body) = call(&client, "POST", rooms_url.clone(), owner,
+            json!({"project": "#quest", "title": "Local playback"})).await?;
+        assert_eq!(status, 201);
+        assert_eq!(body["room"]["channel"], "#quest-s1");
+        assert_eq!(body["room"]["label"], "s1");
+        assert_eq!(body["room"]["title"], "Local playback");
+
+        // New tasks go into the current sprint and stay in their project.
+        let (_, body) = call(&client, "POST", tasks_url.clone(), owner,
+            json!({"channel": "#quest", "title": "Seek bar", "assignee": "worker"})).await?;
+        assert_eq!(body["task"]["channel"], "#quest");
+        assert_eq!(body["task"]["sprint"], "#quest-s1");
+
+        call(&client, "POST", rooms_url.clone(), owner, json!({"project": "#quest"})).await?;
+        let (_, body) = call(&client, "POST", tasks_url.clone(), owner,
+            json!({"channel": "#quest", "title": "Subtitles"})).await?;
+        assert_eq!(body["task"]["sprint"], "#quest-s2");
+        // Naming a room puts the task in that sprint, even an older one.
+        let (_, body) = call(&client, "POST", tasks_url.clone(), owner,
+            json!({"channel": "#quest-s1", "title": "Late fix"})).await?;
+        assert_eq!(body["task"]["channel"], "#quest");
+        assert_eq!(body["task"]["sprint"], "#quest-s1");
+
+        let (_, body) = call(&client, "GET", format!("{rooms_url}?channel=%23quest"), owner,
+            Value::Null).await?;
+        assert_eq!(body["rooms"].as_array().unwrap().len(), 2);
+
+        // The room's history is the record: it holds the notices of its tasks.
+        let history = |room: &str| {
+            let client = client.clone();
+            let url = format!("{base}/v1/messages?channel={}", room.replace('#', "%23"));
+            async move {
+                let (_, body) = call(&client, "GET", url, owner, Value::Null).await.unwrap();
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m["body"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+        let first = history("#quest-s1").await;
+        assert!(first.contains("Seek bar") && first.contains("Late fix"), "{first}");
+        assert!(!first.contains("Subtitles"));
+        assert!(history("#quest-s2").await.contains("Subtitles"));
+        // The assignee, a member of the project, can read the room as well.
+        let (status, _) = call(&client, "GET",
+            format!("{base}/v1/messages?channel=%23quest-s1"), worker, Value::Null).await?;
+        assert_eq!(status, 200);
 
         Ok(())
     }
