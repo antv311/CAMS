@@ -2,8 +2,18 @@ param(
     [string]$Bind = "127.0.0.1:6667",
     [string]$HttpBind = "127.0.0.1:6680",
     [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3",
-    [switch]$Background
+    [switch]$Background,
+    # Do nothing when a hub is already listening (used by the sign-in shortcut).
+    [switch]$IfNotRunning
 )
+
+if ($IfNotRunning) {
+    $HttpPort = [int]($HttpBind -split ':')[-1]
+    if (Get-NetTCPConnection -LocalPort $HttpPort -State Listen -ErrorAction SilentlyContinue) {
+        Write-Host "aircd is already listening on port $HttpPort"
+        exit 0
+    }
+}
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
