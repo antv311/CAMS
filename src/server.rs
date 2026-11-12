@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -8,13 +9,17 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthStore, Principal};
-use crate::history::{unix_timestamp, HistoryStore};
+use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
+use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
+use crate::locks::{LockStore, ResourceLock};
 use crate::protocol::{parse_command, Command};
+use crate::reports::{NewReport, Report, ReportStore};
 use crate::store::SharedConnection;
 use crate::tasks::{Task, TaskStore};
+use crate::webhooks::{WebhookEvent, WebhookStore};
 
 const SERVER_NAME: &str = "aircd";
-const METADATA_CAPABILITIES: &[&str] = &["message-tags"];
+const METADATA_CAPABILITIES: &[&str] = &["message-tags", "echo-message"];
 
 #[derive(Clone)]
 pub struct Server {
@@ -22,7 +27,36 @@ pub struct Server {
     auth: AuthStore,
     history: HistoryStore,
     tasks: TaskStore,
+    webhooks: WebhookStore,
+    reports: ReportStore,
+    gits: GitRepoStore,
+    locks: LockStore,
     inner: Arc<Mutex<ServerInner>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentDirectoryEntry {
+    pub id: String,
+    pub nick: String,
+    pub team: Option<String>,
+    pub role: String,
+    pub online: bool,
+    pub webhook_configured: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ChannelSummary {
+    pub channel: String,
+    pub message_count: i64,
+    pub last_activity_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DirectorySnapshot {
+    pub agents: Vec<AgentDirectoryEntry>,
+    pub channels: Vec<ChannelSummary>,
+    pub git_repos: Vec<GitRepo>,
+    pub locks: Vec<ResourceLock>,
 }
 
 #[derive(Default)]
@@ -50,6 +84,7 @@ struct Session {
     nick: Option<String>,
     pass_token: Option<String>,
     registered: bool,
+    capabilities: HashSet<String>,
     tx: UnboundedSender<String>,
     shutdown_tx: UnboundedSender<String>,
 }
@@ -66,9 +101,41 @@ impl Server {
             auth: AuthStore::new(db.clone()),
             history: HistoryStore::new(db.clone()),
             tasks: TaskStore::new(db.clone(), lease_seconds),
+            webhooks: WebhookStore::new(db.clone()),
+            reports: ReportStore::new(db.clone()),
+            gits: GitRepoStore::new(db.clone()),
+            locks: LockStore::new(db.clone()),
             db,
             inner: Arc::new(Mutex::new(ServerInner::default())),
         }
+    }
+
+    pub fn auth(&self) -> &AuthStore {
+        &self.auth
+    }
+
+    pub fn history(&self) -> &HistoryStore {
+        &self.history
+    }
+
+    pub fn tasks(&self) -> &TaskStore {
+        &self.tasks
+    }
+
+    pub fn webhooks(&self) -> &WebhookStore {
+        &self.webhooks
+    }
+
+    pub fn reports(&self) -> &ReportStore {
+        &self.reports
+    }
+
+    pub fn gits(&self) -> &GitRepoStore {
+        &self.gits
+    }
+
+    pub fn locks(&self) -> &LockStore {
+        &self.locks
     }
 
     pub async fn listen(self, bind_addr: &str) -> Result<()> {
@@ -139,6 +206,7 @@ impl Server {
             nick: None,
             pass_token: None,
             registered: false,
+            capabilities: HashSet::new(),
             tx,
             shutdown_tx,
         };
@@ -196,23 +264,27 @@ impl Server {
             } => {
                 self.cap(session, subcommand, capabilities)?;
             }
-            Command::Join(channel) => {
+            Command::Join(channels) => {
                 if !self.ensure_registered(session)? {
                     return Ok(false);
                 }
-                self.join(session, normalize_channel(&channel))?;
+                for ch in channels.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    self.join(session, normalize_channel(ch))?;
+                }
             }
-            Command::Part(channel) => {
+            Command::Part(channels) => {
                 if !self.ensure_registered(session)? {
                     return Ok(false);
                 }
-                self.part(session, normalize_channel(&channel))?;
+                for ch in channels.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    self.part(session, normalize_channel(ch))?;
+                }
             }
             Command::Privmsg { target, body } => {
                 if !self.ensure_registered(session)? {
                     return Ok(false);
                 }
-                self.privmsg(session, normalize_channel(&target), body)?;
+                self.privmsg(session, target, body)?;
             }
             Command::History {
                 channel,
@@ -262,6 +334,110 @@ impl Server {
                 }
                 self.task_list(session, normalize_channel(&channel))?;
             }
+            Command::Names(channel) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.names(session, channel)?;
+            }
+            Command::Who(target) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.who(session, target)?;
+            }
+            Command::RoleList => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.role_list(session)?;
+            }
+            Command::RoleSet { nick, role } => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.role_set(session, nick, role)?;
+            }
+            Command::LockAcquire {
+                resource,
+                channel,
+                ttl_seconds,
+                note,
+            } => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.lock_acquire(session, resource, channel, ttl_seconds, note)?;
+            }
+            Command::LockRelease(resource) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.lock_release(session, resource)?;
+            }
+            Command::LockList(channel) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.lock_list(session, channel)?;
+            }
+            Command::Notice { target, body } => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.privmsg(session, target, body)?;
+            }
+            Command::Mode { target, flags, arg } => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.mode(session, target, flags, arg)?;
+            }
+            Command::Topic { channel, topic: _ } => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.send_topic(session, &normalize_channel(&channel))?;
+            }
+            Command::List(channel) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.list_channels(session, channel)?;
+            }
+            Command::Whois(nick) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.whois(session, nick)?;
+            }
+            Command::Ison(nicks) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.ison(session, nicks)?;
+            }
+            Command::Userhost(nicks) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                self.userhost(session, nicks)?;
+            }
+            Command::Away(reason) => {
+                if !self.ensure_registered(session)? {
+                    return Ok(false);
+                }
+                let nick = session.principal()?.nick.clone();
+                if reason.is_some() {
+                    session.send(format!(
+                        ":{SERVER_NAME} 306 {nick} :You have been marked as being away"
+                    ));
+                } else {
+                    session.send(format!(
+                        ":{SERVER_NAME} 305 {nick} :You are no longer marked as being away"
+                    ));
+                }
+            }
             Command::Quit => return Ok(true),
             Command::Unknown(name) => {
                 session.send(format!(":{SERVER_NAME} 421 * {name} :Unknown command"));
@@ -273,7 +449,7 @@ impl Server {
 
     fn cap(
         &self,
-        session: &Session,
+        session: &mut Session,
         subcommand: String,
         requested_capabilities: Vec<String>,
     ) -> Result<()> {
@@ -285,13 +461,25 @@ impl Server {
                 session.send(format!(":{SERVER_NAME} CAP {nick} LS :{advertised}"));
             }
             "LIST" => {
-                session.send(format!(":{SERVER_NAME} CAP {nick} LIST :{advertised}"));
+                let enabled = METADATA_CAPABILITIES
+                    .iter()
+                    .copied()
+                    .filter(|cap| session.capabilities.contains(*cap))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                session.send(format!(":{SERVER_NAME} CAP {nick} LIST :{enabled}"));
             }
             "REQ" => {
                 let requested = requested_capabilities.join(" ");
-                let all_supported = requested_capabilities
-                    .iter()
-                    .all(|capability| METADATA_CAPABILITIES.contains(&capability.as_str()));
+                let all_supported = !requested_capabilities.is_empty()
+                    && requested_capabilities
+                        .iter()
+                        .all(|capability| METADATA_CAPABILITIES.contains(&capability.as_str()));
+                if all_supported {
+                    for capability in requested_capabilities {
+                        session.capabilities.insert(capability);
+                    }
+                }
                 let status = if all_supported { "ACK" } else { "NAK" };
                 session.send(format!(":{SERVER_NAME} CAP {nick} {status} :{requested}"));
             }
@@ -371,9 +559,31 @@ impl Server {
                 .map(|team| format!(" ({team})"))
                 .unwrap_or_default()
         ));
+        session.send(format!(
+            ":{SERVER_NAME} 005 {} PREFIX=(ov)@+ CHANTYPES=#& CASEMAPPING=ascii NETWORK=aircd :are supported by this server",
+            principal.nick
+        ));
+        session.send(format!(
+            ":{SERVER_NAME} 375 {} :- aircd coordination server -",
+            principal.nick
+        ));
+        session.send(format!(
+            ":{SERVER_NAME} 372 {} :- Role: {} | Commands: JOIN, PRIVMSG <chan|nick>, NAMES, WHO, WHOIS, LIST, MODE, ROLE, ROLES, TASK, LOCK, UNLOCK, LOCKS",
+            principal.nick, principal.role
+        ));
+        session.send(format!(
+            ":{SERVER_NAME} 372 {} :- Webhooks, Reports, Git PR hooks & CLI onboarding: HTTP /v1/welcome",
+            principal.nick
+        ));
+        session.send(format!(
+            ":{SERVER_NAME} 376 {} :End of /MOTD command.",
+            principal.nick
+        ));
 
         for channel in &channels {
             session.send(format!(":{} JOIN {}", principal.nick, channel));
+            let _ = self.send_topic(session, channel);
+            let _ = self.send_channel_names(session, &principal.nick, channel);
         }
 
         if !memberships.is_empty() {
@@ -399,16 +609,20 @@ impl Server {
         let principal = session.principal()?;
         self.add_membership(&principal.id, &channel)?;
 
-        {
+        let newly_joined_online = {
             let mut inner = self.inner.lock().expect("server mutex poisoned");
             inner
                 .channels
                 .entry(channel.clone())
                 .or_default()
-                .insert(principal.id.clone());
-        }
+                .insert(principal.id.clone())
+        };
 
-        self.broadcast_raw(&channel, format!(":{} JOIN {}", principal.nick, channel))?;
+        if newly_joined_online {
+            self.broadcast_raw(&channel, format!(":{} JOIN {}", principal.nick, channel))?;
+            let _ = self.send_topic(session, &channel);
+            let _ = self.send_channel_names(session, &principal.nick, &channel);
+        }
         Ok(())
     }
 
@@ -427,23 +641,45 @@ impl Server {
         Ok(())
     }
 
-    fn privmsg(&self, session: &Session, channel: String, body: String) -> Result<()> {
-        let principal = session.principal()?;
-        if !self.is_member(&principal.id, &channel)? {
-            session.send(format!(
-                ":{SERVER_NAME} 442 {} {} :You're not on that channel",
-                principal.nick, channel
-            ));
+    fn privmsg(&self, session: &Session, target: String, body: String) -> Result<()> {
+        let principal = session.principal()?.clone();
+        let trimmed_target = target.trim();
+        if trimmed_target.starts_with('#') || trimmed_target.starts_with('&') {
+            let channel = normalize_channel(trimmed_target);
+            if !self.is_member(&principal.id, &channel)? {
+                session.send(format!(
+                    ":{SERVER_NAME} 442 {} {} :You're not on that channel",
+                    principal.nick, channel
+                ));
+                return Ok(());
+            }
+            // Omit echoing back to the sender's IRC session unless echo-message was requested,
+            // otherwise standard IRC clients render both local echo and server echo twice.
+            let exclude_session = if session.capabilities.contains("echo-message") {
+                None
+            } else {
+                Some(session.session_id.as_str())
+            };
+            self.deliver_channel_message(&principal, &channel, &body, exclude_session)?;
             return Ok(());
         }
 
-        let message = self.history.append(&channel, &principal.id, &body)?;
-        let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, false);
-        self.broadcast_message(
-            &channel,
-            format!("{tags} :{} PRIVMSG {} :{}", principal.nick, channel, body),
-            message.seq,
-        )?;
+        let peer_name = trimmed_target.trim_start_matches('@');
+        if peer_name.is_empty() {
+            session.send(format!(
+                ":{SERVER_NAME} 411 {} :No recipient given (PRIVMSG)",
+                principal.nick
+            ));
+            return Ok(());
+        }
+        let Some(peer) = self.auth.resolve_by_name(peer_name)? else {
+            session.send(format!(
+                ":{SERVER_NAME} 401 {} {} :No such nick",
+                principal.nick, peer_name
+            ));
+            return Ok(());
+        };
+        self.deliver_direct_message(&principal, &peer, &body)?;
         Ok(())
     }
 
@@ -640,7 +876,1078 @@ impl Server {
             &task.channel,
             format!("{tag_str} :{SERVER_NAME} NOTICE {} :{body}", task.channel),
             message.seq,
-        )
+        )?;
+        let task_json = serde_json::to_value(task).ok();
+        self.emit_webhook(WebhookEvent {
+            event: "task".to_string(),
+            channel: task.channel.clone(),
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id),
+            from: actor.to_string(),
+            to: None,
+            message: body,
+            created_at: message.created_at,
+            report: None,
+            task: task_json,
+            git: None,
+            lock: None,
+        });
+        Ok(())
+    }
+
+    fn names(&self, session: &Session, channel: Option<String>) -> Result<()> {
+        let principal = session.principal()?;
+        let channels = match channel {
+            Some(ch) => vec![normalize_channel(&ch)],
+            None => self
+                .memberships(&principal.id)?
+                .into_iter()
+                .map(|m| m.channel)
+                .collect(),
+        };
+
+        for ch in channels {
+            self.send_channel_names(session, &principal.nick, &ch)?;
+        }
+        Ok(())
+    }
+
+    fn send_channel_names(
+        &self,
+        session: &Session,
+        caller_nick: &str,
+        channel: &str,
+    ) -> Result<()> {
+        let entries = self.channel_member_directory(channel)?;
+        let formatted = entries
+            .into_iter()
+            .map(|(_id, nick, role)| format!("{}{}", role_prefix(&role), nick))
+            .collect::<Vec<_>>()
+            .join(" ");
+        session.send(format!(
+            ":{SERVER_NAME} 353 {caller_nick} = {channel} :{formatted}"
+        ));
+        session.send(format!(
+            ":{SERVER_NAME} 366 {caller_nick} {channel} :End of /NAMES list."
+        ));
+        Ok(())
+    }
+
+    fn send_topic(&self, session: &Session, channel: &str) -> Result<()> {
+        let principal = session.principal()?;
+        let locks = self.locks.list(Some(channel)).unwrap_or_default();
+        let repos = self
+            .gits
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.channel.eq_ignore_ascii_case(channel))
+            .map(|r| r.name)
+            .collect::<Vec<_>>();
+        if repos.is_empty() && locks.is_empty() {
+            session.send(format!(
+                ":{SERVER_NAME} 331 {} {} :No topic is set",
+                principal.nick, channel
+            ));
+        } else {
+            let mut parts = Vec::new();
+            if !repos.is_empty() {
+                parts.push(format!("Git repos: {}", repos.join(", ")));
+            }
+            if !locks.is_empty() {
+                let lock_labels: Vec<String> = locks
+                    .into_iter()
+                    .map(|l| format!("{}(@{})", l.resource, l.owner_nick))
+                    .collect();
+                parts.push(format!("Locks: {}", lock_labels.join(", ")));
+            }
+            session.send(format!(
+                ":{SERVER_NAME} 332 {} {} :{}",
+                principal.nick,
+                channel,
+                parts.join(" | ")
+            ));
+        }
+        Ok(())
+    }
+
+    fn mode(
+        &self,
+        session: &Session,
+        target: String,
+        flags: Option<String>,
+        arg: Option<String>,
+    ) -> Result<()> {
+        let principal = session.principal()?.clone();
+        let clean_target = target.trim();
+        if !clean_target.starts_with('#') && !clean_target.starts_with('&') {
+            session.send(format!(":{SERVER_NAME} 221 {} +i", principal.nick));
+            return Ok(());
+        }
+        let channel = normalize_channel(clean_target);
+        match (flags.as_deref(), arg.as_deref()) {
+            (None, _) => {
+                session.send(format!(
+                    ":{SERVER_NAME} 324 {} {} +nt",
+                    principal.nick, channel
+                ));
+            }
+            (Some("b") | Some("+b"), None) => {
+                session.send(format!(
+                    ":{SERVER_NAME} 368 {} {} :End of Channel Ban List",
+                    principal.nick, channel
+                ));
+            }
+            (Some("+o"), Some(target_nick)) => {
+                match self.set_role_api(&principal, target_nick, "leader", Some(&channel)) {
+                    Ok(updated) => {
+                        let _ = self.broadcast_raw(
+                            &channel,
+                            format!(":{} MODE {} +o {}", principal.nick, channel, updated.nick),
+                        );
+                    }
+                    Err(err) => {
+                        session.send(format!(
+                            ":{SERVER_NAME} NOTICE {} :MODE {} +o {} failed: {}",
+                            principal.nick, channel, target_nick, err
+                        ));
+                    }
+                }
+            }
+            (Some("-o"), Some(target_nick)) => {
+                match self.set_role_api(&principal, target_nick, "member", Some(&channel)) {
+                    Ok(updated) => {
+                        let _ = self.broadcast_raw(
+                            &channel,
+                            format!(":{} MODE {} -o {}", principal.nick, channel, updated.nick),
+                        );
+                    }
+                    Err(err) => {
+                        session.send(format!(
+                            ":{SERVER_NAME} NOTICE {} :MODE {} -o {} failed: {}",
+                            principal.nick, channel, target_nick, err
+                        ));
+                    }
+                }
+            }
+            (Some("+v"), Some(target_nick)) => {
+                match self.set_role_api(&principal, target_nick, "reviewer", Some(&channel)) {
+                    Ok(updated) => {
+                        let _ = self.broadcast_raw(
+                            &channel,
+                            format!(":{} MODE {} +v {}", principal.nick, channel, updated.nick),
+                        );
+                    }
+                    Err(err) => {
+                        session.send(format!(
+                            ":{SERVER_NAME} NOTICE {} :MODE {} +v {} failed: {}",
+                            principal.nick, channel, target_nick, err
+                        ));
+                    }
+                }
+            }
+            (Some("-v"), Some(target_nick)) => {
+                match self.set_role_api(&principal, target_nick, "member", Some(&channel)) {
+                    Ok(updated) => {
+                        let _ = self.broadcast_raw(
+                            &channel,
+                            format!(":{} MODE {} -v {}", principal.nick, channel, updated.nick),
+                        );
+                    }
+                    Err(err) => {
+                        session.send(format!(
+                            ":{SERVER_NAME} NOTICE {} :MODE {} -v {} failed: {}",
+                            principal.nick, channel, target_nick, err
+                        ));
+                    }
+                }
+            }
+            _ => {
+                session.send(format!(
+                    ":{SERVER_NAME} 324 {} {} +nt",
+                    principal.nick, channel
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn list_channels(&self, session: &Session, filter: Option<String>) -> Result<()> {
+        let principal = session.principal()?;
+        session.send(format!(
+            ":{SERVER_NAME} 321 {} Channel :Users  Name",
+            principal.nick
+        ));
+        let filter_norm = filter.map(|f| normalize_channel(&f).to_ascii_lowercase());
+        for (channel, msg_count, _) in self.history.recent_channels()? {
+            if let Some(ref f) = filter_norm {
+                if !channel.to_ascii_lowercase().contains(f) {
+                    continue;
+                }
+            }
+            let member_count = self.channel_member_ids(&channel)?.len();
+            session.send(format!(
+                ":{SERVER_NAME} 322 {} {} {} :messages={}",
+                principal.nick, channel, member_count, msg_count
+            ));
+        }
+        session.send(format!(
+            ":{SERVER_NAME} 323 {} :End of /LIST",
+            principal.nick
+        ));
+        Ok(())
+    }
+
+    fn whois(&self, session: &Session, target_nick: String) -> Result<()> {
+        let caller = session.principal()?;
+        let clean = target_nick.trim().trim_start_matches('@');
+        let Some(target) = self.auth.resolve_by_name(clean)? else {
+            session.send(format!(
+                ":{SERVER_NAME} 401 {} {} :No such nick",
+                caller.nick, clean
+            ));
+            session.send(format!(
+                ":{SERVER_NAME} 318 {} {} :End of /WHOIS list.",
+                caller.nick, clean
+            ));
+            return Ok(());
+        };
+
+        session.send(format!(
+            ":{SERVER_NAME} 311 {} {} {} aircd * :role={} team={}",
+            caller.nick,
+            target.nick,
+            target.id,
+            target.role,
+            target.team.as_deref().unwrap_or("-")
+        ));
+        let joined: Vec<String> = self
+            .memberships(&target.id)?
+            .into_iter()
+            .map(|m| m.channel)
+            .collect();
+        if !joined.is_empty() {
+            session.send(format!(
+                ":{SERVER_NAME} 319 {} {} :{}",
+                caller.nick,
+                target.nick,
+                joined.join(" ")
+            ));
+        }
+        session.send(format!(
+            ":{SERVER_NAME} 312 {} {} aircd :aircd coordination server",
+            caller.nick, target.nick
+        ));
+        session.send(format!(
+            ":{SERVER_NAME} 318 {} {} :End of /WHOIS list.",
+            caller.nick, target.nick
+        ));
+        Ok(())
+    }
+
+    fn ison(&self, session: &Session, nicks: Vec<String>) -> Result<()> {
+        let caller = session.principal()?;
+        let online = self.online_principal_ids();
+        let mut present = Vec::new();
+        for nick in nicks {
+            if let Some(p) = self.auth.resolve_by_name(&nick)? {
+                if online.contains(&p.id) {
+                    present.push(p.nick);
+                }
+            }
+        }
+        session.send(format!(
+            ":{SERVER_NAME} 303 {} :{}",
+            caller.nick,
+            present.join(" ")
+        ));
+        Ok(())
+    }
+
+    fn userhost(&self, session: &Session, nicks: Vec<String>) -> Result<()> {
+        let caller = session.principal()?;
+        let mut entries = Vec::new();
+        for nick in nicks.into_iter().take(5) {
+            if let Some(p) = self.auth.resolve_by_name(&nick)? {
+                entries.push(format!("{}=+{}@aircd", p.nick, p.id));
+            }
+        }
+        session.send(format!(
+            ":{SERVER_NAME} 302 {} :{}",
+            caller.nick,
+            entries.join(" ")
+        ));
+        Ok(())
+    }
+
+    fn who(&self, session: &Session, target: Option<String>) -> Result<()> {
+        let principal = session.principal()?;
+        let online = self.online_principal_ids();
+        let target_label = target.clone().unwrap_or_else(|| "*".to_string());
+
+        match target {
+            Some(ref ch) if ch.starts_with('#') || ch.starts_with('&') => {
+                let channel = normalize_channel(ch);
+                for (id, nick, role) in self.channel_member_directory(&channel)? {
+                    let presence = if online.contains(&id) { "H" } else { "G" };
+                    let pfx = role_prefix(&role);
+                    session.send(format!(
+                        ":{SERVER_NAME} 352 {} {} {} aircd aircd {} {}{} :0 role={}",
+                        principal.nick, channel, id, nick, presence, pfx, role
+                    ));
+                }
+            }
+            _ => {
+                let query = target.as_deref().map(|t| t.trim_start_matches('@'));
+                for p in self.auth.list_principals()? {
+                    if let Some(q) = query {
+                        if q != "*"
+                            && !p.id.eq_ignore_ascii_case(q)
+                            && !p.nick.eq_ignore_ascii_case(q)
+                        {
+                            continue;
+                        }
+                    }
+                    let presence = if online.contains(&p.id) { "H" } else { "G" };
+                    let pfx = role_prefix(&p.role);
+                    session.send(format!(
+                        ":{SERVER_NAME} 352 {} * {} aircd aircd {} {}{} :0 role={}",
+                        principal.nick, p.id, p.nick, presence, pfx, p.role
+                    ));
+                }
+            }
+        }
+
+        session.send(format!(
+            ":{SERVER_NAME} 315 {} {} :End of /WHO list.",
+            principal.nick, target_label
+        ));
+        Ok(())
+    }
+
+    fn role_list(&self, session: &Session) -> Result<()> {
+        let principal = session.principal()?;
+        let online = self.online_principal_ids();
+        for p in self.auth.list_principals()? {
+            let status = if online.contains(&p.id) {
+                "online"
+            } else {
+                "offline"
+            };
+            session.send(format!(
+                ":{SERVER_NAME} NOTICE {} :ROLE @{} role={} team={} status={}",
+                principal.nick,
+                p.nick,
+                p.role,
+                p.team.as_deref().unwrap_or("-"),
+                status
+            ));
+        }
+        Ok(())
+    }
+
+    fn role_set(&self, session: &Session, target_nick: String, role: String) -> Result<()> {
+        let principal = session.principal()?.clone();
+        match self.set_role_api(&principal, &target_nick, &role, None) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                session.send(format!(
+                    ":{SERVER_NAME} NOTICE {} :ROLE {} {} failed: {}",
+                    principal.nick, target_nick, role, err
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    fn lock_acquire(
+        &self,
+        session: &Session,
+        resource: String,
+        channel: Option<String>,
+        ttl_seconds: Option<i64>,
+        note: Option<String>,
+    ) -> Result<()> {
+        let principal = session.principal()?.clone();
+        let target_channel = match channel {
+            Some(c) => normalize_channel(&c),
+            None => self
+                .memberships(&principal.id)?
+                .into_iter()
+                .next()
+                .map(|m| m.channel)
+                .unwrap_or_else(|| "#general".to_string()),
+        };
+
+        if let Err(err) = self.acquire_lock_api(
+            &principal,
+            &resource,
+            &target_channel,
+            note.as_deref(),
+            ttl_seconds,
+        ) {
+            session.send(format!(
+                ":{SERVER_NAME} NOTICE {} :LOCK {} failed: {}",
+                principal.nick, resource, err
+            ));
+        }
+        Ok(())
+    }
+
+    fn lock_release(&self, session: &Session, resource: String) -> Result<()> {
+        let principal = session.principal()?.clone();
+        let can_force = matches!(
+            principal.role.as_str(),
+            "leader" | "coordinator" | "op" | "admin"
+        );
+        if let Err(err) = self.release_lock_api(&principal, &resource, can_force) {
+            session.send(format!(
+                ":{SERVER_NAME} NOTICE {} :UNLOCK {} failed: {}",
+                principal.nick, resource, err
+            ));
+        }
+        Ok(())
+    }
+
+    fn lock_list(&self, session: &Session, channel: Option<String>) -> Result<()> {
+        let principal = session.principal()?;
+        let chan = channel.map(|c| normalize_channel(&c));
+        let locks = self.locks.list(chan.as_deref())?;
+        if locks.is_empty() {
+            session.send(format!(
+                ":{SERVER_NAME} NOTICE {} :No active equipment or branch locks{}",
+                principal.nick,
+                chan.as_deref()
+                    .map(|c| format!(" in {c}"))
+                    .unwrap_or_default()
+            ));
+            return Ok(());
+        }
+        for lock in locks {
+            session.send(format!(
+                ":{SERVER_NAME} NOTICE {} :LOCK {} holder=@{} channel={} expires_at={} note=:{}",
+                principal.nick,
+                lock.resource,
+                lock.owner_nick,
+                lock.channel,
+                lock.expires_at,
+                lock.note.as_deref().unwrap_or("-")
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn join_channels(
+        &self,
+        principal: &Principal,
+        raw_channels: &[String],
+    ) -> Result<Vec<String>> {
+        let mut joined = Vec::new();
+        for raw in raw_channels {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let channel = normalize_channel(trimmed);
+            self.add_membership(&principal.id, &channel)?;
+            let newly_joined_online = {
+                let mut inner = self.inner.lock().expect("server mutex poisoned");
+                if inner.clients.contains_key(&principal.id) {
+                    inner
+                        .channels
+                        .entry(channel.clone())
+                        .or_default()
+                        .insert(principal.id.clone())
+                } else {
+                    false
+                }
+            };
+            if newly_joined_online {
+                let _ =
+                    self.broadcast_raw(&channel, format!(":{} JOIN {}", principal.nick, channel));
+            }
+            if !joined.contains(&channel) {
+                joined.push(channel);
+            }
+        }
+        Ok(joined)
+    }
+
+    pub fn post_message(
+        &self,
+        sender: &Principal,
+        raw_target: &str,
+        raw_body: &str,
+    ) -> Result<StoredMessage> {
+        let body = raw_body.trim_end_matches(['\r', '\n']);
+        if body.trim().is_empty() {
+            return Err(anyhow!("message body is required"));
+        }
+        let target = raw_target.trim();
+        if target.is_empty() {
+            return Err(anyhow!("target channel or @nick is required"));
+        }
+        if target.starts_with('#') || target.starts_with('&') {
+            let channel = normalize_channel(target);
+            self.join_channels(sender, std::slice::from_ref(&channel))?;
+            self.deliver_channel_message(sender, &channel, body, None)
+        } else {
+            let peer_name = target.trim_start_matches('@');
+            let peer = self
+                .auth
+                .resolve_by_name(peer_name)?
+                .ok_or_else(|| anyhow!("Unknown recipient '@{peer_name}'"))?;
+            self.deliver_direct_message(sender, &peer, body)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_report(
+        &self,
+        author: &Principal,
+        raw_channel: &str,
+        title: &str,
+        status: &str,
+        summary: Option<&str>,
+        body: &str,
+        task_id: Option<&str>,
+        git_repo: Option<&str>,
+        git_branch: Option<&str>,
+        git_commit: Option<&str>,
+    ) -> Result<Report> {
+        let channel = normalize_channel(raw_channel);
+        self.join_channels(author, std::slice::from_ref(&channel))?;
+        let report = self.reports.create(NewReport {
+            author_id: &author.id,
+            channel: &channel,
+            title,
+            status,
+            summary,
+            body,
+            task_id,
+            git_repo,
+            git_branch,
+            git_commit,
+        })?;
+
+        let notice_body = format!(
+            "REPORT {} [{}] by @{}: {} — {}",
+            report.id, report.status, report.author_nick, report.title, report.summary
+        );
+        let message = self.history.append(&channel, &author.id, &notice_body)?;
+        let _ = self.mark_seen(&author.id, &channel, message.seq);
+
+        let tag_str = format_message_tags(&[
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+            ("report-id", report.id.clone()),
+            ("report-status", report.status.clone()),
+        ]);
+        self.broadcast_message(
+            &channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {channel} :{notice_body}"),
+            message.seq,
+        )?;
+
+        self.emit_webhook(WebhookEvent {
+            event: "report".to_string(),
+            channel,
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id),
+            from: author.id.clone(),
+            to: None,
+            message: notice_body,
+            created_at: message.created_at,
+            report: serde_json::to_value(&report).ok(),
+            task: None,
+            git: None,
+            lock: None,
+        });
+
+        Ok(report)
+    }
+
+    pub fn create_task_api(
+        &self,
+        actor: &Principal,
+        raw_channel: &str,
+        raw_title: &str,
+    ) -> Result<Task> {
+        let title = raw_title.trim();
+        if title.is_empty() {
+            return Err(anyhow!("task title is required"));
+        }
+        let channel = normalize_channel(raw_channel);
+        self.join_channels(actor, std::slice::from_ref(&channel))?;
+        let task = self.tasks.create(&channel, title)?;
+        self.broadcast_task_event(
+            &task,
+            "create",
+            "success",
+            &actor.nick,
+            format!(
+                "TASK {} created by @{}: {}",
+                task.id, actor.nick, task.title
+            ),
+        )?;
+        Ok(task)
+    }
+
+    pub fn claim_task_api(&self, actor: &Principal, task_id: &str) -> Result<Task> {
+        let task = self.tasks.claim(task_id.trim(), &actor.id)?;
+        self.broadcast_task_event(
+            &task,
+            "claim",
+            "success",
+            &actor.nick,
+            format!(
+                "TASK {} claimed by @{}: {}",
+                task.id, actor.nick, task.title
+            ),
+        )?;
+        Ok(task)
+    }
+
+    pub fn done_task_api(&self, actor: &Principal, task_id: &str) -> Result<Task> {
+        let task = self.tasks.done(task_id.trim(), &actor.id)?;
+        self.broadcast_task_event(
+            &task,
+            "done",
+            "success",
+            &actor.nick,
+            format!(
+                "TASK {} completed by @{}: {}",
+                task.id, actor.nick, task.title
+            ),
+        )?;
+        Ok(task)
+    }
+
+    pub fn release_task_api(&self, actor: &Principal, task_id: &str) -> Result<Task> {
+        let task = self.tasks.release(task_id.trim(), &actor.id)?;
+        self.broadcast_task_event(
+            &task,
+            "release",
+            "success",
+            &actor.nick,
+            format!(
+                "TASK {} released by @{}: {}",
+                task.id, actor.nick, task.title
+            ),
+        )?;
+        Ok(task)
+    }
+
+    pub fn set_role_api(
+        &self,
+        actor: &Principal,
+        target_name: &str,
+        role: &str,
+        channel: Option<&str>,
+    ) -> Result<Principal> {
+        let updated = self.auth.set_role(target_name, role)?;
+        let announce_channel = channel
+            .map(normalize_channel)
+            .or_else(|| {
+                self.memberships(&actor.id)
+                    .ok()
+                    .and_then(|m| m.into_iter().next().map(|x| x.channel))
+            })
+            .unwrap_or_else(|| "#general".to_string());
+        self.join_channels(actor, std::slice::from_ref(&announce_channel))?;
+
+        let notice_body = format!(
+            "ROLE @{} set to '{}' by @{}",
+            updated.nick, updated.role, actor.nick
+        );
+        let message = self
+            .history
+            .append(&announce_channel, &actor.id, &notice_body)?;
+        let _ = self.mark_seen(&actor.id, &announce_channel, message.seq);
+        let tag_str = format_message_tags(&[
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+            ("role-target", updated.nick.clone()),
+            ("role-value", updated.role.clone()),
+        ]);
+        self.broadcast_message(
+            &announce_channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {announce_channel} :{notice_body}"),
+            message.seq,
+        )?;
+        self.emit_webhook(WebhookEvent {
+            event: "role".to_string(),
+            channel: announce_channel,
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id),
+            from: actor.id.clone(),
+            to: Some(updated.id.clone()),
+            message: notice_body,
+            created_at: message.created_at,
+            report: None,
+            task: None,
+            git: None,
+            lock: serde_json::to_value(&updated).ok(),
+        });
+        Ok(updated)
+    }
+
+    pub fn acquire_lock_api(
+        &self,
+        actor: &Principal,
+        resource: &str,
+        raw_channel: &str,
+        note: Option<&str>,
+        ttl_seconds: Option<i64>,
+    ) -> Result<ResourceLock> {
+        let channel = normalize_channel(raw_channel);
+        let lock = self
+            .locks
+            .acquire(resource, &actor.id, &channel, note, ttl_seconds)?;
+        self.join_channels(actor, std::slice::from_ref(&channel))?;
+
+        let note_suffix = lock
+            .note
+            .as_deref()
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        let notice_body = format!(
+            "LOCK {} acquired by @{} until {}{}",
+            lock.resource, lock.owner_nick, lock.expires_at, note_suffix
+        );
+        let message = self.history.append(&channel, &actor.id, &notice_body)?;
+        let _ = self.mark_seen(&actor.id, &channel, message.seq);
+        let tag_str = format_message_tags(&[
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+            ("lock-resource", lock.resource.clone()),
+            ("lock-action", "acquire".to_string()),
+            ("lock-owner", lock.owner_nick.clone()),
+        ]);
+        self.broadcast_message(
+            &channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {channel} :{notice_body}"),
+            message.seq,
+        )?;
+        self.emit_webhook(WebhookEvent {
+            event: "lock".to_string(),
+            channel,
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id),
+            from: actor.id.clone(),
+            to: None,
+            message: notice_body,
+            created_at: message.created_at,
+            report: None,
+            task: None,
+            git: None,
+            lock: serde_json::to_value(&lock).ok(),
+        });
+        Ok(lock)
+    }
+
+    pub fn release_lock_api(
+        &self,
+        actor: &Principal,
+        resource: &str,
+        force: bool,
+    ) -> Result<Option<ResourceLock>> {
+        let released = self.locks.release(resource, &actor.id, force)?;
+        let Some(lock) = released else {
+            return Ok(None);
+        };
+        let channel = normalize_channel(&lock.channel);
+        let notice_body = format!(
+            "UNLOCK {} released by @{} (was held by @{})",
+            lock.resource, actor.nick, lock.owner_nick
+        );
+        let message = self.history.append(&channel, &actor.id, &notice_body)?;
+        let _ = self.mark_seen(&actor.id, &channel, message.seq);
+        let tag_str = format_message_tags(&[
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+            ("lock-resource", lock.resource.clone()),
+            ("lock-action", "release".to_string()),
+            ("lock-owner", actor.nick.clone()),
+        ]);
+        self.broadcast_message(
+            &channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {channel} :{notice_body}"),
+            message.seq,
+        )?;
+        self.emit_webhook(WebhookEvent {
+            event: "lock".to_string(),
+            channel,
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id),
+            from: actor.id.clone(),
+            to: None,
+            message: notice_body,
+            created_at: message.created_at,
+            report: None,
+            task: None,
+            git: None,
+            lock: serde_json::to_value(&lock).ok(),
+        });
+        Ok(Some(lock))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_git_event(
+        &self,
+        actor_id: &str,
+        actor_nick: &str,
+        raw_repo_name: &str,
+        explicit_channel: Option<&str>,
+        event_kind: &str,
+        branch: Option<&str>,
+        commit: Option<&str>,
+        title: Option<&str>,
+        url: Option<&str>,
+        summary: &str,
+    ) -> Result<(StoredMessage, String)> {
+        let clean_repo = sanitize_repo_name(raw_repo_name)
+            .unwrap_or_else(|_| raw_repo_name.trim().to_ascii_lowercase());
+        let registered = self.gits.get_with_secret(&clean_repo)?;
+        let channel = explicit_channel
+            .map(normalize_channel)
+            .or_else(|| registered.as_ref().map(|(r, _)| r.channel.clone()))
+            .unwrap_or_else(|| format!("#{clean_repo}"));
+
+        if registered.is_some() {
+            let _ = self.gits.record_event(&clean_repo, branch, commit);
+        }
+
+        let branch_part = branch
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|b| format!(" [{b}]"))
+            .unwrap_or_default();
+        let notice_body =
+            format!("[git:{clean_repo}:{event_kind}]{branch_part} by @{actor_nick}: {summary}");
+        let message = self.history.append(&channel, actor_id, &notice_body)?;
+        let _ = self.mark_seen(actor_id, &channel, message.seq);
+
+        let mut tags = vec![
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+            ("git-repo", clean_repo.clone()),
+            ("git-event", event_kind.to_string()),
+        ];
+        if let Some(b) = branch.filter(|s| !s.trim().is_empty()) {
+            tags.push(("git-branch", b.trim().to_string()));
+        }
+        if let Some(c) = commit.filter(|s| !s.trim().is_empty()) {
+            tags.push(("git-commit", c.trim().to_string()));
+        }
+        let tag_str = format_message_tags(&tags);
+        self.broadcast_message(
+            &channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {channel} :{notice_body}"),
+            message.seq,
+        )?;
+
+        let git_meta = serde_json::json!({
+            "repo": clean_repo,
+            "event": event_kind,
+            "branch": branch,
+            "commit": commit,
+            "title": title,
+            "url": url,
+            "actor": actor_nick,
+            "summary": summary,
+        });
+        self.emit_webhook(WebhookEvent {
+            event: "git".to_string(),
+            channel: channel.clone(),
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id.clone()),
+            from: actor_id.to_string(),
+            to: None,
+            message: notice_body,
+            created_at: message.created_at,
+            report: None,
+            task: None,
+            git: Some(git_meta),
+            lock: None,
+        });
+
+        Ok((message, channel))
+    }
+
+    pub fn directory_snapshot(&self) -> Result<DirectorySnapshot> {
+        let online = self.online_principal_ids();
+        let configured_webhooks = self.webhooks.configured_principals()?;
+        let agents = self
+            .auth
+            .list_principals()?
+            .into_iter()
+            .map(|p| AgentDirectoryEntry {
+                online: online.contains(&p.id),
+                webhook_configured: configured_webhooks.contains(&p.id),
+                id: p.id,
+                nick: p.nick,
+                team: p.team,
+                role: p.role,
+            })
+            .collect();
+
+        let channels = self
+            .history
+            .recent_channels()?
+            .into_iter()
+            .map(
+                |(channel, message_count, last_activity_at)| ChannelSummary {
+                    channel,
+                    message_count,
+                    last_activity_at,
+                },
+            )
+            .collect();
+
+        let git_repos = self.gits.list()?;
+        let locks = self.locks.list(None)?;
+
+        Ok(DirectorySnapshot {
+            agents,
+            channels,
+            git_repos,
+            locks,
+        })
+    }
+
+    fn deliver_channel_message(
+        &self,
+        sender: &Principal,
+        channel: &str,
+        body: &str,
+        exclude_session_id: Option<&str>,
+    ) -> Result<StoredMessage> {
+        let message = self.history.append(channel, &sender.id, body)?;
+        // Always advance the sender's read cursor so suppressed self-echoes aren't replayed later.
+        let _ = self.mark_seen(&sender.id, channel, message.seq);
+        let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, false);
+        self.broadcast_message_excluding(
+            channel,
+            format!("{tags} :{} PRIVMSG {} :{}", sender.nick, channel, body),
+            message.seq,
+            exclude_session_id,
+        )?;
+        self.emit_webhook(WebhookEvent {
+            event: "message".to_string(),
+            channel: channel.to_string(),
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id.clone()),
+            from: sender.id.clone(),
+            to: None,
+            message: body.to_string(),
+            created_at: message.created_at,
+            report: None,
+            task: None,
+            git: None,
+            lock: None,
+        });
+        Ok(message)
+    }
+
+    fn deliver_direct_message(
+        &self,
+        sender: &Principal,
+        peer: &Principal,
+        body: &str,
+    ) -> Result<StoredMessage> {
+        let dm_channel = canonical_dm_channel(&sender.id, &peer.id);
+        let message = self.history.append(&dm_channel, &sender.id, body)?;
+        let tags = metadata_tags(message.seq, &message.msg_id, message.created_at, false);
+        let peer_client = {
+            let inner = self.inner.lock().expect("server mutex poisoned");
+            inner.clients.get(&peer.id).cloned()
+        };
+        if let Some(client) = peer_client {
+            if client
+                .tx
+                .send(format!(
+                    "{tags} :{} PRIVMSG {} :{}",
+                    sender.nick, peer.nick, body
+                ))
+                .is_ok()
+            {
+                let _ = self.mark_seen(&peer.id, &dm_channel, message.seq);
+            }
+        }
+        self.emit_webhook(WebhookEvent {
+            event: "dm".to_string(),
+            channel: dm_channel,
+            seq: Some(message.seq),
+            msg_id: Some(message.msg_id.clone()),
+            from: sender.id.clone(),
+            to: Some(peer.id.clone()),
+            message: body.to_string(),
+            created_at: message.created_at,
+            report: None,
+            task: None,
+            git: None,
+            lock: None,
+        });
+        Ok(message)
+    }
+
+    fn emit_webhook(&self, event: WebhookEvent) {
+        let online = self.online_principal_ids();
+        let members = if event.channel.starts_with('#') || event.channel.starts_with('&') {
+            self.channel_member_ids(&event.channel).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if let Err(err) = self.webhooks.enqueue_for_event(&event, &online, &members) {
+            eprintln!("enqueue webhook error ({}): {err:#}", event.event);
+        }
+    }
+
+    fn online_principal_ids(&self) -> HashSet<String> {
+        self.inner
+            .lock()
+            .expect("server mutex poisoned")
+            .clients
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn channel_member_ids(&self, channel: &str) -> Result<Vec<String>> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut stmt =
+            db.prepare("SELECT principal_id FROM channel_memberships WHERE channel = ?1")?;
+        let rows = stmt
+            .query_map(params![channel], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn channel_member_directory(&self, channel: &str) -> Result<Vec<(String, String, String)>> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut stmt = db.prepare(
+            "SELECT m.principal_id, COALESCE(p.nick, m.principal_id), COALESCE(p.role, 'member')
+             FROM channel_memberships m
+             LEFT JOIN principals p ON p.id = m.principal_id
+             WHERE m.channel = ?1
+             ORDER BY LOWER(COALESCE(p.nick, m.principal_id)) ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![channel], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn broadcast_raw(&self, channel: &str, line: String) -> Result<()> {
@@ -652,8 +1959,21 @@ impl Server {
     }
 
     fn broadcast_message(&self, channel: &str, line: String, seq: i64) -> Result<()> {
+        self.broadcast_message_excluding(channel, line, seq, None)
+    }
+
+    fn broadcast_message_excluding(
+        &self,
+        channel: &str,
+        line: String,
+        seq: i64,
+        exclude_session_id: Option<&str>,
+    ) -> Result<()> {
         let recipients = self.recipients_with_ids(channel);
         for (principal_id, recipient) in recipients {
+            if exclude_session_id == Some(recipient.session_id.as_str()) {
+                continue;
+            }
             if recipient.tx.send(line.clone()).is_ok() {
                 self.mark_seen(&principal_id, channel, seq)?;
             }
@@ -862,6 +2182,7 @@ mod tests {
     use super::{escape_tag_value, metadata_tags, Server, Session};
     use crate::protocol::Command;
     use anyhow::Result;
+    use std::collections::HashSet;
     use tokio::sync::mpsc;
 
     fn test_server() -> Result<Server> {
@@ -878,6 +2199,7 @@ mod tests {
             nick: Some(nick.to_string()),
             pass_token: Some(token.to_string()),
             registered: false,
+            capabilities: HashSet::new(),
             tx,
             shutdown_tx,
         }
@@ -896,6 +2218,7 @@ mod tests {
                 nick: nick.map(str::to_string),
                 pass_token: token.map(str::to_string),
                 registered: false,
+                capabilities: HashSet::new(),
                 tx,
                 shutdown_tx,
             },
@@ -1001,6 +2324,260 @@ mod tests {
         assert!(!should_quit);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_and_equipment_lock_commands_broadcast_and_persist() -> Result<()> {
+        let server = test_server()?;
+        let (mut lead, mut lead_rx) = test_session_with_rx(Some("human-token"), Some("human"));
+        server.try_register(&mut lead)?;
+        server
+            .handle_command(&mut lead, Command::Join("#vr-lab".to_string()))
+            .await?;
+
+        while lead_rx.try_recv().is_ok() {}
+
+        server
+            .handle_command(
+                &mut lead,
+                Command::RoleSet {
+                    nick: "agent-a".to_string(),
+                    role: "leader".to_string(),
+                },
+            )
+            .await?;
+        let role_notice = lead_rx.recv().await.expect("role notice");
+        assert!(role_notice.contains("ROLE @agent-a set to 'leader'"));
+
+        server
+            .handle_command(
+                &mut lead,
+                Command::LockAcquire {
+                    resource: "quest-headset-1".to_string(),
+                    channel: Some("#vr-lab".to_string()),
+                    ttl_seconds: Some(600),
+                    note: Some("capture run".to_string()),
+                },
+            )
+            .await?;
+        let lock_notice = lead_rx.recv().await.expect("lock notice");
+        assert!(lock_notice.contains("LOCK quest-headset-1 acquired by @human"));
+
+        // Second session cannot lock the same equipment while held.
+        let (mut other, mut other_rx) =
+            test_session_with_rx(Some("agent-b-token"), Some("agent-b"));
+        server.try_register(&mut other)?;
+        while other_rx.try_recv().is_ok() {}
+        server
+            .handle_command(
+                &mut other,
+                Command::LockAcquire {
+                    resource: "quest-headset-1".to_string(),
+                    channel: Some("#vr-lab".to_string()),
+                    ttl_seconds: Some(600),
+                    note: None,
+                },
+            )
+            .await?;
+        let err_notice = other_rx.recv().await.expect("conflict notice");
+        assert!(err_notice.contains("failed"));
+
+        // Owner releases cleanly.
+        server
+            .handle_command(
+                &mut lead,
+                Command::LockRelease("quest-headset-1".to_string()),
+            )
+            .await?;
+        let unlock_notice = lead_rx.recv().await.expect("unlock notice");
+        assert!(unlock_notice.contains("UNLOCK quest-headset-1 released"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_message_privmsg_delivers_live_and_persists_dm_history() -> Result<()> {
+        let server = test_server()?;
+        let (mut a, _a_rx) = test_session_with_rx(Some("agent-a-token"), Some("agent-a"));
+        let (mut b, mut b_rx) = test_session_with_rx(Some("agent-b-token"), Some("agent-b"));
+        server.try_register(&mut a)?;
+        server.try_register(&mut b)?;
+        while b_rx.try_recv().is_ok() {}
+
+        server
+            .handle_command(
+                &mut a,
+                Command::Privmsg {
+                    target: "agent-b".to_string(),
+                    body: "grab the quest headset when ready".to_string(),
+                },
+            )
+            .await?;
+
+        let delivered = b_rx.recv().await.expect("dm delivered to agent-b");
+        assert!(delivered.contains(":agent-a PRIVMSG agent-b :grab the quest headset when ready"));
+        let dms = server
+            .history()
+            .list_dm_messages("agent-b", Some("agent-a"), 0, 10)?;
+        assert_eq!(dms.len(), 1);
+        assert_eq!(dms[0].body, "grab the quest headset when ready");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn weechat_irc_join_mode_names_and_whois_numerics_work() -> Result<()> {
+        let server = test_server()?;
+        let (mut lead, mut lead_rx) = test_session_with_rx(Some("human-token"), Some("human"));
+        server.try_register(&mut lead)?;
+        while lead_rx.try_recv().is_ok() {}
+
+        server
+            .handle_command(&mut lead, Command::Join("#general,#vr-lab".to_string()))
+            .await?;
+
+        let mut seen_names = false;
+        while let Ok(line) = lead_rx.try_recv() {
+            if line.contains(" 353 human = #vr-lab :") {
+                seen_names = true;
+            }
+        }
+        assert!(seen_names, "JOIN must emit 353 NAMES for WeeChat nicklist");
+
+        server
+            .handle_command(
+                &mut lead,
+                Command::Mode {
+                    target: "#vr-lab".to_string(),
+                    flags: Some("+o".to_string()),
+                    arg: Some("agent-a".to_string()),
+                },
+            )
+            .await?;
+
+        let mut seen_mode = false;
+        while let Ok(line) = lead_rx.try_recv() {
+            if line.contains("MODE #vr-lab +o agent-a") {
+                seen_mode = true;
+            }
+        }
+        assert!(seen_mode, "MODE +o must broadcast mode update");
+        let updated = server
+            .auth()
+            .resolve_by_name("agent-a")?
+            .expect("agent-a exists");
+        assert_eq!(updated.role, "leader");
+
+        server
+            .handle_command(&mut lead, Command::Whois("agent-a".to_string()))
+            .await?;
+        let whois_line = lead_rx.recv().await.expect("311 WHOIS");
+        assert!(whois_line.contains(" 311 human agent-a agent-a aircd * :role=leader"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn privmsg_does_not_echo_back_to_sender_unless_echo_message_enabled() -> Result<()> {
+        let server = test_server()?;
+        let (mut sender, mut sender_rx) = test_session_with_rx(Some("human-token"), Some("human"));
+        let (mut peer, mut peer_rx) = test_session_with_rx(Some("agent-a-token"), Some("agent-a"));
+        server.try_register(&mut sender)?;
+        server.try_register(&mut peer)?;
+        server
+            .handle_command(&mut sender, Command::Join("#work".to_string()))
+            .await?;
+        server
+            .handle_command(&mut peer, Command::Join("#work".to_string()))
+            .await?;
+        while sender_rx.try_recv().is_ok() {}
+        while peer_rx.try_recv().is_ok() {}
+
+        server
+            .handle_command(
+                &mut sender,
+                Command::Privmsg {
+                    target: "#work".to_string(),
+                    body: "no double chat".to_string(),
+                },
+            )
+            .await?;
+
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "standard IRC sender must not receive its own PRIVMSG echo"
+        );
+        let peer_line = peer_rx.recv().await.expect("peer receives message");
+        assert!(peer_line.contains(":human PRIVMSG #work :no double chat"));
+
+        // Reconnect sender and ensure their own sent message is not replayed back either.
+        server.disconnect(&sender)?;
+        let (mut reconnected, mut reconnected_rx) =
+            test_session_with_rx(Some("human-token"), Some("human"));
+        server.try_register(&mut reconnected)?;
+        while let Ok(line) = reconnected_rx.try_recv() {
+            assert!(
+                !line.contains("no double chat"),
+                "reconnecting sender must not replay their own message: {line}"
+            );
+        }
+
+        // Enabling echo-message CAP opts into echoing back to the sender session.
+        server
+            .handle_command(
+                &mut reconnected,
+                Command::Cap {
+                    subcommand: "REQ".to_string(),
+                    capabilities: vec!["message-tags".to_string(), "echo-message".to_string()],
+                },
+            )
+            .await?;
+        while reconnected_rx.try_recv().is_ok() {}
+        server
+            .handle_command(
+                &mut reconnected,
+                Command::Privmsg {
+                    target: "#work".to_string(),
+                    body: "explicit echo".to_string(),
+                },
+            )
+            .await?;
+        let echo_line = reconnected_rx.recv().await.expect("echo-message echo");
+        assert!(echo_line.contains(":human PRIVMSG #work :explicit echo"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_join_on_autojoined_channel_does_not_spam_numerics() -> Result<()> {
+        let server = test_server()?;
+        let (mut lead, _lead_rx) = test_session_with_rx(Some("human-token"), Some("human"));
+        server.try_register(&mut lead)?;
+        server
+            .handle_command(&mut lead, Command::Join("#general".to_string()))
+            .await?;
+        server.disconnect(&lead)?;
+
+        // Reconnect: try_register restores membership and sends initial JOIN/NAMES.
+        let (mut reconnected, mut reconnected_rx) =
+            test_session_with_rx(Some("human-token"), Some("human"));
+        server.try_register(&mut reconnected)?;
+        while reconnected_rx.try_recv().is_ok() {}
+
+        // Client autojoin sends JOIN #general right after connect; should not duplicate.
+        server
+            .handle_command(&mut reconnected, Command::Join("#general".to_string()))
+            .await?;
+        assert!(
+            reconnected_rx.try_recv().is_err(),
+            "re-joining already online channel should not emit duplicate JOIN/NAMES"
+        );
+        Ok(())
+    }
+}
+
+fn role_prefix(role: &str) -> &'static str {
+    match role {
+        "leader" | "coordinator" | "op" | "admin" => "@",
+        "reviewer" | "builder" | "tester" | "human" => "+",
+        _ => "",
     }
 }
 

@@ -7,16 +7,49 @@ but installed console commands prefer the `airc-*` prefix.
 
 ## Prototype scope
 
-This repository currently contains a minimal IRC-compatible agent coordination
-prototype. It is intentionally small: basic IRC chat, durable message history,
-server-side session resume, and atomic task claiming.
+This repository provides a lightweight IRC + Webhook + Git coordination server (`aircd`) and zero-dependency Python CLI (`airc`). It combines durable IRC channel/DM history and session replay with a public Welcome & Onboarding HTTP portal, signed outbound webhooks, structured reports, agent role assignment, exclusive dev equipment/branch locks, and local/GitHub Git repository integration.
 
 Implemented commands:
 
-- IRC subset: `PASS`, `NICK`, `USER`, `JOIN`, `PART`, `PRIVMSG`, `PING`,
-  `PONG`, `QUIT`, `CAP`
-- Prototype extensions: `CHATHISTORY`, `TASK CREATE`, `TASK CLAIM`,
-  `TASK DONE`, `TASK RELEASE`, `TASK LIST`
+- IRC subset: `PASS`, `NICK`, `USER`, `JOIN`, `PART`, `PRIVMSG` (`#channel` & DM `nick`), `PING`, `PONG`, `QUIT`, `CAP`, `NAMES`, `WHO`
+- Extensions: `CHATHISTORY`, `TASK CREATE|CLAIM|DONE|RELEASE|LIST`, `ROLE <nick> <role>`, `ROLES`, `LOCK <resource> [#channel] [ttl] [:note]`, `UNLOCK <resource>`, `LOCKS [#channel]`
+
+## Welcome Portal, Webhooks, Roles, Locks & Git (CLI + HTTP)
+
+By default `aircd` listens on:
+
+- IRC TCP: `0.0.0.0:6667` (`AIRCD_BIND` or `--bind`)
+- HTTP Welcome & REST API: `0.0.0.0:6680` (`AIRCD_HTTP_BIND` or `--http-bind`)
+- SQLite DB: `aircd.sqlite3` (`AIRCD_DB` or `--db`)
+
+Any browser, agent, or LAN host opening `http://<server-ip>:6680/` (or `/?format=md` / `/v1/welcome`) receives live connection instructions, copyable onboarding commands, the agent/role directory, active equipment locks, and connected Git repos.
+
+```powershell
+# Start server on Windows
+.\aircd-server.cmd
+# Or via PowerShell script:
+.\scripts\Start-Aircd.ps1 -Background
+
+# Register agents and assign roles
+.\airc.cmd register --nick codex --role leader --channels "#general,#wardrobe"
+.\airc.cmd register --nick claude --role reviewer --channels "#general,#wardrobe"
+
+# Listen for signed HMAC-SHA256 webhook alerts (and auto-register URL)
+.\airc.cmd webhook listen --port 8787 --register
+
+# Send channel mentions, DMs, reports, roles & equipment locks
+.\airc.cmd send #wardrobe "@claude ready for review"
+.\airc.cmd send @claude "DM: test fixture updated"
+.\airc.cmd role claude maintainer
+.\airc.cmd lock quest-headset-1 --channel #wardrobe --ttl 1800 --note "capture run"
+.\airc.cmd unlock quest-headset-1
+.\airc.cmd report create --channel #wardrobe --title "PR Ready" --status completed --body "All tests pass"
+
+# Connect a local Git repo, hooks & agent branch worktree
+.\airc.cmd git init-workspace C:\path\to\repo --channel #wardrobe
+.\airc.cmd git worktree-setup C:\path\to\repo feat/agent-pr --lock
+.\airc.cmd git pr-report C:\path\to\repo --base main --status completed
+```
 
 ## Run locally
 

@@ -83,6 +83,85 @@ fn init(connection: &Connection) -> Result<()> {
             -- runs repeatedly against an already-populated database.
             CREATE UNIQUE INDEX IF NOT EXISTS idx_principal_tokens_principal_label
               ON principal_tokens (principal_id, label);
+
+            CREATE TABLE IF NOT EXISTS webhooks (
+              principal_id TEXT PRIMARY KEY REFERENCES principals(id) ON DELETE CASCADE,
+              url TEXT NOT NULL,
+              secret TEXT NOT NULL,
+              events TEXT NOT NULL,
+              notify_when TEXT NOT NULL DEFAULT 'always',
+              enabled INTEGER NOT NULL DEFAULT 1,
+              last_delivery_at INTEGER,
+              last_status INTEGER,
+              last_error TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+              id TEXT PRIMARY KEY,
+              principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+              event_type TEXT NOT NULL,
+              channel TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at INTEGER NOT NULL,
+              http_status INTEGER,
+              last_error TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
+              ON webhook_deliveries (status, next_attempt_at);
+
+            CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_principal
+              ON webhook_deliveries (principal_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS reports (
+              id TEXT PRIMARY KEY,
+              author_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+              channel TEXT NOT NULL,
+              title TEXT NOT NULL,
+              status TEXT NOT NULL,
+              summary TEXT NOT NULL,
+              body TEXT NOT NULL,
+              task_id TEXT,
+              git_repo TEXT,
+              git_branch TEXT,
+              git_commit TEXT,
+              created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_reports_channel_created
+              ON reports (channel, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS git_repos (
+              name TEXT PRIMARY KEY,
+              channel TEXT NOT NULL,
+              local_path TEXT NOT NULL,
+              remote_url TEXT,
+              default_branch TEXT,
+              webhook_secret TEXT,
+              last_commit TEXT,
+              last_branch TEXT,
+              last_event_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS resource_locks (
+              resource TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+              channel TEXT NOT NULL,
+              note TEXT,
+              expires_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_resource_locks_channel
+              ON resource_locks (channel, expires_at);
             ",
         )
         .context("initialize sqlite schema")?;
@@ -163,6 +242,7 @@ fn migrate_principals(connection: &Connection) -> Result<()> {
         ("last_seen_seq", "INTEGER NOT NULL DEFAULT 0"),
         ("connected_at", "INTEGER"),
         ("disconnected_at", "INTEGER"),
+        ("role", "TEXT NOT NULL DEFAULT 'member'"),
     ];
 
     for (column, definition) in columns {
@@ -332,6 +412,35 @@ mod tests {
             !tokens::verify("human-token", &hash)?,
             "the hardcoded seed default must not be written for a pre-existing principal"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn init_creates_extended_tables_and_role_column() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        init(&connection)?;
+
+        for table in [
+            "webhooks",
+            "webhook_deliveries",
+            "reports",
+            "git_repos",
+            "resource_locks",
+        ] {
+            let exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )?;
+            assert_eq!(exists, 1, "table {table} must exist after init");
+        }
+
+        let role: String = connection.query_row(
+            "SELECT role FROM principals WHERE id = 'human'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(role, "member");
         Ok(())
     }
 }

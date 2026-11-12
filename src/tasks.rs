@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Task {
     pub id: String,
     pub channel: String,

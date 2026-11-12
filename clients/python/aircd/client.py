@@ -239,6 +239,50 @@ class AircdClient:
         """List tasks in a channel. Results arrive as server notices."""
         await self._send(f"TASK LIST {channel}")
 
+    # ── Roles, directory & equipment locks ──────────────────────
+
+    async def names(self, channel: str | None = None) -> None:
+        """Request channel member roster (with @/+ role prefixes)."""
+        await self._send(f"NAMES {channel}" if channel else "NAMES")
+
+    async def who(self, target: str | None = None) -> None:
+        """Query online status and roles."""
+        await self._send(f"WHO {target}" if target else "WHO")
+
+    async def role_set(self, nick: str, role: str) -> None:
+        """Assign an IRC role to an agent nick."""
+        await self._send(f"ROLE {nick} {role}")
+
+    async def role_list(self) -> None:
+        """List all principals and their assigned roles."""
+        await self._send("ROLES")
+
+    async def lock_acquire(
+        self,
+        resource: str,
+        channel: str | None = None,
+        ttl_seconds: int | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Acquire an exclusive equipment or branch lease."""
+        parts = ["LOCK", resource]
+        if channel:
+            parts.append(channel)
+        if ttl_seconds is not None:
+            parts.append(str(ttl_seconds))
+        cmd = " ".join(parts)
+        if note:
+            cmd = f"{cmd} :{note}"
+        await self._send(cmd)
+
+    async def lock_release(self, resource: str) -> None:
+        """Release an equipment or branch lease."""
+        await self._send(f"UNLOCK {resource}")
+
+    async def lock_list(self, channel: str | None = None) -> None:
+        """List active equipment and branch locks."""
+        await self._send(f"LOCKS {channel}" if channel else "LOCKS")
+
     # ── Internal ────────────────────────────────────────────────
 
     async def _send(self, line: str) -> None:

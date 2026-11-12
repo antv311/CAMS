@@ -1135,7 +1135,8 @@ def main():
             task.cancel()
 
     signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         loop.run_until_complete(daemon.run())
