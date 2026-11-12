@@ -1,4 +1,32 @@
 /target/
+
+# Local hub state contains messages, notes, tokens, and launcher settings.
+.aircd/
+aircd-owner.key
+profiles.json
+
+# SQLite journals and sidecars can contain the same private data as the database.
 *.sqlite
 *.sqlite3
 *.db
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local credentials, TLS private keys, and runtime logs.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.log
+*.log.*

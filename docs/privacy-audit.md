@@ -1,0 +1,66 @@
+# Git privacy audit
+
+Audit date: 2026-11-12. Task: `task_f7b62c71a18b438190d6713635b4aefb`.
+Repository baseline: `c16aece` (`origin/main`).
+
+## Findings
+
+- A personal Windows user/project path remains in the `src/http.rs` test fixture
+  in published history: 7 blob versions across 9 commits, including `a88c294`
+  and `eda4c67`. These commits are ancestors of `origin/main`. The literal value
+  is deliberately omitted here. Commit `38855e1` replaced it with a generic path,
+  so it is absent from the current tracked files. Removing it from the tip did
+  not remove it from history.
+- The fork author's commits use a GitHub noreply email. Upstream history retains
+  its contributor's name and non-noreply email as author attribution. Current
+  source email matches are test fixtures. The public repository name/account also
+  occurs in current source and documentation.
+- No real credentials, private keys, phone numbers, or SSN-shaped values were
+  identified by the scans. Token/password literals inspected in code were demo
+  values, test fixtures, environment expressions, or generated-value prefixes.
+  No database, environment file, saved profile, key, or log file was found among
+  historical tracked filenames. Pattern scans are not a guarantee that every
+  kind of personal information has been detected.
+- Ignore rules previously covered database files but missed local hub state,
+  owner keys, token profiles, SQLite sidecars, environment files, TLS keys, and
+  logs. These could otherwise have been staged accidentally. No untracked or
+  ignored local files existed in this checkout at the start of the audit.
+
+## Preventative change
+
+The root `.gitignore` now covers `.aircd/`, `aircd-owner.key`, `profiles.json`,
+SQLite journals/WAL/SHM files, `.env` variants, TLS key containers, and logs.
+Example environment templates remain trackable. These rules prevent ordinary
+`git add` from including matching untracked files; they do not remove files
+already in history, and `git add -f` can override them.
+
+## Verification
+
+- Fetched all origin branches and tags. Inspected all 19 remote branches,
+  89 reachable commits, and all 229 blob objects in the local object database
+  (577 objects total); no binary blobs or submodules were present.
+- Supplemental scan covered user-home paths, email addresses, credential URLs,
+  provider API keys, private keys, JWTs, token/password literals, IPv4 addresses,
+  phone patterns, SSN patterns, and known local identity strings. Commit metadata
+  was also inspected. All distinct candidate values were reviewed locally.
+- Gitleaks v8.30.1 was downloaded from its official release with its published
+  SHA256 checksum verified. `gitleaks git . --log-opts="--all --full-history"
+  --redact --ignore-gitleaks-allow` reported no leaks (79 commits reported by
+  that scanner; the object/metadata scan additionally covers all 89 commits).
+- `gitleaks dir . --redact --ignore-gitleaks-allow` reported no leaks in the
+  working tree. Reports were stored outside the repository with secrets redacted.
+- Exported all 229 historical blob versions outside the repository and scanned
+  them independently with `gitleaks dir`: no leaks in 5.61 MB of blob content.
+- `git check-ignore --no-index` passed 30 sensitive-path cases and 12 source or
+  example-template controls. All 47 baseline tracked paths remain trackable.
+  `git diff --check` passed. No application code changed, so application tests
+  were not needed for this ignore-rule and documentation change.
+
+## Remaining decision
+
+The historical personal path is already published on `origin/main`. Purging it
+requires a separate, coordinated history rewrite that changes commit IDs and
+updates the shared remote. This audit does not rewrite or force-push history.
+The project manager/owner must decide whether to prepare that cleanup. Existing
+upstream author attribution should be considered separately from the accidental
+test-fixture path.
