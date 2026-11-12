@@ -178,6 +178,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/locks/{resource}", delete(release_lock_delete))
         .route("/v1/register", post(register_agent))
         .route("/v1/owner/reissue", post(owner_reissue_token))
+        .route("/v1/owner/wake", post(owner_wake))
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
         .route("/v1/channels/join", post(join_channels))
@@ -398,6 +399,114 @@ async fn register_agent(
             "channels": joined,
         })),
     ))
+}
+
+/// Check the owner key from the `X-AirCD-Invite` header or the request body.
+fn require_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+    body_key: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(expected) = state.info.register_key.as_deref() else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "owner actions need an owner key to be configured: start aircd without --open-registration",
+        ));
+    };
+    let supplied = headers
+        .get("x-aircd-invite")
+        .and_then(|v| v.to_str().ok())
+        .or(body_key)
+        .unwrap_or_default();
+    if constant_time_eq(supplied.trim().as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this action requires the owner's key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct OwnerWakeReq {
+    invite: Option<String>,
+    /// `set` (default), `show`, `delete`, `runs` or `test`.
+    action: Option<String>,
+    nick: Option<String>,
+    limit: Option<i64>,
+    #[serde(flatten)]
+    config: crate::wake::WakeConfigInput,
+}
+
+/// Owner-only: configure how the server starts an account's agent. It is
+/// owner-only because the configured command runs on the server's machine.
+async fn owner_wake(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OwnerWakeReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let action = req.action.as_deref().unwrap_or("set").to_ascii_lowercase();
+    let wakes = state.server.wakes();
+
+    if action == "runs" && req.nick.is_none() {
+        let runs = wakes
+            .runs(None, req.limit.unwrap_or(20))
+            .map_err(ApiError::internal)?;
+        return Ok((
+            StatusCode::OK,
+            with_cors_headers(),
+            Json(json!({ "ok": true, "runs": runs })),
+        ));
+    }
+
+    let nick = req
+        .nick
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("nick is required"))?;
+    let principal = state
+        .server
+        .auth()
+        .resolve_by_name(nick)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no agent named '{}'", nick.trim())))?;
+
+    let body = match action.as_str() {
+        "set" => {
+            let cfg = wakes
+                .upsert(&principal.id, req.config)
+                .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            json!({ "ok": true, "wake": cfg })
+        }
+        "show" => {
+            let cfg = wakes.get(&principal.id).map_err(ApiError::internal)?;
+            json!({ "ok": true, "wake": cfg })
+        }
+        "delete" => {
+            let removed = wakes.delete(&principal.id).map_err(ApiError::internal)?;
+            json!({ "ok": true, "removed": removed })
+        }
+        "runs" => {
+            let runs = wakes
+                .runs(Some(&principal.id), req.limit.unwrap_or(20))
+                .map_err(ApiError::internal)?;
+            json!({ "ok": true, "runs": runs })
+        }
+        "test" => {
+            let started = state
+                .server
+                .wake_account_api(&principal.id, "manual test by the owner")
+                .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            json!({ "ok": true, "started": started })
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown action '{other}': use set, show, delete, runs or test"
+            )))
+        }
+    };
+    Ok((StatusCode::OK, with_cors_headers(), Json(body)))
 }
 
 #[derive(Deserialize)]
@@ -2388,6 +2497,93 @@ mod tests {
         assert_eq!(body["inbox"]["task_count"], 0);
         let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), coord, Value::Null).await?;
         assert_eq!(body["inbox"]["task_count"], 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assigning_a_task_launches_the_assignees_configured_command() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some("owner-key".to_string());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let mut tokens = std::collections::HashMap::new();
+        for (nick, role) in [("owner", "leader"), ("worker", "member")] {
+            let res: Value = client
+                .post(format!("{base}/v1/register"))
+                .json(&json!({"nick": nick, "role": role, "invite": "owner-key"}))
+                .send()
+                .await?
+                .json()
+                .await?;
+            tokens.insert(nick, res["token"].as_str().unwrap().to_string());
+        }
+        let owner = tokens["owner"].as_str();
+        let wake_url = format!("{base}/v1/owner/wake");
+
+        // The command prints a marker built from the placeholders; no shell
+        // quoting is involved, so it behaves the same on every platform.
+        let (command, args) = if cfg!(windows) {
+            ("cmd", json!(["/C", "echo", "woke-{nick}-{task_id}"]))
+        } else {
+            ("echo", json!(["woke-{nick}-{task_id}"]))
+        };
+        let config = json!({
+            "nick": "worker", "command": command, "args": args,
+            "cooldown_seconds": 0, "timeout_seconds": 30,
+        });
+
+        // Configuring a launcher needs the owner key: it runs a command.
+        let (status, _) = call(&client, "POST", wake_url.clone(), owner, config.clone()).await?;
+        assert_eq!(status, 403);
+        let mut keyed = config.clone();
+        keyed["invite"] = json!("owner-key");
+        let (status, body) = call(&client, "POST", wake_url.clone(), "", keyed).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["wake"]["enabled"], true);
+
+        call(&client, "POST", format!("{base}/v1/projects"), owner,
+            json!({"channel": "#quest"})).await?;
+        call(&client, "POST", format!("{base}/v1/projects/members"), owner,
+            json!({"channel": "#quest", "nick": "worker"})).await?;
+        let (status, body) = call(&client, "POST", format!("{base}/v1/tasks"), owner,
+            json!({"channel": "#quest", "title": "Wake me", "assignee": "worker"})).await?;
+        assert_eq!(status, 201);
+        let task_id = body["task"]["id"].as_str().unwrap().to_string();
+
+        // The assignment itself starts the worker's command.
+        let mut finished = None;
+        for _ in 0..100 {
+            let (_, body) = call(&client, "POST", wake_url.clone(), "",
+                json!({"invite": "owner-key", "action": "runs", "nick": "worker"})).await?;
+            if let Some(run) = body["runs"].as_array().and_then(|runs| runs.first()) {
+                if run["status"] != "running" {
+                    finished = Some(run.clone());
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let run = finished.expect("the wake run should finish");
+        assert_eq!(run["status"], "ok", "run: {run}");
+        assert_eq!(run["task_id"], task_id.as_str());
+        assert!(run["log_tail"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("woke-worker-{task_id}")));
+
+        // An account with no launcher is simply not started.
+        let (_, body) = call(&client, "POST", wake_url.clone(), "",
+            json!({"invite": "owner-key", "action": "test", "nick": "owner"})).await?;
+        assert_eq!(body["started"], false);
 
         Ok(())
     }

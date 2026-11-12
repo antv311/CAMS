@@ -10,6 +10,7 @@ mod server;
 mod store;
 mod tasks;
 mod tokens;
+mod wake;
 mod webhooks;
 
 use anyhow::{Context, Result};
@@ -173,6 +174,14 @@ async fn main() -> Result<()> {
     };
     let mut runtime_info = http::build_runtime_info(&bind_addr, &http_bind, tls_port);
     runtime_info.register_key = register_key;
+    let wake_host = http_bind
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|host| !matches!(*host, "0.0.0.0" | "[::]" | "::"))
+        .unwrap_or("127.0.0.1");
+    server
+        .wakes()
+        .set_server_url(&format!("http://{wake_host}:{}", runtime_info.http_port));
     println!("  registration: {register_note}");
     for host in &runtime_info.detected_hosts {
         println!(

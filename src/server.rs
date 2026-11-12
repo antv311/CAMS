@@ -17,6 +17,7 @@ use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
 use crate::store::SharedConnection;
 use crate::tasks::{NewTask, Task, TaskStore, TERMINAL_STATUSES};
+use crate::wake::{WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
 
 const SERVER_NAME: &str = "aircd";
@@ -33,6 +34,7 @@ pub struct Server {
     gits: GitRepoStore,
     locks: LockStore,
     projects: ProjectStore,
+    wakes: WakeManager,
     inner: Arc<Mutex<ServerInner>>,
 }
 
@@ -108,6 +110,7 @@ impl Server {
             gits: GitRepoStore::new(db.clone()),
             locks: LockStore::new(db.clone()),
             projects: ProjectStore::new(db.clone()),
+            wakes: WakeManager::new(db.clone()),
             db,
             inner: Arc::new(Mutex::new(ServerInner::default())),
         }
@@ -135,6 +138,10 @@ impl Server {
 
     pub fn gits(&self) -> &GitRepoStore {
         &self.gits
+    }
+
+    pub fn wakes(&self) -> &WakeManager {
+        &self.wakes
     }
 
     pub fn projects(&self) -> &ProjectStore {
@@ -2204,12 +2211,111 @@ impl Server {
             Vec::new()
         };
         let role_mentions = self.role_mentions(&event.channel, &event.message);
+        self.request_wakes(&event, &members, &role_mentions);
         if let Err(err) =
             self.webhooks
                 .enqueue_for_event(&event, &online, &members, &role_mentions)
         {
             eprintln!("enqueue webhook error ({}): {err:#}", event.event);
         }
+    }
+
+    /// Start the configured agent of every account this event addresses:
+    /// a direct mention, a role it holds in the project, `@here` in a channel
+    /// it belongs to, or a direct message.
+    fn request_wakes(
+        &self,
+        event: &WebhookEvent,
+        members: &[String],
+        role_mentions: &HashSet<String>,
+    ) {
+        let enabled = match self.wakes.enabled_principals() {
+            Ok(list) if !list.is_empty() => list,
+            _ => return,
+        };
+        let mentions = crate::webhooks::extract_mentions(&event.message);
+        let everyone = crate::webhooks::GROUP_MENTIONS
+            .iter()
+            .any(|tag| mentions.contains(*tag));
+        let sender = event.from.to_ascii_lowercase();
+        let task_id = event
+            .task
+            .as_ref()
+            .and_then(|task| task.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_owned);
+        let task_repo = event
+            .task
+            .as_ref()
+            .and_then(|task| task.get("repo"))
+            .and_then(|repo| repo.as_str())
+            .map(str::to_owned);
+
+        for principal_id in enabled {
+            let lowered = principal_id.to_ascii_lowercase();
+            if lowered == sender {
+                continue;
+            }
+            let is_dm = event.event == "dm"
+                && event
+                    .to
+                    .as_deref()
+                    .is_some_and(|to| to.eq_ignore_ascii_case(&principal_id));
+            let addressed = is_dm
+                || mentions.contains(&lowered)
+                || role_mentions.contains(&lowered)
+                || (everyone && members.iter().any(|m| m.eq_ignore_ascii_case(&principal_id)));
+            if !addressed {
+                continue;
+            }
+            let summary: String = event
+                .message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(300)
+                .collect();
+            let ctx = WakeContext {
+                nick: self
+                    .display_name(&principal_id)
+                    .unwrap_or_else(|_| principal_id.clone()),
+                principal_id,
+                reason: format!(
+                    "{} in {} from @{}: {}",
+                    event.event, event.channel, event.from, summary
+                ),
+                channel: event.channel.clone(),
+                task_id: task_id.clone(),
+                repo_path: self.repo_path_for(&event.channel, task_repo.as_deref()),
+            };
+            if let Err(err) = self.wakes.request(ctx) {
+                eprintln!("wake request error: {err:#}");
+            }
+        }
+    }
+
+    /// The local folder of the task's repo, or of the project's first repo.
+    fn repo_path_for(&self, channel: &str, repo_name: Option<&str>) -> Option<String> {
+        let repos = self.gits.list().ok()?;
+        repo_name
+            .and_then(|name| repos.iter().find(|r| r.name.eq_ignore_ascii_case(name)))
+            .or_else(|| repos.iter().find(|r| r.channel == channel))
+            .map(|r| r.local_path.clone())
+    }
+
+    /// Owner-triggered launch, used to check an account's wake configuration.
+    pub fn wake_account_api(&self, target_name: &str, reason: &str) -> Result<bool> {
+        let target = self
+            .auth
+            .resolve_by_name(target_name.trim().trim_start_matches('@'))?
+            .ok_or_else(|| anyhow!("unknown account '{target_name}'"))?;
+        self.wakes.request(WakeContext {
+            principal_id: target.id,
+            nick: target.nick,
+            reason: reason.to_string(),
+            channel: CHAT_ONLY_CHANNEL.to_string(),
+            task_id: None,
+            repo_path: None,
+        })
     }
 
     /// `@coordinator` or `@leader` in a project channel addresses whoever

@@ -227,6 +227,66 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_owner_wake(args: argparse.Namespace) -> int:
+    """Configure how the server starts an account's agent (owner only)."""
+    server, _token, _prof = resolve_connection(args)
+    invite = args.invite or os.environ.get("AIRC_INVITE")
+    if not invite:
+        raise SystemExit("owner wake needs the owner key: pass --invite or set AIRC_INVITE")
+    payload: dict[str, Any] = {"invite": invite, "action": args.wake_cmd, "nick": args.nick}
+    if args.wake_cmd == "set":
+        env: dict[str, Any] = {}
+        for item in args.env or []:
+            key, sep, value = item.partition("=")
+            env[key] = value if sep else None
+        for key in args.unset_env or []:
+            env[key] = None
+        payload.update(
+            {
+                "command": args.command,
+                "args": args.arg or [],
+                "cwd": args.cwd,
+                "env": env,
+                "prompt": args.prompt,
+                "enabled": not args.disabled,
+                "cooldown_seconds": args.cooldown,
+                "timeout_seconds": args.timeout,
+                "max_runs_per_hour": args.max_per_hour,
+            }
+        )
+    if args.wake_cmd == "runs":
+        payload["limit"] = args.limit
+    data = http_json(server, "POST", "/v1/owner/wake", payload=payload)
+
+    lines: list[str] = []
+    if args.wake_cmd in ("set", "show"):
+        wake = data.get("wake")
+        if not wake:
+            lines.append(f"@{args.nick} has no launcher configured.")
+        else:
+            state = "enabled" if wake["enabled"] else "disabled"
+            lines.append(f"@{wake['principal_id']} launcher ({state}): {wake['command']} {' '.join(wake['args'])}")
+            lines.append(
+                f"cwd={wake.get('cwd') or '{repo_path}'} cooldown={wake['cooldown_seconds']}s "
+                f"timeout={wake['timeout_seconds']}s max/hour={wake['max_runs_per_hour']}"
+            )
+    elif args.wake_cmd == "delete":
+        lines.append("Launcher removed." if data.get("removed") else "No launcher was configured.")
+    elif args.wake_cmd == "test":
+        lines.append("Launch started." if data.get("started") else "Not started: no enabled launcher for that account.")
+    elif args.wake_cmd == "runs":
+        for run in data.get("runs", []):
+            lines.append(
+                f"{run['status']:8} @{run['principal_id']} exit={run.get('exit_code')} "
+                f"task={run.get('task_id') or '-'} :: {run['reason'][:90]}"
+            )
+            if args.logs and run.get("log_tail"):
+                lines.append(run["log_tail"])
+        lines = lines or ["No runs yet."]
+    print_out(args, data, lines)
+    return 0
+
+
 def cmd_owner_reissue(args: argparse.Namespace) -> int:
     server, _token, _prof = resolve_connection(args)
     invite = args.invite or os.environ.get("AIRC_INVITE")
@@ -1216,6 +1276,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--make-default", action="store_true", help="Also make this the default profile"
     )
     p_reissue.set_defaults(func=cmd_owner_reissue)
+
+    p_wake = owner_sub.add_parser(
+        "wake", help="Configure the command the server runs to start an account's agent"
+    )
+    wake_sub = p_wake.add_subparsers(dest="wake_cmd", required=True)
+    p_wset = wake_sub.add_parser(
+        "set",
+        help="Placeholders: {prompt} {nick} {server} {reason} {channel} {task_id} {repo_path}",
+    )
+    p_wset.add_argument("--command", required=True, help="Executable (full path, or a name on the server's PATH)")
+    p_wset.add_argument("--arg", action="append", help="One argument template; repeat for each. Use --arg=-p for dash values")
+    p_wset.add_argument("--cwd", help="Working directory template (default: the task's repo path)")
+    p_wset.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p_wset.add_argument("--unset-env", action="append", metavar="KEY", help="Remove a variable from the agent's environment")
+    p_wset.add_argument("--prompt", help="Prompt template for {prompt} (default: built-in inbox instructions)")
+    p_wset.add_argument("--disabled", action="store_true")
+    p_wset.add_argument("--cooldown", type=int, help="Seconds between runs (default 20)")
+    p_wset.add_argument("--timeout", type=int, help="Kill a run after this many seconds (default 1800)")
+    p_wset.add_argument("--max-per-hour", type=int, help="Launch limit per hour (default 12, 0 = unlimited)")
+    wake_parsers = [p_wset]
+    for name, text in (
+        ("show", "Show an account's launcher"),
+        ("delete", "Remove an account's launcher"),
+        ("test", "Start the account's agent now"),
+    ):
+        wake_parsers.append(wake_sub.add_parser(name, help=text))
+    p_wruns = wake_sub.add_parser("runs", help="List recent launches")
+    p_wruns.add_argument("--limit", type=int, default=20)
+    p_wruns.add_argument("--logs", action="store_true", help="Include the end of each run's output")
+    p_wruns.add_argument("--nick")
+    p_wruns.add_argument("--invite", help="Owner key (or set AIRC_INVITE)")
+    p_wruns.set_defaults(func=cmd_owner_wake)
+    for wake_parser in wake_parsers:
+        wake_parser.add_argument("--nick", required=True)
+        wake_parser.add_argument("--invite", help="Owner key (or set AIRC_INVITE)")
+        wake_parser.set_defaults(func=cmd_owner_wake)
 
     p_log = sub.add_parser("login", help="Verify token, join channels & refresh profile")
     p_log.add_argument("--channels", default="#general")

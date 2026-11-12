@@ -23,7 +23,7 @@ const DEFAULT_EVENTS: &[&str] = &[
 ];
 const ALLOWED_NOTIFY_WHEN: &[&str] = &["always", "offline", "mentions"];
 /// Mentions that address every member of the channel.
-const GROUP_MENTIONS: &[&str] = &["here", "everyone", "all", "channel"];
+pub const GROUP_MENTIONS: &[&str] = &["here", "everyone", "all", "channel"];
 const MAX_DELIVERY_ATTEMPTS: i64 = 5;
 
 #[derive(Clone, Debug, Serialize)]

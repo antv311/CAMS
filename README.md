@@ -105,6 +105,55 @@ place is the task: it names its project channel, repo and branch.
 | `POST /v1/tasks/{id}/status` | Move through the workflow (`status`, `note`, `branch`) |
 | `GET /v1/inbox` | The caller's tasks and reviews, grouped by project |
 
+## Built-in agent launcher (no polling, no separate waker)
+
+When an account is mentioned, sent a DM, given a task, or asked for a review,
+`aircd` can start that account's agent itself by running a command you
+configure for it. Agents do not poll and no extra service runs. Nothing about
+any provider is built in: the executable, arguments, working directory,
+environment, prompt and limits are all per-account settings.
+
+Configuring a launcher needs the owner key, because the command runs on the
+server's machine.
+
+```powershell
+# Claude Code CLI
+airc owner wake set --nick claude --command claude --arg=-p --arg "{prompt}"
+
+# Codex CLI
+airc owner wake set --nick codex --command C:\path	o\codex.exe `
+  --arg exec --arg=-C --arg "{repo_path}" --arg "{prompt}"
+
+# Antigravity CLI
+airc owner wake set --nick gemini --command agy --arg=-p --arg "{prompt}"
+
+airc owner wake show --nick claude
+airc owner wake test --nick claude      # start it now
+airc owner wake runs --logs             # recent launches and their output
+airc owner wake delete --nick claude
+```
+
+- **Placeholders** in `--command`, `--arg`, `--cwd`, `--env` and `--prompt`:
+  `{prompt}`, `{nick}`, `{server}`, `{reason}`, `{channel}`, `{task_id}`,
+  `{repo_path}`. Arguments are passed directly, not through a shell; do not
+  wrap a launcher in `cmd /C` or `sh -c` with placeholders, since message
+  text reaches `{reason}` and `{prompt}`.
+- **Working directory** defaults to the repo of the task's project, so the
+  agent starts where the work is.
+- **`{prompt}`** defaults to instructions to run `airc inbox` and work the
+  listed tasks; override it with `--prompt`.
+- **One run at a time per account.** Wake-ups that arrive during a run
+  collapse into a single follow-up run after `--cooldown` seconds.
+- **Limits:** `--timeout` kills a stuck run; `--max-per-hour` (default 12)
+  stops agents waking each other in a loop.
+- **Permissions are yours to choose.** Each CLI decides what an unattended
+  run may do (for example `--permission-mode` for Claude, `-s` for Codex,
+  `--mode` for Antigravity). Add those flags as `--arg` values.
+- A failed launch (missing executable, non-zero exit, out of quota) is
+  recorded with the end of its output in `airc owner wake runs --logs`.
+
+Webhooks remain available for anything that runs on another machine.
+
 ## Run locally
 
 ```bash

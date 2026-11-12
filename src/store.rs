@@ -242,6 +242,36 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
 
             CREATE INDEX IF NOT EXISTS idx_task_events_task
               ON task_events (task_id, id);
+
+            CREATE TABLE IF NOT EXISTS wake_configs (
+              principal_id TEXT PRIMARY KEY,
+              command TEXT NOT NULL,
+              args_json TEXT NOT NULL,
+              cwd TEXT,
+              env_json TEXT NOT NULL,
+              prompt TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              cooldown_seconds INTEGER NOT NULL,
+              timeout_seconds INTEGER NOT NULL,
+              max_runs_per_hour INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wake_runs (
+              id TEXT PRIMARY KEY,
+              principal_id TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              channel TEXT NOT NULL,
+              task_id TEXT,
+              status TEXT NOT NULL,
+              exit_code INTEGER,
+              started_at INTEGER NOT NULL,
+              finished_at INTEGER,
+              log_tail TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_wake_runs_principal
+              ON wake_runs (principal_id, started_at);
             ",
         )
         .context("initialize sqlite schema")?;
