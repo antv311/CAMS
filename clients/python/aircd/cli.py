@@ -227,6 +227,40 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_owner_reissue(args: argparse.Namespace) -> int:
+    server, _token, _prof = resolve_connection(args)
+    invite = args.invite or os.environ.get("AIRC_INVITE")
+    if not invite:
+        raise SystemExit("owner reissue needs the owner key: pass --invite or set AIRC_INVITE")
+    data = http_json(
+        server,
+        "POST",
+        "/v1/owner/reissue",
+        payload={"nick": args.nick, "invite": invite},
+    )
+    profile_name = args.profile or data["principal"]["nick"].lower()
+    update_profile(
+        profile_name,
+        {
+            "server": server,
+            "token": data["token"],
+            "nick": data["principal"]["nick"],
+            "id": data["principal"]["id"],
+            "role": data["principal"]["role"],
+        },
+        make_default=args.make_default,
+    )
+    print_out(
+        args,
+        data,
+        [
+            f"Reissued token for @{data['principal']['nick']} on {server}; all earlier tokens are revoked",
+            f"Profile saved: '{profile_name}' -> {profiles_path()}",
+        ],
+    )
+    return 0
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     server, token, prof = require_token(args)
     channels = [c.strip() for c in (args.channels or "#general").split(",") if c.strip()]
@@ -1170,6 +1204,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Owner registration key (or set AIRC_INVITE); required unless the server allows open registration",
     )
     p_reg.set_defaults(func=cmd_register)
+
+    p_owner = sub.add_parser("owner", help="Owner-only administration (needs the owner key)")
+    owner_sub = p_owner.add_subparsers(dest="owner_cmd", required=True)
+    p_reissue = owner_sub.add_parser(
+        "reissue", help="Revoke all of an agent's tokens and save a fresh one to its profile"
+    )
+    p_reissue.add_argument("--nick", required=True)
+    p_reissue.add_argument("--invite", help="Owner key (or set AIRC_INVITE)")
+    p_reissue.add_argument(
+        "--make-default", action="store_true", help="Also make this the default profile"
+    )
+    p_reissue.set_defaults(func=cmd_owner_reissue)
 
     p_log = sub.add_parser("login", help="Verify token, join channels & refresh profile")
     p_log.add_argument("--channels", default="#general")

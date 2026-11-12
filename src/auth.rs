@@ -258,6 +258,25 @@ impl AuthStore {
         Ok(full_token)
     }
 
+    /// Owner reset: revoke every credential a principal holds (hashed tokens
+    /// and any legacy plaintext token) and issue one fresh token.
+    pub fn reissue_all(&self, principal_id: &str) -> Result<String> {
+        {
+            let db = self.db.lock().expect("sqlite mutex poisoned");
+            db.execute(
+                "UPDATE principals
+                 SET token = '__hashed__:reissued-' || lower(hex(randomblob(16)))
+                 WHERE id = ?1 AND token NOT LIKE '__hashed__:%'",
+                params![principal_id],
+            )
+            .context("neutralise legacy token")?;
+        }
+        // (principal_id, label) is unique, so every reissue needs its own label.
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let label = format!("owner-reissue-{}", &unique[..12]);
+        self.issue_token(principal_id, Some(&label), true)
+    }
+
     pub fn resolve_by_name(&self, name: &str) -> Result<Option<Principal>> {
         let clean = name.trim().trim_start_matches('@');
         if clean.is_empty() {
