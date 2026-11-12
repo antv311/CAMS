@@ -640,9 +640,14 @@ pub fn extract_mentions(text: &str) -> HashSet<String> {
                 while end < bytes.len()
                     && (bytes[end].is_ascii_alphanumeric()
                         || bytes[end] == b'_'
-                        || bytes[end] == b'-')
+                        || bytes[end] == b'-'
+                        || bytes[end] == b'.')
                 {
                     end += 1;
+                }
+                // A trailing '.' is sentence punctuation, not part of the name.
+                while end > start && bytes[end - 1] == b'.' {
+                    end -= 1;
                 }
                 if end > start {
                     out.insert(text[start..end].to_ascii_lowercase());
@@ -787,6 +792,15 @@ mod tests {
         assert!(found.contains("claude"));
         assert!(found.contains("codex-2"));
         assert!(!found.contains("example"));
+    }
+
+    #[test]
+    fn mentions_keep_dots_inside_names_but_not_sentence_punctuation() {
+        let found = extract_mentions("ping @flash3.8. and @opus5.5, then @codex.");
+        assert!(found.contains("flash3.8"));
+        assert!(found.contains("opus5.5"));
+        assert!(found.contains("codex"));
+        assert_eq!(found.len(), 3);
     }
 
     #[test]
