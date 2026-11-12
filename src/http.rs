@@ -92,8 +92,22 @@ pub fn build_runtime_info(
         http_bind: http_bind.to_string(),
         http_port: parse_port(http_bind, 6680),
         tls_port,
-        detected_hosts: detect_local_ips(),
+        detected_hosts: reachable_hosts(http_bind),
         register_key: None,
+    }
+}
+
+/// Addresses the HTTP listener can actually be reached on. A wildcard bind is
+/// reachable on every local address; a specific bind only on that host.
+fn reachable_hosts(http_bind: &str) -> Vec<String> {
+    let host = http_bind
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(http_bind)
+        .trim_matches(|c| c == '[' || c == ']');
+    match host {
+        "" | "0.0.0.0" | "::" => detect_local_ips(),
+        specific => vec![specific.to_string()],
     }
 }
 
@@ -163,6 +177,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/locks/release", post(release_lock_post))
         .route("/v1/locks/{resource}", delete(release_lock_delete))
         .route("/v1/register", post(register_agent))
+        .route("/v1/owner/reissue", post(owner_reissue_token))
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
         .route("/v1/channels/join", post(join_channels))
@@ -373,6 +388,53 @@ async fn register_agent(
             "http_url": format!("http://{}:{}", host, state.info.http_port),
             "channels": joined,
         })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct OwnerReissueReq {
+    nick: String,
+    invite: Option<String>,
+}
+
+/// Owner-only: revoke all of an agent's tokens and hand back a fresh one.
+/// Authorised by the same owner key that guards registration.
+async fn owner_reissue_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OwnerReissueReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(expected) = state.info.register_key.as_deref() else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "token reissue needs an owner key to be configured: start aircd without --open-registration",
+        ));
+    };
+    let supplied = headers
+        .get("x-aircd-invite")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| req.invite.clone())
+        .unwrap_or_default();
+    if !constant_time_eq(supplied.trim().as_bytes(), expected.as_bytes()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "token reissue requires the owner's key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
+        ));
+    }
+
+    let auth = state.server.auth();
+    let principal = auth
+        .resolve_by_name(&req.nick)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no agent named '{}'", req.nick.trim())))?;
+    let token = auth
+        .reissue_all(&principal.id)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "principal": principal, "token": token })),
     ))
 }
 
@@ -2000,5 +2062,133 @@ mod tests {
         assert_eq!(header_ok.status().as_u16(), 201);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_can_reissue_a_token_and_the_old_one_stops_working() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some("owner-key-123".to_string());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let me = |token: String| {
+            let client = client.clone();
+            let url = format!("{base}/v1/me");
+            async move {
+                client
+                    .get(url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+            }
+        };
+
+        let registered: Value = client
+            .post(format!("{base}/v1/register"))
+            .json(&json!({"nick": "worker-1", "invite": "owner-key-123"}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let old_token = registered["token"].as_str().unwrap().to_string();
+        assert_eq!(me(old_token.clone()).await?, 200);
+
+        let reissue = format!("{base}/v1/owner/reissue");
+        let missing = client
+            .post(&reissue)
+            .json(&json!({"nick": "worker-1"}))
+            .send()
+            .await?;
+        assert_eq!(missing.status().as_u16(), 403);
+        let wrong = client
+            .post(&reissue)
+            .json(&json!({"nick": "worker-1", "invite": "guess"}))
+            .send()
+            .await?;
+        assert_eq!(wrong.status().as_u16(), 403);
+        assert_eq!(me(old_token.clone()).await?, 200, "failed attempts change nothing");
+
+        let unknown = client
+            .post(&reissue)
+            .json(&json!({"nick": "nobody", "invite": "owner-key-123"}))
+            .send()
+            .await?;
+        assert_eq!(unknown.status().as_u16(), 404);
+
+        let ok = client
+            .post(&reissue)
+            .json(&json!({"nick": "@Worker-1", "invite": "owner-key-123"}))
+            .send()
+            .await?;
+        assert_eq!(ok.status().as_u16(), 200);
+        let body: Value = ok.json().await?;
+        assert_eq!(body["principal"]["id"], "worker-1");
+        let new_token = body["token"].as_str().unwrap().to_string();
+        assert_ne!(new_token, old_token);
+        assert_eq!(me(old_token.clone()).await?, 401);
+        assert_eq!(me(new_token.clone()).await?, 200);
+
+        // A second reissue (owner key in the header) works and retires the first.
+        let again = client
+            .post(&reissue)
+            .header("X-AirCD-Invite", "owner-key-123")
+            .json(&json!({"nick": "worker-1"}))
+            .send()
+            .await?;
+        assert_eq!(again.status().as_u16(), 200);
+        let newest = again.json::<Value>().await?["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(me(new_token).await?, 401);
+        assert_eq!(me(newest).await?, 200);
+
+        // Seeded legacy plaintext tokens are neutralised as well.
+        assert_eq!(me("agent-a-token".to_string()).await?, 200);
+        let legacy = client
+            .post(&reissue)
+            .json(&json!({"nick": "agent-a", "invite": "owner-key-123"}))
+            .send()
+            .await?;
+        assert_eq!(legacy.status().as_u16(), 200);
+        assert_eq!(me("agent-a-token".to_string()).await?, 401);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reissue_is_refused_when_no_owner_key_is_configured() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+
+        let refused = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/owner/reissue"))
+            .json(&json!({"nick": "agent-a", "invite": ""}))
+            .send()
+            .await?;
+        assert_eq!(refused.status().as_u16(), 403);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_info_lists_only_reachable_hosts() {
+        let local = build_runtime_info("127.0.0.1:6667", "127.0.0.1:6680", None);
+        assert_eq!(local.detected_hosts, vec!["127.0.0.1".to_string()]);
+        let wildcard = build_runtime_info("0.0.0.0:6667", "0.0.0.0:6680", None);
+        assert!(wildcard.detected_hosts.contains(&"127.0.0.1".to_string()));
     }
 }
