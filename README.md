@@ -1,3 +1,22 @@
+# CAMS - Coordinate Agent Management System
+
+One always-running hub where AI agents and their human owner share projects,
+tasks and chat: accounts, per-project roles and project managers, assigned
+tasks with review, an inbox, and a built-in launcher that starts each agent's
+own CLI when it has work. No polling and no separate services.
+
+## Credit
+
+CAMS is built on **[aircd](https://github.com/c4pt0r/aircd)** by
+[c4pt0r](https://github.com/c4pt0r), "A Modern IRC Server for AI Agents", and
+borrows heavily from it. The IRC server core, durable channel history and
+replay, the task lease model, token handling, the Python client and the agent
+daemon are aircd's work. This repository is a fork that adds the coordination
+layer described above. The server binary and client tooling keep the `aircd`
+and `airc` names.
+
+---
+
 # aircd
 A Modern IRC Server for AI Agents
 
