@@ -15,6 +15,7 @@ use crate::auth::{DuplicatePrincipalError, Principal};
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::locks::LockConflictError;
 use crate::server::Server;
+use crate::store::{ClientTemplate, ClientTemplateInput};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HttpRuntimeInfo {
@@ -181,6 +182,13 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/owner/wake", post(owner_wake))
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
+        .route("/v1/templates", get(list_templates))
+        .route(
+            "/v1/templates/{id}",
+            get(get_template)
+                .post(upsert_template)
+                .delete(delete_template),
+        )
         .route("/v1/channels/join", post(join_channels))
         .route("/v1/messages", get(list_messages).post(post_message))
         .route("/v1/roles", get(list_roles).post(set_role))
@@ -432,6 +440,121 @@ fn require_owner(
             "this action requires the owner's key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
         ))
     }
+}
+
+/// Availability is checked when responding, never persisted or probed by launch.
+#[derive(Serialize)]
+struct TemplateResponse {
+    #[serde(flatten)]
+    template: ClientTemplate,
+    installed: bool,
+}
+
+impl From<ClientTemplate> for TemplateResponse {
+    fn from(template: ClientTemplate) -> Self {
+        let installed = crate::wake::command_found(&template.command);
+        Self {
+            template,
+            installed,
+        }
+    }
+}
+
+fn template_store_error(error: anyhow::Error) -> ApiError {
+    if error.downcast_ref::<rusqlite::Error>().is_some() {
+        ApiError::internal(error)
+    } else {
+        ApiError::bad_request(error.to_string())
+    }
+}
+
+async fn list_templates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate_request(&state, &headers)?;
+    let templates: Vec<TemplateResponse> = state
+        .server
+        .templates()
+        .list()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(TemplateResponse::from)
+        .collect();
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "templates": templates })),
+    ))
+}
+
+async fn get_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate_request(&state, &headers)?;
+    let template = state
+        .server
+        .templates()
+        .get(&id)
+        .map_err(template_store_error)?
+        .ok_or_else(|| ApiError::not_found(format!("no client template named '{id}'")))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "template": TemplateResponse::from(template) })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct UpsertTemplateReq {
+    invite: Option<String>,
+    #[serde(flatten)]
+    template: ClientTemplateInput,
+}
+
+/// Like launcher configuration, defining commands requires the owner's key.
+async fn upsert_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<UpsertTemplateReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let template = state
+        .server
+        .templates()
+        .upsert(&id, req.template)
+        .map_err(template_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "template": TemplateResponse::from(template) })),
+    ))
+}
+
+async fn delete_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, None)?;
+    if !state
+        .server
+        .templates()
+        .delete(&id)
+        .map_err(template_store_error)?
+    {
+        return Err(ApiError::not_found(format!(
+            "no client template named '{id}'"
+        )));
+    }
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "deleted": true })),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -2410,6 +2533,483 @@ mod tests {
     use crate::store;
     use crate::webhooks::sign_payload;
     use tokio::sync::mpsc;
+
+    struct TemplateApi {
+        server: Server,
+        db: store::SharedConnection,
+        client: reqwest::Client,
+        base: String,
+        token: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TemplateApi {
+        async fn start(owner_key: Option<&str>) -> Result<Self> {
+            let db = store::open(":memory:")?;
+            let server = Server::new(db.clone());
+            let (_, token) = server
+                .auth()
+                .register_principal("reader", Some("member"), None)?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+            info.register_key = owner_key.map(str::to_string);
+            let router = router(server.clone(), info);
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            Ok(Self {
+                server,
+                db,
+                client: reqwest::Client::new(),
+                base: format!("http://{addr}"),
+                token,
+                task,
+            })
+        }
+
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            token: Option<&str>,
+            key: Option<&str>,
+            body: Option<&Value>,
+        ) -> Result<(StatusCode, Value)> {
+            let mut request = self
+                .client
+                .request(method.parse()?, format!("{}{path}", self.base));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            if let Some(key) = key {
+                request = request.header("X-AirCD-Invite", key);
+            }
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().await?;
+            let status = response.status();
+            let body = response.json().await?;
+            Ok((status, body))
+        }
+
+        async fn read(&self, path: &str) -> Result<(StatusCode, Value)> {
+            self.request("GET", path, Some(&self.token), None, None)
+                .await
+        }
+
+        async fn write(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<&Value>,
+        ) -> Result<(StatusCode, Value)> {
+            self.request(method, path, None, Some("template-owner-key"), body)
+                .await
+        }
+    }
+
+    impl Drop for TemplateApi {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn template_body() -> Value {
+        json!({"name": "Example Client", "command": "aircd-uninstalled-example-client"})
+    }
+
+    #[tokio::test]
+    async fn templates_http_authenticates_reads_and_requires_the_owner_key_for_writes() -> Result<()>
+    {
+        let api = TemplateApi::start(Some("template-owner-key")).await?;
+        let path = "/v1/templates/example";
+        api.write("POST", path, Some(&template_body())).await?;
+        let (_, owner_token) =
+            api.server
+                .auth()
+                .register_principal("owner", Some("leader"), None)?;
+
+        for read_path in ["/v1/templates", path] {
+            for token in [None, Some("invalid-token")] {
+                let (status, body) = api.request("GET", read_path, token, None, None).await?;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{read_path}: {body}");
+                assert_eq!(body["ok"], false);
+            }
+            // Owner credentials do not replace an account token on read endpoints.
+            let (status, _) = api
+                .request("GET", read_path, None, Some("template-owner-key"), None)
+                .await?;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(api.read(read_path).await?.0, StatusCode::OK);
+        }
+
+        for method in ["POST", "DELETE"] {
+            let body = (method == "POST").then(template_body);
+            for token in [None, Some(api.token.as_str()), Some(owner_token.as_str())] {
+                for key in [None, Some("wrong-key")] {
+                    let (status, response) =
+                        api.request(method, path, token, key, body.as_ref()).await?;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {response}");
+                    assert_eq!(response["ok"], false);
+                }
+            }
+            assert!(api.server.templates().get("example")?.is_some());
+        }
+
+        // POST accepts the body key, and the header takes precedence over it.
+        let mut body = template_body();
+        body["invite"] = json!("template-owner-key");
+        assert_eq!(
+            api.request("POST", path, None, None, Some(&body)).await?.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            api.request("POST", path, None, Some("wrong-key"), Some(&body))
+                .await?
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        body["invite"] = json!("wrong-key");
+        assert_eq!(
+            api.write("POST", path, Some(&body)).await?.0,
+            StatusCode::OK
+        );
+        assert_eq!(api.write("DELETE", path, None).await?.0, StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_http_refuses_writes_without_a_configured_owner_key() -> Result<()> {
+        let api = TemplateApi::start(None).await?;
+        for method in ["POST", "DELETE"] {
+            let mut body = template_body();
+            body["invite"] = json!("template-owner-key");
+            let (status, response) = api
+                .write(method, "/v1/templates/example", Some(&body))
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+        }
+        assert_eq!(api.read("/v1/templates").await?.1["templates"], json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_http_crud_preserves_settings_and_replaces_mutable_fields() -> Result<()> {
+        let api = TemplateApi::start(Some("template-owner-key")).await?;
+        assert_eq!(
+            api.read("/v1/templates").await?.1,
+            json!({"ok": true, "templates": []})
+        );
+        let path = "/v1/templates/Example_1";
+        let input = json!({
+            "name": " Example Client — 日本語 ",
+            "command": " aircd-uninstalled-example-client ",
+            "args": ["--model={model}", "{prompt}", "", "O'Brien says \"hi\"\n$literal `text`"],
+            "cwd": "{repo_path}",
+            "env": {"KEEP": "{model}", "REMOVE": null},
+            "prompt": "Keep {model} and {unknown} literal\n",
+            "session_mode": "resume",
+            "resume_args": ["--resume", "{session_id}"],
+            "session_marker": "conversation_id:",
+            "session_scope": "channel"
+        });
+        let (status, body) = api.write("POST", path, Some(&input)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved = &body["template"];
+        assert_eq!(saved["id"], "Example_1");
+        assert_eq!(saved["name"], "Example Client — 日本語");
+        assert_eq!(saved["command"], "aircd-uninstalled-example-client");
+        for field in [
+            "args",
+            "cwd",
+            "env",
+            "prompt",
+            "session_mode",
+            "resume_args",
+            "session_marker",
+            "session_scope",
+        ] {
+            assert_eq!(saved[field], input[field], "{field}");
+        }
+        assert_eq!(saved["installed"], false);
+        assert!(saved["created_at"].is_i64());
+        assert!(saved["updated_at"].is_i64());
+        assert!(saved.get("invite").is_none());
+        assert_eq!(api.read(path).await?.1["template"], *saved);
+        assert_eq!(
+            api.read("/v1/templates").await?.1["templates"],
+            json!([saved])
+        );
+
+        let replacement = json!({"name": "Replacement", "command": "other-uninstalled-client"});
+        let (status, updated) = api.write("POST", path, Some(&replacement)).await?;
+        assert_eq!(status, StatusCode::OK);
+        let updated = &updated["template"];
+        assert_eq!(updated["name"], replacement["name"]);
+        assert_eq!(updated["command"], replacement["command"]);
+        assert_eq!(updated["created_at"], saved["created_at"]);
+        assert!(updated["updated_at"].as_i64() >= saved["updated_at"].as_i64());
+        for field in ["args", "resume_args"] {
+            assert_eq!(updated[field], json!([]));
+        }
+        assert_eq!(updated["env"], json!({}));
+        for field in ["cwd", "prompt", "session_marker"] {
+            assert!(updated[field].is_null());
+        }
+        assert_eq!(updated["session_mode"], "fresh");
+        assert_eq!(updated["session_scope"], "account");
+        assert_eq!(
+            api.server.templates().get("Example_1")?.unwrap().name,
+            "Replacement"
+        );
+
+        api.write("POST", "/v1/templates/z-client", Some(&template_body()))
+            .await?;
+        api.write("POST", "/v1/templates/a-client", Some(&template_body()))
+            .await?;
+        let listed = api.read("/v1/templates").await?.1;
+        let ids: Vec<_> = listed["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["Example_1", "a-client", "z-client"]);
+        assert_eq!(
+            api.read("/v1/templates/example_1").await?.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            api.write("DELETE", path, None).await?,
+            (StatusCode::OK, json!({"ok": true, "deleted": true}))
+        );
+        assert_eq!(api.read(path).await?.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            api.write("DELETE", path, None).await?.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(api.server.templates().list()?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_http_rejects_invalid_input_without_changing_existing_templates() -> Result<()>
+    {
+        let api = TemplateApi::start(Some("template-owner-key")).await?;
+        let path = "/v1/templates/example";
+        let saved = api.write("POST", path, Some(&template_body())).await?.1;
+        for input in [
+            json!({}),
+            json!({"name": "Example"}),
+            json!({"command": "example"}),
+            json!({"name": " ", "command": "example"}),
+            json!({"name": "Example", "command": " "}),
+            json!({"name": "Bad\u{0}name", "command": "example"}),
+            json!({"name": "Example", "command": "bad\u{0}command"}),
+            json!({"name": "Example", "command": "example", "session_mode": "invalid"}),
+            json!({"name": "Example", "command": "example", "session_scope": "invalid"}),
+        ] {
+            let (status, body) = api.write("POST", path, Some(&input)).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{input}: {body}");
+            assert_eq!(body["ok"], false);
+            assert_eq!(api.read(path).await?.1, saved);
+        }
+        for bad_id in ["bad.id", "bad%20id", "%E6%97%A5%E6%9C%AC", "%20"] {
+            let path = format!("/v1/templates/{bad_id}");
+            assert_eq!(
+                api.write("POST", &path, Some(&template_body())).await?.0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(api.read(&path).await?.0, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                api.write("DELETE", &path, None).await?.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        // Invalid JSON types fail extraction rather than silently dropping settings.
+        for (field, value) in [
+            ("args", json!("not-an-array")),
+            ("args", json!([1])),
+            ("env", json!({"KEY": 123})),
+            ("command", Value::Null),
+            ("session_mode", json!(true)),
+        ] {
+            let mut input = template_body();
+            input[field] = value;
+            let response = api
+                .client
+                .post(format!("{}{path}", api.base))
+                .header("X-AirCD-Invite", "template-owner-key")
+                .json(&input)
+                .send()
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{input}"
+            );
+        }
+        let malformed = api
+            .client
+            .post(format!("{}{path}", api.base))
+            .header("X-AirCD-Invite", "template-owner-key")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{")
+            .send()
+            .await?;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(api.read(path).await?.1, saved);
+        assert_eq!(api.server.templates().list()?.len(), 1);
+        Ok(())
+    }
+
+    struct TemplateProbeDir(std::path::PathBuf);
+
+    impl TemplateProbeDir {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "aircd-template-probe-{} with spaces",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for TemplateProbeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn templates_http_detects_paths_and_path_commands_at_request_time_without_launching(
+    ) -> Result<()> {
+        let api = TemplateApi::start(Some("template-owner-key")).await?;
+        let dir = TemplateProbeDir::new()?;
+        let executable = dir.0.join(if cfg!(windows) {
+            "client.cmd"
+        } else {
+            "client"
+        });
+        let marker = dir.0.join("must-not-be-created");
+        let script = if cfg!(windows) {
+            format!("@echo executed>\"{}\"\r\n", marker.display())
+        } else {
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display())
+        };
+        std::fs::write(&executable, &script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let path = "/v1/templates/probe";
+        let (status, created) = api
+            .write(
+                "POST",
+                path,
+                Some(&json!({
+                    "name": "Probe", "command": executable.to_str().unwrap()
+                })),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(created["template"]["installed"], true);
+        assert_eq!(api.read(path).await?.1["template"]["installed"], true);
+        assert_eq!(
+            api.read("/v1/templates").await?.1["templates"][0]["installed"],
+            true
+        );
+        std::fs::remove_file(&executable)?;
+        assert_eq!(api.read(path).await?.1["template"]["installed"], false);
+        assert_eq!(
+            api.read("/v1/templates").await?.1["templates"][0]["installed"],
+            false
+        );
+        std::fs::write(&executable, &script)?;
+        assert_eq!(api.read(path).await?.1["template"]["installed"], true);
+        assert!(
+            !marker.exists(),
+            "availability checks must never execute the command"
+        );
+
+        // A directory or missing file is not a client executable.
+        for command in [dir.0.clone(), dir.0.join("missing-client")] {
+            let (_, response) = api
+                .write(
+                    "POST",
+                    path,
+                    Some(&json!({
+                        "name": "Probe", "command": command.to_str().unwrap()
+                    })),
+                )
+                .await?;
+            assert_eq!(response["template"]["installed"], false);
+        }
+        // Known host commands cover PATH lookup (including .exe inference on Windows).
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
+        let (_, response) = api
+            .write(
+                "POST",
+                path,
+                Some(&json!({"name": "Host shell", "command": command})),
+            )
+            .await?;
+        assert_eq!(
+            response["template"]["installed"], true,
+            "{command} must be on the test host PATH"
+        );
+        assert_eq!(api.read(path).await?.1["template"]["installed"], true);
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_http_reports_storage_failures_as_server_errors() -> Result<()> {
+        let api = TemplateApi::start(Some("template-owner-key")).await?;
+        let path = "/v1/templates/example";
+        api.write("POST", path, Some(&template_body())).await?;
+        api.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE client_templates SET args_json = 'corrupt'", [])?;
+        for read_path in ["/v1/templates", path] {
+            let (status, body) = api.read(read_path).await?;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(body["ok"], false);
+        }
+        api.db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE client_templates")?;
+        for (method, read_path, body) in [
+            ("GET", "/v1/templates", None),
+            ("GET", path, None),
+            ("POST", path, Some(template_body())),
+            ("DELETE", path, None),
+        ] {
+            let (status, body) = api
+                .request(
+                    method,
+                    read_path,
+                    Some(&api.token),
+                    Some("template-owner-key"),
+                    body.as_ref(),
+                )
+                .await?;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {read_path}: {body}"
+            );
+            assert_eq!(body["ok"], false);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn welcome_register_webhook_report_roles_locks_and_git_http_flow() -> Result<()> {
