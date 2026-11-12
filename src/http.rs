@@ -431,10 +431,12 @@ fn require_owner(
 #[derive(Deserialize)]
 struct OwnerWakeReq {
     invite: Option<String>,
-    /// `set` (default), `show`, `delete`, `runs` or `test`.
+    /// `set` (default), `show`, `delete`, `runs`, `test` or `reset`.
     action: Option<String>,
     nick: Option<String>,
     limit: Option<i64>,
+    /// For `test`: the reason handed to the agent, such as an instruction.
+    message: Option<String>,
     #[serde(flatten)]
     config: crate::wake::WakeConfigInput,
 }
@@ -493,16 +495,29 @@ async fn owner_wake(
                 .map_err(ApiError::internal)?;
             json!({ "ok": true, "runs": runs })
         }
+        "reset" => {
+            let removed = wakes
+                .clear_sessions(&principal.id, None)
+                .map_err(ApiError::internal)?;
+            json!({ "ok": true, "removed": removed })
+        }
         "test" => {
             let started = state
                 .server
-                .wake_account_api(&principal.id, "manual test by the owner")
+                .wake_account_api(
+                    &principal.id,
+                    req.message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or("manual test by the owner"),
+                )
                 .map_err(|err| ApiError::bad_request(err.to_string()))?;
             json!({ "ok": true, "started": started })
         }
         other => {
             return Err(ApiError::bad_request(format!(
-                "unknown action '{other}': use set, show, delete, runs or test"
+                "unknown action '{other}': use set, show, delete, runs, test or reset"
             )))
         }
     };
@@ -2584,6 +2599,83 @@ mod tests {
         let (_, body) = call(&client, "POST", wake_url.clone(), "",
             json!({"invite": "owner-key", "action": "test", "nick": "owner"})).await?;
         assert_eq!(body["started"], false);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_resume_launcher_continues_the_stored_conversation() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some("owner-key".to_string());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        client
+            .post(format!("{base}/v1/register"))
+            .json(&json!({"nick": "pm", "invite": "owner-key"}))
+            .send()
+            .await?;
+        let wake_url = format!("{base}/v1/owner/wake");
+
+        // A stand-in agent: the first launch prints a conversation id, later
+        // launches are started with that id.
+        let (command, fresh, resumed) = if cfg!(windows) {
+            (
+                "cmd",
+                json!(["/C", "echo", "fresh", "session_id:", "conv-777"]),
+                json!(["/C", "echo", "resumed-{session_id}"]),
+            )
+        } else {
+            (
+                "echo",
+                json!(["fresh", "session_id:", "conv-777"]),
+                json!(["resumed-{session_id}"]),
+            )
+        };
+        let (status, body) = call(&client, "POST", wake_url.clone(), "", json!({
+            "invite": "owner-key", "nick": "pm", "command": command, "args": fresh,
+            "resume_args": resumed, "session_mode": "resume",
+            "session_marker": "session_id:", "cooldown_seconds": 0,
+        })).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["wake"]["session_mode"], "resume");
+
+        let mut logs = Vec::new();
+        for round in 0..3 {
+            if round == 2 {
+                // Forgetting the conversation makes the next launch fresh again.
+                let (_, body) = call(&client, "POST", wake_url.clone(), "",
+                    json!({"invite": "owner-key", "action": "reset", "nick": "pm"})).await?;
+                assert_eq!(body["removed"], 1);
+            }
+            call(&client, "POST", wake_url.clone(), "",
+                json!({"invite": "owner-key", "action": "test", "nick": "pm"})).await?;
+            let mut done = None;
+            for _ in 0..100 {
+                let (_, body) = call(&client, "POST", wake_url.clone(), "",
+                    json!({"invite": "owner-key", "action": "runs", "nick": "pm"})).await?;
+                let runs = body["runs"].as_array().cloned().unwrap_or_default();
+                if runs.len() == round + 1 && runs.iter().all(|r| r["status"] != "running") {
+                    done = runs.first().cloned();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let run = done.expect("the wake run should finish");
+            assert_eq!(run["status"], "ok", "run: {run}");
+            logs.push(run["log_tail"].as_str().unwrap().to_string());
+            // Let the launcher release the account before the next round.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        assert!(logs[0].contains("fresh"), "{logs:?}");
+        assert!(logs[1].contains("resumed-conv-777"), "{logs:?}");
+        assert!(logs[2].contains("fresh"), "{logs:?}");
 
         Ok(())
     }

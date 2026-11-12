@@ -152,6 +152,38 @@ airc owner wake delete --nick claude
 - A failed launch (missing executable, non-zero exit, out of quota) is
   recorded with the end of its output in `airc owner wake runs --logs`.
 
+### Workers and coordinators: fresh or resumed conversations
+
+By default every launch is a new conversation (`--session fresh`). That suits
+workers: their context is the task, so work can be reassigned freely.
+
+A coordinator needs to remember. With `--session resume` the server stores the
+conversation id the agent prints and passes it back on the next launch, so the
+account continues one conversation. Messaging that account on the hub is then
+a conversation with it.
+
+```powershell
+# Claude Code: the id is in the JSON output; resume with --resume
+airc owner wake set --nick claude --command claude --session resume `
+  --arg=-p --arg "{prompt}" --arg=--output-format --arg json `
+  --resume-arg=-p --resume-arg "{prompt}" --resume-arg=--output-format --resume-arg json `
+  --resume-arg=--resume --resume-arg "{session_id}" --session-marker '"session_id"'
+
+# Antigravity: --conversation, marker "conversation_id"
+# Codex: resume args `exec resume {session_id} {prompt}`, marker "session id:"
+
+airc owner wake reset --nick claude     # forget it; the next launch starts fresh
+airc owner wake test --nick claude --message "Summarise where the project stands"
+```
+
+- `--session-marker` is the text that precedes the id in the agent's output.
+- `--session-scope channel` keeps one conversation per project instead of one
+  per account.
+- If a resumed launch fails, the stored id is dropped and the next launch
+  starts fresh.
+- A resumed conversation grows over time. Keep what must last in the hub
+  (tasks, history, reports) and reset the conversation when it gets long.
+
 Webhooks remain available for anything that runs on another machine.
 
 ## Run locally

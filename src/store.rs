@@ -272,6 +272,14 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
 
             CREATE INDEX IF NOT EXISTS idx_wake_runs_principal
               ON wake_runs (principal_id, started_at);
+
+            CREATE TABLE IF NOT EXISTS wake_sessions (
+              principal_id TEXT NOT NULL,
+              scope_key TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY (principal_id, scope_key)
+            );
             ",
         )
         .context("initialize sqlite schema")?;
@@ -279,6 +287,7 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
     migrate_principals(connection)?;
     migrate_channel_memberships(connection)?;
     migrate_tasks(connection)?;
+    migrate_wake_configs(connection)?;
 
     if seed_demo {
         for (id, token, team) in DEMO_PRINCIPALS {
@@ -289,6 +298,32 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
     }
 
     backfill_principal_tokens(connection)?;
+
+    Ok(())
+}
+
+fn migrate_wake_configs(connection: &Connection) -> Result<()> {
+    let columns = [
+        ("session_mode", "TEXT NOT NULL DEFAULT 'fresh'"),
+        ("resume_args_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("session_marker", "TEXT"),
+        ("session_scope", "TEXT NOT NULL DEFAULT 'account'"),
+    ];
+
+    for (column, definition) in columns {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('wake_configs') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?;
+
+        if exists == 0 {
+            connection.execute(
+                &format!("ALTER TABLE wake_configs ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
 
     Ok(())
 }

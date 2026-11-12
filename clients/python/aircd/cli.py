@@ -252,10 +252,16 @@ def cmd_owner_wake(args: argparse.Namespace) -> int:
                 "cooldown_seconds": args.cooldown,
                 "timeout_seconds": args.timeout,
                 "max_runs_per_hour": args.max_per_hour,
+                "session_mode": args.session,
+                "resume_args": args.resume_arg or [],
+                "session_marker": args.session_marker,
+                "session_scope": args.session_scope,
             }
         )
     if args.wake_cmd == "runs":
         payload["limit"] = args.limit
+    if args.wake_cmd == "test":
+        payload["message"] = args.message
     data = http_json(server, "POST", "/v1/owner/wake", payload=payload)
 
     lines: list[str] = []
@@ -270,6 +276,13 @@ def cmd_owner_wake(args: argparse.Namespace) -> int:
                 f"cwd={wake.get('cwd') or '{repo_path}'} cooldown={wake['cooldown_seconds']}s "
                 f"timeout={wake['timeout_seconds']}s max/hour={wake['max_runs_per_hour']}"
             )
+            if wake.get("session_mode") == "resume":
+                lines.append(
+                    f"session=resume (per {wake['session_scope']}) marker={wake.get('session_marker')!r} "
+                    f"resume args: {' '.join(wake.get('resume_args') or [])}"
+                )
+    elif args.wake_cmd == "reset":
+        lines.append(f"Forgot {data.get('removed', 0)} stored conversation(s); the next launch starts fresh.")
     elif args.wake_cmd == "delete":
         lines.append("Launcher removed." if data.get("removed") else "No launcher was configured.")
     elif args.wake_cmd == "test":
@@ -1295,13 +1308,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_wset.add_argument("--cooldown", type=int, help="Seconds between runs (default 20)")
     p_wset.add_argument("--timeout", type=int, help="Kill a run after this many seconds (default 1800)")
     p_wset.add_argument("--max-per-hour", type=int, help="Launch limit per hour (default 12, 0 = unlimited)")
+    p_wset.add_argument(
+        "--session",
+        choices=["fresh", "resume"],
+        default="fresh",
+        help="fresh: new conversation per launch (workers). resume: continue one conversation (coordinators)",
+    )
+    p_wset.add_argument("--resume-arg", action="append", help="Argument template used once a conversation is stored; {session_id} is its id")
+    p_wset.add_argument("--session-marker", help="Text that precedes the conversation id in the agent's output")
+    p_wset.add_argument("--session-scope", choices=["account", "channel"], default="account", help="One conversation per account, or one per project channel")
     wake_parsers = [p_wset]
     for name, text in (
         ("show", "Show an account's launcher"),
         ("delete", "Remove an account's launcher"),
         ("test", "Start the account's agent now"),
+        ("reset", "Forget the stored conversation so the next launch starts fresh"),
     ):
-        wake_parsers.append(wake_sub.add_parser(name, help=text))
+        wake_sub_parser = wake_sub.add_parser(name, help=text)
+        if name == "test":
+            wake_sub_parser.add_argument("--message", help="Reason or instruction handed to the agent")
+        wake_parsers.append(wake_sub_parser)
     p_wruns = wake_sub.add_parser("runs", help="List recent launches")
     p_wruns.add_argument("--limit", type=int, default=20)
     p_wruns.add_argument("--logs", action="store_true", help="Include the end of each run's output")
