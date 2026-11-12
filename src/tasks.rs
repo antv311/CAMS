@@ -16,6 +16,7 @@ pub const ALL_STATUSES: &[&str] = &[
     "claimed",
     "assigned",
     "in_progress",
+    "testing",
     "blocked",
     "review",
     "changes_requested",

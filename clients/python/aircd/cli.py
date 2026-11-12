@@ -1498,7 +1498,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tas.add_argument("nick", nargs="?")
     p_tas.set_defaults(func=cmd_task)
 
-    p_tst = task_sub.add_parser("status", help="Move a task: in_progress, review, changes_requested, merged, cancelled")
+    p_tst = task_sub.add_parser("status", help="Move a task: in_progress, testing, review (needs --note with your test report), changes_requested, merged, cancelled")
     p_tst.add_argument("id")
     p_tst.add_argument("status")
     p_tst.add_argument("--note")

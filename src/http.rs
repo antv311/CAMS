@@ -461,7 +461,17 @@ async fn owner_wake(
     let wakes = state.server.wakes();
 
     if action == "list" {
-        let launchers = wakes.list().map_err(ApiError::internal)?;
+        let launchers: Vec<serde_json::Value> = wakes
+            .list()
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(|cfg| {
+                let found = crate::wake::command_found(&cfg.command);
+                let mut entry = serde_json::to_value(&cfg).unwrap_or(serde_json::Value::Null);
+                entry["command_found"] = json!(found);
+                entry
+            })
+            .collect();
         return Ok((
             StatusCode::OK,
             with_cors_headers(),
@@ -2659,8 +2669,20 @@ mod tests {
         let (status, _) = call(&client, "POST", status_url.clone(), worker,
             json!({"status": "in_progress"})).await?;
         assert_eq!(status, 200);
+        // Work is tested before it is handed in, and handing it in needs a test report.
+        let (status, _) = call(&client, "POST", status_url.clone(), worker,
+            json!({"status": "review", "note": "skipping tests"})).await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(&client, "POST", status_url.clone(), worker,
+            json!({"status": "testing"})).await?;
+        assert_eq!(status, 200);
         let (status, body) = call(&client, "POST", status_url.clone(), worker,
             json!({"status": "review", "branch": "fix/seek-bar"})).await?;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("test report"));
+        let (status, body) = call(&client, "POST", status_url.clone(), worker, json!({
+            "status": "review", "branch": "fix/seek-bar", "note": "cargo test: 12 passed",
+        })).await?;
         assert_eq!(status, 200);
         assert_eq!(body["task"]["branch"], "fix/seek-bar");
         let (status, _) = call(&client, "POST", status_url.clone(), worker,
@@ -2674,7 +2696,10 @@ mod tests {
             json!({"status": "changes-requested", "note": "add a test"})).await?;
         assert_eq!(status, 200);
         let (status, _) = call(&client, "POST", status_url.clone(), worker,
-            json!({"status": "review"})).await?;
+            json!({"status": "testing"})).await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(&client, "POST", status_url.clone(), worker,
+            json!({"status": "review", "note": "added a test; 13 passed"})).await?;
         assert_eq!(status, 200);
         let (status, body) = call(&client, "POST", status_url.clone(), coord,
             json!({"status": "merged"})).await?;
@@ -2684,7 +2709,7 @@ mod tests {
         let (_, body) = call(&client, "GET", format!("{base}/v1/inbox"), worker, Value::Null).await?;
         assert_eq!(body["inbox"]["task_count"], 0);
         let (_, body) = call(&client, "GET", format!("{base}/v1/tasks/{id}"), worker, Value::Null).await?;
-        assert_eq!(body["events"].as_array().unwrap().len(), 5);
+        assert_eq!(body["events"].as_array().unwrap().len(), 7);
 
         // Reassignment moves the task to the new account's inbox.
         let (_, body) = call(&client, "POST", format!("{base}/v1/tasks"), owner,

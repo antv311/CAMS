@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,10 +25,12 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const NOTICE_FOR: Duration = Duration::from_secs(6);
-const TABS: &str = " [D]ashboard  [C]hat  [Q]uit ";
-const CHANNEL_PANE_WIDTH: u16 = 24;
+const TABS: &str = " [H]ome  [D]ashboard  [C]hat  [Q]uit ";
+const CHANNEL_PANE_WIDTH: u16 = 26;
+const PEOPLE_PANE_WIDTH: u16 = 26;
 const STATUS_CHOICES: &[&str] = &[
     "in_progress",
+    "testing",
     "review",
     "changes_requested",
     "merged",
@@ -37,7 +39,13 @@ const STATUS_CHOICES: &[&str] = &[
 const ROLE_CHOICES: &[&str] = &["member", "builder", "reviewer", "tester", "coordinator"];
 const KIND_CHOICES: &[&str] = &["task", "bug", "feature"];
 const HELP: &[&str] = &[
-    "Dashboard",
+    "Home",
+    "  up/down     choose a project      Enter  open its dashboard",
+    "  n           new project (name, then its repo folder)",
+    "  m / p       add a member / choose the project manager",
+    "  t           send a test wake to an agent (uses its quota)",
+    "",
+    "Dashboard  (Esc returns to Home)",
     "  up/down     move between projects and tasks",
     "  Enter       show the selected task with its history",
     "  n           new task in the selected project",
@@ -63,6 +71,22 @@ pub struct Account {
     pub role: String,
     pub online: bool,
     pub running: bool,
+    /// `None`: no launcher. `Some(enabled)` otherwise.
+    pub launcher: Option<bool>,
+    /// The launcher's executable exists on the hub's machine.
+    pub command_found: bool,
+    /// Outcome of the most recent launch: ok, failed, out of quota, ...
+    pub last_run: Option<String>,
+}
+
+/// A repo attached to a project, with what could be checked locally.
+#[derive(Clone, Debug, Default)]
+pub struct RepoView {
+    pub name: String,
+    pub folder_found: bool,
+    pub local_ok: bool,
+    pub branch: Option<String>,
+    pub remote: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,6 +111,7 @@ pub struct ProjectView {
     pub pm: Option<String>,
     pub tasks: Vec<TaskView>,
     pub members: Vec<Member>,
+    pub repos: Vec<RepoView>,
 }
 
 /// A question that is stopping a task until this user answers it.
@@ -151,10 +176,13 @@ pub enum Action {
     /// POST `body` to `path`. `owner` adds the owner key from this machine.
     Api { path: String, body: Value, owner: bool, done: String },
     LoadTask(String),
+    /// Several requests in order; stops at the first that fails.
+    Many(Vec<Action>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum View {
+    Home,
     Dashboard,
     Chat,
 }
@@ -175,6 +203,9 @@ pub enum Flow {
     AnswerPick,
     AnswerText { task_id: String },
     ToggleLauncher,
+    NewProjectName,
+    NewProjectRepo { name: String },
+    TestAgent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,8 +231,14 @@ pub struct App {
     /// Selected row in the projects-and-tasks list.
     pub cursor: usize,
     pub modal: Option<Modal>,
+    /// The project opened from Home; the dashboard shows only its tasks.
+    pub project: Option<String>,
+    pub home_cursor: usize,
+    /// Last message seen in each room, for the unread counts.
+    pub seen: HashMap<String, i64>,
     channel_rows: Vec<(u16, usize)>,
     task_rows: Vec<(u16, usize)>,
+    home_rows: Vec<(u16, usize)>,
     scroll: usize,
 }
 
@@ -213,17 +250,24 @@ impl Default for App {
             input: String::new(),
             cursor: 0,
             modal: None,
+            project: None,
+            home_cursor: 0,
+            seen: HashMap::new(),
             channel_rows: Vec::new(),
             task_rows: Vec::new(),
+            home_rows: Vec::new(),
             scroll: 0,
         }
     }
 }
 
 /// The projects-and-tasks list, flattened in display order.
-pub fn rows(snap: &Snapshot) -> Vec<Row> {
+pub fn rows(snap: &Snapshot, only: Option<&str>) -> Vec<Row> {
     let mut out = Vec::new();
     for (p, project) in snap.projects.iter().enumerate() {
+        if only.is_some_and(|channel| channel != project.channel) {
+            continue;
+        }
         out.push(Row::Project(p));
         out.extend((0..project.tasks.len()).map(|t| Row::Task(p, t)));
     }
@@ -231,13 +275,19 @@ pub fn rows(snap: &Snapshot) -> Vec<Row> {
 }
 
 fn selected_project<'a>(app: &App, snap: &'a Snapshot) -> Option<&'a ProjectView> {
-    match rows(snap).get(app.cursor)? {
+    if app.view == View::Home {
+        return snap.projects.get(app.home_cursor);
+    }
+    match rows(snap, app.project.as_deref()).get(app.cursor)? {
         Row::Project(p) | Row::Task(p, _) => snap.projects.get(*p),
     }
 }
 
 fn selected_task<'a>(app: &App, snap: &'a Snapshot) -> Option<&'a TaskView> {
-    match rows(snap).get(app.cursor)? {
+    if app.view == View::Home {
+        return None;
+    }
+    match rows(snap, app.project.as_deref()).get(app.cursor)? {
         Row::Task(p, t) => snap.projects.get(*p)?.tasks.get(*t),
         Row::Project(_) => None,
     }
@@ -352,6 +402,27 @@ fn waiting_from(question: &Value, escalated: bool) -> Waiting {
     }
 }
 
+/// Check an attached repo on this machine: no network, no git process.
+fn repo_view(repo: &Value) -> RepoView {
+    let path = text(&repo["local_path"]);
+    let root = std::path::Path::new(&path);
+    let git = root.join(".git");
+    RepoView {
+        name: text(&repo["name"]),
+        folder_found: root.is_dir(),
+        local_ok: root.is_dir() && git.exists(),
+        branch: std::fs::read_to_string(git.join("HEAD")).ok().and_then(|head| {
+            head.trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_owned)
+        }),
+        remote: repo["remote_url"]
+            .as_str()
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned),
+    }
+}
+
 async fn refresh(
     client: &reqwest::Client,
     cfg: &TuiConfig,
@@ -363,10 +434,12 @@ async fn refresh(
 
     // Owner-only views: who is running right now, launches and launchers.
     let mut running: HashSet<String> = HashSet::new();
+    let mut last_run: HashMap<String, String> = HashMap::new();
+    let mut launcher_state: HashMap<String, (bool, bool)> = HashMap::new();
     snap.runs.clear();
     snap.launchers.clear();
     if let Some(key) = cfg.owner_key.as_deref() {
-        let wake = |action: &str| json!({"invite": key, "action": action, "limit": 12});
+        let wake = |action: &str| json!({"invite": key, "action": action, "limit": 40});
         if let Ok(body) = request(client, cfg, "/v1/owner/wake", Some(&wake("runs"))).await {
             for run in body["runs"].as_array().into_iter().flatten() {
                 let status = text(&run["status"]);
@@ -374,21 +447,36 @@ async fn refresh(
                 if status == "running" {
                     running.insert(who.clone());
                 }
-                snap.runs
-                    .push(format!("{status:8} @{who}  {}", text(&run["reason"])));
+                if snap.runs.len() < 12 {
+                    snap.runs
+                        .push(format!("{status:8} @{who}  {}", text(&run["reason"])));
+                }
+                // Runs come newest first: keep each account's latest outcome.
+                let output = text(&run["log_tail"]).to_ascii_lowercase();
+                let outcome = if status == "failed"
+                    && (output.contains("quota") || output.contains("resource_exhausted"))
+                {
+                    "out of quota".to_string()
+                } else {
+                    status
+                };
+                last_run.entry(who).or_insert(outcome);
             }
         }
         if let Ok(body) = request(client, cfg, "/v1/owner/wake", Some(&wake("list"))).await {
-            snap.launchers = body["launchers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|l| Launcher {
-                    nick: text(&l["principal_id"]),
-                    enabled: l["enabled"].as_bool().unwrap_or(false),
-                    mode: text(&l["session_mode"]),
-                })
-                .collect();
+            for launcher in body["launchers"].as_array().into_iter().flatten() {
+                let nick = text(&launcher["principal_id"]);
+                let enabled = launcher["enabled"].as_bool().unwrap_or(false);
+                launcher_state.insert(
+                    nick.clone(),
+                    (enabled, launcher["command_found"].as_bool().unwrap_or(true)),
+                );
+                snap.launchers.push(Launcher {
+                    nick,
+                    enabled,
+                    mode: text(&launcher["session_mode"]),
+                });
+            }
         }
     }
 
@@ -399,11 +487,18 @@ async fn refresh(
         .flatten()
         // The bundled demo and test accounts are noise on a real hub.
         .filter(|a| !matches!(a["team"].as_str(), Some("demo") | Some("test")))
-        .map(|a| Account {
-            nick: text(&a["nick"]),
-            role: text(&a["role"]),
-            online: a["online"].as_bool().unwrap_or(false),
-            running: running.contains(&text(&a["id"])),
+        .map(|a| {
+            let id = text(&a["id"]);
+            let launcher = launcher_state.get(&id);
+            Account {
+                nick: text(&a["nick"]),
+                role: text(&a["role"]),
+                online: a["online"].as_bool().unwrap_or(false),
+                running: running.contains(&id),
+                launcher: launcher.map(|(enabled, _)| *enabled),
+                command_found: launcher.is_some_and(|(_, found)| *found),
+                last_run: last_run.get(&id).cloned(),
+            }
         })
         .collect();
     if let Some(me) = snap
@@ -415,6 +510,7 @@ async fn refresh(
     }
 
     let projects = get(client, cfg, "/v1/projects").await?;
+    let gits = get(client, cfg, "/v1/gits").await?;
     let mut views = Vec::new();
     for project in projects["projects"].as_array().into_iter().flatten() {
         let channel = text(&project["channel"]);
@@ -449,6 +545,13 @@ async fn refresh(
                     role: text(&m["role"]),
                 })
                 .collect(),
+            repos: gits["git_repos"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|repo| repo["channel"].as_str() == Some(channel.as_str()))
+                .map(repo_view)
+                .collect(),
             channel,
         });
     }
@@ -471,14 +574,17 @@ async fn refresh(
 
     // Channels: #general first, then every project and any other channel.
     let listed = get(client, cfg, "/v1/channels").await?;
+    // Order: #general and other hub rooms first, then each project's rooms.
+    let project_channels: Vec<String> = snap.projects.iter().map(|p| p.channel.clone()).collect();
     let mut channels = vec!["#general".to_string()];
-    for name in snap.projects.iter().map(|p| p.channel.clone()).chain(
-        listed["channels"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|c| text(&c["channel"])),
-    ) {
+    for name in listed["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| text(&c["channel"]))
+        .filter(|name| !project_channels.contains(name))
+        .chain(project_channels.iter().cloned())
+    {
         if name.starts_with('#') && !channels.contains(&name) {
             channels.push(name);
         }
@@ -565,6 +671,28 @@ async fn load_task(client: &reqwest::Client, cfg: &TuiConfig, id: &str) -> Resul
     Ok(lines)
 }
 
+/// Send one request for an action; returns whether it worked and the line
+/// to show the user.
+async fn run_api(
+    client: &reqwest::Client,
+    cfg: &TuiConfig,
+    path: String,
+    mut body: Value,
+    owner: bool,
+    done: String,
+) -> (bool, String) {
+    if owner {
+        match cfg.owner_key.as_deref() {
+            Some(key) => body["invite"] = json!(key),
+            None => return (false, "the owner key is not on this machine".to_string()),
+        }
+    }
+    match request(client, cfg, &path, Some(&body)).await {
+        Ok(_) => (true, done),
+        Err(err) => (false, format!("{err}")),
+    }
+}
+
 async fn fetch_loop(
     cfg: TuiConfig,
     shared: Arc<Mutex<Snapshot>>,
@@ -586,19 +714,21 @@ async fn fetch_loop(
                             set_notice(false, format!("send failed: {err}"));
                         }
                     }
-                    Some(Action::Api { path, mut body, owner, done }) => {
-                        let key = cfg.owner_key.clone();
-                        if owner && key.is_none() {
-                            set_notice(false, "the owner key is not on this machine".to_string());
-                        } else {
-                            if let (true, Some(key)) = (owner, key) {
-                                body["invite"] = json!(key);
-                            }
-                            match request(&client, &cfg, &path, Some(&body)).await {
-                                Ok(_) => set_notice(true, done),
-                                Err(err) => set_notice(false, format!("{err}")),
+                    Some(Action::Api { path, body, owner, done }) => {
+                        let (ok, message) = run_api(&client, &cfg, path, body, owner, done).await;
+                        set_notice(ok, message);
+                    }
+                    Some(Action::Many(steps)) => {
+                        let mut outcome = (true, String::new());
+                        for step in steps {
+                            if let Action::Api { path, body, owner, done } = step {
+                                outcome = run_api(&client, &cfg, path, body, owner, done).await;
+                                if !outcome.0 {
+                                    break;
+                                }
                             }
                         }
+                        set_notice(outcome.0, outcome.1);
                     }
                     Some(Action::LoadTask(id)) => {
                         let lines = load_task(&client, &cfg, &id)
@@ -831,6 +961,48 @@ fn advance(app: &mut App, flow: Flow, value: String, snap: &Snapshot) -> Option<
                 "Answer sent",
             )
         }
+        Flow::NewProjectName => {
+            if !value.trim().is_empty() {
+                app.modal = prompt(
+                    "Repo folder on this machine (optional, Enter to skip)",
+                    Flow::NewProjectRepo {
+                        name: value.trim().to_string(),
+                    },
+                );
+            }
+            None
+        }
+        Flow::NewProjectRepo { name } => {
+            let slug = name
+                .trim_start_matches('#')
+                .to_ascii_lowercase()
+                .replace(' ', "-");
+            let channel = format!("#{slug}");
+            let mut steps = vec![Action::Api {
+                path: "/v1/projects".to_string(),
+                body: json!({"channel": channel, "name": name}),
+                owner: false,
+                done: format!("Project {channel} created"),
+            }];
+            if !value.trim().is_empty() {
+                steps.push(Action::Api {
+                    path: "/v1/gits".to_string(),
+                    body: json!({"name": slug, "channel": channel, "local_path": value.trim()}),
+                    owner: false,
+                    done: format!("Project {channel} created and its repo attached"),
+                });
+            }
+            Some(Action::Many(steps))
+        }
+        Flow::TestAgent => Some(Action::Api {
+            path: "/v1/owner/wake".to_string(),
+            body: json!({
+                "action": "test", "nick": value,
+                "message": "Connectivity check from the owner. Reply on the hub in one short line that you are reachable, and do nothing else.",
+            }),
+            owner: true,
+            done: format!("Test wake sent to @{value}"),
+        }),
         Flow::ToggleLauncher => {
             let (nick, action) = value.split_once('|')?;
             Some(Action::Api {
@@ -908,16 +1080,66 @@ pub fn handle_key(
         return handle_modal(app, code, snap);
     }
     match app.view {
+        View::Home => handle_home_key(app, code, snap),
         View::Dashboard => handle_dashboard_key(app, code, snap),
         View::Chat => handle_chat_key(app, code, snap),
     }
 }
 
+fn handle_home_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
+    match code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.home_cursor = (app.home_cursor + 1).min(snap.projects.len().saturating_sub(1));
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.home_cursor = app.home_cursor.saturating_sub(1),
+        KeyCode::Enter | KeyCode::Char('d') => {
+            if let Some(project) = snap.projects.get(app.home_cursor) {
+                app.project = Some(project.channel.clone());
+                app.cursor = 0;
+                app.scroll = 0;
+                app.view = View::Dashboard;
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.modal = prompt("New project: name", Flow::NewProjectName);
+        }
+        KeyCode::Char('t') => {
+            app.modal = picker(
+                "Send a test wake (uses that agent's quota)",
+                snap.accounts
+                    .iter()
+                    .filter(|a| a.launcher.is_some())
+                    .map(|a| (format!("@{}", a.nick), a.nick.clone()))
+                    .collect(),
+                Flow::TestAgent,
+            );
+        }
+        // Task actions belong to the dashboard.
+        KeyCode::Char('a') | KeyCode::Char('s') | KeyCode::Esc => {}
+        other => return handle_dashboard_key(app, other, snap),
+    }
+    None
+}
+
 fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
-    let last = rows(snap).len().saturating_sub(1);
+    let last = rows(snap, app.project.as_deref())
+        .len()
+        .saturating_sub(1);
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => return Some(Action::Quit),
-        KeyCode::Char('c') | KeyCode::Char('C') => app.view = View::Chat,
+        KeyCode::Esc => app.view = View::Home,
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            // Chat opens in the room of the project you are looking at.
+            let room = if app.view == View::Home {
+                snap.projects.get(app.home_cursor).map(|p| p.channel.clone())
+            } else {
+                app.project.clone()
+            };
+            if let Some(index) = room.and_then(|r| snap.channels.iter().position(|c| *c == r)) {
+                app.channel_idx = index;
+            }
+            app.view = View::Chat;
+        }
         KeyCode::Char('r') | KeyCode::Char('R') => return Some(Action::Refresh),
         KeyCode::Char('?') | KeyCode::Char('h') => app.modal = Some(Modal::Help),
         KeyCode::Down | KeyCode::Char('j') => app.cursor = (app.cursor + 1).min(last),
@@ -1082,7 +1304,9 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
             let start = TABS.find(label).unwrap_or(0) as u16;
             column >= start && column < start + label.len() as u16
         };
-        if within("[D]ashboard") {
+        if within("[H]ome") {
+            app.view = View::Home;
+        } else if within("[D]ashboard") {
             app.view = View::Dashboard;
         } else if within("[C]hat") {
             app.view = View::Chat;
@@ -1102,6 +1326,11 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
                 app.cursor = *index;
             }
         }
+        View::Home => {
+            if let Some((_, index)) = app.home_rows.iter().find(|(y, _)| *y == row) {
+                app.home_cursor = *index;
+            }
+        }
         _ => {}
     }
     None
@@ -1112,8 +1341,9 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
 fn status_color(status: &str) -> Color {
     match status {
         "blocked" => Color::Red,
-        "review" => Color::Yellow,
-        "changes_requested" => Color::Magenta,
+        "testing" => Color::Magenta,
+        "review" => Color::Blue,
+        "changes_requested" => Color::Yellow,
         "in_progress" | "claimed" => Color::Green,
         _ => Color::Gray,
     }
@@ -1159,15 +1389,42 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
     );
 
     match app.view {
+        View::Home => draw_home(frame, app, snap, body),
         View::Dashboard => draw_dashboard(frame, app, snap, body),
         View::Chat => draw_chat(frame, app, snap, body),
     }
 
-    let hint = match app.view {
-        View::Dashboard => {
-            "n new · a assign · s status · p PM · m member · w answer · l launchers · c chat · ? help · q quit"
-        }
-        View::Chat => "Enter send · Tab complete @name · up/down channel · Esc dashboard",
+    let hints: &[(&str, &str)] = match app.view {
+        View::Home => &[
+            ("Enter", "open"),
+            ("n", "new project"),
+            ("m", "member"),
+            ("p", "PM"),
+            ("t", "test"),
+            ("l", "launcher"),
+            ("w", "answer"),
+            ("c", "chat"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        View::Dashboard => &[
+            ("Enter", "details"),
+            ("n", "new"),
+            ("a", "assign"),
+            ("s", "status"),
+            ("w", "answer"),
+            ("l", "launcher"),
+            ("c", "chat"),
+            ("Esc", "home"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        View::Chat => &[
+            ("Enter", "send"),
+            ("Tab", "complete @name"),
+            ("Up/Down", "room"),
+            ("Esc", "dashboard"),
+        ],
     };
     let recent_notice = snap
         .notice
@@ -1182,7 +1439,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             format!(" {message}"),
             bold().fg(if *ok { Color::Green } else { Color::Red }),
         )),
-        (None, None) => Line::from(Span::styled(format!(" {hint}"), dim())),
+        (None, None) => hint_line(hints),
     };
     frame.render_widget(Paragraph::new(footer_line), footer);
 
@@ -1191,10 +1448,279 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
     }
 }
 
+fn trio_height(snap: &Snapshot, area: Rect) -> u16 {
+    (snap.accounts.len() as u16 + 2).clamp(9, (area.height / 2 + 1).max(9))
+}
+
+/// One word on whether the hub can start this account's agent. Reading it
+/// costs nothing: it comes from the launcher settings and the last launch.
+pub fn account_status(account: &Account) -> (String, Color) {
+    let status = |text: &str, color: Color| (text.to_string(), color);
+    if account.running {
+        return status("working", Color::Cyan);
+    }
+    match account.launcher {
+        None => status("no launcher", Color::DarkGray),
+        Some(false) => status("launcher off", Color::Red),
+        Some(true) if !account.command_found => status("command missing", Color::Red),
+        Some(true) => match account.last_run.as_deref() {
+            Some("out of quota") => status("out of quota", Color::Red),
+            Some("failed") | Some("timeout") => status("last run failed", Color::Red),
+            _ => status("ready", Color::Green),
+        },
+    }
+}
+
+fn project_line(project: &ProjectView) -> Line<'static> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for task in &project.tasks {
+        *counts.entry(task.status.as_str()).or_default() += 1;
+    }
+    let summary = if counts.is_empty() {
+        "no open tasks".to_string()
+    } else {
+        counts
+            .iter()
+            .map(|(status, n)| format!("{status} {n}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    Line::from(vec![
+        Span::styled(project.channel.clone(), bold().fg(Color::Cyan)),
+        Span::raw(format!("  {}  ", project.name)),
+        Span::styled(
+            match &project.pm {
+                Some(pm) => format!("PM @{pm}"),
+                None => "no PM".to_string(),
+            },
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(format!("   {summary}"), Style::default().fg(Color::Gray)),
+    ])
+}
+
+fn repo_line(repo: &RepoView) -> Line<'static> {
+    let (local, local_color) = if !repo.folder_found {
+        ("folder missing".to_string(), Color::Red)
+    } else if !repo.local_ok {
+        ("not a git repo".to_string(), Color::Red)
+    } else {
+        (
+            format!("local ok ({})", repo.branch.as_deref().unwrap_or("?")),
+            Color::Green,
+        )
+    };
+    let remote = match &repo.remote {
+        Some(url) => Span::styled(
+            format!(
+                "remote {}",
+                url.trim_start_matches("https://github.com/")
+                    .trim_end_matches(".git")
+            ),
+            Style::default().fg(Color::Cyan),
+        ),
+        None => Span::styled("no remote", dim()),
+    };
+    Line::from(vec![
+        Span::styled(format!("    repo {}  ", repo.name), dim()),
+        Span::styled(local, Style::default().fg(local_color)),
+        Span::styled("  on hub  ", Style::default().fg(Color::Green)),
+        remote,
+    ])
+}
+
+/// Home: every project with its repo check, then the hub-wide header.
+fn draw_home(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
+    let [projects_area, trio] = Layout::vertical([
+        Constraint::Min(5),
+        Constraint::Length(trio_height(snap, area)),
+    ])
+    .areas(area);
+
+    app.home_cursor = app.home_cursor.min(snap.projects.len().saturating_sub(1));
+    app.home_rows.clear();
+    let mut lines: Vec<Line> = Vec::new();
+    for (index, project) in snap.projects.iter().enumerate() {
+        app.home_rows
+            .push((projects_area.y + 1 + lines.len() as u16, index));
+        let mut line = project_line(project);
+        if index == app.home_cursor {
+            line = line.style(Style::default().bg(Color::DarkGray));
+        }
+        lines.push(line);
+        if project.repos.is_empty() {
+            lines.push(Line::from(Span::styled("    no repo attached", dim())));
+        }
+        lines.extend(project.repos.iter().map(repo_line));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No projects yet. Press n to create one.",
+            dim(),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Projects  (Enter opens a project) ")),
+        projects_area,
+    );
+    draw_trio(frame, snap, trio);
+}
+
+fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (key, label) in hints {
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            bold().fg(Color::Black).bg(Color::Cyan),
+        ));
+        spans.push(Span::raw(format!(" {label} ")));
+    }
+    Line::from(spans)
+}
+
+/// The channel list as a tree: a header row per project (or "Hub"), its
+/// rooms underneath, numbered, with unread counts on the right.
+fn channel_tree(app: &mut App, snap: &Snapshot, area: Rect) -> Vec<Line<'static>> {
+    app.channel_rows.clear();
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut number = 0usize;
+    let mut last_group: Option<String> = None;
+    for (index, name) in snap.channels.iter().enumerate() {
+        let title = snap
+            .projects
+            .iter()
+            .find(|p| &p.channel == name)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Hub".to_string());
+        if last_group.as_deref() != Some(title.as_str()) {
+            number += 1;
+            lines.push(Line::from(Span::styled(
+                format!("{number:>2} [-] {title:<w$}", w = width.saturating_sub(7)),
+                bold().fg(Color::White).bg(Color::Blue),
+            )));
+            last_group = Some(title);
+        }
+        number += 1;
+        let last_seq = snap
+            .messages
+            .get(name)
+            .and_then(|m| m.last())
+            .map(|m| m.seq)
+            .unwrap_or(0);
+        let seen = app.seen.entry(name.clone()).or_insert(last_seq);
+        if index == app.channel_idx {
+            *seen = last_seq;
+        }
+        let seen = *seen;
+        let unread = snap
+            .messages
+            .get(name)
+            .map(|m| m.iter().filter(|line| line.seq > seen).count())
+            .unwrap_or(0);
+        let count = if unread > 0 {
+            unread.to_string()
+        } else {
+            String::new()
+        };
+        let label = format!("{number:>2}   {name:<w$}{count:>4}", w = width.saturating_sub(9));
+        app.channel_rows
+            .push((area.y + 1 + lines.len() as u16, index));
+        lines.push(if index == app.channel_idx {
+            Line::from(Span::styled(label, bold().fg(Color::Black).bg(Color::Cyan)))
+        } else if unread > 0 {
+            Line::from(Span::styled(label, bold()))
+        } else {
+            Line::from(label)
+        });
+    }
+    lines
+}
+
+/// What an account is doing in `channel`, from its tasks there: the dot
+/// colour and a word. `None` means it is standing by.
+pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color, &'static str)> {
+    let is_project = snap.projects.iter().any(|p| p.channel == channel);
+    let mut best: Option<(u8, Color, &'static str)> = None;
+    for project in snap
+        .projects
+        .iter()
+        .filter(|p| !is_project || p.channel == channel)
+    {
+        for task in project
+            .tasks
+            .iter()
+            .filter(|t| t.assignee.eq_ignore_ascii_case(nick))
+        {
+            let escalated = snap
+                .waiting
+                .iter()
+                .any(|w| w.task_id == task.id && w.escalated);
+            let state = match task.status.as_str() {
+                "blocked" if escalated => (0, Color::Red, "needs you"),
+                "blocked" => (1, Color::Yellow, "waiting on PM"),
+                "testing" => (2, Color::Magenta, "testing"),
+                "review" => (3, Color::Blue, "in review"),
+                "in_progress" | "claimed" => (4, Color::Green, "coding"),
+                _ => (5, Color::White, "has work"),
+            };
+            if best.is_none_or(|current| state.0 < current.0) {
+                best = Some(state);
+            }
+        }
+    }
+    best.map(|(_, color, label)| (color, label)).or_else(|| {
+        snap.accounts
+            .iter()
+            .any(|a| a.nick.eq_ignore_ascii_case(nick) && a.running)
+            .then_some((Color::Green, "working"))
+    })
+}
+
+/// Who is working in this room (above the line) and who is standing by.
+fn draw_people(frame: &mut Frame, snap: &Snapshot, channel: &str, area: Rect) {
+    let names: Vec<String> = match snap.projects.iter().find(|p| p.channel == channel) {
+        Some(project) => project.members.iter().map(|m| m.nick.clone()).collect(),
+        None => snap.accounts.iter().map(|a| a.nick.clone()).collect(),
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    let mut standby: Vec<Line> = Vec::new();
+    for name in names {
+        match member_state(snap, channel, &name) {
+            Some((color, label)) => lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(color)),
+                Span::styled(name, bold()),
+                Span::styled(format!(" {label}"), Style::default().fg(color)),
+            ])),
+            None => standby.push(Line::from(vec![
+                Span::styled("○ ", dim()),
+                Span::styled(name, dim()),
+            ])),
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "─".repeat(area.width.saturating_sub(2) as usize),
+        dim(),
+    )));
+    lines.extend(standby);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" People ")),
+        area,
+    );
+}
+
 fn draw_dashboard(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
-    let top_height = (snap.accounts.len() as u16 + 2).clamp(9, (area.height / 2 + 1).max(9));
-    let [top, bottom] =
-        Layout::vertical([Constraint::Length(top_height), Constraint::Min(4)]).areas(area);
+    let [top, bottom] = Layout::vertical([
+        Constraint::Length(trio_height(snap, area)),
+        Constraint::Min(4),
+    ])
+    .areas(area);
+    draw_trio(frame, snap, top);
+    draw_task_list(frame, app, snap, bottom);
+}
+
+/// Accounts, what is waiting on you, and recent launches.
+fn draw_trio(frame: &mut Frame, snap: &Snapshot, top: Rect) {
     let [accounts_area, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(top);
     let [attention_area, runs_area] =
@@ -1212,39 +1738,13 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect)
             } else {
                 ("  ", Color::DarkGray)
             };
-            let lowered = account.nick.to_ascii_lowercase();
-            let managing: Vec<&str> = snap
-                .projects
-                .iter()
-                .filter(|p| p.pm.as_deref() == Some(lowered.as_str()))
-                .map(|p| p.channel.as_str())
-                .collect();
-            let mut spans = vec![
+            let (status, status_color) = account_status(account);
+            Line::from(vec![
                 Span::styled(marker, Style::default().fg(color)),
                 Span::styled(format!("{:<12} ", account.nick), bold()),
-                Span::styled(
-                    if account.running { "working " } else { "" },
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw(account.role.clone()),
-            ];
-            if !managing.is_empty() {
-                spans.push(Span::styled(
-                    format!("  PM {}", managing.join(" ")),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-            if snap
-                .launchers
-                .iter()
-                .any(|l| l.nick == lowered && !l.enabled)
-            {
-                spans.push(Span::styled(
-                    "  launcher off",
-                    Style::default().fg(Color::Red),
-                ));
-            }
-            Line::from(spans)
+                Span::raw(format!("{:<12}", account.role)),
+                Span::styled(status, Style::default().fg(status_color)),
+            ])
         })
         .collect();
     frame.render_widget(
@@ -1306,8 +1806,11 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect)
         runs_area,
     );
 
-    // Projects with their tasks grouped by state: the simple sprint view.
-    let all_rows = rows(snap);
+}
+
+/// Projects with their tasks grouped by state: the simple sprint view.
+fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rect) {
+    let all_rows = rows(snap, app.project.as_deref());
     app.cursor = app.cursor.min(all_rows.len().saturating_sub(1));
     let visible = bottom.height.saturating_sub(2) as usize;
     if app.cursor < app.scroll {
@@ -1392,35 +1895,19 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect)
 }
 
 fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
-    let [channels_area, right] = Layout::horizontal([
+    let [channels_area, right, people_area] = Layout::horizontal([
         Constraint::Length(CHANNEL_PANE_WIDTH),
         Constraint::Min(20),
+        Constraint::Length(PEOPLE_PANE_WIDTH),
     ])
     .areas(area);
     let [messages_area, input_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(right);
 
     app.channel_idx = app.channel_idx.min(snap.channels.len().saturating_sub(1));
-    app.channel_rows.clear();
-    let channel_lines: Vec<Line> = snap
-        .channels
-        .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            app.channel_rows
-                .push((channels_area.y + 1 + index as u16, index));
-            if index == app.channel_idx {
-                Line::from(Span::styled(
-                    format!("> {name}"),
-                    bold().fg(Color::Black).bg(Color::Cyan),
-                ))
-            } else {
-                Line::from(format!("  {name}"))
-            }
-        })
-        .collect();
+    let channel_lines = channel_tree(app, snap, channels_area);
     frame.render_widget(
-        Paragraph::new(channel_lines).block(Block::bordered().title(" Channels ")),
+        Paragraph::new(channel_lines).block(Block::bordered().title(" Rooms ")),
         channels_area,
     );
 
@@ -1477,6 +1964,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
         + 1
         + (app.input.chars().count() as u16).min(input_area.width.saturating_sub(3));
     frame.set_cursor_position((cursor_x, input_area.y + 1));
+    draw_people(frame, snap, &current, people_area);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -1584,7 +2072,10 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, snap: &Snapshot, area: Rect) {
 fn ui_loop(shared: Arc<Mutex<Snapshot>>, commands: UnboundedSender<Action>) -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let mut app = App::default();
+    let mut app = App {
+        view: View::Home,
+        ..App::default()
+    };
 
     let outcome = (|| -> Result<()> {
         loop {
@@ -1665,6 +2156,10 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         let snap = shared.lock().expect("snapshot mutex poisoned").clone();
         let last_channel = snap.channels.len().saturating_sub(1);
         for mut app in [
+            App {
+                view: View::Home,
+                ..App::default()
+            },
             App::default(),
             App {
                 view: View::Chat,
@@ -1708,6 +2203,7 @@ mod tests {
             role: role.into(),
             online,
             running,
+            ..Account::default()
         };
         Snapshot {
             server: "http://127.0.0.1:6680".to_string(),
@@ -1715,8 +2211,17 @@ mod tests {
             my_role: "leader".to_string(),
             accounts: vec![
                 account("tony", "leader", true, false),
-                account("flash3.8", "builder", false, true),
-                account("flash-lite", "builder", false, false),
+                Account {
+                    launcher: Some(true),
+                    command_found: true,
+                    last_run: Some("ok".into()),
+                    ..account("flash3.8", "builder", false, true)
+                },
+                Account {
+                    launcher: Some(false),
+                    command_found: true,
+                    ..account("flash-lite", "builder", false, false)
+                },
             ],
             projects: vec![ProjectView {
                 channel: "#quest-video".into(),
@@ -1739,6 +2244,13 @@ mod tests {
                         role: "builder".into(),
                     },
                 ],
+                repos: vec![RepoView {
+                    name: "quest-player".into(),
+                    folder_found: false,
+                    local_ok: false,
+                    branch: None,
+                    remote: Some("https://github.com/antv311/quest-video-workspace.git".into()),
+                }],
             }],
             waiting: vec![Waiting {
                 task_id: "task_abc123".into(),
@@ -1796,7 +2308,7 @@ mod tests {
             "you: @tony (leader)",
             "flash3.8",
             "working",
-            "PM #quest-video",
+            "no launcher",
             "launcher off",
             "NEEDS YOU",
             "May I buy a licence?",
@@ -1821,7 +2333,10 @@ mod tests {
         app.input = "hello team".to_string();
         let screen = render(&mut app, &snap);
         for expected in [
-            "> #quest-video",
+            "[-] Quest player",
+            "#quest-video",
+            "codex needs you",
+            "flash3.8 working",
             "14:05",
             "flash3.8: ",
             "Stepping in as PM",
@@ -1973,7 +2488,13 @@ mod tests {
         press(
             &mut app,
             &snap,
-            &[KeyCode::Char('s'), KeyCode::Down, KeyCode::Down, KeyCode::Enter],
+            &[
+                KeyCode::Char('s'),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
         );
         type_text(&mut app, &snap, "needs a test");
         assert_eq!(
@@ -2063,5 +2584,174 @@ mod tests {
         assert!(render(&mut App::default(), &snap).contains("Task created"));
         snap.notice = Some((false, "only the owner can choose".into(), Instant::now()));
         assert!(render(&mut App::default(), &snap).contains("only the owner can choose"));
+    }
+
+    fn home() -> App {
+        App {
+            view: View::Home,
+            ..App::default()
+        }
+    }
+
+    #[test]
+    fn home_lists_projects_with_repo_and_agent_checks_and_opens_a_project() {
+        let snap = fixture();
+        let mut app = home();
+        let screen = render(&mut app, &snap);
+        for expected in [
+            "[H]ome",
+            "#quest-video",
+            "PM @flash3.8",
+            "repo quest-player",
+            "folder missing",
+            "on hub",
+            "remote antv311/quest-video-workspace",
+            "working",
+            "launcher off",
+            "no launcher",
+            "[n] new project",
+        ] {
+            assert!(screen.contains(expected), "home is missing {expected:?}");
+        }
+
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Enter]), None);
+        assert_eq!(app.view, View::Dashboard);
+        assert_eq!(app.project.as_deref(), Some("#quest-video"));
+        // Chat opened from a project starts in that project's room.
+        press(&mut app, &snap, &[KeyCode::Char('c')]);
+        assert_eq!(app.channel_idx, 1);
+        press(&mut app, &snap, &[KeyCode::Esc, KeyCode::Esc]);
+        assert_eq!(app.view, View::Home);
+    }
+
+    #[test]
+    fn the_dashboard_shows_only_the_opened_project() {
+        let mut snap = fixture();
+        snap.projects.push(ProjectView {
+            channel: "#wardrobe".into(),
+            name: "Wardrobe".into(),
+            ..ProjectView::default()
+        });
+        let mut app = App::default();
+        assert!(render(&mut app, &snap).contains("#wardrobe"));
+        app.project = Some("#quest-video".into());
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Fix seek bar") && !screen.contains("#wardrobe"));
+    }
+
+    #[test]
+    fn new_project_flow_creates_the_project_and_attaches_the_repo() {
+        let snap = fixture();
+        let mut app = home();
+        press(&mut app, &snap, &[KeyCode::Char('n')]);
+        type_text(&mut app, &snap, "Wardrobe Sim");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        type_text(&mut app, &snap, "C:/repos/wardrobe");
+        let create = Action::Api {
+            path: "/v1/projects".into(),
+            body: json!({"channel": "#wardrobe-sim", "name": "Wardrobe Sim"}),
+            owner: false,
+            done: "Project #wardrobe-sim created".into(),
+        };
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::Many(vec![
+                create,
+                Action::Api {
+                    path: "/v1/gits".into(),
+                    body: json!({
+                        "name": "wardrobe-sim", "channel": "#wardrobe-sim",
+                        "local_path": "C:/repos/wardrobe",
+                    }),
+                    owner: false,
+                    done: "Project #wardrobe-sim created and its repo attached".into(),
+                },
+            ]))
+        );
+
+        // A test wake is a deliberate choice because it spends quota.
+        press(&mut app, &snap, &[KeyCode::Char('t')]);
+        assert!(render(&mut app, &snap).contains("uses that agent's quota"));
+        let action = press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(matches!(
+            action,
+            Some(Action::Api { ref path, owner: true, .. }) if path == "/v1/owner/wake"
+        ));
+    }
+
+    #[test]
+    fn account_status_reads_the_launcher_and_the_last_launch() {
+        let with = |launcher: Option<bool>, found: bool, last: Option<&str>| Account {
+            launcher,
+            command_found: found,
+            last_run: last.map(str::to_owned),
+            ..Account::default()
+        };
+        let word = |account: Account| account_status(&account).0;
+        assert_eq!(word(with(Some(true), true, Some("ok"))), "ready");
+        assert_eq!(word(with(Some(true), true, None)), "ready");
+        assert_eq!(word(with(Some(true), true, Some("out of quota"))), "out of quota");
+        assert_eq!(word(with(Some(true), true, Some("failed"))), "last run failed");
+        assert_eq!(word(with(Some(true), false, Some("ok"))), "command missing");
+        assert_eq!(word(with(Some(false), true, Some("ok"))), "launcher off");
+        assert_eq!(word(with(None, false, None)), "no launcher");
+    }
+
+    #[test]
+    fn people_dots_follow_each_accounts_tasks_in_the_room() {
+        let mut snap = fixture();
+        let state = |snap: &Snapshot, nick: &str| member_state(snap, "#quest-video", nick);
+        // codex's task is blocked on a question escalated to the owner.
+        assert_eq!(state(&snap, "codex"), Some((Color::Red, "needs you")));
+        snap.waiting[0].escalated = false;
+        assert_eq!(state(&snap, "codex"), Some((Color::Yellow, "waiting on PM")));
+        for (status, expected) in [
+            ("testing", (Color::Magenta, "testing")),
+            ("review", (Color::Blue, "in review")),
+            ("in_progress", (Color::Green, "coding")),
+            ("assigned", (Color::White, "has work")),
+        ] {
+            snap.projects[0].tasks[0].status = status.into();
+            assert_eq!(state(&snap, "codex"), Some(expected));
+        }
+        // No task, but its agent is running right now.
+        assert_eq!(state(&snap, "flash3.8"), Some((Color::Green, "working")));
+        assert_eq!(state(&snap, "tony"), None);
+    }
+
+    #[test]
+    fn the_channel_tree_counts_unread_messages_in_other_rooms() {
+        let mut snap = fixture();
+        let mut app = App {
+            view: View::Chat,
+            channel_idx: 0,
+            ..App::default()
+        };
+        render(&mut app, &snap); // first sight: everything counts as read
+        snap.messages.get_mut("#quest-video").unwrap().push(ChatLine {
+            seq: 2,
+            sender: "codex".into(),
+            body: "done".into(),
+            time: 0,
+        });
+        let screen = render(&mut app, &snap);
+        let row = screen
+            .lines()
+            .find(|line| line.contains("#quest-video") && !line.contains("Message"))
+            .unwrap()
+            .to_string();
+        assert!(row.contains(" 1"), "unread count missing in {row:?}");
+        // Opening the room marks it read.
+        press(&mut app, &snap, &[KeyCode::Down]);
+        render(&mut app, &snap);
+        assert_eq!(app.seen["#quest-video"], 2);
+    }
+
+    #[test]
+    fn key_hints_are_bracketed_letters() {
+        let screen = render(&mut App::default(), &fixture());
+        for expected in ["[n] new", "[a] assign", "[Esc] home", "[q] quit"] {
+            assert!(screen.contains(expected), "hints are missing {expected:?}");
+        }
     }
 }

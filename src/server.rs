@@ -1887,8 +1887,9 @@ impl Server {
         let is_manager = self.is_project_manager(actor, &current.channel)?;
 
         let allowed = match (from.as_str(), to.as_str()) {
-            ("assigned" | "changes_requested", "in_progress") => is_assignee,
-            ("assigned" | "in_progress" | "changes_requested", "review") => is_assignee,
+            ("assigned" | "changes_requested" | "testing", "in_progress") => is_assignee,
+            ("assigned" | "in_progress" | "changes_requested", "testing") => is_assignee,
+            ("testing", "review") => is_assignee,
             ("review", "in_progress") => is_assignee,
             ("review", "merged" | "changes_requested") => is_manager,
             (current_status, "cancelled") if !TERMINAL_STATUSES.contains(&current_status) => {
@@ -1898,12 +1899,18 @@ impl Server {
         };
         if !allowed {
             return Err(anyhow!(
-                "cannot move task from {from} to {to}: the assignee moves work to in_progress and review; a project leader or coordinator moves review to merged or changes_requested"
+                "cannot move task from {from} to {to}: the assignee moves work to in_progress, then testing, then review; a project leader or coordinator moves review to merged or changes_requested"
             ));
         }
 
         let note = note.map(str::trim).filter(|n| !n.is_empty());
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+        // Whoever reviews reads the evidence instead of re-running the tests.
+        if from == "testing" && to == "review" && note.is_none() {
+            return Err(anyhow!(
+                "a test report is required to hand work in: pass what you ran and the result as the note"
+            ));
+        }
         let task = self
             .tasks
             .set_status(&current.id, &from, &to, &actor.id, note, branch)?;
