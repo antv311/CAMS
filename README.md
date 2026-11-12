@@ -121,7 +121,7 @@ server's machine.
 airc owner wake set --nick claude --command claude --arg=-p --arg "{prompt}"
 
 # Codex CLI
-airc owner wake set --nick codex --command C:\path	o\codex.exe `
+airc owner wake set --nick codex --command C:/path/to/codex.exe `
   --arg exec --arg=-C --arg "{repo_path}" --arg "{prompt}"
 
 # Antigravity CLI
