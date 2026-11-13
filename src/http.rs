@@ -15,7 +15,7 @@ use crate::auth::{DuplicatePrincipalError, Principal};
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::locks::LockConflictError;
 use crate::server::{Server, SpawnError};
-use crate::store::{ClientTemplate, ClientTemplateInput};
+use crate::store::{ClientTemplate, ClientTemplateInput, GroupInput, GroupStoreError};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HttpRuntimeInfo {
@@ -185,6 +185,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
         .route("/v1/templates", get(list_templates))
+        .route("/v1/groups", get(list_groups).post(upsert_group))
+        .route("/v1/groups/{name}/attach", post(attach_group))
         .route("/v1/templates/{id}/spawn", post(spawn_template_worker))
         .route(
             "/v1/templates/{id}",
@@ -443,6 +445,77 @@ fn require_owner(
             "this action requires the owner's key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
         ))
     }
+}
+
+fn group_store_error(error: anyhow::Error) -> ApiError {
+    if error.downcast_ref::<GroupStoreError>().is_some() {
+        ApiError::not_found(error.to_string())
+    } else {
+        template_store_error(error)
+    }
+}
+
+async fn list_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate_request(&state, &headers)?;
+    let groups = state.server.groups().list().map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "groups": groups})),
+    ))
+}
+
+#[derive(Deserialize)]
+struct UpsertGroupReq {
+    invite: Option<String>,
+    #[serde(flatten)]
+    group: GroupInput,
+}
+
+async fn upsert_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpsertGroupReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let group = state
+        .server
+        .groups()
+        .upsert(req.group)
+        .map_err(group_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "group": group})),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AttachGroupReq {
+    channel: String,
+    invite: Option<String>,
+}
+
+async fn attach_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(req): Json<AttachGroupReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let group = state
+        .server
+        .groups()
+        .attach(&name, &req.channel)
+        .map_err(group_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "group": group})),
+    ))
 }
 
 /// Availability is checked when responding, never persisted or probed by launch.
@@ -2790,6 +2863,222 @@ mod tests {
 
     fn template_body() -> Value {
         json!({"name": "Example Client", "command": "aircd-uninstalled-example-client"})
+    }
+
+    fn group_body() -> Value {
+        json!({
+            "name": "dev",
+            "description": "Opus lead with local workers",
+            "lead": {"template": "claude", "model": "opus", "count": 1, "nick": "dev-lead"},
+            "workers": [{"template": "ollama", "model": "qwen3:35b", "count": 3}],
+            "lead_prompt": "Split {task}.\nTest and review.\n",
+            "worker_prompt": "Write the assigned code.\n"
+        })
+    }
+
+    #[tokio::test]
+    async fn groups_http_round_trips_definitions_and_attaches_without_provisioning() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let counts = provisioning_counts(&api)?;
+        assert_eq!(
+            api.read("/v1/groups").await?.1,
+            json!({"ok": true, "groups": []})
+        );
+        let input = group_body();
+        let (status, body) = api.write("POST", "/v1/groups", Some(&input)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for (key, value) in input.as_object().unwrap() {
+            assert_eq!(&body["group"][key], value, "{key}");
+        }
+        assert_eq!(body["group"]["projects"], json!([]));
+        let created_at = body["group"]["created_at"].clone();
+        let path = "/v1/groups/dev/attach";
+        for channel in ["#two", "#one", "#one"] {
+            let (status, response) = api
+                .write("POST", path, Some(&json!({"channel": channel})))
+                .await?;
+            assert_eq!(status, StatusCode::OK, "{response}");
+        }
+        let attached = api.read("/v1/groups").await?.1["groups"][0].clone();
+        assert_eq!(attached["projects"], json!(["#one", "#two"]));
+        assert_eq!(attached["created_at"], created_at);
+        let mut replacement = input.clone();
+        replacement["worker_prompt"] = json!("Replacement");
+        replacement.as_object_mut().unwrap().remove("lead_prompt");
+        // Clients cannot bypass attach by supplying response metadata on create.
+        replacement["projects"] = json!(["#unregistered"]);
+        let (status, response) = api.write("POST", "/v1/groups", Some(&replacement)).await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["group"]["lead_prompt"], Value::Null);
+        assert_eq!(response["group"]["worker_prompt"], "Replacement");
+        assert_eq!(response["group"]["projects"], attached["projects"]);
+        assert_eq!(response["group"]["created_at"], created_at);
+        // Group names are URL path segments, including encoded spaces and Unicode.
+        let mut named = input;
+        named["name"] = json!("dev équipe");
+        api.write("POST", "/v1/groups", Some(&named)).await?;
+        let (status, response) = api
+            .write(
+                "POST",
+                "/v1/groups/dev%20%C3%A9quipe/attach",
+                Some(&json!({"channel": "#one"})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["group"]["name"], "dev équipe");
+        assert_eq!(
+            api.read("/v1/groups").await?.1["groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(provisioning_counts(&api)?, counts);
+        assert!(api.server.wakes().runs(None, 10)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn groups_http_authenticates_reads_and_guards_all_writes_with_owner_key() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        api.write("POST", "/v1/groups", Some(&group_body())).await?;
+        let (_, owner_token) =
+            api.server
+                .auth()
+                .register_principal("owner", Some("leader"), None)?;
+        for token in [None, Some("invalid-token")] {
+            assert_eq!(
+                api.request("GET", "/v1/groups", token, None, None).await?.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            api.request("GET", "/v1/groups", None, Some("template-owner-key"), None)
+                .await?
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(api.read("/v1/groups").await?.0, StatusCode::OK);
+        for (path, body) in [
+            ("/v1/groups", group_body()),
+            ("/v1/groups/dev/attach", json!({"channel": "#one"})),
+        ] {
+            let before = api.server.groups().list()?;
+            for token in [None, Some(api.token.as_str()), Some(owner_token.as_str())] {
+                for key in [None, Some("wrong-key")] {
+                    let (status, response) =
+                        api.request("POST", path, token, key, Some(&body)).await?;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {response}");
+                    assert_eq!(response["ok"], false);
+                    assert_eq!(api.server.groups().list()?, before);
+                }
+            }
+            let mut with_key = body;
+            with_key["invite"] = json!("template-owner-key");
+            assert_eq!(
+                api.request("POST", path, None, Some("wrong-key"), Some(&with_key))
+                    .await?
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                api.request("POST", path, None, None, Some(&with_key))
+                    .await?
+                    .0,
+                StatusCode::OK
+            );
+            with_key["invite"] = json!("wrong-key");
+            assert_eq!(
+                api.write("POST", path, Some(&with_key)).await?.0,
+                StatusCode::OK
+            );
+        }
+        let open = TemplateApi::start(None).await?;
+        for (path, mut body) in [
+            ("/v1/groups", group_body()),
+            ("/v1/groups/dev/attach", json!({"channel": "#one"})),
+        ] {
+            body["invite"] = json!("template-owner-key");
+            assert_eq!(
+                open.write("POST", path, Some(&body)).await?.0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(open.server.groups().list()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn groups_http_rejects_invalid_inputs_and_surfaces_storage_failures() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        api.write("POST", "/v1/groups", Some(&group_body())).await?;
+        let before = api.server.groups().list()?;
+        for (pointer, invalid) in [
+            ("/name", json!(" ")),
+            ("/name", json!("bad/name")),
+            ("/lead/count", json!(2)),
+            ("/workers/0/count", json!(0)),
+            ("/workers", json!([])),
+            ("/lead/model", json!("two words")),
+            ("/workers/0/template", json!("../bad")),
+        ] {
+            let mut input = group_body();
+            *input.pointer_mut(pointer).unwrap() = invalid;
+            let (status, body) = api.write("POST", "/v1/groups", Some(&input)).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["ok"], false);
+            assert_eq!(api.server.groups().list()?, before);
+        }
+        for (name, channel, expected) in [
+            ("dev", "one", StatusCode::BAD_REQUEST),
+            ("dev", "#missing", StatusCode::NOT_FOUND),
+            ("dev", "#general", StatusCode::NOT_FOUND),
+            ("missing", "#one", StatusCode::NOT_FOUND),
+        ] {
+            let (status, body) = api
+                .write(
+                    "POST",
+                    &format!("/v1/groups/{name}/attach"),
+                    Some(&json!({"channel": channel})),
+                )
+                .await?;
+            assert_eq!(status, expected, "{body}");
+            assert_eq!(api.server.groups().list()?, before);
+        }
+        for invalid in [json!({"name": "missing-lead"}), {
+            let mut body = group_body();
+            body["workers"][0]["count"] = json!(-1);
+            body
+        }] {
+            let response = api
+                .client
+                .post(format!("{}/v1/groups", api.base))
+                .header("X-AirCD-Invite", "template-owner-key")
+                .json(&invalid)
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(api.server.groups().list()?, before);
+        }
+        api.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE groups SET lead_json = 'corrupt'", [])?;
+        assert_eq!(
+            api.read("/v1/groups").await?.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            api.write(
+                "POST",
+                "/v1/groups/dev/attach",
+                Some(&json!({"channel": "#one"}))
+            )
+            .await?
+            .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        Ok(())
     }
 
     async fn spawn_api(owner_key: Option<&str>) -> Result<TemplateApi> {

@@ -12,8 +12,8 @@ the hub's group and subtask endpoints are built to:
 where lead and each worker are {"template", "model", "count", "nick"?}.
 
 The integration tests run the real aircd binary (skipped when it is not
-built) for the parts the hub already serves: task create stays compatible,
-and handing in for review needs a note or an attached report.
+built), including group creation/attachment and handing in a task for review
+with a note or an attached report.
 """
 
 from __future__ import annotations
@@ -423,6 +423,7 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         rep = json.loads(self.cli(
             "--json", "report", "create", "--channel", "#grp", "--title", "unit tests",
             "--status", "completed", "--summary", "12 passed", "--task-id", tid,
+            "--body", "Synthetic integration fixture: unit tests passed.",
         ).stdout)["report"]
         moved = json.loads(self.cli("--json", "task", "status", tid, "review", "--report", rep["id"]).stdout)["task"]
         self.assertEqual(moved["status"], "review")
@@ -430,17 +431,25 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         notes = [ev.get("note") or "" for ev in shown["events"]]
         self.assertTrue(any(f"report {rep['id']}" in n and "12 passed" in n for n in notes), notes)
 
-    def test_groups_endpoint_when_served(self) -> None:
+    def test_real_hub_groups(self) -> None:
         listed = self.cli("--json", "group", "list", check=False)
-        if listed.returncode != 0 and "HTTP 404" in listed.stderr:
-            self.skipTest("this hub build has no /v1/groups yet")
         self.assertEqual(listed.returncode, 0, listed.stderr)
-        self.cli(
-            "group", "create", "itest", "--lead", "claude:opus", "--worker", "ollama:gemma3*2", "--invite", OWNER_KEY,
-        )
+        created = json.loads(self.cli(
+            "--json", "group", "create", "itest", "--lead", "claude:opus", "--worker", "ollama:gemma3*2",
+            "--description", "Integration team", "--lead-prompt", "Split.\nReview.\n",
+            "--worker-prompt", "Code only.\n", "--invite", OWNER_KEY,
+        ).stdout)["group"]
+        self.assertEqual(created["lead"]["model"], "opus")
+        self.assertEqual(created["workers"][0]["count"], 2)
+        self.assertEqual(created["lead_prompt"], "Split.\nReview.\n")
+        self.assertEqual(created["worker_prompt"], "Code only.\n")
         self.cli("project", "create", "#grp2")
         attached = json.loads(self.cli("--json", "group", "attach", "itest", "#grp2", "--invite", OWNER_KEY).stdout)
         self.assertIn("#grp2", attached["group"]["projects"])
+        repeated = json.loads(self.cli("--json", "group", "attach", "itest", "#grp2", "--invite", OWNER_KEY).stdout)
+        self.assertEqual(repeated["group"], attached["group"])
+        listed = json.loads(self.cli("--json", "group", "list").stdout)
+        self.assertIn(attached["group"], listed["groups"])
 
 
 if __name__ == "__main__":

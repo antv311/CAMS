@@ -307,6 +307,29 @@ place is the task: it names its project channel, repo and branch.
 | `POST /v1/tasks/{id}/status` | Move through the workflow (`status`, `note`, `branch`, `report_body`, `report_id`) |
 | `GET /v1/inbox` | The caller's tasks and reviews, grouped by project |
 
+## Groups
+
+Groups are reusable definitions with one lead and one or more worker seats.
+Create one with `airc group create dev --lead claude:opus --worker ollama:qwen3*3
+--invite <owner-key>`, list with `airc group list`, then attach it to an existing
+project using `airc group attach dev '#cams' --invite <owner-key>`.
+`--lead-prompt` and `--worker-prompt` accept text or `@path` for separate role prompts.
+
+`GET /v1/groups` requires an account bearer token and returns `{"groups": [...]}`.
+`POST /v1/groups` takes `name`, `lead`, `workers`, and optional `description`,
+`lead_prompt`, and `worker_prompt`; each seat is `{template, model, count, nick?}`
+with `count` defaulting to one. The lead count must be one and worker counts
+must be positive. A group name is one nonempty URL path segment of at most
+100 characters. Posting an existing name replaces its definition while keeping
+its creation time and project attachments. Prompts are stored verbatim.
+
+`POST /v1/groups/{name}/attach` takes `{"channel": "#cams"}` and returns the group
+with its sorted `projects` list. Attachment is idempotent; unknown groups or
+projects return 404. Both POST endpoints require the configured owner key in
+`X-AirCD-Invite` or the JSON `invite` field. In open registration mode, group
+writes are disabled. Definitions and attachments persist across restarts;
+these endpoints store metadata without provisioning accounts or launching workers.
+
 ## Sprint rooms
 
 A project can have numbered rooms, one per sprint: `s1`, `s2`, `s3`. They are

@@ -17,7 +17,7 @@ use crate::rooms::{Room, RoomStore};
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
-use crate::store::{ClientTemplate, ClientTemplateStore, SharedConnection};
+use crate::store::{ClientTemplate, ClientTemplateStore, GroupStore, SharedConnection};
 use crate::tasks::{NewTask, Task, TaskStore, TERMINAL_STATUSES};
 use crate::wake::{WakeConfig, WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
@@ -69,6 +69,7 @@ pub struct Server {
     notes: NoteStore,
     rooms: RoomStore,
     templates: ClientTemplateStore,
+    groups: GroupStore,
     inner: Arc<Mutex<ServerInner>>,
 }
 
@@ -148,6 +149,7 @@ impl Server {
             notes: NoteStore::new(db.clone()),
             rooms: RoomStore::new(db.clone()),
             templates: ClientTemplateStore::new(db.clone()),
+            groups: GroupStore::new(db.clone()),
             db,
             inner: Arc::new(Mutex::new(ServerInner::default())),
         }
@@ -183,6 +185,10 @@ impl Server {
 
     pub fn templates(&self) -> &ClientTemplateStore {
         &self.templates
+    }
+
+    pub fn groups(&self) -> &GroupStore {
+        &self.groups
     }
 
     pub fn notes(&self) -> &NoteStore {
