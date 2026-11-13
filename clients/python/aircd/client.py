@@ -392,7 +392,8 @@ class AircdHttpClient:
     """Blocking client for the hub's HTTP API (stdlib only).
 
     Reading templates needs an account token; changing them, deleting them and
-    listing a template's models need the owner key::
+    listing a template's models need the owner key. Spawning a worker takes
+    either the owner key or a project manager's token::
 
         hub = AircdHttpClient("http://127.0.0.1:6680", token="...", invite="owner-key")
         for t in hub.list_templates():
@@ -400,6 +401,7 @@ class AircdHttpClient:
         hub.set_template("claude", {"name": "Claude Code", "command": "claude",
                                     "args": ["-p", "{prompt}", "--model", "{model}"]})
         models = hub.list_template_models("claude")["models"]
+        worker = hub.spawn_worker("claude", "builder1", "opus", channels=["#proj"])
     """
 
     def __init__(
@@ -449,6 +451,33 @@ class AircdHttpClient:
         """
         return self._request(
             "POST", "/v1/owner/models", payload={"template": template_id}, owner=True
+        )
+
+    def spawn_worker(
+        self,
+        template_id: str,
+        nick: str,
+        model: str,
+        *,
+        channels: Optional[list[str]] = None,
+        role: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Provision a worker account from a template. Returns the response:
+        ``{"ok", "account": {"principal", "token", "channel", "channels", "role",
+        "model", "template", "wake"}, "http_url"}``. The token is shown only once.
+
+        Sends the owner key when one is set; otherwise the account token, which
+        must belong to the owner or a manager of every requested project.
+        ``channels`` defaults to the hub's chat-only channel; ``role`` is the
+        project role (default member).
+        """
+        payload: dict[str, Any] = {"nick": nick, "model": model}
+        if channels:
+            payload["channels"] = list(channels)
+        if role:
+            payload["role"] = role
+        return self._request(
+            "POST", _template_path(template_id) + "/spawn", payload=payload, owner=bool(self.invite)
         )
 
     # Internal

@@ -1338,7 +1338,14 @@ def cmd_git(args: argparse.Namespace) -> int:
 
 
 def template_client(args: argparse.Namespace, *, owner: bool) -> AircdHttpClient:
-    """Reads need an account token; changes and model listing need the owner key."""
+    """Reads need an account token; changes and model listing need the owner key.
+    spawn takes the owner key when given, else the profile's token."""
+    if args.template_cmd == "spawn":
+        server, token, _prof = resolve_connection(args)
+        invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
+        if not invite and not token:
+            raise CliError("template spawn needs a manager's token (airc register/login) or the owner key (--invite or AIRC_INVITE)")
+        return AircdHttpClient(server, token=token, invite=invite)
     if owner:
         server, token, _prof = resolve_connection(args)
         invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
@@ -1447,6 +1454,20 @@ def cmd_template(args: argparse.Namespace) -> int:
             lines = [m["id"] + (f"  {m['label']}" if m.get("label") else "") for m in data.get("models", [])]
             if data.get("warning"):
                 print(f"warning: models command failed: {data['warning']}", file=sys.stderr)
+        elif action == "spawn":
+            data = hub.spawn_worker(
+                args.id, args.nick, args.model, channels=args.channel, role=args.role
+            )
+            account = data.get("account") or {}
+            principal = account.get("principal") or {}
+            lines = [
+                f"Spawned {principal.get('nick', args.nick)} from template {account.get('template', args.id)} "
+                f"(model {account.get('model', args.model)}, role {account.get('role', '')})",
+                f"  channels: {', '.join(account.get('channels') or [])}",
+                f"  token:    {account.get('token', '')}  (shown once; save it now)",
+                f"  save as profile: airc --server {data.get('http_url', '')} --token {account.get('token', '')} "
+                f"--profile {principal.get('nick', args.nick)} login --channels {account.get('channel', '#general')}",
+            ]
         else:
             raise CliError(f"Unsupported template subcommand: {action}")
     except AircdHttpError as err:
@@ -1586,6 +1607,19 @@ def build_parser() -> argparse.ArgumentParser:
         "models", help="List a template's models; runs its models command on the hub (owner)"
     )
     p_tmod.add_argument("id")
+    p_tspawn = tpl_sub.add_parser(
+        "spawn",
+        help="Provision a worker account from a template (owner, or a manager of every channel's project)",
+        description="Creates an account that wakes with the template's command and the given model. "
+        "Uses the owner key when given, else this profile's token. The new token is printed once.",
+    )
+    p_tspawn.add_argument("id", help="Template id")
+    p_tspawn.add_argument("nick", help="Nick for the new account")
+    p_tspawn.add_argument("--model", required=True, help="Model to run, e.g. one from 'airc template models ID'")
+    p_tspawn.add_argument("--channel", action="append", help="Channel to join; repeat for each (default: chat only)")
+    p_tspawn.add_argument("--role", help="Project role (default member)")
+    p_tspawn.add_argument("--invite", help="Owner key (or set AIRC_INVITE); omit to use this profile's token")
+    p_tspawn.set_defaults(func=cmd_template)
     for owner_parser in (p_tset, p_tdel, p_tmod):
         owner_parser.add_argument("--invite", help="Owner key (or set AIRC_INVITE)")
         owner_parser.set_defaults(func=cmd_template)

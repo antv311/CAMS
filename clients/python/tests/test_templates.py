@@ -119,6 +119,35 @@ class HttpClientTemplateTest(unittest.TestCase):
         self.assertEqual(listing["body"], {"template": "agy"})
         self.assertEqual(listing["headers"]["x-aircd-invite"], "owner")
 
+    def test_spawn_worker_with_owner_key(self) -> None:
+        created = {"ok": True, "account": {"principal": {"nick": "w1"}, "token": "new"}, "http_url": "http://h:1"}
+        self.hub.replies = [(201, created)]
+        result = self.client.spawn_worker("a b", "w1", "opus", channels=["#p", "#q"], role="pm")
+        self.assertEqual(result, created)
+        req = self.hub.requests[0]
+        self.assertEqual((req["method"], req["path"]), ("POST", "/v1/templates/a%20b/spawn"))
+        self.assertEqual(req["headers"]["x-aircd-invite"], "owner")
+        self.assertEqual(req["body"], {"nick": "w1", "model": "opus", "channels": ["#p", "#q"], "role": "pm"})
+
+    def test_spawn_worker_without_owner_key_uses_the_token(self) -> None:
+        self.hub.replies = [(201, {"ok": True, "account": {}})]
+        AircdHttpClient(self.url, token="tok").spawn_worker("claude", "w2", "sonnet")
+        req = self.hub.requests[0]
+        self.assertEqual(req["path"], "/v1/templates/claude/spawn")
+        self.assertEqual(req["headers"]["authorization"], "Bearer tok")
+        self.assertNotIn("x-aircd-invite", req["headers"])
+        self.assertEqual(req["body"], {"nick": "w2", "model": "sonnet"})
+
+    def test_spawn_worker_errors(self) -> None:
+        self.hub.replies = [(403, {"ok": False, "error": "only the owner or a manager of #p can provision"})]
+        with self.assertRaises(AircdHttpError) as caught:
+            self.client.spawn_worker("claude", "w3", "m", channels=["#p"])
+        self.assertEqual(caught.exception.status, 403)
+        self.assertIn("only the owner", str(caught.exception))
+        with self.assertRaises(AircdHttpError):
+            self.client.spawn_worker(" ", "w3", "m")
+        self.assertEqual(len(self.hub.requests), 1)
+
     def test_errors_carry_status_and_server_message(self) -> None:
         self.hub.replies = [(404, {"ok": False, "error": "no client template named 'nope'"})]
         with self.assertRaises(AircdHttpError) as caught:
@@ -297,6 +326,60 @@ class TemplateCliE2ETest(unittest.TestCase):
         self.assertIn("HTTP 404", gone.stderr)
         again = self.cli("template", "delete", "ghost", "--invite", OWNER_KEY, check=False)
         self.assertIn("HTTP 404", again.stderr)
+
+    def test_template_spawn(self) -> None:
+        self.cli("template", "set", "spawnable", "--invite", OWNER_KEY,
+                 "--command", sys.executable, "--arg=-c", "--arg", "print('{model}')")
+
+        spawned = json.loads(
+            self.cli(
+                "--json", "template", "spawn", "spawnable", "worker1",
+                "--model", "model-x", "--channel", "#spawnroom", "--channel", "#other",
+                "--role", "builder", "--invite", OWNER_KEY,
+            ).stdout
+        )
+        account = spawned["account"]
+        self.assertEqual(account["principal"]["nick"], "worker1")
+        self.assertEqual(account["template"], "spawnable")
+        self.assertEqual(account["model"], "model-x")
+        self.assertEqual(account["role"], "builder")
+        self.assertEqual(account["channel"], "#spawnroom")
+        self.assertIn("#spawnroom", account["channels"])
+        self.assertIn("#other", account["channels"])
+        self.assertEqual(account["wake"]["command"], sys.executable)
+        self.assertTrue(spawned["http_url"].startswith("http://"))
+
+        # The new token works for the new account.
+        me = json.loads(self.cli("--json", "--token", account["token"], "whoami").stdout)
+        self.assertEqual(me["principal"]["nick"], "worker1")
+
+        text = self.cli("template", "spawn", "spawnable", "worker2", "--model", "m2", "--invite", OWNER_KEY).stdout
+        self.assertIn("Spawned worker2 from template spawnable (model m2, role member)", text)
+        self.assertIn("token:", text)
+        self.assertIn("--profile worker2 login", text)
+
+        duplicate = self.cli("template", "spawn", "spawnable", "worker1", "--model", "m", "--invite", OWNER_KEY, check=False)
+        self.assertEqual(duplicate.returncode, 1)
+        self.assertIn("HTTP 409", duplicate.stderr)
+        missing = self.cli("template", "spawn", "nope", "worker9", "--model", "m", "--invite", OWNER_KEY, check=False)
+        self.assertIn("HTTP 404", missing.stderr)
+        bad_model = self.cli("template", "spawn", "spawnable", "worker9", "--model", "{x}", "--invite", OWNER_KEY, check=False)
+        self.assertIn("HTTP 400", bad_model.stderr)
+        no_model = self.cli("template", "spawn", "spawnable", "worker9", check=False)
+        self.assertEqual(no_model.returncode, 2)
+        self.assertIn("--model", no_model.stderr)
+
+        # Without the owner key the profile's token is sent; a plain member is refused.
+        member = self.cli("template", "spawn", "spawnable", "worker9", "--model", "m", check=False)
+        self.assertEqual(member.returncode, 1)
+        self.assertIn("HTTP 403", member.stderr)
+        # A wrong owner key never falls back to the token.
+        wrong = self.cli("template", "spawn", "spawnable", "worker9", "--model", "m", "--invite", "wrong", check=False)
+        self.assertIn("HTTP 403", wrong.stderr)
+        # No token and no key: refused before any request.
+        nothing = self.cli("--profile", "nobody", "template", "spawn", "spawnable", "worker9", "--model", "m", check=False)
+        self.assertEqual(nothing.returncode, 1)
+        self.assertIn("needs a manager's token", nothing.stderr)
 
 
 if __name__ == "__main__":
