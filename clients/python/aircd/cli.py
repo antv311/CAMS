@@ -734,7 +734,234 @@ def cmd_task(args: argparse.Namespace) -> int:
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (claimed_by={t.get('claimed_by') or '-'})"])
         return 0
+    if args.task_cmd == "worktree":
+        return _cmd_task_worktree(args, server, token, _prof)
     raise CliError("Unsupported task subcommand")
+
+
+def _primary_repo_root(path: Path) -> Path:
+    """Resolve the primary git repository root (never nested inside another worktree)."""
+    top = Path(_run_git(path, ["rev-parse", "--show-toplevel"])).resolve()
+    common_raw = _run_git(top, ["rev-parse", "--git-common-dir"])
+    common = Path(common_raw)
+    if not common.is_absolute():
+        common = (top / common).resolve()
+    else:
+        common = common.resolve()
+    if common.name == ".git":
+        return common.parent
+    return top
+
+
+def _validate_branch_name(repo_root: Path, branch: str) -> str:
+    clean = branch.strip()
+    if not clean or clean.startswith(("/", "\\")) or ".." in clean or ":" in clean:
+        raise CliError(f"unsafe task branch name: {branch!r}")
+    _run_git(repo_root, ["check-ref-format", "--branch", clean])
+    return clean
+
+
+def _parse_worktree_list(repo_root: Path) -> list[dict[str, Any]]:
+    raw = _run_git(repo_root, ["worktree", "list", "--porcelain"])
+    items: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            if current is not None:
+                items.append(current)
+                current = None
+            continue
+        if line.startswith("worktree "):
+            if current is not None:
+                items.append(current)
+            wt_path = str(Path(line[9:].strip()).resolve())
+            current = {"path": wt_path, "head": None, "branch": None, "bare": False}
+        elif current is not None:
+            if line.startswith("HEAD "):
+                current["head"] = line[5:].strip()
+            elif line.startswith("branch "):
+                ref = line[7:].strip()
+                current["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+            elif line == "bare":
+                current["bare"] = True
+    if current is not None:
+        items.append(current)
+    return items
+
+
+def _resolve_task_repo(
+    server: str, token: str, task: dict[str, Any]
+) -> dict[str, Any] | None:
+    repos = http_json(server, "GET", "/v1/gits", token=token).get("git_repos", [])
+    channel = task.get("channel")
+    task_repo = (task.get("repo") or "").strip()
+    if task_repo:
+        for r in repos:
+            if r.get("channel") == channel and r.get("name", "").lower() == task_repo.lower():
+                return r
+        for r in repos:
+            if r.get("name", "").lower() == task_repo.lower():
+                return r
+        return None
+    for r in repos:
+        if r.get("channel") == channel:
+            return r
+    return None
+
+
+def _ref_exists(repo_root: Path, ref: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo_root), "show-ref", "--verify", "--quiet", ref],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _cmd_task_worktree(
+    args: argparse.Namespace, server: str, token: str, prof: dict[str, Any]
+) -> int:
+    if args.list:
+        matched_repo = None
+        if args.path:
+            seed = Path(args.path).resolve()
+        elif args.id:
+            task = http_json(server, "GET", f"/v1/tasks/{urllib.parse.quote(args.id)}", token=token)["task"]
+            matched_repo = _resolve_task_repo(server, token, task)
+            if not matched_repo or not matched_repo.get("local_path"):
+                raise CliError(f"no git repo is registered for {task['channel']} and --path was not provided")
+            seed = Path(matched_repo["local_path"]).resolve()
+        else:
+            seed = Path(".").resolve()
+        root = _primary_repo_root(seed)
+        worktrees = _parse_worktree_list(root)
+        lines = [f"{w['path']} [{w.get('branch') or '(detached)'}]" for w in worktrees]
+        print_out(args, {"ok": True, "repo_root": str(root), "worktrees": worktrees}, lines or ["No worktrees."])
+        return 0
+
+    if not args.id:
+        raise CliError("task id is required (or pass --list)")
+
+    task = http_json(server, "GET", f"/v1/tasks/{urllib.parse.quote(args.id)}", token=token)["task"]
+    matched_repo = _resolve_task_repo(server, token, task)
+    if args.path:
+        seed = Path(args.path).resolve()
+    elif matched_repo and matched_repo.get("local_path"):
+        seed = Path(matched_repo["local_path"]).resolve()
+    else:
+        try:
+            seed = _primary_repo_root(Path(".").resolve())
+        except CliError:
+            raise CliError(f"no git repo is registered for {task['channel']} and --path was not provided")
+
+    root = _primary_repo_root(seed)
+    repo_name = (matched_repo or {}).get("name") or task.get("repo") or root.name
+    raw_branch = args.branch or task.get("branch") or f"task/{task['id']}"
+    branch = _validate_branch_name(root, raw_branch)
+    worktree_dir = (
+        Path(args.worktree_dir).resolve()
+        if args.worktree_dir
+        else (root / ".aircd" / "worktrees").joinpath(*branch.split("/")).resolve()
+    )
+
+    existing = _parse_worktree_list(root)
+    match_wt = next((w for w in existing if os.path.normcase(w["path"]) == os.path.normcase(str(worktree_dir))), None)
+
+    if args.remove:
+        if match_wt is not None or worktree_dir.exists():
+            rm_args = ["worktree", "remove"]
+            if args.force:
+                rm_args.append("--force")
+            rm_args.append(str(worktree_dir))
+            _run_git(root, rm_args)
+        _run_git(root, ["worktree", "prune"])
+        if args.delete_branch and _ref_exists(root, f"refs/heads/{branch}"):
+            _run_git(root, ["branch", "-D" if args.force else "-d", branch])
+        out = {
+            "ok": True,
+            "removed": True,
+            "task_id": task["id"],
+            "repo_root": str(root),
+            "branch": branch,
+            "worktree": str(worktree_dir),
+        }
+        print_out(args, out, [f"Removed worktree: {worktree_dir} (branch={branch})"])
+        return 0
+
+    created = False
+    reused = False
+    if match_wt is not None:
+        if match_wt.get("branch") and match_wt["branch"] != branch:
+            raise CliError(f"worktree {worktree_dir} is on branch {match_wt['branch']}, expected {branch}")
+        reused = True
+    else:
+        if worktree_dir.exists() and any(worktree_dir.iterdir()):
+            raise CliError(f"path already exists and is not a registered git worktree: {worktree_dir}")
+        worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+        if _ref_exists(root, f"refs/heads/{branch}"):
+            _run_git(root, ["worktree", "add", str(worktree_dir), branch])
+        else:
+            base_ref = args.base
+            if not base_ref:
+                default_branch = (matched_repo or {}).get("default_branch")
+                if default_branch and _ref_exists(root, f"refs/heads/{default_branch}"):
+                    base_ref = default_branch
+                elif _ref_exists(root, "refs/heads/main"):
+                    base_ref = "main"
+                else:
+                    base_ref = "HEAD"
+            _run_git(root, ["worktree", "add", "-b", branch, str(worktree_dir), base_ref])
+        created = True
+
+    lock_res = None
+    if args.lock:
+        lock_res = http_json(
+            server,
+            "POST",
+            "/v1/locks",
+            token=token,
+            payload={
+                "resource": f"repo:{repo_name}:{branch}",
+                "channel": task["channel"],
+                "ttl_seconds": args.ttl,
+                "note": f"task {task['id']} worktree owned by @{prof.get('nick') or 'agent'}",
+            },
+        )
+    if created:
+        try:
+            http_json(
+                server,
+                "POST",
+                "/v1/git/event",
+                token=token,
+                payload={
+                    "repo": repo_name,
+                    "channel": task["channel"],
+                    "event": "worktree",
+                    "branch": branch,
+                    "summary": f"task {task['id']} worktree at {worktree_dir}",
+                },
+                timeout=3.0,
+            )
+        except CliError:
+            pass
+
+    out = {
+        "ok": True,
+        "task_id": task["id"],
+        "repo": repo_name,
+        "repo_root": str(root),
+        "branch": branch,
+        "worktree": str(worktree_dir),
+        "created": created,
+        "reused": reused,
+        "lock": lock_res,
+    }
+    state = "reused" if reused else "created"
+    print_out(args, out, [f"Task {task['id']} worktree ({state}): {worktree_dir} (branch={branch})"])
+    return 0
 
 
 def review_note(server: str, token: str, args: argparse.Namespace) -> str:
@@ -1901,6 +2128,23 @@ def build_parser() -> argparse.ArgumentParser:
         p_ta = task_sub.add_parser(action)
         p_ta.add_argument("id")
         p_ta.set_defaults(func=cmd_task)
+
+    p_tw = task_sub.add_parser(
+        "worktree",
+        help="Provision or remove an isolated git worktree at .aircd/worktrees/<branch> for a task",
+    )
+    p_tw.add_argument("id", nargs="?", help="Task id (required unless --list is used)")
+    p_tw.add_argument("--branch", help="Branch name (defaults to task.branch or task/<id>)")
+    p_tw.add_argument("--base", help="Base ref when creating a new branch")
+    p_tw.add_argument("--path", help="Local git repository path override")
+    p_tw.add_argument("--worktree-dir", help="Explicit worktree directory override")
+    p_tw.add_argument("--lock", action="store_true", help="Acquire a branch lock on the hub")
+    p_tw.add_argument("--ttl", type=int, default=3600)
+    p_tw.add_argument("--remove", action="store_true", help="Remove the task worktree")
+    p_tw.add_argument("--force", action="store_true", help="Force removal or branch deletion")
+    p_tw.add_argument("--delete-branch", action="store_true", help="Delete local branch with --remove")
+    p_tw.add_argument("--list", action="store_true", help="List git worktrees")
+    p_tw.set_defaults(func=cmd_task)
 
     p_group = sub.add_parser("group", help="Reusable teams: a lead that splits and reviews work, plus workers")
     group_sub = p_group.add_subparsers(dest="group_cmd", required=True)

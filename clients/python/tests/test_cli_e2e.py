@@ -373,6 +373,81 @@ class AircdCliE2ETest(unittest.TestCase):
         pr_ev = self._next_hook(secret)
         self.assertEqual(pr_ev["event"], "report")
 
+    def test_04_task_repo_validation_and_task_worktree_lifecycle(self) -> None:
+        self._drain_hooks()
+        repo_dir = Path(self.tmp_dir.name) / "wt-repo"
+        repo_dir.mkdir()
+        for cmd in (
+            ["git", "init", "-b", "main"],
+            ["git", "config", "user.email", "codex@example.local"],
+            ["git", "config", "user.name", "Codex"],
+        ):
+            subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
+        (repo_dir / "README.md").write_text("wt init\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
+
+        self._run_cli("--profile", "codex", "--json", "project", "create", "#wtproj")
+        self._run_cli("--profile", "codex", "--json", "project", "add", "#wtproj", "claude")
+        reg = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "git", "register", str(repo_dir), "--channel", "#wtproj",
+            ).stdout
+        )
+        self.assertEqual(reg["git_repo"]["name"], "wt-repo")
+
+        # Repo attached to #wardrobe (sample-repo) is rejected for #wtproj
+        bad = self._run_cli(
+            "--profile", "codex",
+            "task", "create", "#wtproj", "Wrong repo", "--repo", "sample-repo",
+            check=False,
+        )
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("400", bad.stderr)
+        self.assertIn("#wardrobe", bad.stderr)
+
+        created_task = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#wtproj", "Worktree feature",
+                "--assign", "claude", "--repo", "wt-repo", "--branch", "feat/e2e-wt",
+            ).stdout
+        )["task"]
+        task_id = created_task["id"]
+        self.assertEqual(created_task["repo"], "wt-repo")
+
+        wt = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "worktree", task_id, "--lock",
+            ).stdout
+        )
+        expected_wt = (repo_dir / ".aircd" / "worktrees" / "feat" / "e2e-wt").resolve()
+        self.assertTrue(wt["created"])
+        self.assertFalse(wt["reused"])
+        self.assertEqual(Path(wt["worktree"]).resolve(), expected_wt)
+        self.assertTrue((expected_wt / ".git").exists())
+        self.assertIsNotNone(wt["lock"])
+
+        reused = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "worktree", task_id,
+            ).stdout
+        )
+        self.assertFalse(reused["created"])
+        self.assertTrue(reused["reused"])
+
+        removed = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "worktree", task_id, "--remove", "--delete-branch",
+            ).stdout
+        )
+        self.assertTrue(removed["removed"])
+        self.assertFalse(expected_wt.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
