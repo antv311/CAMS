@@ -19,6 +19,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from aircd.client import AircdHttpClient, AircdHttpError
+
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:6680"
 ALLOWED_REPORT_STATUSES = ("info", "ok", "completed", "needs_input", "failed", "warning")
@@ -1332,6 +1334,127 @@ def cmd_git(args: argparse.Namespace) -> int:
     raise CliError("Unsupported git subcommand")
 
 
+# ── Client templates ──────────────────────────────────────────
+
+
+def template_client(args: argparse.Namespace, *, owner: bool) -> AircdHttpClient:
+    """Reads need an account token; changes and model listing need the owner key."""
+    if owner:
+        server, token, _prof = resolve_connection(args)
+        invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
+        if not invite:
+            raise CliError(f"template {args.template_cmd} needs the owner key: pass --invite or set AIRC_INVITE")
+        return AircdHttpClient(server, token=token, invite=invite)
+    server, token, _prof = require_token(args)
+    return AircdHttpClient(server, token=token)
+
+
+def template_payload(args: argparse.Namespace) -> dict[str, Any]:
+    """The full template to save: --file (JSON) first, then any flags given."""
+    template: dict[str, Any] = {}
+    if args.file:
+        try:
+            raw = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as err:
+            raise CliError(f"cannot read template JSON from {args.file}: {err}") from None
+        # Accept the output of `airc --json template show` as well as a bare template.
+        if isinstance(loaded, dict) and isinstance(loaded.get("template"), dict):
+            loaded = loaded["template"]
+        if not isinstance(loaded, dict):
+            raise CliError("template JSON must be an object")
+        template.update(loaded)
+    flags = {
+        "name": args.name,
+        "command": args.command,
+        "cwd": args.cwd,
+        "prompt": args.prompt,
+        "session_mode": args.session,
+        "session_marker": args.session_marker,
+        "session_scope": args.session_scope,
+        "args": args.arg,
+        "resume_args": args.resume_arg,
+        "models": args.model,
+    }
+    template.update({k: v for k, v in flags.items() if v is not None})
+    if args.models_command is not None:
+        command_line = args.models_command
+        if os.name == "nt":
+            # Keep the backslashes in Windows paths such as C:\Tools\agy.exe.
+            command_line = command_line.replace("\\", "\\\\")
+        template["models_command"] = shlex.split(command_line)
+    if args.env or args.unset_env:
+        env = dict(template.get("env") or {})
+        for item in args.env or []:
+            key, sep, value = item.partition("=")
+            env[key] = value if sep else None
+        for key in args.unset_env or []:
+            env[key] = None
+        template["env"] = env
+    if not str(template.get("command") or "").strip():
+        raise CliError('template set needs --command (or a "command" in --file)')
+    if not str(template.get("name") or "").strip():
+        template["name"] = args.id
+    return template
+
+
+def template_lines(t: dict[str, Any]) -> list[str]:
+    state = "installed" if t.get("installed") else "not installed"
+    lines = [
+        f"{t['id']} ({t.get('name') or t['id']}): {state}",
+        f"command: {' '.join(shlex.quote(p) for p in [t['command'], *(t.get('args') or [])])}",
+        f"cwd={t.get('cwd') or '{repo_path}'} session={t.get('session_mode')} (per {t.get('session_scope')})",
+    ]
+    if t.get("resume_args"):
+        lines.append(f"resume args: {' '.join(t['resume_args'])} marker={t.get('session_marker')!r}")
+    if t.get("env"):
+        lines.append(
+            "env: " + " ".join(f"{k}={v}" if v is not None else f"-{k}" for k, v in sorted(t["env"].items()))
+        )
+    if t.get("prompt"):
+        lines.append(f"prompt: {t['prompt']}")
+    lines.append(f"models: {', '.join(t.get('models') or []) or '-'}")
+    if t.get("models_command"):
+        lines.append(f"models command: {' '.join(shlex.quote(p) for p in t['models_command'])}")
+    return lines
+
+
+def cmd_template(args: argparse.Namespace) -> int:
+    action = args.template_cmd
+    hub = template_client(args, owner=action in ("set", "delete", "models"))
+    data: dict[str, Any]
+    try:
+        if action == "list":
+            templates = hub.list_templates()
+            data = {"ok": True, "templates": templates}
+            lines = [
+                f"{t['id']:<16} {'installed' if t.get('installed') else 'missing':<10} "
+                f"{t['command']:<20} models={len(t.get('models') or [])}"
+                f"{'+command' if t.get('models_command') else ''}  {t.get('name') or ''}"
+                for t in templates
+            ] or ["No client templates. Add one with: airc template set <id> --command <program> --invite <owner key>"]
+        elif action == "show":
+            template = hub.get_template(args.id)
+            data, lines = {"ok": True, "template": template}, template_lines(template)
+        elif action == "set":
+            template = hub.set_template(args.id, template_payload(args))
+            data, lines = {"ok": True, "template": template}, ["Saved template:", *template_lines(template)]
+        elif action == "delete":
+            data = {"ok": True, "deleted": hub.delete_template(args.id)}
+            lines = [f"Deleted template {args.id}."]
+        elif action == "models":
+            data = hub.list_template_models(args.id)
+            lines = [m["id"] + (f"  {m['label']}" if m.get("label") else "") for m in data.get("models", [])]
+            if data.get("warning"):
+                print(f"warning: models command failed: {data['warning']}", file=sys.stderr)
+        else:
+            raise CliError(f"Unsupported template subcommand: {action}")
+    except AircdHttpError as err:
+        raise CliError(str(err)) from None
+    print_out(args, data, lines)
+    return 0
+
+
 # ── Argument parser ───────────────────────────────────────────
 
 
@@ -1421,6 +1544,51 @@ def build_parser() -> argparse.ArgumentParser:
         wake_parser.add_argument("--nick", required=True)
         wake_parser.add_argument("--invite", help="Owner key (or set AIRC_INVITE)")
         wake_parser.set_defaults(func=cmd_owner_wake)
+
+    p_tpl = sub.add_parser(
+        "template", help="Client templates: how a kind of agent (claude, codex, ...) is launched"
+    )
+    tpl_sub = p_tpl.add_subparsers(dest="template_cmd", required=True)
+    tpl_sub.add_parser(
+        "list", help="List templates and whether each command is installed on the hub"
+    ).set_defaults(func=cmd_template)
+    p_tshow = tpl_sub.add_parser("show", help="Show one template")
+    p_tshow.add_argument("id")
+    p_tshow.set_defaults(func=cmd_template)
+    p_tset = tpl_sub.add_parser(
+        "set",
+        help="Create or replace a template (owner). Placeholders include {model} {prompt} {nick} {channel}",
+        description="Saves the whole template; fields not given take their defaults. "
+        "Start from JSON with --file (or --file - for stdin, e.g. the output of 'airc --json template show ID'), "
+        "then any flags given override it.",
+    )
+    p_tset.add_argument("id")
+    p_tset.add_argument("--file", help="Template JSON to start from ('-' reads stdin)")
+    p_tset.add_argument("--name", help="Display name (default: the id)")
+    p_tset.add_argument("--command", help="Executable (full path, or a name on the hub's PATH)")
+    p_tset.add_argument("--arg", action="append", help="One argument template; repeat for each. Use --arg=-p for dash values")
+    p_tset.add_argument("--cwd", help="Working directory template (default: the task's repo path)")
+    p_tset.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p_tset.add_argument("--unset-env", action="append", metavar="KEY", help="Remove a variable from the agent's environment")
+    p_tset.add_argument("--prompt", help="Prompt template for {prompt}")
+    p_tset.add_argument("--session", choices=["fresh", "resume", "pm"], help="Conversation mode (default fresh)")
+    p_tset.add_argument("--resume-arg", action="append", help="Argument template used once a conversation is stored; {session_id} is its id")
+    p_tset.add_argument("--session-marker", help="Text that precedes the conversation id in the agent's output")
+    p_tset.add_argument("--session-scope", choices=["account", "channel"], help="One conversation per account or per project channel")
+    p_tset.add_argument("--model", action="append", help="A model this template offers; repeat for each")
+    p_tset.add_argument(
+        "--models-command",
+        help="Command, program first, that prints the models, e.g. \"agy models\" (split like a shell; \"\" clears it)",
+    )
+    p_tdel = tpl_sub.add_parser("delete", help="Delete a template (owner)")
+    p_tdel.add_argument("id")
+    p_tmod = tpl_sub.add_parser(
+        "models", help="List a template's models; runs its models command on the hub (owner)"
+    )
+    p_tmod.add_argument("id")
+    for owner_parser in (p_tset, p_tdel, p_tmod):
+        owner_parser.add_argument("--invite", help="Owner key (or set AIRC_INVITE)")
+        owner_parser.set_defaults(func=cmd_template)
 
     p_log = sub.add_parser("login", help="Verify token, join channels & refresh profile")
     p_log.add_argument("--channels", default="#general")

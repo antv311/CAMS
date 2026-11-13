@@ -8,10 +8,14 @@ reliability and automatic reconnection matter more than full IRC compliance.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("aircd")
 
@@ -371,6 +375,126 @@ class AircdClient:
 
             except asyncio.CancelledError:
                 return
+
+
+# ── HTTP API: client templates ──────────────────────────────────
+
+
+class AircdHttpError(Exception):
+    """An HTTP API call failed. ``status`` is None when the hub was unreachable."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+class AircdHttpClient:
+    """Blocking client for the hub's HTTP API (stdlib only).
+
+    Reading templates needs an account token; changing them, deleting them and
+    listing a template's models need the owner key::
+
+        hub = AircdHttpClient("http://127.0.0.1:6680", token="...", invite="owner-key")
+        for t in hub.list_templates():
+            print(t["id"], t["installed"])
+        hub.set_template("claude", {"name": "Claude Code", "command": "claude",
+                                    "args": ["-p", "{prompt}", "--model", "{model}"]})
+        models = hub.list_template_models("claude")["models"]
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        token: str = "",
+        invite: str = "",
+        timeout: float = 15.0,
+    ):
+        base_url = base_url.strip().rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            base_url = f"http://{base_url}"
+        self.base_url = base_url
+        self.token = token
+        self.invite = invite
+        self.timeout = timeout
+
+    # Templates
+
+    def list_templates(self) -> list[dict[str, Any]]:
+        """All templates, sorted by id, each with a live ``installed`` flag."""
+        return self._request("GET", "/v1/templates").get("templates", [])
+
+    def get_template(self, template_id: str) -> dict[str, Any]:
+        """One template; raises AircdHttpError(status=404) when there is none."""
+        return self._request("GET", _template_path(template_id))["template"]
+
+    def set_template(self, template_id: str, template: dict[str, Any]) -> dict[str, Any]:
+        """Create or fully replace a template (owner key). Returns the saved template.
+
+        Fields: name, command (required), args, cwd, env (None unsets a
+        variable), prompt, session_mode, resume_args, session_marker,
+        session_scope, models, models_command. Omitted fields take defaults.
+        """
+        payload = {k: v for k, v in template.items() if k not in ("id", "installed", "created_at", "updated_at")}
+        return self._request("POST", _template_path(template_id), payload=payload, owner=True)["template"]
+
+    def delete_template(self, template_id: str) -> bool:
+        """Delete a template (owner key); raises AircdHttpError(status=404) when there is none."""
+        return bool(self._request("DELETE", _template_path(template_id), owner=True).get("deleted"))
+
+    def list_template_models(self, template_id: str) -> dict[str, Any]:
+        """A template's models (owner key): its saved list, then what its listing
+        command prints on the hub. Returns ``{"template", "models": [{"id", "label"}],
+        "warning"}``; ``warning`` is set when the listing command failed.
+        """
+        return self._request(
+            "POST", "/v1/owner/models", payload={"template": template_id}, owner=True
+        )
+
+    # Internal
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Any = None,
+        owner: bool = False,
+    ) -> dict[str, Any]:
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if owner:
+            if not self.invite:
+                raise AircdHttpError("this action needs the owner key (invite)")
+            headers["X-AirCD-Invite"] = self.invite
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as err:
+            raw = err.read().decode("utf-8", errors="replace")
+            try:
+                message = json.loads(raw).get("error") or raw
+            except Exception:
+                message = raw or str(err)
+            raise AircdHttpError(f"HTTP {err.code} {method} {path}: {message}", err.code) from None
+        except urllib.error.URLError as err:
+            raise AircdHttpError(f"Cannot reach aircd at {self.base_url}: {err.reason}") from None
+        return json.loads(raw) if raw.strip() else {"ok": True}
+
+
+def _template_path(template_id: str) -> str:
+    template_id = template_id.strip()
+    if not template_id:
+        raise AircdHttpError("template id must not be empty")
+    return "/v1/templates/" + urllib.parse.quote(template_id, safe="")
 
 
 # ── IRC line parser ─────────────────────────────────────────────
