@@ -273,20 +273,37 @@ impl AuthStore {
     /// Owner reset: revoke every credential a principal holds (hashed tokens
     /// and any legacy plaintext token) and issue one fresh token.
     pub fn reissue_all(&self, principal_id: &str) -> Result<String> {
-        {
-            let db = self.db.lock().expect("sqlite mutex poisoned");
-            db.execute(
-                "UPDATE principals
-                 SET token = '__hashed__:reissued-' || lower(hex(randomblob(16)))
-                 WHERE id = ?1 AND token NOT LIKE '__hashed__:%'",
-                params![principal_id],
+        let (full_token, token_id, secret) = tokens::generate();
+        let token_hash = tokens::hash(&secret).context("hash reissued token")?;
+        // (principal_id, label) is unique, so every reissue needs its own label.
+        let label = format!("owner-reissue-{token_id}");
+        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let tx = db
+            .transaction()
+            .context("start token reissue transaction")?;
+        let updated = tx
+            .execute(
+                "UPDATE principals SET token = ?2 WHERE id = ?1",
+                params![principal_id, format!("__hashed__:{token_id}")],
             )
             .context("neutralise legacy token")?;
+        if updated != 1 {
+            return Err(anyhow!("unknown principal"));
         }
-        // (principal_id, label) is unique, so every reissue needs its own label.
-        let unique = uuid::Uuid::new_v4().simple().to_string();
-        let label = format!("owner-reissue-{}", &unique[..12]);
-        self.issue_token(principal_id, Some(&label), true)
+        tx.execute(
+            "UPDATE principal_tokens SET revoked_at = unixepoch()
+             WHERE principal_id = ?1 AND revoked_at IS NULL",
+            params![principal_id],
+        )
+        .context("revoke old tokens")?;
+        tx.execute(
+            "INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())",
+            params![principal_id, token_id, token_hash, label],
+        )
+        .context("insert reissued token")?;
+        tx.commit().context("commit token reissue")?;
+        Ok(full_token)
     }
 
     pub fn resolve_by_name(&self, name: &str) -> Result<Option<Principal>> {
@@ -455,6 +472,102 @@ mod tests {
         let auth = AuthStore::new(db);
         assert!(auth.authenticate("does-not-exist").is_err());
         assert!(auth.authenticate("airc_deadbeef_nope").is_err());
+    }
+
+    #[test]
+    fn reissue_retires_every_credential_and_can_be_repeated() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let auth = AuthStore::new(db.clone());
+        let extra = auth.issue_token("agent-a", Some("extra"), false)?;
+        let first = auth.reissue_all("agent-a")?;
+        assert!(auth.authenticate("agent-a-token").is_err());
+        assert!(auth.authenticate(&extra).is_err());
+        assert_eq!(auth.authenticate(&first)?.id, "agent-a");
+        let second = auth.reissue_all("agent-a")?;
+        assert!(auth.authenticate(&first).is_err());
+        assert_eq!(auth.authenticate(&second)?.id, "agent-a");
+        assert_eq!(auth.authenticate("agent-b-token")?.id, "agent-b");
+        let conn = db.lock().unwrap();
+        let active: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM principal_tokens WHERE principal_id = 'agent-a' AND revoked_at IS NULL",
+            [], |row| row.get(0),
+        )?;
+        assert_eq!(active, 1);
+        let sentinel: String = conn.query_row(
+            "SELECT token FROM principals WHERE id = 'agent-a'",
+            [],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+        assert!(sentinel.starts_with("__hashed__:"));
+        assert!(auth.authenticate(&sentinel).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn reissue_rolls_back_every_mutation_when_any_statement_fails() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let auth = AuthStore::new(db.clone());
+        let extra = auth.issue_token("agent-a", Some("extra"), false)?;
+        let snapshot = || -> Result<_> {
+            let conn = db.lock().unwrap();
+            let legacy: String = conn.query_row(
+                "SELECT token FROM principals WHERE id = 'agent-a'",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT id, token_id, token_hash, label, created_at, revoked_at
+                 FROM principal_tokens WHERE principal_id = 'agent-a' ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((legacy, rows))
+        };
+        let before = snapshot()?;
+        for operation in [
+            "UPDATE ON principals",
+            "UPDATE ON principal_tokens",
+            "INSERT ON principal_tokens",
+        ] {
+            db.lock().unwrap().execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_reissue BEFORE {operation}
+                 BEGIN SELECT RAISE(ABORT, 'injected reissue failure'); END;"
+            ))?;
+            let error = auth.reissue_all("agent-a").expect_err("injected failure");
+            assert!(format!("{error:#}").contains("injected reissue failure"));
+            assert_eq!(snapshot()?, before, "failed at {operation}");
+            assert_eq!(auth.authenticate("agent-a-token")?.id, "agent-a");
+            assert_eq!(auth.authenticate(&extra)?.id, "agent-a");
+            db.lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_reissue")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reissue_of_unknown_principal_does_not_insert_a_token() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let auth = AuthStore::new(db.clone());
+        assert!(auth.reissue_all("missing").is_err());
+        let count: i64 = db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM principal_tokens WHERE principal_id = 'missing'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
+        Ok(())
     }
 
     #[test]

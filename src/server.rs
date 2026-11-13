@@ -70,6 +70,9 @@ pub struct Server {
     rooms: RoomStore,
     templates: ClientTemplateStore,
     groups: GroupStore,
+    // Lock before db/inner: registration, command effects, reissue and cleanup
+    // must agree on which session owns a principal across credential changes.
+    session_gate: Arc<Mutex<()>>,
     inner: Arc<Mutex<ServerInner>>,
 }
 
@@ -151,12 +154,32 @@ impl Server {
             templates: ClientTemplateStore::new(db.clone()),
             groups: GroupStore::new(db.clone()),
             db,
+            session_gate: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(ServerInner::default())),
         }
     }
 
     pub fn auth(&self) -> &AuthStore {
         &self.auth
+    }
+
+    /// Commit the credential reset before invalidating the active IRC session.
+    /// Registration and IRC command effects cannot straddle this operation.
+    pub fn reissue_token(&self, principal_id: &str) -> Result<String> {
+        let _guard = self.session_gate.lock().expect("session mutex poisoned");
+        let token = self.auth.reissue_all(principal_id)?;
+        let client = self
+            .inner
+            .lock()
+            .expect("server mutex poisoned")
+            .clients
+            .remove(principal_id);
+        if let Some(client) = client {
+            let _ = client
+                .shutdown_tx
+                .send("Credentials reissued by owner".into());
+        }
+        Ok(token)
     }
 
     pub fn history(&self) -> &HistoryStore {
@@ -284,33 +307,46 @@ impl Server {
             ":{SERVER_NAME} NOTICE * :Welcome to aircd prototype"
         ));
 
-        loop {
-            tokio::select! {
-                line = lines.next_line() => {
-                    let Some(line) = line? else {
-                        break;
-                    };
-                    let command = parse_command(&line);
-                    let should_quit = self.handle_command(&mut session, command).await?;
-                    if should_quit {
+        let result: Result<()> = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    shutdown_reason = shutdown_rx.recv() => {
+                        if let Some(reason) = shutdown_reason {
+                            session.send(format!(":{SERVER_NAME} ERROR :{reason}"));
+                        }
                         break;
                     }
-                }
-                shutdown_reason = shutdown_rx.recv() => {
-                    if let Some(reason) = shutdown_reason {
-                        session.send(format!(":{SERVER_NAME} ERROR :{reason}"));
+                    line = lines.next_line() => {
+                        let Some(line) = line? else {
+                            break;
+                        };
+                        let command = parse_command(&line);
+                        let should_quit = self.handle_command(&mut session, command).await?;
+                        if should_quit {
+                            break;
+                        }
                     }
-                    break;
                 }
             }
+            Ok(())
         }
+        .await;
 
-        self.disconnect(&session)?;
+        let cleanup = self.disconnect(&session);
         writer_task.abort();
-        Ok(())
+        result.and(cleanup)
     }
 
     async fn handle_command(&self, session: &mut Session, command: Command) -> Result<bool> {
+        // Unregistered sessions acquire the gate in try_register instead.
+        // There is no await while holding this synchronous guard.
+        let _guard = session
+            .registered
+            .then(|| self.session_gate.lock().expect("session mutex poisoned"));
+        if session.registered {
+            self.ensure_registered(session)?;
+        }
         match command {
             Command::Pass(token) => {
                 session.pass_token = Some(token);
@@ -568,6 +604,7 @@ impl Server {
         if session.registered {
             return Ok(());
         }
+        let _guard = self.session_gate.lock().expect("session mutex poisoned");
 
         let Some(token) = session.pass_token.as_deref() else {
             return Ok(());
@@ -3147,6 +3184,7 @@ impl Server {
     }
 
     fn disconnect(&self, session: &Session) -> Result<()> {
+        let _guard = self.session_gate.lock().expect("session mutex poisoned");
         let Some(principal) = session.principal.as_ref() else {
             return Ok(());
         };
@@ -3157,7 +3195,8 @@ impl Server {
                 .clients
                 .get(&principal.id)
                 .map(|client| client.tx.same_channel(&session.tx))
-                .unwrap_or(false);
+                // Reissue already removed the client; still record its exit.
+                .unwrap_or(true);
             if should_remove {
                 inner.clients.remove(&principal.id);
             }
@@ -3445,6 +3484,232 @@ mod tests {
             )?;
         assert!(disconnected_at.is_some());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reissue_invalidates_commands_and_preserves_new_session_during_old_cleanup(
+    ) -> Result<()> {
+        let server = test_server()?;
+        let mut old = test_session("agent-a-token", "agent-a");
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+        old.shutdown_tx = shutdown_tx;
+        server.try_register(&mut old)?;
+        server.join(&old, "#kept".into())?;
+        let first = server.reissue_token("agent-a")?;
+        assert_eq!(
+            shutdown_rx.try_recv()?.as_str(),
+            "Credentials reissued by owner"
+        );
+        assert!(!server.inner.lock().unwrap().clients.contains_key("agent-a"));
+        assert!(server
+            .handle_command(
+                &mut old,
+                Command::Privmsg {
+                    target: "#kept".into(),
+                    body: "must not be stored".into(),
+                }
+            )
+            .await
+            .is_err());
+        assert!(server
+            .handle_command(&mut old, Command::Ping("stale".into()))
+            .await
+            .is_err());
+        let mut fresh = test_session(&first, "agent-a");
+        server.try_register(&mut fresh)?;
+        assert!(fresh.registered);
+        server.disconnect(&old)?;
+        assert!(server.ensure_registered(&fresh)?);
+        let disconnected_at: Option<i64> = server.db.lock().unwrap().query_row(
+            "SELECT disconnected_at FROM principals WHERE id = 'agent-a'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(disconnected_at, None);
+        assert!(server.is_member("agent-a", "#kept")?);
+        let stored: i64 = server.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM messages WHERE body = 'must not be stored'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored, 0);
+        // A reset of a session using an already-reissued (hashed) token works too.
+        let second = server.reissue_token("agent-a")?;
+        assert!(server.ensure_registered(&fresh).is_err());
+        server.disconnect(&fresh)?;
+        let mut latest = test_session(&second, "agent-a");
+        server.try_register(&mut latest)?;
+        assert!(latest.registered);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reissue_failure_keeps_the_active_session_usable() -> Result<()> {
+        let server = test_server()?;
+        let mut session = test_session("agent-a-token", "agent-a");
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+        session.shutdown_tx = shutdown_tx;
+        server.try_register(&mut session)?;
+        server.db.lock().unwrap().execute_batch(
+            "CREATE TEMP TRIGGER fail_reissue BEFORE INSERT ON principal_tokens
+             BEGIN SELECT RAISE(ABORT, 'injected reissue failure'); END;",
+        )?;
+        assert!(server.reissue_token("agent-a").is_err());
+        assert!(shutdown_rx.try_recv().is_err());
+        assert!(server.ensure_registered(&session)?);
+        assert_eq!(server.auth.authenticate("agent-a-token")?.id, "agent-a");
+        assert!(
+            !server
+                .handle_command(&mut session, Command::Ping("still-active".into()))
+                .await?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reissue_racing_old_token_registrations_leaves_no_stale_client() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+        let server = test_server()?;
+        let barrier = Arc::new(Barrier::new(9));
+        std::thread::scope(|scope| -> Result<()> {
+            let mut registrations = Vec::new();
+            for _ in 0..8 {
+                let server = server.clone();
+                let barrier = barrier.clone();
+                registrations.push(scope.spawn(move || -> Result<Session> {
+                    let mut session = test_session("agent-a-token", "agent-a");
+                    barrier.wait();
+                    server.try_register(&mut session)?;
+                    Ok(session)
+                }));
+            }
+            barrier.wait();
+            let token = server.reissue_token("agent-a")?;
+            for registration in registrations {
+                let session = registration.join().unwrap()?;
+                if session.registered {
+                    assert!(server.ensure_registered(&session).is_err());
+                }
+                server.disconnect(&session)?;
+            }
+            assert!(!server.inner.lock().unwrap().clients.contains_key("agent-a"));
+            let mut fresh = test_session(&token, "agent-a");
+            server.try_register(&mut fresh)?;
+            assert!(fresh.registered);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn reissue_http_closes_idle_irc_socket_and_allows_only_the_new_token() -> Result<()> {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::timeout;
+
+        let server = test_server()?;
+        let irc = TcpListener::bind("127.0.0.1:0").await?;
+        let irc_addr = irc.local_addr()?;
+        let irc_server = server.clone();
+        let irc_task = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = irc.accept().await.unwrap();
+                let server = irc_server.clone();
+                tokio::spawn(async move { server.handle_stream(stream).await });
+            }
+        });
+        let http = TcpListener::bind("127.0.0.1:0").await?;
+        let http_addr = http.local_addr()?;
+        let mut info =
+            crate::http::build_runtime_info(&irc_addr.to_string(), &http_addr.to_string(), None);
+        info.register_key = Some("reissue-test-key".into());
+        let app = crate::http::router(server.clone(), info);
+        let http_task = tokio::spawn(async move { axum::serve(http, app).await });
+
+        let (read, mut write) = TcpStream::connect(irc_addr).await?.into_split();
+        let mut lines = BufReader::new(read).lines();
+        write
+            .write_all(b"PASS agent-a-token\r\nNICK agent-a\r\nUSER agent-a 0 * :test\r\n")
+            .await?;
+        loop {
+            let line = timeout(Duration::from_secs(5), lines.next_line())
+                .await??
+                .unwrap();
+            if line.contains(" 376 ") {
+                break;
+            }
+        }
+        let client = reqwest::Client::new();
+        let url = format!("http://{http_addr}/v1/owner/reissue");
+        // A rejected request must leave the socket alive.
+        let denied = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "nick": "agent-a", "invite": "wrong",
+            }))
+            .send()
+            .await?;
+        assert_eq!(denied.status().as_u16(), 403);
+        write.write_all(b"PING :before-reset\r\n").await?;
+        loop {
+            let line = timeout(Duration::from_secs(5), lines.next_line())
+                .await??
+                .unwrap();
+            if line.contains(" PONG ") {
+                break;
+            }
+        }
+        let reset = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "nick": "agent-a", "invite": "reissue-test-key",
+            }))
+            .send()
+            .await?;
+        assert_eq!(reset.status().as_u16(), 200);
+        let body: serde_json::Value = reset.json().await?;
+        let token = body["token"].as_str().unwrap();
+        // No input on the old connection is needed to trigger its shutdown.
+        timeout(Duration::from_secs(5), async {
+            while lines.next_line().await?.is_some() {}
+            anyhow::Ok(())
+        })
+        .await??;
+        assert!(!server.inner.lock().unwrap().clients.contains_key("agent-a"));
+
+        let (read, mut write) = TcpStream::connect(irc_addr).await?.into_split();
+        let mut stale = BufReader::new(read).lines();
+        write
+            .write_all(b"PASS agent-a-token\r\nNICK agent-a\r\n")
+            .await?;
+        loop {
+            let line = timeout(Duration::from_secs(5), stale.next_line())
+                .await??
+                .unwrap();
+            assert!(!line.contains(" 001 "));
+            if line.contains(" 464 ") {
+                break;
+            }
+        }
+        drop(write);
+        drop(stale);
+        let (read, mut write) = TcpStream::connect(irc_addr).await?.into_split();
+        let mut fresh = BufReader::new(read).lines();
+        write
+            .write_all(format!("PASS {token}\r\nNICK agent-a\r\n").as_bytes())
+            .await?;
+        loop {
+            let line = timeout(Duration::from_secs(5), fresh.next_line())
+                .await??
+                .unwrap();
+            if line.contains(" 001 ") {
+                break;
+            }
+        }
+        write.write_all(b"QUIT\r\n").await?;
+        http_task.abort();
+        irc_task.abort();
         Ok(())
     }
 
