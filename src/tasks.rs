@@ -26,7 +26,8 @@ pub const ALL_STATUSES: &[&str] = &[
 ];
 
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
-     body, kind, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint";
+     body, kind, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
+     reviewer, parent_task_id";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Task {
@@ -49,6 +50,9 @@ pub struct Task {
     pub updated_at: i64,
     /// The sprint room this task belongs to, such as `#quest-video-s2`.
     pub sprint: Option<String>,
+    /// Account ID of the lead or PM who reviews this work.
+    pub reviewer: Option<String>,
+    pub parent_task_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -63,6 +67,8 @@ pub struct NewTask {
     pub branch: Option<String>,
     pub issue_url: Option<String>,
     pub sprint: Option<String>,
+    pub reviewer: Option<String>,
+    pub parent_task_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -147,8 +153,8 @@ impl TaskStore {
         db.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, assignee, created_by, repo, branch, issue_url,
-                                created_at, updated_at, sprint)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
+                                created_at, updated_at, sprint, reviewer, parent_task_id)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15)",
             params![
                 id,
                 new.channel,
@@ -162,7 +168,9 @@ impl TaskStore {
                 clean_opt(new.branch),
                 clean_opt(new.issue_url),
                 now,
-                clean_opt(new.sprint)
+                clean_opt(new.sprint),
+                clean_opt(new.reviewer),
+                clean_opt(new.parent_task_id)
             ],
         )
         .context("insert task")?;
@@ -613,6 +621,8 @@ impl TaskStore {
             created_at: row.get(13)?,
             updated_at: row.get(14)?,
             sprint: row.get(15)?,
+            reviewer: row.get(16)?,
+            parent_task_id: row.get(17)?,
         })
     }
 }

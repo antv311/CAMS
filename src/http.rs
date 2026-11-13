@@ -1363,6 +1363,8 @@ struct CreateTaskReq {
     repo: Option<String>,
     branch: Option<String>,
     issue_url: Option<String>,
+    reviewer: Option<String>,
+    parent_task_id: Option<String>,
 }
 
 async fn create_task(
@@ -1390,6 +1392,8 @@ async fn create_task(
                 branch: req.branch,
                 issue_url: req.issue_url,
                 sprint: None,
+                reviewer: req.reviewer,
+                parent_task_id: req.parent_task_id,
             },
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -1428,6 +1432,8 @@ struct TaskStatusReq {
     status: String,
     note: Option<String>,
     branch: Option<String>,
+    report_body: Option<String>,
+    report_id: Option<String>,
 }
 
 async fn set_task_status(
@@ -1445,6 +1451,8 @@ async fn set_task_status(
             &req.status,
             req.note.as_deref(),
             req.branch.as_deref(),
+            req.report_body.as_deref(),
+            req.report_id.as_deref(),
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
@@ -3824,6 +3832,428 @@ mod tests {
         let response = request.bearer_auth(token).send().await?;
         let status = response.status().as_u16();
         Ok((status, response.json().await.unwrap_or(Value::Null)))
+    }
+
+    #[tokio::test]
+    async fn task_reviewers_default_to_parent_lead_or_pm_and_validate_input() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let post = |body: Value| {
+            call(
+                &api.client,
+                "POST",
+                format!("{}/v1/tasks", api.base),
+                &tokens["pm"],
+                body,
+            )
+        };
+        let (status, body) =
+            post(json!({"channel": "#one", "title": "Parent", "assignee": "lead"})).await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["task"]["reviewer"], "pm");
+        assert!(body["task"]["parent_task_id"].is_null());
+        let parent = body["task"]["id"].as_str().unwrap();
+        let child_input = json!({"channel": "#one", "title": "Child", "assignee": "worker", "parent_task_id": parent});
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/tasks", api.base),
+            &tokens["lead"],
+            child_input.clone(),
+        )
+        .await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["task"]["reviewer"], "lead");
+        assert_eq!(body["task"]["parent_task_id"], parent);
+        let child = body["task"]["id"].as_str().unwrap();
+
+        // The lead can reassign its child, without acquiring project-wide authority.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/tasks/{child}/assign", api.base),
+            &tokens["lead"],
+            json!({"assignee": "peer"}),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/tasks/{parent}/assign", api.base),
+            &tokens["worker"],
+            json!({"assignee": "peer"}),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/tasks", api.base),
+            &tokens["lead"],
+            json!({"channel": "#one", "title": "Unrelated", "assignee": "worker"}),
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        let mut explicit = child_input.clone();
+        explicit["reviewer"] = json!(" @Peer ");
+        let (status, body) = post(explicit).await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["task"]["reviewer"], "peer");
+
+        let (_, body) = post(json!({"channel": "#one", "title": "Unassigned parent"})).await?;
+        let unassigned = body["task"]["id"].as_str().unwrap();
+        let (status, body) =
+            post(json!({"channel": "#one", "title": "Fallback", "parent_task_id": unassigned}))
+                .await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["task"]["reviewer"], "pm");
+        let owner = api.server.auth().resolve_by_name("human")?.unwrap();
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/tasks", api.base),
+            "human-token",
+            json!({"channel": "#two", "title": "No PM"}),
+        )
+        .await?;
+        assert_eq!(status, 201, "{body}");
+        assert!(body["task"]["reviewer"].is_null());
+        let other_project = body["task"]["id"].as_str().unwrap();
+
+        let before = api.server.tasks().list("#one")?.len();
+        for (field, value) in [
+            ("parent_task_id", json!("missing")),
+            ("parent_task_id", json!(other_project)),
+            ("reviewer", json!("missing")),
+            ("reviewer", json!("reader")), // existing account, outside the project
+        ] {
+            let mut invalid = child_input.clone();
+            invalid[field] = value;
+            let (status, body) = post(invalid).await?;
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(api.server.tasks().list("#one")?.len(), before);
+        }
+        let (status, _) = call(&api.client, "POST", format!("{}/v1/tasks", api.base), &tokens["worker"], json!({"channel": "#one", "title": "Self-selected review", "assignee": "worker", "reviewer": "peer"})).await?;
+        assert_eq!(status, 400);
+        api.server
+            .set_task_status_api(&owner, parent, "cancelled", None, None, None, None)?;
+        let (status, _) = post(child_input).await?;
+        assert_eq!(status, 400);
+        Ok(())
+    }
+
+    async fn task_workflow_api(
+    ) -> Result<(TemplateApi, std::collections::HashMap<&'static str, String>)> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let owner = api.server.auth().resolve_by_name("human")?.unwrap();
+        let mut tokens = std::collections::HashMap::new();
+        for nick in ["pm", "lead", "worker", "peer"] {
+            let (_, token) = api
+                .server
+                .auth()
+                .register_principal(nick, Some("builder"), None)?;
+            api.server
+                .set_project_member_api(&owner, "#one", nick, Some("builder"))?;
+            tokens.insert(nick, token);
+        }
+        api.server.set_project_pm_api(&owner, "#one", "pm")?;
+        Ok((api, tokens))
+    }
+
+    #[tokio::test]
+    async fn task_review_requires_evidence_and_routes_to_the_named_lead() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/tasks", api.base),
+            &tokens["pm"],
+            json!({"channel": "#one", "title": "Parent", "assignee": "lead"}),
+        )
+        .await?;
+        let parent = body["task"]["id"].as_str().unwrap();
+        let (_, body) = call(&api.client, "POST", format!("{}/v1/tasks", api.base), &tokens["lead"], json!({"channel": "#one", "title": "Child", "assignee": "worker", "parent_task_id": parent})).await?;
+        let id = body["task"]["id"].as_str().unwrap();
+        let url = format!("{}/v1/tasks/{id}/status", api.base);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "review", "note": "cannot skip testing"}),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "testing"}),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let before = serde_json::to_value(api.server.get_task_api(id)?)?;
+        let event_count = api.server.tasks().events(id)?.len();
+        for evidence in [
+            json!({}),
+            json!({"note": null}),
+            json!({"note": ""}),
+            json!({"note": " \t\n", "report_body": " \r\n", "report_id": " "}),
+        ] {
+            let mut request = evidence;
+            request["status"] = json!("review");
+            request["branch"] = json!("must-not-stick");
+            let (status, body) =
+                call(&api.client, "POST", url.clone(), &tokens["worker"], request).await?;
+            assert_eq!(status, 400, "{body}");
+            assert!(body["error"].as_str().unwrap().contains("test report"));
+            assert_eq!(serde_json::to_value(api.server.get_task_api(id)?)?, before);
+            assert_eq!(api.server.tasks().events(id)?.len(), event_count);
+        }
+        let report = "cargo test --locked: 8 passed\nresult: ok";
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "review", "report_body": report, "branch": "feat/child"}),
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["task"]["branch"], "feat/child");
+        assert_eq!(
+            api.server
+                .tasks()
+                .events(id)?
+                .last()
+                .unwrap()
+                .note
+                .as_deref(),
+            Some(report)
+        );
+        for nick in ["lead", "pm"] {
+            let (_, body) = call(
+                &api.client,
+                "GET",
+                format!("{}/v1/inbox", api.base),
+                &tokens[nick],
+                Value::Null,
+            )
+            .await?;
+            assert_eq!(body["inbox"]["review_count"], 1, "{nick}: {body}");
+            assert_eq!(body["inbox"]["projects"][0]["to_review"][0]["id"], id);
+        }
+        let (_, body) = call(
+            &api.client,
+            "GET",
+            format!("{}/v1/inbox", api.base),
+            &tokens["peer"],
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(body["inbox"]["review_count"], 0);
+        let messages = api.server.history().tail("#one", 0, 20)?;
+        assert!(messages.iter().any(|message| message.body.contains(id)
+            && message.body.contains("testing -> review")
+            && message.body.contains("@pm")
+            && message.body.contains("@lead")));
+        for nick in ["worker", "peer"] {
+            let (status, _) = call(
+                &api.client,
+                "POST",
+                url.clone(),
+                &tokens[nick],
+                json!({"status": "merged"}),
+            )
+            .await?;
+            assert_eq!(status, 400);
+        }
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["lead"],
+            json!({"status": "cancelled"}),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["lead"],
+            json!({"status": "changes_requested", "note": "fix the test"}),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "testing"}),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "review"}),
+        )
+        .await?;
+        assert_eq!(status, 400); // prior evidence does not authorize another handoff
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "review", "note": "fixed; 9 tests pass"}),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url,
+            &tokens["lead"],
+            json!({"status": "merged"}),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_task_reviewers_cannot_approve_their_own_work_or_review_after_leaving(
+    ) -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        for reviewer in ["worker", "peer"] {
+            let (status, body) = call(
+                &api.client, "POST", format!("{}/v1/tasks", api.base), &tokens["pm"],
+                json!({"channel": "#one", "title": "Review permissions", "assignee": "worker", "reviewer": reviewer}),
+            ).await?;
+            assert_eq!(status, 201, "{body}");
+            let id = body["task"]["id"].as_str().unwrap();
+            let url = format!("{}/v1/tasks/{id}/status", api.base);
+            for request in [
+                json!({"status": "testing"}),
+                json!({"status": "review", "note": "cargo test: passed"}),
+            ] {
+                let (status, body) =
+                    call(&api.client, "POST", url.clone(), &tokens["worker"], request).await?;
+                assert_eq!(status, 200, "{body}");
+            }
+            if reviewer == "peer" {
+                api.db.lock().unwrap().execute(
+                    "DELETE FROM project_roles WHERE channel = '#one' AND principal_id = 'peer'",
+                    [],
+                )?;
+            }
+            let (_, body) = call(
+                &api.client,
+                "GET",
+                format!("{}/v1/inbox", api.base),
+                &tokens[reviewer],
+                Value::Null,
+            )
+            .await?;
+            assert_eq!(body["inbox"]["review_count"], 0);
+            let (status, _) = call(
+                &api.client,
+                "POST",
+                url.clone(),
+                &tokens[reviewer],
+                json!({"status": "merged"}),
+            )
+            .await?;
+            assert_eq!(status, 400);
+            let (status, _) = call(
+                &api.client,
+                "POST",
+                url,
+                &tokens["pm"],
+                json!({"status": "merged"}),
+            )
+            .await?;
+            assert_eq!(status, 200);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_review_accepts_only_the_assignees_task_linked_report_body() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/tasks", api.base),
+            &tokens["pm"],
+            json!({"channel": "#one", "title": "Test reports", "assignee": "worker"}),
+        )
+        .await?;
+        let id = body["task"]["id"].as_str().unwrap();
+        let url = format!("{}/v1/tasks/{id}/status", api.base);
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "testing"}),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let before = serde_json::to_value(api.server.get_task_api(id)?)?;
+        let event_count = api.server.tasks().events(id)?.len();
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            url.clone(),
+            &tokens["worker"],
+            json!({"status": "review", "report_id": "missing"}),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        for (author, channel, task_id, body) in [
+            ("worker", "#one", Some(id), " \n"),
+            ("peer", "#one", Some(id), "8 passed"),
+            ("worker", "#one", None, "8 passed"),
+            ("worker", "#one", Some("another-task"), "8 passed"),
+            ("worker", "#two", Some(id), "8 passed"),
+        ] {
+            let (_, report) = call(&api.client, "POST", format!("{}/v1/reports", api.base), &tokens[author], json!({"channel": channel, "title": "Tests", "status": "ok", "body": body, "task_id": task_id})).await?;
+            let report_id = report["report"]["id"].as_str().unwrap();
+            let (status, body) = call(
+                &api.client,
+                "POST",
+                url.clone(),
+                &tokens["worker"],
+                json!({"status": "review", "report_id": report_id, "branch": "must-not-stick"}),
+            )
+            .await?;
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(serde_json::to_value(api.server.get_task_api(id)?)?, before);
+            assert_eq!(api.server.tasks().events(id)?.len(), event_count);
+        }
+        let (_, report) = call(&api.client, "POST", format!("{}/v1/reports", api.base), &tokens["worker"], json!({"channel": "#one", "title": "Tests", "status": "ok", "body": "cargo test: 8 passed\nno failures", "task_id": id})).await?;
+        let report_id = report["report"]["id"].as_str().unwrap();
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            url,
+            &tokens["worker"],
+            json!({"status": "review", "report_id": report_id}),
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let events = api.server.tasks().events(id)?;
+        let note = events.last().unwrap().note.as_deref().unwrap();
+        assert!(note.contains(report_id));
+        assert!(note.contains("cargo test: 8 passed\nno failures"));
+        Ok(())
     }
 
     #[tokio::test]

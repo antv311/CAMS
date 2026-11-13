@@ -2044,7 +2044,25 @@ impl Server {
 
     /// Resolve who a task may be given to. Assignment only exists inside a
     /// project, and only to an account that is a member of that project.
-    fn resolve_assignee(&self, actor: &Principal, channel: &str, name: &str) -> Result<String> {
+    fn resolve_assignee(
+        &self,
+        actor: &Principal,
+        channel: &str,
+        name: &str,
+        parent: Option<&Task>,
+    ) -> Result<String> {
+        let target_id = self.resolve_task_account(channel, name)?;
+        let is_lead = parent.is_some_and(|task| task.assignee.as_deref() == Some(&actor.id));
+        if target_id != actor.id && !is_lead && !self.is_project_manager(actor, channel)? {
+            return Err(anyhow!(
+                "only a parent task's assignee or a leader or coordinator of {channel} can assign work to someone else"
+            ));
+        }
+        Ok(target_id)
+    }
+
+    /// Reviewers and assignees both name existing project members.
+    fn resolve_task_account(&self, channel: &str, name: &str) -> Result<String> {
         let project = self.project_of(channel);
         let channel = project.as_str();
         self.require_project(channel)?;
@@ -2052,11 +2070,6 @@ impl Server {
             .auth
             .resolve_by_name(name.trim().trim_start_matches('@'))?
             .ok_or_else(|| anyhow!("unknown account '{name}'"))?;
-        if target.id != actor.id && !self.is_project_manager(actor, channel)? {
-            return Err(anyhow!(
-                "only a leader or coordinator of {channel} can assign work to someone else"
-            ));
-        }
         if self.projects.role_of(channel, &target.id)?.is_none() {
             return Err(anyhow!(
                 "@{} is not a member of {channel}; add them with POST /v1/projects/members first",
@@ -2085,18 +2098,56 @@ impl Server {
                 "{CHAT_ONLY_CHANNEL} is chat only; create the task in a project channel"
             ));
         }
+        new.parent_task_id = new
+            .parent_task_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let parent = new
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        if let Some(parent) = &parent {
+            if parent.channel != channel {
+                return Err(anyhow!("parent task must belong to the same project"));
+            }
+            if TERMINAL_STATUSES.contains(&parent.status.as_str()) {
+                return Err(anyhow!("cannot add subtasks to a {} parent", parent.status));
+            }
+        }
         let assignee_id = match new
             .assignee
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            Some(name) => Some(self.resolve_assignee(actor, &channel, name)?),
+            Some(name) => Some(self.resolve_assignee(actor, &channel, name, parent.as_ref())?),
             None => None,
+        };
+        let reviewer = match new
+            .reviewer
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            Some(name) => {
+                let is_lead = parent
+                    .as_ref()
+                    .is_some_and(|task| task.assignee.as_deref() == Some(actor.id.as_str()));
+                if !is_lead && !self.is_project_manager(actor, &channel)? {
+                    return Err(anyhow!("only the parent task's assignee or a project manager can choose a reviewer"));
+                }
+                Some(self.resolve_task_account(&channel, name)?)
+            }
+            None => parent
+                .as_ref()
+                .and_then(|task| task.assignee.clone())
+                .or(self.projects.get(&channel)?.and_then(|project| project.pm)),
         };
         new.channel = channel.clone();
         new.title = title;
         new.assignee = assignee_id.clone();
+        new.reviewer = reviewer;
         new.created_by = Some(actor.id.clone());
 
         self.join_channels(actor, std::slice::from_ref(&channel))?;
@@ -2129,11 +2180,21 @@ impl Server {
         assignee: Option<&str>,
     ) -> Result<Task> {
         let current = self.get_task_api(task_id)?;
+        let parent = current
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
         let assignee_id = match assignee.map(str::trim).filter(|name| !name.is_empty()) {
-            Some(name) => Some(self.resolve_assignee(actor, &current.channel, name)?),
+            Some(name) => {
+                Some(self.resolve_assignee(actor, &current.channel, name, parent.as_ref())?)
+            }
             None => {
                 let is_owner = current.assignee.as_deref() == Some(actor.id.as_str());
-                if !is_owner && !self.is_project_manager(actor, &current.channel)? {
+                let is_lead = parent
+                    .as_ref()
+                    .is_some_and(|task| task.assignee.as_deref() == Some(actor.id.as_str()));
+                if !is_owner && !is_lead && !self.is_project_manager(actor, &current.channel)? {
                     return Err(anyhow!(
                         "only the assignee or a project leader/coordinator can unassign a task"
                     ));
@@ -2161,7 +2222,9 @@ impl Server {
     /// Move a task through its review workflow.
     ///
     /// The assignee starts work and asks for review; a project leader or
-    /// coordinator merges it, asks for changes, or cancels it.
+    /// coordinator oversees reviews. A named reviewer can decide their assigned
+    /// reviews, but cannot approve their own work or cancel project tasks.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_task_status_api(
         &self,
         actor: &Principal,
@@ -2169,19 +2232,27 @@ impl Server {
         raw_to: &str,
         note: Option<&str>,
         branch: Option<&str>,
+        report_body: Option<&str>,
+        report_id: Option<&str>,
     ) -> Result<Task> {
         let current = self.get_task_api(task_id)?;
         let to = raw_to.trim().to_ascii_lowercase().replace('-', "_");
         let from = current.status.clone();
         let is_assignee = current.assignee.as_deref() == Some(actor.id.as_str());
         let is_manager = self.is_project_manager(actor, &current.channel)?;
+        let is_reviewer = !is_assignee
+            && current.reviewer.as_deref() == Some(actor.id.as_str())
+            && self
+                .projects
+                .role_of(&current.channel, &actor.id)?
+                .is_some();
 
         let allowed = match (from.as_str(), to.as_str()) {
             ("assigned" | "changes_requested" | "testing", "in_progress") => is_assignee,
             ("assigned" | "in_progress" | "changes_requested", "testing") => is_assignee,
             ("testing", "review") => is_assignee,
             ("review", "in_progress") => is_assignee,
-            ("review", "merged" | "changes_requested") => is_manager,
+            ("review", "merged" | "changes_requested") => is_manager || is_reviewer,
             (current_status, "cancelled") if !TERMINAL_STATUSES.contains(&current_status) => {
                 is_manager
             }
@@ -2189,18 +2260,44 @@ impl Server {
         };
         if !allowed {
             return Err(anyhow!(
-                "cannot move task from {from} to {to}: the assignee moves work to in_progress, then testing, then review; a project leader or coordinator moves review to merged or changes_requested"
+                "cannot move task from {from} to {to}: the assignee moves work to in_progress, then testing, then review; the named reviewer or a project leader or coordinator moves review to merged or changes_requested"
             ));
         }
 
-        let note = note.map(str::trim).filter(|n| !n.is_empty());
+        let mut evidence: Vec<String> = note
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .into_iter()
+            .collect();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
         // Whoever reviews reads the evidence instead of re-running the tests.
-        if from == "testing" && to == "review" && note.is_none() {
-            return Err(anyhow!(
-                "a test report is required to hand work in: pass what you ran and the result as the note"
-            ));
+        if from == "testing" && to == "review" {
+            if let Some(body) = report_body.map(str::trim).filter(|b| !b.is_empty()) {
+                evidence.push(body.to_string());
+            }
+            if let Some(id) = report_id.map(str::trim).filter(|id| !id.is_empty()) {
+                let report = self
+                    .reports
+                    .get(id)?
+                    .ok_or_else(|| anyhow!("report '{id}' not found"))?;
+                if report.author_id != actor.id
+                    || report.task_id.as_deref() != Some(current.id.as_str())
+                    || self.project_of(&report.channel) != current.channel
+                    || report.body.trim().is_empty()
+                {
+                    return Err(anyhow!("test report must have a nonblank body, be authored by the assignee and belong to this task and project"));
+                }
+                evidence.push(format!("Test report {}:\n{}", report.id, report.body));
+            }
+            if evidence.is_empty() {
+                return Err(anyhow!(
+                    "a test report is required to hand work in: pass what you ran and the result as note, report_body or a task-linked report_id"
+                ));
+            }
         }
+        let evidence = evidence.join("\n\n");
+        let note = (!evidence.is_empty()).then_some(evidence.as_str());
         let task = self
             .tasks
             .set_status(&current.id, &from, &to, &actor.id, note, branch)?;
@@ -2208,7 +2305,13 @@ impl Server {
         let mut cc = String::new();
         match to.as_str() {
             "review" => {
-                for manager in self.project_managers(&task.channel)? {
+                let mut reviewers = self.project_managers(&task.channel)?;
+                if let Some(reviewer) = &task.reviewer {
+                    if !reviewers.contains(reviewer) {
+                        reviewers.push(reviewer.clone());
+                    }
+                }
+                for manager in reviewers {
                     if manager != actor.id {
                         cc.push_str(&format!(" @{manager}"));
                     }
@@ -2255,17 +2358,21 @@ impl Server {
         for channel in channels {
             let my_role = roles.get(&channel).cloned();
             let tasks: Vec<&Task> = mine.iter().filter(|t| t.channel == channel).collect();
-            let to_review = if my_role
-                .as_deref()
-                .is_some_and(|role| MANAGER_ROLES.contains(&role))
-            {
-                self.tasks.review_queue(&channel)?
-            } else {
-                Vec::new()
-            };
             let is_manager = my_role
                 .as_deref()
-                .is_some_and(|role| MANAGER_ROLES.contains(&role));
+                .is_some_and(|role| MANAGER_ROLES.contains(&role))
+                || Self::is_owner(actor);
+            let to_review: Vec<Task> = self
+                .tasks
+                .review_queue(&channel)?
+                .into_iter()
+                .filter(|task| {
+                    is_manager
+                        || (my_role.is_some()
+                            && task.reviewer.as_deref() == Some(actor.id.as_str())
+                            && task.assignee.as_deref() != Some(actor.id.as_str()))
+                })
+                .collect();
             // Questions from blocked workers that this account should answer.
             let questions = if is_manager {
                 self.tasks.questions(Some(&channel), "open")?
