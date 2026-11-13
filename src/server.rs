@@ -139,7 +139,7 @@ impl Server {
             .filter(|value| *value > 0)
             .unwrap_or(300);
 
-        Self {
+        let server = Self {
             auth: AuthStore::new(db.clone()),
             history: HistoryStore::new(db.clone()),
             tasks: TaskStore::new(db.clone(), lease_seconds),
@@ -156,7 +156,68 @@ impl Server {
             db,
             session_gate: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(ServerInner::default())),
+        };
+        // The poster gets its own idle launcher so the server's launcher does
+        // not hold a reference to itself. Posting never wakes anyone.
+        let poster = Self {
+            wakes: WakeManager::new(server.db.clone()),
+            ..server.clone()
+        };
+        server.wakes.set_notifier(Arc::new(move |failure| {
+            if let Err(err) = poster.post_wake_failure(failure) {
+                eprintln!("wake failure notice @{}: {err:#}", failure.principal_id);
+            }
+        }));
+        server
+    }
+
+    /// Tell the channel that woke an account that its agent did not run.
+    /// The notice is not passed to webhooks or launchers, so a failing agent
+    /// cannot set off more launches by being reported.
+    fn post_wake_failure(&self, failure: &crate::wake::WakeFailure) -> Result<()> {
+        let channel = failure.channel.as_str();
+        let body = failure.notice();
+        let message = self.history.append(channel, SERVER_NAME, &body)?;
+        let mut tags = vec![
+            ("seq", message.seq.to_string()),
+            ("msg-id", message.msg_id.clone()),
+            ("time", message.created_at.to_string()),
+            ("wake-failed", failure.principal_id.clone()),
+        ];
+        if let Some(task_id) = &failure.task_id {
+            tags.push(("task-id", task_id.clone()));
         }
+        let tag_str = format_message_tags(&tags);
+        if let Some((left, right)) = channel
+            .strip_prefix("@dm:")
+            .and_then(|pair| pair.split_once(':'))
+        {
+            // A direct message: tell the other side, who sent it.
+            let peer = if left.eq_ignore_ascii_case(&failure.principal_id) {
+                right
+            } else {
+                left
+            };
+            let client = self
+                .inner
+                .lock()
+                .expect("server mutex poisoned")
+                .clients
+                .get(peer)
+                .cloned();
+            if let Some(client) = client {
+                let target = self.display_name(peer).unwrap_or_else(|_| peer.to_string());
+                let _ = client
+                    .tx
+                    .send(format!("{tag_str} :{SERVER_NAME} NOTICE {target} :{body}"));
+            }
+            return Ok(());
+        }
+        self.broadcast_message(
+            channel,
+            format!("{tag_str} :{SERVER_NAME} NOTICE {channel} :{body}"),
+            message.seq,
+        )
     }
 
     pub fn auth(&self) -> &AuthStore {
@@ -4026,6 +4087,69 @@ mod tests {
             reconnected_rx.try_recv().is_err(),
             "re-joining already online channel should not emit duplicate JOIN/NAMES"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_wake_is_reported_in_the_channel_once_per_quota_cooldown() -> Result<()> {
+        let server = test_server()?;
+        let (human, _) = server
+            .auth()
+            .register_principal("quota-human", None, None)?;
+        let (agent, _) = server
+            .auth()
+            .register_principal("quota-agent", None, None)?;
+        let (command, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        server.wakes().upsert(
+            &agent.id,
+            crate::wake::WakeConfigInput {
+                command: command.into(),
+                args: vec![
+                    flag.into(),
+                    "echo 429 Too Many Requests: RESOURCE_EXHAUSTED 1>&2 && exit 1".into(),
+                ],
+                cooldown_seconds: Some(0),
+                timeout_seconds: Some(10),
+                ..Default::default()
+            },
+        )?;
+        let notices = || -> Result<Vec<String>> {
+            Ok(server
+                .history()
+                .after("#cams", 0, 50)?
+                .into_iter()
+                .filter(|m| m.body.starts_with("wake failed:"))
+                .map(|m| m.body)
+                .collect())
+        };
+
+        server.post_message(&human, "#cams", "@quota-agent please build")?;
+        for _ in 0..200 {
+            if !notices()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let posted = notices()?;
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert!(
+            posted[0].starts_with("wake failed: @quota-agent is out of quota (exited with code 1: 429 Too Many Requests"),
+            "{}",
+            posted[0]
+        );
+
+        // Later mentions are held back without launching or posting again.
+        server.post_message(&human, "#cams", "@quota-agent are you there?")?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(notices()?.len(), 1);
+        let runs = server.wakes().runs(Some(&agent.id), 10)?;
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, "skipped");
+        assert_eq!(runs[1].status, "failed");
         Ok(())
     }
 

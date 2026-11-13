@@ -48,6 +48,41 @@ const DEFAULT_TIMEOUT_SECONDS: i64 = 1800;
 const DEFAULT_MAX_RUNS_PER_HOUR: i64 = 30;
 const MAX_DM_WAKE_DEPTH: u32 = 2;
 const LOG_TAIL_BYTES: usize = 4000;
+/// How long an account's wake-ups are held back after its agent reported
+/// that its provider is out of quota.
+pub const QUOTA_COOLDOWN_SECONDS: i64 = 900;
+const FAILURE_SUMMARY_CHARS: usize = 200;
+
+/// A launch that did not succeed, reported to the channel that caused it.
+#[derive(Clone, Debug)]
+pub struct WakeFailure {
+    pub principal_id: String,
+    pub nick: String,
+    pub channel: String,
+    pub task_id: Option<String>,
+    /// Exit code or launch error followed by the agent's last words.
+    pub summary: String,
+    /// Set when the agent ran out of quota: wake-ups wait until this time.
+    pub cooldown_until: Option<i64>,
+}
+
+impl WakeFailure {
+    /// The text posted in the channel.
+    pub fn notice(&self) -> String {
+        match self.cooldown_until {
+            Some(until) => format!(
+                "wake failed: @{} is out of quota ({}); its wake-ups are paused for {} minutes (until unix time {until})",
+                self.nick,
+                self.summary,
+                ((until - unix_timestamp()).max(0) + 59) / 60
+            ),
+            None => format!("wake failed: @{} {}", self.nick, self.summary),
+        }
+    }
+}
+
+/// Receives launch failures; the server posts them in the origin channel.
+pub type WakeNotifier = Arc<dyn Fn(&WakeFailure) + Send + Sync>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WakeConfig {
@@ -155,6 +190,71 @@ pub struct WakeManager {
     slots: Arc<Mutex<HashMap<String, Slot>>>,
     dm_states: Arc<Mutex<HashMap<String, DmWakeState>>>,
     server_url: Arc<Mutex<String>>,
+    notifier: Arc<Mutex<Option<WakeNotifier>>>,
+    /// Lowercased account id -> unix time its quota cooldown ends.
+    quota_cooldowns: Arc<Mutex<HashMap<String, i64>>>,
+}
+
+/// The line of a failed agent's output that says its provider is out of
+/// quota or rate limited, if any.
+pub fn quota_exhausted(text: &str) -> Option<&str> {
+    const MARKERS: &[&str] = &[
+        "resource_exhausted",
+        "resource exhausted",
+        "out of quota",
+        "quota exceeded",
+        "exceeded your current quota",
+        "insufficient_quota",
+        "too many requests",
+        "rate_limit_exceeded",
+        "usage limit reached",
+    ];
+    text.lines().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        if MARKERS.iter().any(|marker| lower.contains(marker)) {
+            return true;
+        }
+        // A bare 429 is only a quota error next to HTTP wording, so that a
+        // line number or count does not pause an account.
+        let has_429 = lower.match_indices("429").any(|(at, _)| {
+            let before = lower[..at].chars().next_back();
+            let after = lower[at + 3..].chars().next();
+            !before.is_some_and(|c| c.is_ascii_digit())
+                && !after.is_some_and(|c| c.is_ascii_digit())
+        });
+        has_429
+            && ["http", "status", "code", "error"]
+                .iter()
+                .any(|w| lower.contains(w))
+    })
+}
+
+/// A one-line, bounded description of why a run failed.
+fn failure_summary(head: &str, detail: &str) -> String {
+    let detail: String = detail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let detail = detail.trim();
+    let mut out = if detail.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}: {detail}")
+    };
+    if out.chars().count() > FAILURE_SUMMARY_CHARS {
+        out = out
+            .chars()
+            .take(FAILURE_SUMMARY_CHARS - 3)
+            .collect::<String>()
+            + "...";
+    }
+    out
+}
+
+/// The last non-empty line of the agent's error output, else of its output.
+fn last_words<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
+    let last = |text: &'a str| text.lines().rev().map(str::trim).find(|l| !l.is_empty());
+    last(stderr).or_else(|| last(stdout)).unwrap_or("")
 }
 
 /// Whether a launcher's executable can be found: a path that exists, or a
@@ -346,6 +446,67 @@ impl WakeManager {
             slots: Arc::new(Mutex::new(HashMap::new())),
             dm_states: Arc::new(Mutex::new(HashMap::new())),
             server_url: Arc::new(Mutex::new("http://127.0.0.1:6680".to_string())),
+            notifier: Arc::new(Mutex::new(None)),
+            quota_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Where launch failures are reported.
+    pub fn set_notifier(&self, notifier: WakeNotifier) {
+        *self.notifier.lock().expect("wake notifier mutex poisoned") = Some(notifier);
+    }
+
+    /// When the account's quota cooldown ends, if it is cooling down now.
+    pub fn quota_cooldown_until(&self, principal_id: &str) -> Option<i64> {
+        let key = principal_id.trim().to_ascii_lowercase();
+        let mut cooldowns = self
+            .quota_cooldowns
+            .lock()
+            .expect("quota cooldown mutex poisoned");
+        match cooldowns.get(&key) {
+            Some(&until) if until > unix_timestamp() => Some(until),
+            Some(_) => {
+                cooldowns.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn clear_quota_cooldown(&self, principal_id: &str) {
+        self.quota_cooldowns
+            .lock()
+            .expect("quota cooldown mutex poisoned")
+            .remove(&principal_id.trim().to_ascii_lowercase());
+    }
+
+    /// The note for a wake held back by a quota cooldown. Owner launches go
+    /// through so the owner can check whether the quota is back.
+    fn quota_skip_note(&self, ctx: &WakeContext) -> Option<String> {
+        if ctx.event.as_deref() == Some("owner") {
+            return None;
+        }
+        let until = self.quota_cooldown_until(&ctx.principal_id)?;
+        Some(format!(
+            "skipped: out of quota, wake-ups paused until unix time {until}"
+        ))
+    }
+
+    fn report_failure(&self, ctx: &WakeContext, summary: String, cooldown_until: Option<i64>) {
+        let notifier = self
+            .notifier
+            .lock()
+            .expect("wake notifier mutex poisoned")
+            .clone();
+        if let Some(notify) = notifier {
+            notify(&WakeFailure {
+                principal_id: ctx.principal_id.clone(),
+                nick: ctx.nick.clone(),
+                channel: ctx.channel.clone(),
+                task_id: ctx.task_id.clone(),
+                summary,
+                cooldown_until,
+            });
         }
     }
 
@@ -355,7 +516,11 @@ impl WakeManager {
 
     pub fn upsert(&self, principal_id: &str, input: WakeConfigInput) -> Result<WakeConfig> {
         let db = self.db.lock().expect("sqlite mutex poisoned");
-        Self::upsert_on(&db, principal_id, input)
+        let saved = Self::upsert_on(&db, principal_id, input)?;
+        drop(db);
+        // A changed launcher (another account or model) may have quota left.
+        self.clear_quota_cooldown(principal_id);
+        Ok(saved)
     }
 
     /// Save a launcher as part of a larger provisioning transaction.
@@ -548,6 +713,9 @@ impl WakeManager {
             )
             .context("toggle wake config")?;
         drop(db);
+        if changed > 0 {
+            self.clear_quota_cooldown(principal_id);
+        }
         if changed > 0 && !enabled {
             self.dm_states
                 .lock()
@@ -692,6 +860,12 @@ impl WakeManager {
         let Some(cfg) = self.get(&ctx.principal_id)?.filter(|cfg| cfg.enabled) else {
             return Ok(false);
         };
+        if let Some(note) = self.quota_skip_note(&ctx) {
+            let run_id = format!("wake_{}", Uuid::new_v4().simple());
+            let now = unix_timestamp();
+            self.insert_run(&run_id, &ctx, "skipped", now, Some(now), None, Some(&note))?;
+            return Ok(false);
+        }
         if let Some(note) = self.check_and_record_dm_wake(&ctx)? {
             let run_id = format!("wake_{}", Uuid::new_v4().simple());
             let now = unix_timestamp();
@@ -880,6 +1054,20 @@ impl WakeManager {
         let run_id = format!("wake_{}", Uuid::new_v4().simple());
         let started = unix_timestamp();
 
+        // A wake queued before the quota ran out waits out the cooldown too.
+        if let Some(note) = self.quota_skip_note(ctx) {
+            self.insert_run(
+                &run_id,
+                ctx,
+                "skipped",
+                started,
+                Some(started),
+                None,
+                Some(&note),
+            )?;
+            return Ok(());
+        }
+
         let recent = self.count_runs_since(&ctx.principal_id, started - 3600)?;
         if cfg.max_runs_per_hour > 0 && recent >= cfg.max_runs_per_hour {
             let note = format!(
@@ -974,6 +1162,7 @@ impl WakeManager {
             Err(err) => {
                 let note = format!("could not start '{}': {err}", cfg.command);
                 self.finish_run(&run_id, "failed", None, Some(&note))?;
+                self.report_failure(ctx, failure_summary(&note, ""), None);
                 return Ok(());
             }
         };
@@ -981,10 +1170,12 @@ impl WakeManager {
         let limit = Duration::from_secs(cfg.timeout_seconds.max(1) as u64);
         match tokio::time::timeout(limit, child.wait_with_output()).await {
             Ok(Ok(output)) => {
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                if !output.stderr.is_empty() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let mut text = stdout.clone().into_owned();
+                if !stderr.is_empty() {
                     text.push_str("\n[stderr]\n");
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
+                    text.push_str(&stderr);
                 }
                 let status = if output.status.success() { "ok" } else { "failed" };
                 if resuming {
@@ -1008,14 +1199,38 @@ impl WakeManager {
                     output.status.code().map(i64::from),
                     Some(tail(&text)),
                 )?;
+                if output.status.success() {
+                    self.clear_quota_cooldown(&ctx.principal_id);
+                } else {
+                    let head = match output.status.code() {
+                        Some(code) => format!("exited with code {code}"),
+                        None => "was stopped by a signal".to_string(),
+                    };
+                    // Only a failed run is read for quota errors: a working
+                    // agent may well talk about them.
+                    let quota_line = quota_exhausted(&stderr).or_else(|| quota_exhausted(&stdout));
+                    let cooldown_until = quota_line.map(|_| {
+                        let until = unix_timestamp() + QUOTA_COOLDOWN_SECONDS;
+                        self.quota_cooldowns
+                            .lock()
+                            .expect("quota cooldown mutex poisoned")
+                            .insert(ctx.principal_id.trim().to_ascii_lowercase(), until);
+                        until
+                    });
+                    let detail = quota_line.unwrap_or_else(|| last_words(&stdout, &stderr));
+                    self.report_failure(ctx, failure_summary(&head, detail), cooldown_until);
+                }
             }
             Ok(Err(err)) => {
-                self.finish_run(&run_id, "failed", None, Some(&format!("wait failed: {err}")))?;
+                let note = format!("wait failed: {err}");
+                self.finish_run(&run_id, "failed", None, Some(&note))?;
+                self.report_failure(ctx, failure_summary(&note, ""), None);
             }
             Err(_) => {
                 // Dropping the wait future drops the child, which kills it.
                 let note = format!("killed after timeout_seconds={}", cfg.timeout_seconds);
                 self.finish_run(&run_id, "timeout", None, Some(&note))?;
+                self.report_failure(ctx, failure_summary(&note, ""), None);
             }
         }
         Ok(())
@@ -1495,6 +1710,236 @@ mod tests {
             .iter()
             .all(|run| run.status == "skipped"));
         Ok(())
+    }
+
+    /// A launcher that runs one shell line.
+    fn shell_launcher(line: &str) -> WakeConfigInput {
+        let (command, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        WakeConfigInput {
+            command: command.to_string(),
+            args: vec![flag.to_string(), line.to_string()],
+            enabled: Some(true),
+            cooldown_seconds: Some(0),
+            timeout_seconds: Some(10),
+            ..Default::default()
+        }
+    }
+
+    fn collect_failures(wakes: &WakeManager) -> Arc<Mutex<Vec<WakeFailure>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        wakes.set_notifier(Arc::new(move |failure: &WakeFailure| {
+            sink.lock().unwrap().push(failure.clone());
+        }));
+        seen
+    }
+
+    #[test]
+    fn quota_exhausted_finds_quota_errors_but_not_stray_numbers() {
+        for line in [
+            "Error: 8 RESOURCE_EXHAUSTED: Quota exceeded for model",
+            "You are out of quota for today",
+            "API Error: 429 Too Many Requests",
+            "request failed with status 429",
+            r#"{"error":{"code":429,"message":"slow down"}}"#,
+            "HTTP 429",
+            "Claude usage limit reached. Your limit resets at 5pm",
+            "insufficient_quota: You exceeded your current quota",
+        ] {
+            assert_eq!(
+                quota_exhausted(&format!("start\n{line}\nend")),
+                Some(line),
+                "{line}"
+            );
+        }
+        for text in [
+            "",
+            "Error: permission denied",
+            "error: 14290 bytes written",
+            "processed 429 files",
+        ] {
+            assert_eq!(quota_exhausted(text), None, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_launch_posts_a_notice_naming_the_account_and_error() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        let failures = collect_failures(&wakes);
+        wakes.upsert(
+            "agent-a",
+            shell_launcher("echo working && echo boom: no repo 1>&2 && exit 3"),
+        )?;
+
+        assert!(wakes.request(task_ctx("pm", "agent-a", "task_9"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+
+        let seen = failures.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let failure = &seen[0];
+        assert_eq!(failure.principal_id, "agent-a");
+        assert_eq!(failure.channel, "#cams");
+        assert_eq!(failure.task_id.as_deref(), Some("task_9"));
+        assert_eq!(failure.cooldown_until, None);
+        assert_eq!(failure.summary, "exited with code 3: boom: no repo");
+        assert_eq!(
+            failure.notice(),
+            "wake failed: @agent-a exited with code 3: boom: no repo"
+        );
+        // A plain failure does not hold back the next wake.
+        assert_eq!(wakes.quota_cooldown_until("agent-a"), None);
+        assert!(wakes.request(task_ctx("pm", "agent-a", "task_9"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+        assert_eq!(failures.lock().unwrap().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn launcher_that_cannot_start_posts_a_notice() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        let failures = collect_failures(&wakes);
+        wakes.upsert(
+            "agent-a",
+            WakeConfigInput {
+                command: "aircd-no-such-agent-binary".into(),
+                cooldown_seconds: Some(0),
+                ..Default::default()
+            },
+        )?;
+
+        assert!(wakes.request(channel_ctx("tony", "agent-a", "#quest"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+
+        let seen = failures.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].channel, "#quest");
+        assert!(
+            seen[0]
+                .notice()
+                .starts_with("wake failed: @agent-a could not start 'aircd-no-such-agent-binary'"),
+            "{}",
+            seen[0].notice()
+        );
+        assert_eq!(wakes.runs(Some("agent-a"), 10)?[0].status, "failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_and_quota_free_runs_post_nothing() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        let failures = collect_failures(&wakes);
+        // A working agent that talks about quota errors is not paused.
+        wakes.upsert(
+            "agent-a",
+            shell_launcher("echo fixing RESOURCE_EXHAUSTED handling"),
+        )?;
+        assert!(wakes.request(channel_ctx("tony", "agent-a", "#cams"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+        assert!(failures.lock().unwrap().is_empty());
+        assert_eq!(wakes.quota_cooldown_until("agent-a"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_exhaustion_starts_a_cooldown_that_suppresses_later_wakes() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        let failures = collect_failures(&wakes);
+        wakes.upsert(
+            "agent-a",
+            shell_launcher("echo Error: RESOURCE_EXHAUSTED: out of quota 1>&2 && exit 1"),
+        )?;
+
+        assert!(wakes.request(task_ctx("pm", "agent-a", "task_1"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+
+        let seen = failures.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let until = seen[0]
+            .cooldown_until
+            .expect("quota failure sets a cooldown");
+        let now = unix_timestamp();
+        assert!(until > now && until <= now + QUOTA_COOLDOWN_SECONDS);
+        assert_eq!(wakes.quota_cooldown_until("AGENT-A"), Some(until));
+        assert!(
+            seen[0].summary.contains("RESOURCE_EXHAUSTED"),
+            "{}",
+            seen[0].summary
+        );
+        assert!(
+            seen[0].notice().contains("is out of quota") && seen[0].notice().contains("15 minutes"),
+            "{}",
+            seen[0].notice()
+        );
+
+        // Mentions, DMs and tasks during the cooldown neither launch nor post.
+        assert!(!wakes.request(channel_ctx("tony", "agent-a", "#cams"))?);
+        assert!(!wakes.request(dm_ctx("tony", "agent-a"))?);
+        assert!(!wakes.request(task_ctx("pm", "agent-a", "task_2"))?);
+        assert_eq!(failures.lock().unwrap().len(), 1);
+        let runs = wakes.runs(Some("agent-a"), 10)?;
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs.iter().filter(|run| run.status == "skipped").count(), 3);
+        assert!(runs
+            .iter()
+            .filter(|run| run.status == "skipped")
+            .all(|run| run
+                .log_tail
+                .as_deref()
+                .is_some_and(|n| n.contains("out of quota"))));
+
+        // The owner can still launch it to check whether the quota is back;
+        // a successful run ends the cooldown.
+        wakes.upsert("agent-a", fast_launcher(true))?;
+        assert_eq!(
+            wakes.quota_cooldown_until("agent-a"),
+            None,
+            "a new launcher clears it"
+        );
+        wakes
+            .quota_cooldowns
+            .lock()
+            .unwrap()
+            .insert("agent-a".into(), unix_timestamp() + 60);
+        let owner = WakeContext {
+            event: Some("owner".into()),
+            ..channel_ctx("tony", "agent-a", "#cams")
+        };
+        assert!(wakes.request(owner)?);
+        wait_until_idle(&wakes, "agent-a").await;
+        assert_eq!(wakes.quota_cooldown_until("agent-a"), None);
+        assert!(wakes.request(channel_ctx("tony", "agent-a", "#cams"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+        Ok(())
+    }
+
+    #[test]
+    fn expired_quota_cooldowns_are_forgotten() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes
+            .quota_cooldowns
+            .lock()
+            .unwrap()
+            .insert("agent-a".into(), unix_timestamp() - 1);
+        assert_eq!(wakes.quota_cooldown_until("agent-a"), None);
+        assert!(wakes.quota_cooldowns.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failure_summary_is_one_bounded_line() {
+        assert_eq!(
+            failure_summary("exited with code 1", ""),
+            "exited with code 1"
+        );
+        let long = failure_summary("exited with code 1", &format!("a\tb\r{}", "x".repeat(500)));
+        assert_eq!(long.chars().count(), FAILURE_SUMMARY_CHARS);
+        assert!(long.starts_with("exited with code 1: a b x") && long.ends_with("..."));
+        assert_eq!(last_words("out\nlast out\n", "  \n"), "last out");
+        assert_eq!(last_words("out", "err one\nerr two\n\n"), "err two");
     }
 
     #[tokio::test]
