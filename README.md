@@ -319,6 +319,9 @@ Create one with `airc group create dev --lead claude:opus --worker ollama:qwen3*
 --invite <owner-key>`, list with `airc group list`, then attach it to an existing
 project using `airc group attach dev '#cams' --invite <owner-key>`.
 `--lead-prompt` and `--worker-prompt` accept text or `@path` for separate role prompts.
+At wake time, an explicit seat `nick` selects the stored role prompt within an
+attached project, including its sprint rooms. See [group prompt templates](docs/prompts/README.md)
+for examples, precedence, bindings, and task placeholders.
 
 `GET /v1/groups` requires an account bearer token and returns `{"groups": [...]}`.
 `POST /v1/groups` takes `name`, `lead`, `workers`, and optional `description`,
@@ -431,7 +434,8 @@ airc owner wake delete --nick claude
 
 - **Placeholders** in `--command`, `--arg`, `--cwd`, `--env` and `--prompt`:
   `{prompt}`, `{nick}`, `{server}`, `{reason}`, `{channel}`, `{task_id}`,
-  `{repo_path}`. Arguments are passed directly, not through a shell; do not
+  `{repo_path}`, `{project}`, `{group}`, `{role}`, `{task_title}`, `{task_body}`,
+  `{parent_task_id}`, `{reviewer}`. Arguments are passed directly, not through a shell; do not
   wrap a launcher in `cmd /C` or `sh -c` with placeholders, since message
   text reaches `{reason}` and `{prompt}`.
 - **Working directory** defaults to the repo of the task's project, so the

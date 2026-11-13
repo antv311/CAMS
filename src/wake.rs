@@ -60,7 +60,7 @@ pub struct WakeConfig {
     pub cwd: Option<String>,
     /// Extra environment for the agent. A `null` value removes the variable.
     pub env: BTreeMap<String, Option<String>>,
-    /// Prompt template substituted for `{prompt}`. Defaults to [`DEFAULT_PROMPT`].
+    /// Account prompt fallback; an attached group's stored role prompt takes precedence.
     pub prompt: Option<String>,
     pub enabled: bool,
     /// Pause after a run before the next queued wake-up starts.
@@ -306,12 +306,38 @@ fn one_of(value: Option<String>, allowed: &[&str], name: &str) -> Result<String>
 
 /// Replace `{name}` placeholders. Unknown placeholders are left as written.
 pub fn expand(template: &str, vars: &[(&str, &str)]) -> String {
-    let mut out = template.to_string();
-    for (key, value) in vars {
-        out = out.replace(&format!("{{{key}}}"), value);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(end) = rest.find('}') else {
+            break;
+        };
+        let key = &rest[1..end];
+        if let Some((_, value)) = vars.iter().find(|(name, _)| *name == key) {
+            out.push_str(value);
+            rest = &rest[end + 1..];
+        } else {
+            // Literal braces (for example a JSON object) may surround a
+            // known placeholder. Keep scanning the original template only.
+            out.push('{');
+            rest = &rest[1..];
+        }
     }
+    out.push_str(rest);
     out
 }
+
+struct GroupPrompt {
+    name: String,
+    role: &'static str,
+    template: Option<String>,
+}
+
+#[cfg(test)]
+#[path = "wake_prompt_tests.rs"]
+mod prompt_tests;
 
 impl WakeManager {
     pub fn new(db: Arc<Mutex<Connection>>) -> Self {
@@ -723,6 +749,133 @@ impl WakeManager {
         }
     }
 
+    /// Resolve named seats only, within the event's project. Client/model/count
+    /// describe desired seats, not the identity of an existing account.
+    fn group_prompt(&self, ctx: &WakeContext, project: &str) -> Result<Option<GroupPrompt>> {
+        let mut selected = None;
+        for group in crate::store::GroupStore::new(self.db.clone()).list()? {
+            if !group.projects.iter().any(|channel| channel == project) {
+                continue;
+            }
+            let definition = group.definition;
+            let matches = |member: &crate::store::GroupMember| {
+                member.nick.as_deref().is_some_and(|nick| {
+                    nick.trim_start_matches('@').eq_ignore_ascii_case(&ctx.nick)
+                })
+            };
+            let lead = matches(&definition.lead);
+            let worker = definition.workers.iter().any(matches);
+            if !lead && !worker {
+                continue;
+            }
+            if selected.is_some() || (lead && worker) {
+                return Err(anyhow!(
+                    "ambiguous group role for @{} in {project}; bind this nick to one group role per project",
+                    ctx.nick
+                ));
+            }
+            selected = Some(GroupPrompt {
+                name: definition.name,
+                role: if lead { "group lead" } else { "group worker" },
+                template: if lead {
+                    definition.lead_prompt
+                } else {
+                    definition.worker_prompt
+                },
+            });
+        }
+        Ok(selected)
+    }
+
+    fn launch_vars(
+        &self,
+        cfg: &WakeConfig,
+        ctx: &WakeContext,
+        server_url: &str,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let project = crate::rooms::RoomStore::new(self.db.clone())
+            .get(&ctx.channel)?
+            .map(|room| room.project)
+            .unwrap_or_else(|| ctx.channel.clone());
+        let group = self.group_prompt(ctx, &project)?;
+        let task = ctx
+            .task_id
+            .as_deref()
+            .map(|id| crate::tasks::TaskStore::new(self.db.clone(), 0).get(id))
+            .transpose()?
+            .flatten()
+            .filter(|task| task.channel == project);
+        let default_prompt = if ctx.is_pm {
+            DEFAULT_PM_PROMPT
+        } else {
+            DEFAULT_PROMPT
+        };
+        let template = group
+            .as_ref()
+            .and_then(|group| group.template.as_deref())
+            .or(cfg.prompt.as_deref())
+            .unwrap_or(default_prompt);
+        let mut vars = vec![
+            ("nick", ctx.nick.clone()),
+            ("server", server_url.to_string()),
+            ("reason", ctx.reason.clone()),
+            ("channel", ctx.channel.clone()),
+            ("project", project),
+            ("task_id", ctx.task_id.clone().unwrap_or_default()),
+            ("repo_path", ctx.repo_path.clone().unwrap_or_default()),
+            (
+                "role",
+                group
+                    .as_ref()
+                    .map(|group| group.role)
+                    .unwrap_or(if ctx.is_pm {
+                        "project manager"
+                    } else {
+                        "member"
+                    })
+                    .to_string(),
+            ),
+            (
+                "group",
+                group
+                    .as_ref()
+                    .map(|group| group.name.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "task_title",
+                task.as_ref()
+                    .map(|task| task.title.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "task_body",
+                task.as_ref()
+                    .and_then(|task| task.body.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "parent_task_id",
+                task.as_ref()
+                    .and_then(|task| task.parent_task_id.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "reviewer",
+                task.as_ref()
+                    .and_then(|task| task.reviewer.clone())
+                    .unwrap_or_default(),
+            ),
+        ];
+        let refs: Vec<_> = vars
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        let prompt = expand(template, &refs);
+        vars.push(("prompt", prompt));
+        Ok(vars)
+    }
+
     async fn run_once(&self, cfg: &WakeConfig, ctx: &WakeContext) -> Result<()> {
         let run_id = format!("wake_{}", Uuid::new_v4().simple());
         let started = unix_timestamp();
@@ -744,21 +897,21 @@ impl WakeManager {
             .clone();
         let task_id = ctx.task_id.clone().unwrap_or_default();
         let repo_path = ctx.repo_path.clone().unwrap_or_default();
-        let base_vars = [
-            ("nick", ctx.nick.as_str()),
-            ("server", server_url.as_str()),
-            ("reason", ctx.reason.as_str()),
-            ("channel", ctx.channel.as_str()),
-            ("task_id", task_id.as_str()),
-            ("repo_path", repo_path.as_str()),
-            ("role", if ctx.is_pm { "project manager" } else { "member" }),
-        ];
-        let default_prompt = if ctx.is_pm {
-            DEFAULT_PM_PROMPT
-        } else {
-            DEFAULT_PROMPT
+        let mut values = match self.launch_vars(cfg, ctx, &server_url) {
+            Ok(values) => values,
+            Err(err) => {
+                self.insert_run(
+                    &run_id,
+                    ctx,
+                    "failed",
+                    started,
+                    Some(started),
+                    None,
+                    Some(&format!("could not resolve wake prompt: {err:#}")),
+                )?;
+                return Ok(());
+            }
         };
-        let prompt = expand(cfg.prompt.as_deref().unwrap_or(default_prompt), &base_vars);
         let pm_mode = cfg.session_mode == "pm";
         let resuming = cfg.session_mode == "resume" || (pm_mode && ctx.is_pm);
         let session_key = if pm_mode || cfg.session_scope == "channel" {
@@ -773,9 +926,11 @@ impl WakeManager {
         };
         let session_id = stored_session.clone().unwrap_or_default();
 
-        let mut vars = base_vars.to_vec();
-        vars.push(("prompt", prompt.as_str()));
-        vars.push(("session_id", session_id.as_str()));
+        values.push(("session_id", session_id));
+        let vars: Vec<_> = values
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
 
         let arg_templates = if stored_session.is_some() && !cfg.resume_args.is_empty() {
             &cfg.resume_args

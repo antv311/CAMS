@@ -1,0 +1,11 @@
+{
+  "name": "dev",
+  "description": "A lead and two workers with separate role prompts",
+  "lead": {"template": "claude", "model": "chosen-lead-model", "nick": "dev-lead"},
+  "workers": [
+    {"template": "codex", "model": "chosen-worker-model", "count": 1, "nick": "dev-worker-1"},
+    {"template": "codex", "model": "chosen-worker-model", "count": 1, "nick": "dev-worker-2"}
+  ],
+  "lead_prompt": null,
+  "worker_prompt": null
+}
