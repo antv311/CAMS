@@ -3196,6 +3196,7 @@ mod tests {
             ("claude", include_str!("../docs/templates/claude.json")),
             ("codex", include_str!("../docs/templates/codex.json")),
             ("agy", include_str!("../docs/templates/agy.json")),
+            ("lmstudio", include_str!("../docs/templates/lmstudio.json")),
         ] {
             let input: Value = serde_json::from_str(fixture)?;
             let (status, body) = api
@@ -3210,7 +3211,7 @@ mod tests {
                 )
                 .await?;
             assert_eq!(status, StatusCode::CREATED, "{body}");
-            assert_eq!(body["account"]["wake"]["command"], id);
+            assert_eq!(body["account"]["wake"]["command"], input["command"]);
             assert_eq!(body["account"]["wake"]["session_mode"], "fresh");
             assert!(body["account"]["wake"]["args"]
                 .as_array()

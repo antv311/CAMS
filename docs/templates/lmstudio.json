@@ -1,0 +1,8 @@
+{
+  "name": "LM Studio",
+  "command": "lms",
+  "args": ["chat", "-y", "-p", "{prompt}", "{model}"],
+  "models_command": ["lms", "ls", "--llm", "--json"],
+  "session_mode": "fresh",
+  "session_scope": "account"
+}

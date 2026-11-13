@@ -1,15 +1,22 @@
 # Worker template presets
 
-These opt-in fixtures supply default `claude`, `codex` and `agy` templates.
+These opt-in fixtures supply default `claude`, `codex`, `agy` and `lmstudio` templates.
 They do not overwrite stored templates or run installers or client commands.
 Install each client separately and set `command` to its executable path if it
 is not on the server's PATH. Choose permissions and session settings for your
 deployment before saving a template. Each preset starts a fresh conversation.
 Model names are supplied when provisioning; the presets do not pin model lists.
+The LM Studio preset discovers local and LM Link models using
+`lms ls --llm --json`. Connect LM Link in LM Studio on the hub machine first.
+If `lms` is not on the hub process's PATH, set both `command` and the first
+entry of `models_command` to the installed `lms` executable's full path.
 
 An owner can install a fixture with `POST /v1/templates/claude` (or `codex` or
-`agy`), sending the JSON file as the body and the owner key in
+`agy` or `lmstudio`), sending the JSON file as the body and the owner key in
 `X-AirCD-Invite`. This is a full replacement of that template ID.
+Once saved, choose `m` -> create a new account -> LM Studio in the TUI.
+The model picker shows the discovered model names and uses each `modelKey`
+as the model argument when creating the account's launcher.
 
 `POST /v1/templates/{id}/spawn` takes:
 

@@ -175,24 +175,26 @@ pub struct ModelChoice {
     pub label: Option<String>,
 }
 
-/// Read a model listing. A model API's JSON (`{"data": [{"id": ...}]}`, as
-/// the Anthropic and OpenAI model lists return) gives each `id`, labelled by
-/// its `display_name` when there is one. Anything else is read as one model
-/// per line, the id first and an optional label after whitespace. Blank
-/// lines and duplicates are skipped.
+/// Read a model listing: JSON arrays, `data`/`models` lists, or a single
+/// model object. Model APIs use `id`/`display_name`; LM Studio's `lms ls`
+/// uses `modelKey`/`displayName`, including models available over LM Link.
+/// Non-JSON output is read as one model per line, the id first and an
+/// optional label after whitespace. Blank lines and duplicates are skipped.
 pub fn parse_models(output: &str) -> Vec<ModelChoice> {
     let mut out: Vec<ModelChoice> = Vec::new();
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(output.trim()) {
         let list = json
-            .get("data")
-            .or_else(|| json.get("models"))
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for entry in list {
+            .as_array()
+            .or_else(|| json.get("data").and_then(|v| v.as_array()))
+            .or_else(|| json.get("models").and_then(|v| v.as_array()));
+        for entry in list
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| std::slice::from_ref(&json))
+        {
             let Some(id) = entry
                 .get("id")
                 .and_then(|v| v.as_str())
+                .or_else(|| entry.get("modelKey").and_then(|v| v.as_str()))
                 .filter(|id| crate::store::valid_model(id))
             else {
                 continue;
@@ -203,6 +205,7 @@ pub fn parse_models(output: &str) -> Vec<ModelChoice> {
             let label = entry
                 .get("display_name")
                 .and_then(|v| v.as_str())
+                .or_else(|| entry.get("displayName").and_then(|v| v.as_str()))
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && *l != id)
                 .map(str::to_owned);
@@ -935,6 +938,86 @@ mod tests {
                 ("model-c", Some("C  label")),
             ]
         );
+    }
+
+    #[test]
+    fn parse_models_reads_lms_models_available_over_lm_link() {
+        let listed = parse_models(
+            r#"[
+            {"type":"llm", "modelKey":"qwen3.8-35b-a3b-distill-mlx",
+             "displayName":"Qwen3.8 35B A3B Distill", "format":"safetensors",
+             "path":"remote-device:publisher/model", "deviceIdentifier":"remote-device"},
+            {"type":"llm", "modelKey":"google/gemma-4-26b-a4b-qat",
+             "displayName":" Gemma 4 26B A4B QAT ", "variants":["google/gemma-4-26b-a4b-qat@4bit"]}
+        ]"#,
+        );
+        assert_eq!(
+            listed,
+            vec![
+                ModelChoice {
+                    id: "qwen3.8-35b-a3b-distill-mlx".into(),
+                    label: Some("Qwen3.8 35B A3B Distill".into())
+                },
+                ModelChoice {
+                    id: "google/gemma-4-26b-a4b-qat".into(),
+                    label: Some("Gemma 4 26B A4B QAT".into())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_models_reads_lms_wrappers_and_single_objects() {
+        for output in [
+            r#"{"data":[{"modelKey":"model-a", "displayName":"Model A"}]}"#,
+            r#"{"models":[{"modelKey":"model-a", "displayName":"Model A"}]}"#,
+            r#"{"modelKey":"model-a", "displayName":"Model A"}"#,
+            r#"[{"id":"model-a", "display_name":"Model A"}]"#,
+            r#"{"models":[{"id":"model-a", "display_name":"Model A"}]}"#,
+        ] {
+            assert_eq!(
+                parse_models(output),
+                vec![ModelChoice {
+                    id: "model-a".into(),
+                    label: Some("Model A".into()),
+                }],
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_models_skips_invalid_and_duplicate_lms_entries() {
+        let listed = parse_models(
+            r#"[
+            {"modelKey":"model-a", "displayName":"model-a"},
+            {"modelKey":"model-a", "displayName":"Duplicate"},
+            {"modelKey":"bad id", "displayName":"Invalid"},
+            {"modelKey":""}, {"modelKey":42}, null, "not a model",
+            {"displayName":"Missing key"},
+            {"id":null, "modelKey":"model-b", "display_name":null, "displayName":"Model B"},
+            {"modelKey":"model-c", "displayName":"  "}
+        ]"#,
+        );
+        assert_eq!(
+            listed,
+            vec![
+                ModelChoice {
+                    id: "model-a".into(),
+                    label: None
+                },
+                ModelChoice {
+                    id: "model-b".into(),
+                    label: Some("Model B".into())
+                },
+                ModelChoice {
+                    id: "model-c".into(),
+                    label: None
+                },
+            ]
+        );
+        assert!(parse_models(r#"{"error":"LM Link disconnected"}"#).is_empty());
+        assert!(parse_models("[]").is_empty());
     }
 
     #[test]
