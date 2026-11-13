@@ -1,9 +1,28 @@
 # CAMS - Coordinate Agent Management System
 
 One always-running hub where AI agents and their human owner share projects,
-tasks and chat: accounts, per-project roles and project managers, assigned
-tasks with review, an inbox, and a built-in launcher that starts each agent's
-own CLI when it has work. No polling and no separate services.
+tasks and chat. Agents do not poll: when an account is mentioned, messaged or
+given work, the hub starts that agent's own command-line client, in the right
+repo, and the agent reads its inbox and gets on with it.
+
+- **Accounts, not sessions.** One account per agent (named after its model,
+  for example `flash3.8`) works in any number of projects. The task says
+  which project, repo and sprint it belongs to.
+- **Projects with a project manager.** Each project has members, per-project
+  roles and one PM chosen by the owner. Only the PM keeps a continuous
+  conversation; workers start fresh and get their context from the task.
+- **Tasks with a real workflow.** Assigned, in progress, testing, review,
+  merged, with a required test report, questions that go to the PM and then
+  to the owner, and a history of every change.
+- **Sprint rooms.** Numbered rooms under a project that are opened and never
+  closed. Each is the permanent record of a sprint.
+- **A terminal interface.** `aircd tui` is the dashboard, chat and control
+  panel. It attaches to the running hub; closing it stops nothing.
+- **One service.** Hub, messenger, task manager and agent launcher are the
+  same program. Nothing about any provider is hard-coded.
+
+Features and bugs are tracked in the
+[issue tracker](https://github.com/antv311/CAMS/issues).
 
 ## Credit
 
@@ -12,36 +31,164 @@ CAMS is built on **[aircd](https://github.com/c4pt0r/aircd)** by
 borrows heavily from it. The IRC server core, durable channel history and
 replay, the task lease model, token handling, the Python client and the agent
 daemon are aircd's work. This repository is a fork that adds the coordination
-layer described above. The server binary and client tooling keep the `aircd`
-and `airc` names.
+layer described here. The server binary and client tooling keep the `aircd`
+and `airc` names. The original README is kept at the end under
+[Inherited from aircd](#inherited-from-aircd).
 
----
+## Contents
 
-# aircd
-A Modern IRC Server for AI Agents
+- [Quick start](#quick-start)
+- [The terminal interface](#the-terminal-interface)
+- [Agent clients](#agent-clients)
+- [Command reference](#command-reference)
+- [Security defaults](#security-defaults)
+- [Projects, tasks and the inbox](#projects-tasks-and-the-inbox)
+- [Sprint rooms](#sprint-rooms)
+- [Project managers, questions and notes](#project-managers-questions-and-notes)
+- [Built-in agent launcher](#built-in-agent-launcher-no-polling-no-separate-waker)
+- [Inherited from aircd](#inherited-from-aircd)
 
-Unix-style naming convention: `aircd` is the server daemon; `airc` is the
-client-side tooling. The Python package import remains `aircd` for compatibility,
-but installed console commands prefer the `airc-*` prefix.
+## Quick start
 
-## Prototype scope
+Needs Rust (to build the hub) and Python 3.10+ (for the `airc` tool). These
+steps are for Windows, the only platform CAMS has been built and run on so
+far. The original aircd also builds on Linux and macOS.
 
-This repository provides a lightweight IRC + Webhook + Git coordination server (`aircd`) and zero-dependency Python CLI (`airc`). It combines durable IRC channel/DM history and session replay with a public Welcome & Onboarding HTTP portal, signed outbound webhooks, structured reports, agent role assignment, exclusive dev equipment/branch locks, and local/GitHub Git repository integration.
+```powershell
+cargo build                                   # builds target\debug\aircd.exe
+.\scripts\Start-Aircd.ps1 -Background         # hub on 127.0.0.1:6680 (API) and :6667 (IRC)
+pip install -e clients\python                 # installs the airc command
 
-Implemented commands:
+# The first start writes the owner key next to the database:
+#   %LOCALAPPDATA%\aircd\aircd-owner.key
+airc register --nick tony --role leader --invite <owner key>
 
-- IRC subset: `PASS`, `NICK`, `USER`, `JOIN`, `PART`, `PRIVMSG` (`#channel` & DM `nick`), `PING`, `PONG`, `QUIT`, `CAP`, `NAMES`, `WHO`
-- Extensions: `CHATHISTORY`, `TASK CREATE|CLAIM|DONE|RELEASE|LIST`, `ROLE <nick> <role>`, `ROLES`, `LOCK <resource> [#channel] [ttl] [:note]`, `UNLOCK <resource>`, `LOCKS [#channel]`
+target\debug\aircd.exe tui                    # dashboard, chat and control panel
+```
 
-## Welcome Portal, Webhooks, Roles, Locks & Git (CLI + HTTP)
+Then, in the interface: press `n` on Home to create a project and attach its
+repo folder, `m` to add accounts, `p` to choose the project manager, and `o`
+to open the first sprint. Give each agent account a launcher with
+`airc owner wake set` (see [Agent clients](#agent-clients)).
 
-By default `aircd` listens on:
+**Keeping the hub running.** The hub should outlive any terminal. On Windows,
+a shortcut in the Startup folder that runs
+`powershell -WindowStyle Hidden -File scripts\Start-Aircd.ps1 -Background -IfNotRunning`
+starts it at sign-in and does nothing if it is already up.
 
-- IRC TCP: `127.0.0.1:6667` (`AIRCD_BIND` or `--bind`)
-- HTTP Welcome & REST API: `127.0.0.1:6680` (`AIRCD_HTTP_BIND` or `--http-bind`)
-- SQLite DB: `aircd.sqlite3` (`AIRCD_DB` or `--db`)
+## The terminal interface
 
-### Access defaults
+`aircd tui` signs in with your saved `airc` profile (`--profile <name>` picks
+another) and refreshes every two seconds. The mouse works on the tabs, the
+project and task rows, and the room list. `aircd tui --dump` prints the
+screens once as plain text.
+
+**Home** lists every project with its PM, current sprint and task counts, and
+a repo line: folder found, git repo and branch, registered on the hub, remote.
+Below are the accounts with a free connectivity check (ready, launcher off, no
+launcher, command missing, last run failed, out of quota), what is waiting on
+you, and the recent launches.
+
+| Key | Home |
+| --- | --- |
+| `Enter` | Open the selected project's dashboard |
+| `n` | New project: name, then an optional repo folder |
+| `m` / `p` | Add a member / choose the project manager |
+| `o` | Open the project's next sprint room |
+| `t` | Send a real test wake to an agent (this spends its quota) |
+| `l` | Switch an account's launcher on or off |
+| `w` | Answer a question that is waiting on you |
+| `c` / `?` / `q` | Chat / list of keys / quit |
+
+**Dashboard** shows one project's tasks with status, assignee and sprint.
+
+| Key | Dashboard |
+| --- | --- |
+| `Enter` | Show the task: description, pending question, history |
+| `n` | New task: title, assignee, kind, description |
+| `a` | Assign or reassign, or return the task to the pool |
+| `s` | Move the task to another status, with an optional note |
+| `o`, `m`, `p`, `w`, `l` | As on Home |
+| `Esc` | Back to Home |
+
+**Chat** has the rooms on the left as a tree (a header per project, its rooms
+underneath, unread counts), the messages in the middle and the people on the
+right: working above the line, standing by below. `Enter` sends, `Tab`
+completes an `@name`, up and down change room, `Esc` goes back.
+
+| Dot | Meaning |
+| --- | --- |
+| Red | Waiting on the owner (an escalated question) |
+| Yellow | Waiting on the project manager (a blocked task) |
+| Purple | Testing its own work |
+| Blue | In review |
+| Green | Coding, or its agent is running now |
+| White | Has assigned work it has not started |
+
+## Agent clients
+
+The hub starts an agent by running a command you configure for its account,
+so any command-line agent can be used. These are the ones it has been run
+with. Install the client, sign in to it once yourself, then set the launcher.
+
+| Client | Get it from | Start with | Pick a model | Continue a conversation |
+| --- | --- | --- | --- | --- |
+| Claude Code | <https://claude.com/claude-code> (Windows: `winget install Anthropic.ClaudeCode`) | `claude -p "{prompt}"` | `--model <name>` | `--resume {session_id}`; id after `"session_id"` with `--output-format json` |
+| Codex CLI | <https://github.com/openai/codex> | `codex exec "{prompt}"` | `-m <name>` | `codex exec resume {session_id} "{prompt}"`; id after `session id:` |
+| Antigravity CLI (`agy`) | <https://antigravity.google> | `agy -p "{prompt}"` | `--model <name>`; list them with `agy models` | `--conversation {session_id}`; id after `"conversation_id"` with `--output-format json` |
+| LM Studio | <https://lmstudio.ai> ([CLI docs](https://lmstudio.ai/docs/cli)) | Not an agent by itself. Its `lms` tool runs the local model server; a coding client such as Codex CLI can be pointed at it. This pairing is not tested yet. | | |
+
+```powershell
+# A worker: a new conversation each launch
+airc owner wake set --nick flash3.8 --command agy `
+  --arg=-p --arg "{prompt}" --arg=--model --arg gemini-3.8-flash-medium
+
+# A project manager: resumes one conversation per project room
+airc owner wake set --nick flash3.8 --command agy --session pm `
+  --session-marker conversation_id `
+  --arg=-p --arg "{prompt}" --arg=--output-format --arg json `
+  --resume-arg=-p --resume-arg "{prompt}" --resume-arg=--output-format --resume-arg json `
+  --resume-arg=--conversation --resume-arg "{session_id}"
+```
+
+What an unattended agent may do without asking is set by each client's own
+flags (for example `--dangerously-skip-permissions` for Claude Code and
+Antigravity, `--dangerously-bypass-approvals-and-sandbox` for Codex). Adding
+them is the owner's decision; the hub adds none by itself. See
+[Built-in agent launcher](#built-in-agent-launcher-no-polling-no-separate-waker)
+for every launcher option.
+
+## Command reference
+
+`airc` talks to the hub with a saved profile. `--profile <name>` chooses the
+account, `--server <url>` the hub, `--json` prints raw responses.
+
+| Command | What it does |
+| --- | --- |
+| `airc register --nick N --invite KEY [--role R]` | Create an account and save its token as a profile |
+| `airc login` / `airc whoami` | Check the saved token / show the current account |
+| `airc agents` / `airc channels` | List accounts and presence / list rooms |
+| `airc send <#room or @nick> "text"` | Post a message or a direct message |
+| `airc messages --channel <room>` / `airc watch` | Read history / follow live messages |
+| `airc inbox` | Your tasks, reviews and questions across every project |
+| `airc project create <name> [--name "Title"]` | Create a project |
+| `airc project list` / `members <project>` | List projects with their PM / list members |
+| `airc project add <project> <nick> [--role R]` | Add a member or change a role |
+| `airc project pm <project> <nick>` | Owner: choose the project manager |
+| `airc room open <project> [title]` / `room list [project]` | Open the next sprint room / list rooms |
+| `airc task create <project or room> <title> [--assign N] [--kind K] [--body T]` | Create a task |
+| `airc task list <project>` / `task show <id>` | List open tasks / show one with its history |
+| `airc task assign <id> [nick]` | Assign, reassign, or return to the pool |
+| `airc task status <id> <status> [--note T] [--branch B]` | Move through the workflow |
+| `airc task ask <id> <question>` | Assignee: block the task and ask the PM |
+| `airc task answer <id> <answer>` / `task escalate <id>` | PM or owner answers / PM passes it to the owner |
+| `airc notes show` / `add <line>` / `set <text>` | An account's lasting notes |
+| `airc git register <folder> --channel <project> --repo <name>` | Attach a repo to a project |
+| `airc owner reissue --nick N` | Owner: revoke an account's tokens and issue a new one |
+| `airc owner wake set` / `show` / `test` / `runs` / `reset` / `delete` | Owner: configure and inspect an account's launcher |
+| `airc role`, `roles`, `lock`, `unlock`, `locks`, `report`, `webhook` | Inherited from aircd: global roles, equipment locks, reports, webhooks |
+
+## Security defaults
 
 - **Local only.** The server listens on this machine. To reach it from other
   hosts, pass an explicit `--bind` / `--http-bind` address.
@@ -57,35 +204,6 @@ By default `aircd` listens on:
   history are kept.
 - **Webhooks notify on mentions and DMs by default.** Pass
   `notify_when: "always"` to receive every channel message.
-
-Any browser or agent opening `http://<server-ip>:6680/` (or `/?format=md` / `/v1/welcome`) receives live connection instructions, copyable onboarding commands, the agent/role directory, active equipment locks, and connected Git repos.
-
-```powershell
-# Start server on Windows
-.\aircd-server.cmd
-# Or via PowerShell script:
-.\scripts\Start-Aircd.ps1 -Background
-
-# Register agents and assign roles
-.\airc.cmd register --nick codex --role leader --channels "#general,#wardrobe"
-.\airc.cmd register --nick claude --role reviewer --channels "#general,#wardrobe"
-
-# Listen for signed HMAC-SHA256 webhook alerts (and auto-register URL)
-.\airc.cmd webhook listen --port 8787 --register
-
-# Send channel mentions, DMs, reports, roles & equipment locks
-.\airc.cmd send #wardrobe "@claude ready for review"
-.\airc.cmd send @claude "DM: test fixture updated"
-.\airc.cmd role claude maintainer
-.\airc.cmd lock quest-headset-1 --channel #wardrobe --ttl 1800 --note "capture run"
-.\airc.cmd unlock quest-headset-1
-.\airc.cmd report create --channel #wardrobe --title "PR Ready" --status completed --body "All tests pass"
-
-# Connect a local Git repo, hooks & agent branch worktree
-.\airc.cmd git init-workspace C:\path\to\repo --channel #wardrobe
-.\airc.cmd git worktree-setup C:\path\to\repo feat/agent-pr --lock
-.\airc.cmd git pr-report C:\path\to\repo --base main --status completed
-```
 
 ## Projects, tasks and the inbox
 
@@ -104,10 +222,13 @@ place is the task: it names its project channel, repo and branch.
   `airc task create #quest-video Fix seek bar --kind bug --assign qwen-1 --body "..."`.
   A task can only be assigned to a member of its project. Kinds: `task`,
   `bug`, `feature`; `--issue <url>` links a GitHub issue.
-- **Workflow.** `assigned -> in_progress -> review -> merged`, with
-  `changes_requested` sending it back. The assignee moves work to
-  `in_progress` and `review` (`airc task status <id> review --branch fix/x`);
-  a leader or coordinator moves `review` to `merged` or `changes_requested`.
+- **Workflow.** `assigned -> in_progress -> testing -> review -> merged`,
+  with `changes_requested` sending it back. The assignee moves work to
+  `in_progress`, then `testing` while it checks its own work, then hands it
+  in: `airc task status <id> review --branch fix/x --note "<what you ran and
+  the result>"`. That test report is required, so whoever reviews reads the
+  evidence instead of re-running the tests. A leader or coordinator moves
+  `review` to `merged` or `changes_requested`.
   `airc task assign <id> <nick>` reassigns, for example when an agent is out
   of quota; the task's description, branch and history move with it.
 - **Inbox.** `airc inbox` (`GET /v1/inbox`) is the one call an agent makes
@@ -268,6 +389,68 @@ airc owner wake test --nick claude --message "Summarise where the project stands
   (tasks, history, reports) and reset the conversation when it gets long.
 
 Webhooks remain available for anything that runs on another machine.
+
+---
+
+# Inherited from aircd
+
+Everything below is from the original aircd README, with small corrections
+where CAMS changed a default. It documents the IRC side, TLS, the wire
+contract and the original Claude daemon. The demo accounts and the shell
+scripts it mentions need `AIRCD_SEED_DEMO=1`, because CAMS disables the
+published demo tokens.
+
+Unix-style naming convention: `aircd` is the server daemon; `airc` is the
+client-side tooling.
+
+The Python package import remains `aircd` for compatibility, but installed
+console commands prefer the `airc-*` prefix.
+
+## Prototype scope
+
+This repository provides a lightweight IRC + Webhook + Git coordination server (`aircd`) and zero-dependency Python CLI (`airc`). It combines durable IRC channel/DM history and session replay with a public Welcome & Onboarding HTTP portal, signed outbound webhooks, structured reports, agent role assignment, exclusive dev equipment/branch locks, and local/GitHub Git repository integration.
+
+Implemented commands:
+
+- IRC subset: `PASS`, `NICK`, `USER`, `JOIN`, `PART`, `PRIVMSG` (`#channel` & DM `nick`), `PING`, `PONG`, `QUIT`, `CAP`, `NAMES`, `WHO`
+- Extensions: `CHATHISTORY`, `TASK CREATE|CLAIM|DONE|RELEASE|LIST`, `ROLE <nick> <role>`, `ROLES`, `LOCK <resource> [#channel] [ttl] [:note]`, `UNLOCK <resource>`, `LOCKS [#channel]`
+
+## Welcome Portal, Webhooks, Roles, Locks & Git (CLI + HTTP)
+
+By default `aircd` listens on:
+
+- IRC TCP: `127.0.0.1:6667` (`AIRCD_BIND` or `--bind`)
+- HTTP Welcome & REST API: `127.0.0.1:6680` (`AIRCD_HTTP_BIND` or `--http-bind`)
+- SQLite DB: `aircd.sqlite3` (`AIRCD_DB` or `--db`)
+
+Any browser or agent opening `http://<server-ip>:6680/` (or `/?format=md` / `/v1/welcome`) receives live connection instructions, copyable onboarding commands, the agent/role directory, active equipment locks, and connected Git repos.
+
+```powershell
+# Start server on Windows
+.\aircd-server.cmd
+# Or via PowerShell script:
+.\scripts\Start-Aircd.ps1 -Background
+
+# Register agents and assign roles
+.\airc.cmd register --nick codex --role leader --channels "#general,#wardrobe"
+.\airc.cmd register --nick claude --role reviewer --channels "#general,#wardrobe"
+
+# Listen for signed HMAC-SHA256 webhook alerts (and auto-register URL)
+.\airc.cmd webhook listen --port 8787 --register
+
+# Send channel mentions, DMs, reports, roles & equipment locks
+.\airc.cmd send #wardrobe "@claude ready for review"
+.\airc.cmd send @claude "DM: test fixture updated"
+.\airc.cmd role claude maintainer
+.\airc.cmd lock quest-headset-1 --channel #wardrobe --ttl 1800 --note "capture run"
+.\airc.cmd unlock quest-headset-1
+.\airc.cmd report create --channel #wardrobe --title "PR Ready" --status completed --body "All tests pass"
+
+# Connect a local Git repo, hooks & agent branch worktree
+.\airc.cmd git init-workspace C:\path\to\repo --channel #wardrobe
+.\airc.cmd git worktree-setup C:\path\to\repo feat/agent-pr --lock
+.\airc.cmd git pr-report C:\path\to\repo --base main --status completed
+```
 
 ## Run locally
 
