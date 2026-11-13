@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use crate::auth::{DuplicatePrincipalError, Principal};
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::locks::LockConflictError;
-use crate::server::Server;
+use crate::server::{Server, SpawnError};
 use crate::store::{ClientTemplate, ClientTemplateInput};
 
 #[derive(Clone, Debug, Serialize)]
@@ -185,6 +185,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
         .route("/v1/templates", get(list_templates))
+        .route("/v1/templates/{id}/spawn", post(spawn_template_worker))
         .route(
             "/v1/templates/{id}",
             get(get_template)
@@ -556,6 +557,68 @@ async fn delete_template(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "deleted": true })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SpawnTemplateReq {
+    invite: Option<String>,
+    nick: String,
+    model: String,
+    channels: Option<Vec<String>>,
+    /// Project role; never grants a global owner role.
+    role: Option<String>,
+}
+
+async fn spawn_template_worker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SpawnTemplateReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    // An explicit invite must be valid; an invalid invite cannot silently
+    // fall back to a bearer token. Owner-key calls need no bearer token.
+    let actor = if headers.contains_key("x-aircd-invite") || req.invite.is_some() {
+        require_owner(&state, &headers, req.invite.as_deref())?;
+        None
+    } else {
+        Some(authenticate_request(&state, &headers)?)
+    };
+    let created = state
+        .server
+        .spawn_worker_from_template(
+            actor.as_ref(),
+            &id,
+            &req.model,
+            &req.nick,
+            req.channels.as_deref().unwrap_or_default(),
+            req.role.as_deref(),
+        )
+        .map_err(|err| {
+            if let Some(error) = err.downcast_ref::<SpawnError>() {
+                match error {
+                    SpawnError::Forbidden(message) => {
+                        ApiError::new(StatusCode::FORBIDDEN, message.clone())
+                    }
+                    SpawnError::TemplateNotFound(message) => ApiError::not_found(message.clone()),
+                }
+            } else if err.downcast_ref::<DuplicatePrincipalError>().is_some() {
+                ApiError::conflict(err.to_string())
+            } else if err.downcast_ref::<rusqlite::Error>().is_some() {
+                ApiError::internal(err)
+            } else {
+                ApiError::bad_request(err.to_string())
+            }
+        })?;
+    let host = resolve_request_host(&headers, &state.info);
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "account": created,
+            "http_url": format!("http://{}:{}", host, state.info.http_port),
+        })),
     ))
 }
 
@@ -2719,6 +2782,450 @@ mod tests {
 
     fn template_body() -> Value {
         json!({"name": "Example Client", "command": "aircd-uninstalled-example-client"})
+    }
+
+    async fn spawn_api(owner_key: Option<&str>) -> Result<TemplateApi> {
+        let api = TemplateApi::start(owner_key).await?;
+        api.server
+            .templates()
+            .upsert("example", serde_json::from_value(template_body())?)?;
+        let owner = api.server.auth().set_role("human", "leader")?;
+        api.server.create_project_api(&owner, "#one", "One", None)?;
+        api.server.create_project_api(&owner, "#two", "Two", None)?;
+        Ok(api)
+    }
+
+    fn provisioning_counts(api: &TemplateApi) -> Result<Vec<i64>> {
+        let db = api.db.lock().unwrap();
+        [
+            "principals",
+            "principal_tokens",
+            "wake_configs",
+            "project_roles",
+            "channel_memberships",
+            "wake_runs",
+        ]
+        .iter()
+        .map(|table| Ok(db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn templates_spawn_http_scopes_pm_permissions_to_every_project() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let (pm, pm_token) = api.server.auth().register_principal("pm", None, None)?;
+        let (outsider, outsider_token) =
+            api.server
+                .auth()
+                .register_principal("outsider", Some("coordinator"), None)?;
+        api.server
+            .projects()
+            .set_role("#one", &pm.id, "coordinator")?;
+        api.server
+            .projects()
+            .set_role("#one", &outsider.id, "builder")?;
+        let owner = api.server.auth().authenticate("human-token")?;
+        let room = api.server.open_room_api(&owner, "#one", None)?;
+        let path = "/v1/templates/example/spawn";
+        let request = json!({"nick": "new-worker", "model": "chosen", "channels": ["#one"]});
+        let before = provisioning_counts(&api)?;
+        for (token, status) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("invalid-token"), StatusCode::UNAUTHORIZED),
+            (Some(api.token.as_str()), StatusCode::FORBIDDEN),
+            (Some(outsider_token.as_str()), StatusCode::FORBIDDEN),
+        ] {
+            let (actual, body) = api
+                .request("POST", path, token, None, Some(&request))
+                .await?;
+            assert_eq!(actual, status, "{body}");
+        }
+        for channels in [
+            json!(["#two"]),
+            json!(["#one", "#two"]),
+            json!([]),
+            json!(["#chat"]),
+        ] {
+            let mut body = request.clone();
+            body["channels"] = channels;
+            let (status, body) = api
+                .request("POST", path, Some(&pm_token), None, Some(&body))
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+        assert_eq!(provisioning_counts(&api)?, before);
+
+        let (status, body) = api
+            .request(
+                "POST",
+                path,
+                Some(&pm_token),
+                None,
+                Some(&json!({"nick": "new-worker", "model": "chosen",
+                         "channels": [room.channel, "one", "#one"], "role": "admin"})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["account"]["principal"]["role"], "member");
+        assert_eq!(
+            api.server
+                .projects()
+                .role_of("#one", "new-worker")?
+                .as_deref(),
+            Some("admin")
+        );
+        assert_eq!(api.server.projects().role_of("#two", "new-worker")?, None);
+        assert_eq!(body["account"]["channels"].as_array().unwrap().len(), 3);
+        let (_, me) = api
+            .request(
+                "GET",
+                "/v1/me",
+                body["account"]["token"].as_str(),
+                None,
+                None,
+            )
+            .await?;
+        assert_eq!(me["principal"]["id"], "new-worker");
+        let memberships: Vec<String> = {
+            let db = api.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT channel FROM channel_memberships WHERE principal_id = 'new-worker' ORDER BY channel",
+            )?;
+            let channels = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            channels
+        };
+        assert_eq!(
+            memberships,
+            vec!["#general".to_string(), "#one".to_string(), room.channel]
+        );
+        let principal = api.server.auth().resolve_by_name("new-worker")?.unwrap();
+        assert!(!Server::is_owner(&principal));
+        assert!(!api.server.is_project_manager(&principal, "#two")?);
+
+        // A second project is allowed only once the actor manages it too.
+        api.server.projects().set_role("#two", &pm.id, "leader")?;
+        let (status, body) = api
+            .request(
+                "POST",
+                path,
+                Some(&pm_token),
+                None,
+                Some(&json!({"nick": "both", "model": "chosen", "channels": ["one", "two"]})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        for project in ["#one", "#two"] {
+            assert_eq!(
+                api.server.projects().role_of(project, "both")?.as_deref(),
+                Some("member")
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_spawn_http_accepts_owner_keys_and_owner_bearers() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let path = "/v1/templates/example/spawn";
+        let request = json!({"nick": "default-worker", "model": "chosen"});
+        let before = provisioning_counts(&api)?;
+        for (key, body) in [
+            (Some("wrong"), request.clone()),
+            (
+                Some("wrong"),
+                json!({"invite": "template-owner-key", "nick": "worker", "model": "chosen"}),
+            ),
+            (
+                None,
+                json!({"invite": "wrong", "nick": "worker", "model": "chosen"}),
+            ),
+        ] {
+            let (status, body) = api
+                .request("POST", path, Some("human-token"), key, Some(&body))
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+        assert_eq!(provisioning_counts(&api)?, before);
+        let (status, body) = api.write("POST", path, Some(&request)).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["account"]["channels"], json!(["#general"]));
+        assert_eq!(body["account"]["role"], "member");
+        let (status, body) = api.request("POST", path, None, None,
+            Some(&json!({"invite": "template-owner-key", "nick": "body-key", "model": "chosen", "channels": null}))).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let open_api = spawn_api(None).await?;
+        let (status, _) = open_api.write("POST", path, Some(&request)).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = open_api
+            .request("POST", path, None, None, Some(&request))
+            .await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = open_api
+            .request(
+                "POST",
+                path,
+                Some("human-token"),
+                None,
+                Some(&json!({"nick": "owner-bearer", "model": "chosen", "channels": ["lounge"]})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["account"]["channels"], json!(["#general", "#lounge"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_spawn_http_substitutes_models_and_preserves_launcher_settings() -> Result<()>
+    {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        for mode in ["fresh", "resume", "pm"] {
+            let input = json!({
+                "name": "Custom", "command": "aircd-not-installed-{model}",
+                "args": ["--model", "{model}", "{prompt}", "{model}/{model}"],
+                "cwd": "{repo_path}/{model}",
+                "env": {"MODEL": "{model}", "REMOVE": null, "NICK": "{nick}"},
+                "prompt": "Use {model}; wake {nick} for {reason} in {repo_path}",
+                "session_mode": mode, "session_scope": "channel",
+                "session_marker": "session id:",
+                "resume_args": ["resume", "{session_id}", "--model={model}", "{prompt}"],
+                "models": ["listed-model"],
+                "models_command": ["aircd-not-installed-lister", "{model}"]
+            });
+            let source = api
+                .server
+                .templates()
+                .upsert("custom", serde_json::from_value(input)?)?;
+            let nick = format!("worker-{mode}");
+            let (status, body) = api.write("POST", "/v1/templates/custom/spawn",
+                Some(&json!({"nick": nick, "model": " chosen-v2 ", "channels": ["one"], "role": "builder"}))).await?;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let account = &body["account"];
+            assert_eq!(account["model"], "chosen-v2");
+            assert_eq!(account["template"], "custom");
+            let wake = api.server.wakes().get(&nick)?.unwrap();
+            assert_eq!(serde_json::to_value(&wake)?, account["wake"]);
+            assert_eq!(wake.command, "aircd-not-installed-chosen-v2");
+            assert_eq!(
+                wake.args,
+                ["--model", "chosen-v2", "{prompt}", "chosen-v2/chosen-v2"]
+            );
+            assert_eq!(wake.cwd.as_deref(), Some("{repo_path}/chosen-v2"));
+            assert_eq!(wake.env["MODEL"].as_deref(), Some("chosen-v2"));
+            assert_eq!(wake.env["NICK"].as_deref(), Some("{nick}"));
+            assert_eq!(wake.env["REMOVE"], None);
+            assert_eq!(
+                wake.prompt.as_deref(),
+                Some("Use chosen-v2; wake {nick} for {reason} in {repo_path}")
+            );
+            assert_eq!(wake.session_mode, mode);
+            assert_eq!(wake.session_scope, "channel");
+            assert_eq!(wake.session_marker.as_deref(), Some("session id:"));
+            assert_eq!(
+                wake.resume_args,
+                ["resume", "{session_id}", "--model=chosen-v2", "{prompt}"]
+            );
+            assert!(wake.enabled);
+            assert_eq!(wake.cooldown_seconds, 20);
+            assert_eq!(wake.timeout_seconds, 1800);
+            assert_eq!(wake.max_runs_per_hour, 12);
+            let token = account["token"].as_str().unwrap();
+            assert!(token.starts_with("airc_"));
+            assert_eq!(api.server.auth().authenticate(token)?.id, nick);
+            assert_eq!(api.server.templates().get("custom")?.unwrap(), source);
+            let stored_token: String = api.db.lock().unwrap().query_row(
+                "SELECT token FROM principals WHERE id = ?1",
+                [&nick],
+                |r| r.get(0),
+            )?;
+            assert!(stored_token.starts_with("__hashed__:"));
+            assert_ne!(stored_token, token);
+        }
+        assert!(api.server.wakes().runs(None, 10)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_spawn_http_rejects_invalid_input_without_mutation() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let path = "/v1/templates/example/spawn";
+        let before = provisioning_counts(&api)?;
+        for (field, value) in [
+            ("nick", json!("")),
+            ("nick", json!("#bad")),
+            ("nick", json!("bad nick")),
+            ("model", json!("")),
+            ("model", json!("a b")),
+            ("model", json!("{prompt}")),
+            ("model", json!("x".repeat(101))),
+            ("model", json!("bad\u{0}")),
+            ("role", json!("bad role")),
+            ("channels", json!([""])),
+            ("channels", json!(["#"])),
+            ("channels", json!(["bad channel"])),
+            ("channels", json!(["#one", "#bad,other"])),
+            ("channels", json!(["bad\nchannel"])),
+        ] {
+            let mut request = json!({"nick": "ghost", "model": "chosen", "channels": ["#one"]});
+            request[field] = value;
+            let (status, body) = api.write("POST", path, Some(&request)).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(provisioning_counts(&api)?, before);
+        }
+        for body in [
+            json!({"model": "chosen"}),
+            json!({"nick": "ghost"}),
+            json!({"nick": "ghost", "model": null}),
+            json!({"nick": "ghost", "model": "chosen", "channels": "#one"}),
+            json!({"nick": "ghost", "model": "chosen", "role": 3}),
+        ] {
+            let response = api
+                .client
+                .post(format!("{}{path}", api.base))
+                .header("X-AirCD-Invite", "template-owner-key")
+                .json(&body)
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let response = api
+            .client
+            .post(format!("{}{path}", api.base))
+            .header("X-AirCD-Invite", "template-owner-key")
+            .header("Content-Type", "application/json")
+            .body("{")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provisioning_counts(&api)?, before);
+        let (status, _) = api
+            .write(
+                "POST",
+                "/v1/templates/missing/spawn",
+                Some(&json!({"nick": "ghost", "model": "chosen"})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(provisioning_counts(&api)?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_spawn_http_keeps_duplicate_accounts_and_tokens_unchanged() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let path = "/v1/templates/example/spawn";
+        let body = json!({"nick": "Same-Worker", "model": "chosen", "channels": ["#one"]});
+        let (first, second) = tokio::join!(
+            api.write("POST", path, Some(&body)),
+            api.write("POST", path, Some(&body)),
+        );
+        let mut results = [first?, second?];
+        results.sort_by_key(|(status, _)| status.as_u16());
+        assert_eq!(results[0].0, StatusCode::CREATED);
+        assert_eq!(results[1].0, StatusCode::CONFLICT);
+        let token = results[0].1["account"]["token"].as_str().unwrap();
+        let before = provisioning_counts(&api)?;
+        let (status, _) = api
+            .write(
+                "POST",
+                path,
+                Some(&json!({"nick": "same-worker", "model": "different", "channels": ["#two"]})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(provisioning_counts(&api)?, before);
+        assert_eq!(api.server.auth().authenticate(token)?.id, "same-worker");
+        assert_eq!(api.server.projects().role_of("#two", "same-worker")?, None);
+        assert_eq!(
+            api.server.wakes().get("same-worker")?.unwrap().command,
+            "aircd-uninstalled-example-client"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_spawn_http_rolls_back_every_provisioning_write_on_failure() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let path = "/v1/templates/example/spawn";
+        let before = provisioning_counts(&api)?;
+        let request = json!({"nick": "rollback-worker", "model": "chosen", "channels": ["#one"]});
+        for table in [
+            "principal_tokens",
+            "wake_configs",
+            "project_roles",
+            "channel_memberships",
+        ] {
+            api.db.lock().unwrap().execute_batch(&format!(
+                "CREATE TRIGGER fail_provision BEFORE INSERT ON {table}
+                 BEGIN SELECT RAISE(ABORT, 'injected provisioning failure'); END;"
+            ))?;
+            let (status, body) = api.write("POST", path, Some(&request)).await?;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{table}: {body}");
+            api.db
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_provision")?;
+            assert_eq!(provisioning_counts(&api)?, before, "{table}");
+            assert!(api
+                .server
+                .auth()
+                .resolve_by_name("rollback-worker")?
+                .is_none());
+        }
+        api.db.lock().unwrap().execute(
+            "UPDATE client_templates SET command = '' WHERE id = 'example'",
+            [],
+        )?;
+        let (status, _) = api.write("POST", path, Some(&request)).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(provisioning_counts(&api)?, before);
+        api.db.lock().unwrap().execute(
+            "UPDATE client_templates SET command = 'example-client', args_json = 'corrupt' WHERE id = 'example'", [])?;
+        let (status, _) = api.write("POST", path, Some(&request)).await?;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(provisioning_counts(&api)?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn templates_spawn_http_provisions_from_all_builtin_fixtures() -> Result<()> {
+        let api = TemplateApi::start(Some("template-owner-key")).await?;
+        for (id, fixture) in [
+            ("claude", include_str!("../docs/templates/claude.json")),
+            ("codex", include_str!("../docs/templates/codex.json")),
+            ("agy", include_str!("../docs/templates/agy.json")),
+        ] {
+            let input: Value = serde_json::from_str(fixture)?;
+            let (status, body) = api
+                .write("POST", &format!("/v1/templates/{id}"), Some(&input))
+                .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (status, body) = api
+                .write(
+                    "POST",
+                    &format!("/v1/templates/{id}/spawn"),
+                    Some(&json!({"nick": format!("fixture-{id}"), "model": "user-chosen-model"})),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(body["account"]["wake"]["command"], id);
+            assert_eq!(body["account"]["wake"]["session_mode"], "fresh");
+            assert!(body["account"]["wake"]["args"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("user-chosen-model")));
+            assert!(body["account"]["wake"]["args"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("{prompt}")));
+            if id == "claude" {
+                assert_eq!(body["account"]["wake"]["env"], json!({"CLAUDECODE": null}));
+            }
+        }
+        assert!(api.server.wakes().runs(None, 10)?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

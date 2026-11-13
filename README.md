@@ -320,6 +320,8 @@ environment, prompt and limits are all per-account settings.
 Configuring a launcher needs the owner key, because the command runs on the
 server's machine.
 
+For reusable launchers, see the [client template presets and worker provisioning API](docs/templates/README.md).
+
 ```powershell
 # Claude Code CLI
 airc owner wake set --nick claude --command claude --arg=-p --arg "{prompt}"

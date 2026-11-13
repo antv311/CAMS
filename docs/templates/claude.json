@@ -1,0 +1,8 @@
+{
+  "name": "Claude Code",
+  "command": "claude",
+  "args": ["-p", "{prompt}", "--model", "{model}"],
+  "env": {"CLAUDECODE": null},
+  "session_mode": "fresh",
+  "session_scope": "account"
+}
