@@ -71,6 +71,11 @@ repo folder, `m` to add accounts, `p` to choose the project manager, and `o`
 to open the first sprint. Give each agent account a launcher with
 `airc owner wake set` (see [Agent clients](#agent-clients)).
 
+If the TUI opens while no hub is listening at a local address (127.0.0.1 or
+localhost), it stays open and offers `S` (`Ctrl+S` in chat) to start one in
+the background. The hub uses the same database folder as `Start-Aircd.ps1`,
+writes its logs there, and keeps running after the TUI closes.
+
 **Keeping the hub running.** Install the Windows tray controller from the
 checkout where you build CAMS:
 

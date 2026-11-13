@@ -62,6 +62,8 @@ const HELP: &[&str] = &[
     "  w           answer a question that is waiting on you",
     "  l           switch an account's launcher on or off (owner)",
     "  c           chat      r  refresh      q  quit",
+    "  S           start the hub on this machine when it is not running",
+    "              (Ctrl+S in chat)",
     "",
     "Chat",
     "  Enter send · Tab complete @name · up/down channel · Esc dashboard",
@@ -201,6 +203,8 @@ pub struct Snapshot {
     pub notice: Option<(bool, String, Instant)>,
     /// The hub could not be reached or refused the refresh.
     pub error: Option<String>,
+    /// Nothing is listening at the hub's address, so it can be started.
+    pub hub_down: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +229,8 @@ pub enum Action {
     CreateAccount { body: Value },
     /// Several requests in order; stops at the first that fails.
     Many(Vec<Action>),
+    /// Start the hub on this machine because nothing answers at its address.
+    StartHub,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -866,6 +872,7 @@ async fn refresh(
     snap.detail = guard.detail.clone();
     snap.models = guard.models.clone();
     snap.error = None;
+    snap.hub_down = false;
     *guard = snap;
     Ok(())
 }
@@ -1069,6 +1076,110 @@ async fn run_api(
     }
 }
 
+/// The `--http-bind` address for a hub this machine can start itself:
+/// only a hub on the loopback address, at the port in its URL.
+pub fn hub_bind_for(server: &str) -> Option<String> {
+    let url = reqwest::Url::parse(server).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    let host = url.host_str()?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(format!("127.0.0.1:{port}"));
+    }
+    let ip: std::net::IpAddr = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()?;
+    ip.is_loopback()
+        .then(|| std::net::SocketAddr::new(ip, port).to_string())
+}
+
+/// True when the request never reached a listening hub (connection refused
+/// or no route), as opposed to the hub answering with an error.
+fn hub_unreachable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect())
+    })
+}
+
+/// Start `aircd` in the background on the hub's address, with the same
+/// database folder `scripts/Start-Aircd.ps1` uses. The hub keeps running
+/// after the interface closes. Returns what to tell the user.
+async fn start_hub(server: &str) -> (bool, String) {
+    let Some(http_bind) = hub_bind_for(server) else {
+        return (
+            false,
+            format!("{server} is not on this machine; start that hub there"),
+        );
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => return (false, format!("cannot find the aircd program: {err}")),
+    };
+    let dir = config_dir();
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        return (false, format!("cannot create {}: {err}", dir.display()));
+    }
+    let log = dir.join("aircd.stdout.log");
+    let err_log = dir.join("aircd.stderr.log");
+    let (Ok(out), Ok(errs)) = (std::fs::File::create(&log), std::fs::File::create(&err_log)) else {
+        return (
+            false,
+            format!("cannot write the hub log in {}", dir.display()),
+        );
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--http-bind")
+        .arg(&http_bind)
+        .arg("--db")
+        .arg(dir.join("aircd.sqlite3"))
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(errs);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // No console window, and Ctrl+C here does not reach the hub.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => return (false, format!("could not start the hub: {err}")),
+    };
+    // A hub that cannot bind its ports or open its database exits at once.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => (
+            false,
+            format!(
+                "the hub stopped at once ({status}); see {}",
+                err_log.display()
+            ),
+        ),
+        _ => (
+            true,
+            format!(
+                "started the hub (PID {}) on {http_bind}; log in {}",
+                child.id(),
+                dir.display()
+            ),
+        ),
+    }
+}
+
 async fn fetch_loop(
     cfg: TuiConfig,
     shared: Arc<Mutex<Snapshot>>,
@@ -1130,6 +1241,16 @@ async fn fetch_loop(
                             .unwrap_or_else(|err| vec![format!("Could not load the task: {err}")]);
                         shared.lock().expect("snapshot mutex poisoned").detail = Some((id, lines));
                     }
+                    Some(Action::StartHub) => {
+                        // Someone may have started it since the last refresh.
+                        if refresh(&client, &cfg, &shared).await.is_ok() {
+                            set_notice(true, "the hub is already running".to_string());
+                        } else {
+                            set_notice(true, "starting the hub...".to_string());
+                            let (ok, message) = start_hub(&cfg.server).await;
+                            set_notice(ok, message);
+                        }
+                    }
                     Some(_) => {}
                     None => break,
                 }
@@ -1137,7 +1258,9 @@ async fn fetch_loop(
             _ = tokio::time::sleep(REFRESH_EVERY) => {}
         }
         if let Err(err) = refresh(&client, &cfg, &shared).await {
-            shared.lock().expect("snapshot mutex poisoned").error = Some(format!("{err:#}"));
+            let mut snap = shared.lock().expect("snapshot mutex poisoned");
+            snap.hub_down = hub_unreachable(&err);
+            snap.error = Some(format!("{err:#}"));
         }
     }
 }
@@ -1625,6 +1748,17 @@ pub fn handle_key(
     if app.modal.is_some() {
         return handle_modal(app, code, snap);
     }
+    // S starts a hub that is not running; Ctrl+S too, so chat can type an S.
+    let start_key = match code {
+        KeyCode::Char('s') | KeyCode::Char('S') if modifiers.contains(KeyModifiers::CONTROL) => {
+            true
+        }
+        KeyCode::Char('S') => app.view != View::Chat,
+        _ => false,
+    };
+    if start_key && snap.hub_down && hub_bind_for(&snap.server).is_some() {
+        return Some(Action::StartHub);
+    }
     if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('d')) {
         let people: Vec<(String, String)> = snap
             .accounts
@@ -2099,6 +2233,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
         .as_ref()
         .filter(|(_, _, at)| at.elapsed() < NOTICE_FOR);
     let footer_line = match (&snap.error, recent_notice) {
+        (Some(_), None) if snap.hub_down => hub_down_line(snap, app.view),
+        (Some(_), Some((ok, message, _))) if snap.hub_down => Line::from(Span::styled(
+            format!(" {message}"),
+            bold().fg(if *ok { Color::Green } else { Color::Red }),
+        )),
         (Some(err), _) => Line::from(Span::styled(
             format!(" {err}"),
             Style::default().fg(Color::Red),
@@ -2114,6 +2253,29 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
     if let Some(modal) = app.modal.clone() {
         draw_modal(frame, &modal, snap, body);
     }
+}
+
+/// The footer while nothing answers at the hub's address: what is wrong
+/// and, for a hub on this machine, the key that starts it.
+fn hub_down_line(snap: &Snapshot, view: View) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!(" No hub is running at {}. ", snap.server),
+        bold().fg(Color::Red),
+    )];
+    if hub_bind_for(&snap.server).is_some() {
+        let key = if view == View::Chat { "^S" } else { "S" };
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            bold().fg(Color::Black).bg(Color::Green),
+        ));
+        spans.push(Span::raw(" start it "));
+    } else {
+        spans.push(Span::raw("Start it on its machine. "));
+    }
+    let quit = if view == View::Chat { "[^C]" } else { "[q]" };
+    spans.push(Span::styled(quit, bold().fg(Color::Black).bg(Color::Red)));
+    spans.push(Span::raw(" quit"));
+    Line::from(spans)
 }
 
 fn trio_height(snap: &Snapshot, area: Rect) -> u16 {
@@ -2228,7 +2390,14 @@ fn draw_home(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
         }
         lines.extend(project.repos.iter().map(repo_line));
     }
-    if lines.is_empty() {
+    if lines.is_empty() && snap.hub_down {
+        let text = if hub_bind_for(&snap.server).is_some() {
+            "The hub is not running. Press S to start it on this machine."
+        } else {
+            "The hub cannot be reached. Start it on its machine."
+        };
+        lines.push(Line::from(Span::styled(text, bold().fg(Color::Red))));
+    } else if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "No projects yet. Press n to create one.",
             dim(),
@@ -3082,9 +3251,21 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }
     let cfg = load_config(server, profile)?;
 
-    let shared = Arc::new(Mutex::new(Snapshot::default()));
-    // Fail with a clear message before taking over the terminal.
-    refresh(&reqwest::Client::new(), &cfg, &shared).await?;
+    let shared = Arc::new(Mutex::new(Snapshot {
+        server: cfg.server.clone(),
+        me: cfg.nick.clone(),
+        ..Snapshot::default()
+    }));
+    // Fail with a clear message before taking over the terminal, except
+    // when the hub is simply not running: the interface offers to start it.
+    if let Err(err) = refresh(&reqwest::Client::new(), &cfg, &shared).await {
+        if dump || !hub_unreachable(&err) {
+            return Err(err);
+        }
+        let mut snap = shared.lock().expect("snapshot mutex poisoned");
+        snap.hub_down = true;
+        snap.error = Some(format!("{err:#}"));
+    }
 
     if dump {
         let snap = shared.lock().expect("snapshot mutex poisoned").clone();
@@ -3218,6 +3399,7 @@ mod tests {
             models: None,
             notice: None,
             error: None,
+            hub_down: false,
         }
     }
 
@@ -4609,5 +4791,102 @@ mod tests {
             lines.contains(&"reviewer -   parent -".to_string()),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn only_a_loopback_hub_can_be_started_here() {
+        assert_eq!(
+            hub_bind_for("http://127.0.0.1:6680").as_deref(),
+            Some("127.0.0.1:6680")
+        );
+        assert_eq!(
+            hub_bind_for("http://localhost:7000/").as_deref(),
+            Some("127.0.0.1:7000")
+        );
+        assert_eq!(
+            hub_bind_for("http://[::1]:6680").as_deref(),
+            Some("[::1]:6680")
+        );
+        assert_eq!(
+            hub_bind_for("http://127.0.0.1").as_deref(),
+            Some("127.0.0.1:80")
+        );
+        assert_eq!(hub_bind_for("http://192.168.1.5:6680"), None);
+        assert_eq!(hub_bind_for("http://hub.example.com:6680"), None);
+        assert_eq!(hub_bind_for("https://127.0.0.1:6680"), None);
+        assert_eq!(hub_bind_for("not a url"), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_counts_as_the_hub_being_down() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cfg = TuiConfig {
+            server: format!("http://127.0.0.1:{port}"),
+            token: "t".into(),
+            nick: "me".into(),
+            owner_key: None,
+        };
+        let err = get(&reqwest::Client::new(), &cfg, "/v1/me")
+            .await
+            .unwrap_err();
+        assert!(hub_unreachable(&err), "{err:#}");
+        assert!(!hub_unreachable(&anyhow!("unauthorized")));
+    }
+
+    #[test]
+    fn a_hub_that_is_down_offers_a_key_to_start_it() {
+        let down = Snapshot {
+            server: "http://127.0.0.1:6680".into(),
+            me: "tony".into(),
+            error: Some("cannot reach the hub at http://127.0.0.1:6680".into()),
+            hub_down: true,
+            ..Snapshot::default()
+        };
+        let mut app = home();
+        let screen = render(&mut app, &down);
+        assert!(
+            screen.contains("No hub is running at http://127.0.0.1:6680. [S] start it"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("The hub is not running. Press S to start it"),
+            "{screen}"
+        );
+        assert_eq!(
+            press(&mut app, &down, &[KeyCode::Char('S')]),
+            Some(Action::StartHub)
+        );
+
+        // In chat a capital S is text; Ctrl+S starts the hub instead.
+        app.view = View::Chat;
+        assert!(render(&mut app, &down).contains("[^S] start it"));
+        assert_eq!(press(&mut app, &down, &[KeyCode::Char('S')]), None);
+        assert_eq!(app.input, "S");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL, &down),
+            Some(Action::StartHub)
+        );
+
+        // A hub on another machine cannot be started from here.
+        let remote = Snapshot {
+            server: "http://10.0.0.9:6680".into(),
+            ..down.clone()
+        };
+        let mut app = home();
+        assert!(render(&mut app, &remote).contains("Start it on its machine."));
+        assert_eq!(press(&mut app, &remote, &[KeyCode::Char('S')]), None);
+
+        // A running hub never gets the offer.
+        let mut app = home();
+        let up = fixture();
+        assert_ne!(
+            press(&mut app, &up, &[KeyCode::Char('S')]),
+            Some(Action::StartHub)
+        );
+        assert!(!render(&mut app, &up).contains("No hub is running"));
     }
 }
