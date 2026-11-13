@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from aircd.client import AircdHttpClient, AircdHttpError
+from aircd.client import REVIEW_NEEDS_REPORT, AircdHttpClient, AircdHttpError, Group, GroupMember, task_create_payload
 
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:6680"
@@ -621,20 +621,27 @@ def cmd_task(args: argparse.Namespace) -> int:
             "POST",
             "/v1/tasks",
             token=token,
-            payload={
-                "channel": args.channel,
-                "title": " ".join(args.title),
-                "body": args.body,
-                "kind": args.kind,
-                "assignee": args.assign,
-                "repo": args.repo,
-                "branch": args.branch,
-                "issue_url": args.issue,
-            },
+            payload=task_create_payload(
+                args.channel,
+                " ".join(args.title),
+                body=args.body,
+                kind=args.kind,
+                assignee=args.assign,
+                repo=args.repo,
+                branch=args.branch,
+                issue_url=args.issue,
+                parent=args.parent,
+                reviewer=args.reviewer,
+            ),
         )
         t = data["task"]
         owner = f" -> @{t['assignee']}" if t.get("assignee") else ""
-        print_out(args, data, [f"Created {t['kind']} {t['id']} in {t['channel']}{owner}: {t['title']}"])
+        lines = [f"Created {t['kind']} {t['id']} in {t['channel']}{owner}: {t['title']}"]
+        if t.get("parent_task_id"):
+            lines.append(f"  subtask of {t['parent_task_id']}")
+        if t.get("reviewer"):
+            lines.append(f"  reviewer @{t['reviewer']}")
+        print_out(args, data, lines)
         return 0
     if args.task_cmd == "assign":
         data = http_json(
@@ -648,12 +655,13 @@ def cmd_task(args: argparse.Namespace) -> int:
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (assignee={t.get('assignee') or '-'})"])
         return 0
     if args.task_cmd == "status":
+        note = review_note(server, token, args) if args.status == "review" else args.note
         data = http_json(
             server,
             "POST",
             f"/v1/tasks/{urllib.parse.quote(args.id)}/status",
             token=token,
-            payload={"status": args.status, "note": args.note, "branch": args.branch},
+            payload={"status": args.status, "note": note, "branch": args.branch},
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (branch={t.get('branch') or '-'})"])
@@ -680,6 +688,13 @@ def cmd_task(args: argparse.Namespace) -> int:
             f"assignee={t.get('assignee') or '-'} repo={t.get('repo') or '-'} "
             f"branch={t.get('branch') or '-'} issue={t.get('issue_url') or '-'} sprint={t.get('sprint') or '-'}",
         ]
+        if t.get("parent_task_id") or t.get("reviewer"):
+            lines.append(f"parent={t.get('parent_task_id') or '-'} reviewer={t.get('reviewer') or '-'}")
+        for child in data.get("subtasks") or []:
+            lines.append(
+                f"  subtask {child['id']} [{child.get('status', '?')}] "
+                f"@{child.get('assignee') or '-'}: {child.get('title', '')}"
+            )
         if t.get("body"):
             lines.append(t["body"])
         q = data.get("question")
@@ -714,6 +729,129 @@ def cmd_task(args: argparse.Namespace) -> int:
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (claimed_by={t.get('claimed_by') or '-'})"])
         return 0
     raise CliError("Unsupported task subcommand")
+
+
+def review_note(server: str, token: str, args: argparse.Namespace) -> str:
+    """The test report sent when handing a task in for review.
+
+    Either --note, or --report naming a report posted with `airc report create
+    --task-id <id>` (its title and summary become the note), or both. Refused
+    before reaching the hub when there is neither.
+    """
+    note = (args.note or "").strip()
+    report_id = (getattr(args, "report", None) or "").strip()
+    if report_id:
+        rep = http_json(server, "GET", f"/v1/reports/{urllib.parse.quote(report_id)}", token=token)["report"]
+        if rep.get("task_id") and rep["task_id"] != args.id:
+            raise CliError(f"report {report_id} belongs to task {rep['task_id']}, not {args.id}")
+        detail = (rep.get("summary") or rep.get("body") or "").strip()
+        attached = f"report {rep['id']} [{rep.get('status', '?')}]: {rep.get('title', '')}"
+        if detail:
+            attached += f" - {detail}"
+        note = f"{note}\n{attached}" if note else attached
+    if not note:
+        raise CliError(REVIEW_NEEDS_REPORT)
+    return note
+
+
+# ── Groups ────────────────────────────────────────────────────
+
+
+def group_client(args: argparse.Namespace) -> AircdHttpClient:
+    """Reads use the account token; create and attach also send the owner key when given."""
+    server, token, _prof = resolve_connection(args)
+    invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
+    if not token and not invite:
+        raise CliError("airc group needs an account token (airc register/login) or the owner key (--invite or AIRC_INVITE)")
+    return AircdHttpClient(server, token=token, invite=invite)
+
+
+def group_from_args(args: argparse.Namespace) -> Group:
+    """--file (JSON) first, then any flags given."""
+    data: dict[str, Any] = {}
+    if args.file:
+        try:
+            raw = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as err:
+            raise CliError(f"cannot read group JSON from {args.file}: {err}") from None
+        if isinstance(loaded, dict) and isinstance(loaded.get("group"), dict):
+            loaded = loaded["group"]
+        if not isinstance(loaded, dict):
+            raise CliError("group JSON must be an object")
+        data.update(loaded)
+    data["name"] = args.name
+    for key, value in (
+        ("description", args.description),
+        ("lead_prompt", _text_or_file(args.lead_prompt)),
+        ("worker_prompt", _text_or_file(args.worker_prompt)),
+    ):
+        if value is not None:
+            data[key] = value
+    try:
+        if args.lead:
+            data["lead"] = GroupMember.parse(args.lead).to_dict()
+        if args.worker:
+            data["workers"] = [GroupMember.parse(spec).to_dict() for spec in args.worker]
+        if not data.get("lead"):
+            raise CliError("group create needs --lead TEMPLATE:MODEL (or a \"lead\" in --file)")
+        group = Group.from_dict(data)
+    except ValueError as err:
+        raise CliError(str(err)) from None
+    if group.lead.count != 1:
+        raise CliError("a group has exactly one lead; drop the count from --lead")
+    if not group.workers:
+        raise CliError("group create needs at least one --worker TEMPLATE:MODEL[*COUNT]")
+    return group
+
+
+def _text_or_file(value: str | None) -> str | None:
+    """'@path' reads the prompt from a file; anything else is the text itself."""
+    if value is None or not value.startswith("@"):
+        return value
+    try:
+        return Path(value[1:]).read_text(encoding="utf-8")
+    except OSError as err:
+        raise CliError(f"cannot read prompt file {value[1:]}: {err}") from None
+
+
+def group_lines(g: Group) -> list[str]:
+    lines = [
+        f"{g.name}: lead {g.lead.label()}, {g.worker_count} worker(s)" + (f"  {g.description}" if g.description else ""),
+        "  workers: " + (", ".join(w.label() for w in g.workers) or "-"),
+        "  projects: " + (", ".join(g.projects) or "-"),
+    ]
+    for label, prompt in (("lead prompt", g.lead_prompt), ("worker prompt", g.worker_prompt)):
+        if prompt:
+            first = prompt.strip().splitlines()[0] if prompt.strip() else ""
+            lines.append(f"  {label}: {first}{' ...' if len(prompt.strip().splitlines()) > 1 else ''}")
+    return lines
+
+
+def cmd_group(args: argparse.Namespace) -> int:
+    hub = group_client(args)
+    action = args.group_cmd
+    try:
+        if action == "list":
+            groups = hub.list_groups()
+            data = {"ok": True, "groups": [{**g.to_dict(), "projects": g.projects} for g in groups]}
+            lines = [line for g in groups for line in group_lines(g)] or [
+                "No groups. Define one with: airc group create <name> --lead TEMPLATE:MODEL --worker TEMPLATE:MODEL*3"
+            ]
+        elif action == "create":
+            group = hub.create_group(group_from_args(args))
+            data = {"ok": True, "group": {**group.to_dict(), "projects": group.projects}}
+            lines = ["Created group:", *group_lines(group)]
+        elif action == "attach":
+            group = hub.attach_group(args.name, args.channel)
+            data = {"ok": True, "group": {**group.to_dict(), "projects": group.projects}}
+            lines = [f"Attached group {group.name} to {args.channel}.", *group_lines(group)]
+        else:
+            raise CliError(f"Unsupported group subcommand: {action}")
+    except AircdHttpError as err:
+        raise CliError(str(err)) from None
+    print_out(args, data, lines)
+    return 0
 
 
 def cmd_inbox(args: argparse.Namespace) -> int:
@@ -1718,6 +1856,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--repo")
     p_tc.add_argument("--branch")
     p_tc.add_argument("--issue", metavar="URL", help="Linked GitHub issue")
+    p_tc.add_argument("--parent", metavar="TASK_ID", help="Make this a subtask of TASK_ID (a group lead splitting work)")
+    p_tc.add_argument("--reviewer", metavar="NICK", help="Who reviews it (default: the parent's assignee, else the PM)")
     p_tc.set_defaults(func=cmd_task)
 
     p_tas = task_sub.add_parser("assign", help="Assign or reassign a task; omit NICK to return it to the pool")
@@ -1728,7 +1868,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_tst = task_sub.add_parser("status", help="Move a task: in_progress, testing, review (needs --note with your test report), changes_requested, merged, cancelled")
     p_tst.add_argument("id")
     p_tst.add_argument("status")
-    p_tst.add_argument("--note")
+    p_tst.add_argument("--note", help="Your test report: what you ran and the result (needed for review)")
+    p_tst.add_argument("--report", metavar="REPORT_ID", help="Attach a report from 'airc report create --task-id ID' as the test report")
     p_tst.add_argument("--branch")
     p_tst.set_defaults(func=cmd_task)
 
@@ -1755,7 +1896,28 @@ def build_parser() -> argparse.ArgumentParser:
         p_ta.add_argument("id")
         p_ta.set_defaults(func=cmd_task)
 
-    p_room = sub.add_parser("room", help="Sprint rooms under a project (opened, never closed)")
+    p_group = sub.add_parser("group", help="Reusable teams: a lead that splits and reviews work, plus workers")
+    group_sub = p_group.add_subparsers(dest="group_cmd", required=True)
+    p_gl = group_sub.add_parser("list", help="List groups and the projects they serve")
+    p_gc = group_sub.add_parser("create", help="Define a group once; attach it to projects later")
+    p_gc.add_argument("name")
+    p_gc.add_argument("--lead", metavar="TEMPLATE:MODEL", help="The lead's client template and model, e.g. claude:opus")
+    p_gc.add_argument(
+        "--worker", action="append", metavar="TEMPLATE:MODEL[*N]",
+        help="Workers of one kind, e.g. ollama:gemma3*3; repeat for each kind",
+    )
+    p_gc.add_argument("--description")
+    p_gc.add_argument("--lead-prompt", help="Lead instructions (split, hand out, test, review, submit); @file reads a file")
+    p_gc.add_argument("--worker-prompt", help="Worker instructions (code only, no project context); @file reads a file")
+    p_gc.add_argument("--file", help="Group JSON to start from ('-' reads stdin)")
+    p_ga = group_sub.add_parser("attach", help="Attach a group to a project channel")
+    p_ga.add_argument("name")
+    p_ga.add_argument("channel")
+    for group_parser in (p_gl, p_gc, p_ga):
+        group_parser.add_argument("--invite", help="Owner key (or set AIRC_INVITE); omit to use this profile's token")
+        group_parser.set_defaults(func=cmd_group)
+
+    p_room = sub.add_parser("room",help="Sprint rooms under a project (opened, never closed)")
     room_sub = p_room.add_subparsers(dest="room_cmd", required=True)
     p_ro = room_sub.add_parser("open", help="Open the project's next sprint room; new tasks go there")
     p_ro.add_argument("project")

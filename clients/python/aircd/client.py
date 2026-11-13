@@ -45,6 +45,117 @@ class Task:
 
 
 @dataclass
+class GroupMember:
+    """One seat in a group: the client template and model an account runs.
+
+    ``count`` is how many accounts of this kind the group has (workers only;
+    the lead is always one). ``nick`` names the account once it exists.
+    """
+
+    template: str
+    model: str
+    count: int = 1
+    nick: Optional[str] = None
+
+    @classmethod
+    def parse(cls, spec: str) -> "GroupMember":
+        """Parse ``TEMPLATE:MODEL`` with an optional ``*COUNT`` suffix, e.g.
+        ``claude:opus`` or ``ollama:gemma3*3``. The model may itself contain
+        colons (``ollama:qwen2.5-coder:7b``).
+        """
+        spec = spec.strip()
+        template, sep, model = spec.partition(":")
+        template, model = template.strip(), model.strip()
+        count = 1
+        head, star, tail = model.rpartition("*")
+        if star:
+            if not tail.strip().isdigit():
+                raise ValueError(f"group member count after '*' must be a number, got {spec!r}")
+            model, count = head.strip(), int(tail)
+        if not sep or not template or not model:
+            raise ValueError(f"group member must look like TEMPLATE:MODEL[*COUNT], got {spec!r}")
+        if count < 1:
+            raise ValueError(f"group member count must be at least 1, got {spec!r}")
+        return cls(template=template, model=model, count=count)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GroupMember":
+        return cls(
+            template=str(data.get("template") or ""),
+            model=str(data.get("model") or ""),
+            count=int(data.get("count") or 1),
+            nick=data.get("nick") or None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"template": self.template, "model": self.model, "count": self.count}
+        if self.nick:
+            out["nick"] = self.nick
+        return out
+
+    def label(self) -> str:
+        text = f"{self.template}:{self.model}"
+        if self.count != 1:
+            text += f" x{self.count}"
+        if self.nick:
+            text += f" (@{self.nick})"
+        return text
+
+
+@dataclass
+class Group:
+    """A reusable team: one lead that splits and reviews work, plus workers.
+
+    A group is defined once and attached to any number of project channels.
+    ``lead_prompt`` and ``worker_prompt`` are part of the definition: workers
+    get no project context and only code; the lead splits, hands out, tests,
+    reviews and submits.
+    """
+
+    name: str
+    lead: GroupMember
+    workers: list[GroupMember] = field(default_factory=list)
+    description: str = ""
+    lead_prompt: Optional[str] = None
+    worker_prompt: Optional[str] = None
+    projects: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Group":
+        def member(raw: Any) -> GroupMember:
+            return GroupMember.from_dict(raw) if isinstance(raw, dict) else GroupMember.parse(str(raw))
+
+        return cls(
+            name=str(data.get("name") or ""),
+            lead=member(data.get("lead") or {}),
+            workers=[member(w) for w in data.get("workers") or []],
+            description=str(data.get("description") or ""),
+            lead_prompt=data.get("lead_prompt") or None,
+            worker_prompt=data.get("worker_prompt") or None,
+            projects=list(data.get("projects") or data.get("channels") or []),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """The create payload (``projects`` is managed by attach, so it is left out)."""
+        out: dict[str, Any] = {
+            "name": self.name,
+            "lead": self.lead.to_dict(),
+            "workers": [w.to_dict() for w in self.workers],
+        }
+        if self.description:
+            out["description"] = self.description
+        if self.lead_prompt:
+            out["lead_prompt"] = self.lead_prompt
+        if self.worker_prompt:
+            out["worker_prompt"] = self.worker_prompt
+        return out
+
+    @property
+    def worker_count(self) -> int:
+        return sum(w.count for w in self.workers)
+
+
+@dataclass
 class _ConnectionState:
     reader: Optional[asyncio.StreamReader] = None
     writer: Optional[asyncio.StreamWriter] = None
@@ -480,6 +591,71 @@ class AircdHttpClient:
             "POST", _template_path(template_id) + "/spawn", payload=payload, owner=bool(self.invite)
         )
 
+    # Groups
+
+    def list_groups(self) -> list[Group]:
+        """All groups on the hub, with the projects each is attached to."""
+        return [Group.from_dict(g) for g in self._request("GET", "/v1/groups").get("groups", [])]
+
+    def create_group(self, group: Group) -> Group:
+        """Define a reusable group (lead, workers and role prompts). Returns it as saved.
+
+        Sends the owner key when one is set; otherwise the account token.
+        """
+        if not group.name.strip():
+            raise AircdHttpError("group name must not be empty")
+        data = self._request("POST", "/v1/groups", payload=group.to_dict(), owner=bool(self.invite))
+        return Group.from_dict(data["group"])
+
+    def attach_group(self, name: str, channel: str) -> Group:
+        """Attach a group to a project channel; one group can serve many projects."""
+        channel = channel.strip()
+        if not channel.startswith("#"):
+            raise AircdHttpError(f"project channel must start with '#', got {channel!r}")
+        data = self._request(
+            "POST", _group_path(name) + "/attach", payload={"channel": channel}, owner=bool(self.invite)
+        )
+        return Group.from_dict(data["group"])
+
+    # Tasks
+
+    def create_task(
+        self,
+        channel: str,
+        title: str,
+        *,
+        body: Optional[str] = None,
+        kind: str = "task",
+        assignee: Optional[str] = None,
+        repo: Optional[str] = None,
+        branch: Optional[str] = None,
+        issue_url: Optional[str] = None,
+        parent: Optional[str] = None,
+        reviewer: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a task and return it. ``parent`` makes it a subtask of that task
+        id; ``reviewer`` names who reviews it (the hub defaults to the parent's
+        assignee for subtasks, otherwise the project manager)."""
+        payload = task_create_payload(
+            channel, title, body=body, kind=kind, assignee=assignee, repo=repo,
+            branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
+        )
+        return self._request("POST", "/v1/tasks", payload=payload)["task"]
+
+    def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        note: Optional[str] = None,
+        branch: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Move a task and return it. Moving to ``review`` needs a test report as ``note``."""
+        if status == "review" and not (note or "").strip():
+            raise AircdHttpError(REVIEW_NEEDS_REPORT)
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/status"
+        return self._request("POST", path, payload={"status": status, "note": note, "branch": branch})["task"]
+
     # Internal
 
     def _request(
@@ -524,6 +700,58 @@ def _template_path(template_id: str) -> str:
     if not template_id:
         raise AircdHttpError("template id must not be empty")
     return "/v1/templates/" + urllib.parse.quote(template_id, safe="")
+
+
+REVIEW_NEEDS_REPORT = (
+    "handing in for review needs a test report: pass --note \"<what you ran and the result>\" "
+    "or --report <report id>"
+)
+
+
+def _group_path(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise AircdHttpError("group name must not be empty")
+    return "/v1/groups/" + urllib.parse.quote(name, safe="")
+
+
+def _clean_nick(nick: Optional[str]) -> Optional[str]:
+    nick = (nick or "").strip().lstrip("@").strip()
+    return nick or None
+
+
+def task_create_payload(
+    channel: str,
+    title: str,
+    *,
+    body: Optional[str] = None,
+    kind: str = "task",
+    assignee: Optional[str] = None,
+    repo: Optional[str] = None,
+    branch: Optional[str] = None,
+    issue_url: Optional[str] = None,
+    parent: Optional[str] = None,
+    reviewer: Optional[str] = None,
+) -> dict[str, Any]:
+    """The POST /v1/tasks body. ``parent_task_id`` and ``reviewer`` are only sent
+    when set, so a hub without subtask support sees the same request as before."""
+    payload: dict[str, Any] = {
+        "channel": channel,
+        "title": title,
+        "body": body,
+        "kind": kind,
+        "assignee": assignee,
+        "repo": repo,
+        "branch": branch,
+        "issue_url": issue_url,
+    }
+    parent = (parent or "").strip()
+    if parent:
+        payload["parent_task_id"] = parent
+    reviewer = _clean_nick(reviewer)
+    if reviewer:
+        payload["reviewer"] = reviewer
+    return payload
 
 
 # ── IRC line parser ─────────────────────────────────────────────
