@@ -2043,10 +2043,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             &snap.my_role
         }
     );
-    let mut header_spans = vec![
-        Span::styled(TABS, bold().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(who),
-    ];
+    let mut header_spans = tab_spans(app.view);
+    header_spans.push(Span::raw(who));
     let dm_unread: usize = snap
         .messages
         .keys()
@@ -2243,16 +2241,62 @@ fn draw_home(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
     draw_trio(frame, snap, trio);
 }
 
+/// The background behind a key hint, by what the key does: moving around
+/// is blue, making or changing something green, talking yellow, waking an
+/// agent (which spends its quota) magenta, quitting red, help grey.
+pub fn hint_color(key: &str, label: &str) -> Color {
+    match (key, label) {
+        ("q", _) | ("Q", _) => Color::Red,
+        ("?", _) => Color::Gray,
+        ("t", _) => Color::Magenta,
+        (_, "answer" | "chat" | "send" | "complete @name" | "direct message") => Color::Yellow,
+        ("Enter" | "Esc" | "Up/Down" | "PgUp/PgDn" | "End", _) => Color::Blue,
+        _ => Color::Green,
+    }
+}
+
 fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (key, label) in hints {
         spans.push(Span::styled(
             format!("[{key}]"),
-            bold().fg(Color::Black).bg(Color::Cyan),
+            bold().fg(Color::Black).bg(hint_color(key, label)),
         ));
         spans.push(Span::raw(format!(" {label} ")));
     }
     Line::from(spans)
+}
+
+/// The tab bar: each tab's bracketed letter on a coloured background and
+/// its label after it, the open view's label highlighted. The text is
+/// exactly `TABS`, so clicks can be found by position in it.
+fn tab_spans(view: View) -> Vec<Span<'static>> {
+    let tabs = [
+        ("[H]", "ome", Some(View::Home)),
+        ("[D]", "ashboard", Some(View::Dashboard)),
+        ("[C]", "hat", Some(View::Chat)),
+        ("[Q]", "uit", None),
+    ];
+    let mut spans = vec![Span::raw(" ")];
+    for (at, (key, label, tab)) in tabs.into_iter().enumerate() {
+        let open = tab == Some(view);
+        let key_color = match tab {
+            None => Color::Red,
+            Some(_) if open => Color::Yellow,
+            Some(_) => Color::Cyan,
+        };
+        spans.push(Span::styled(key, bold().fg(Color::Black).bg(key_color)));
+        spans.push(Span::styled(
+            label,
+            if open {
+                bold().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default()
+            },
+        ));
+        spans.push(Span::raw(if at == tabs.len() - 1 { " " } else { "  " }));
+    }
+    spans
 }
 
 /// The channel list as a tree: a header row per project (or "Hub"), its
@@ -2335,16 +2379,14 @@ pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color
             t.assignee.eq_ignore_ascii_case(nick)
                 && (!in_sprint_room || t.sprint.as_deref() == Some(channel))
         }) {
-            let escalated = snap
-                .waiting
-                .iter()
-                .any(|w| w.task_id == task.id && w.escalated);
-            let state = match task.status.as_str() {
-                "blocked" if escalated => (0, Color::Red, "needs you"),
-                "blocked" => (1, Color::Yellow, "waiting on PM"),
-                "testing" => (2, Color::Magenta, "testing"),
-                "review" => (3, Color::Blue, "in review"),
-                "in_progress" | "claimed" => (4, Color::Green, "coding"),
+            // An open question counts whatever status the task shows.
+            let question = snap.waiting.iter().find(|w| w.task_id == task.id);
+            let state = match (question, task.status.as_str()) {
+                (Some(w), _) if w.escalated => (0, Color::Red, "needs you"),
+                (Some(_), _) | (None, "blocked") => (1, Color::Yellow, "waiting on PM"),
+                (None, "testing") => (2, Color::Magenta, "testing"),
+                (None, "review") => (3, Color::Blue, "in review"),
+                (None, "in_progress" | "claimed") => (4, Color::Green, "coding"),
                 _ => (5, Color::White, "has work"),
             };
             if best.is_none_or(|current| state.0 < current.0) {
@@ -2352,12 +2394,15 @@ pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color
             }
         }
     }
-    best.map(|(_, color, label)| (color, label)).or_else(|| {
-        snap.accounts
-            .iter()
-            .any(|a| a.nick.eq_ignore_ascii_case(nick) && a.running)
-            .then_some((Color::Green, "working"))
-    })
+    // A running agent is working, even on a task it has not moved yet.
+    let running = snap
+        .accounts
+        .iter()
+        .any(|a| a.nick.eq_ignore_ascii_case(nick) && a.running);
+    if running && best.is_none_or(|(rank, _, _)| rank > 4) {
+        return Some((Color::Green, "working"));
+    }
+    best.map(|(_, color, label)| (color, label))
 }
 
 /// Who is working in this room (above the line) and who is standing by.
@@ -3961,6 +4006,8 @@ mod tests {
         assert_eq!(state(&snap, "codex"), Some((Color::Red, "needs you")));
         snap.waiting[0].escalated = false;
         assert_eq!(state(&snap, "codex"), Some((Color::Yellow, "waiting on PM")));
+        // Answered: the dot follows the task's status.
+        let question = snap.waiting.remove(0);
         for (status, expected) in [
             ("testing", (Color::Magenta, "testing")),
             ("review", (Color::Blue, "in review")),
@@ -3973,6 +4020,63 @@ mod tests {
         // No task, but its agent is running right now.
         assert_eq!(state(&snap, "flash3.8"), Some((Color::Green, "working")));
         assert_eq!(state(&snap, "tony"), None);
+
+        // An open question wins over the status the task shows.
+        snap.waiting.push(question);
+        snap.projects[0].tasks[0].status = "in_progress".into();
+        assert_eq!(
+            state(&snap, "codex"),
+            Some((Color::Yellow, "waiting on PM"))
+        );
+        snap.waiting[0].escalated = true;
+        assert_eq!(state(&snap, "codex"), Some((Color::Red, "needs you")));
+        // A running agent with work it has not started shows as working,
+        // but its review still shows as review.
+        snap.waiting.clear();
+        snap.projects[0].tasks[0].status = "assigned".into();
+        snap.accounts.push(Account {
+            nick: "codex".into(),
+            running: true,
+            ..Account::default()
+        });
+        assert_eq!(state(&snap, "codex"), Some((Color::Green, "working")));
+        snap.projects[0].tasks[0].status = "review".into();
+        assert_eq!(state(&snap, "codex"), Some((Color::Blue, "in review")));
+    }
+
+    #[test]
+    fn hints_and_tabs_are_coloured_by_what_the_key_does() {
+        assert_eq!(hint_color("q", "quit"), Color::Red);
+        assert_eq!(hint_color("t", "test"), Color::Magenta);
+        assert_eq!(hint_color("Esc", "home"), Color::Blue);
+        assert_eq!(hint_color("w", "answer"), Color::Yellow);
+        assert_eq!(hint_color("n", "new project"), Color::Green);
+
+        // The tab bar keeps the exact TABS text, so clicks still line up,
+        // and highlights the open view.
+        for view in [View::Home, View::Dashboard, View::Chat] {
+            let text: String = tab_spans(view).iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, TABS);
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        let mut app = App {
+            view: View::Dashboard,
+            ..App::default()
+        };
+        let snap = fixture();
+        terminal.draw(|frame| draw(frame, &mut app, &snap)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let bg_at = |x: usize, y: u16| buffer[(x as u16, y)].bg;
+        assert_eq!(bg_at(TABS.find("[D]").unwrap() + 4, 0), Color::Yellow);
+        assert_eq!(bg_at(TABS.find("[H]").unwrap(), 0), Color::Cyan);
+        assert_eq!(bg_at(TABS.find("[Q]").unwrap(), 0), Color::Red);
+        // Footer: the [q] quit hint sits on red, [n] new on green.
+        let footer: String = (0..120)
+            .map(|x| buffer[(x, 29)].symbol().to_string())
+            .collect();
+        assert_eq!(bg_at(footer.find("[q]").unwrap(), 29), Color::Red);
+        assert_eq!(bg_at(footer.find("[n]").unwrap(), 29), Color::Green);
     }
 
     #[test]
