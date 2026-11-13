@@ -13,6 +13,7 @@ Base `main` commit: `b164cc8`.
 | #14 | Atomic token reissue and IRC session invalidation | `task_30662416b057453ba313fa5e2fc7e7d8` | `2a5ff68` (merged `932e284`) |
 | #15 | DM wake loop prevention between automated accounts | `task_543c921157344e878f5eef4b40457b12` | `6f08b8a` (merged `04ce7fd`) |
 | #19 | TUI direct messages pane and private conversation view | `task_7fd8cb4d42264ce7bead451457a94830` | `9119447` (merged `97fb7f2`) |
+| #20 | Wake failure notice broadcast and quota cooldown | `task_3334f6a62e944089b51011ba9b58a8c2` | `0c5eeec` (merged `9c62e62`) |
 | #21 | TUI home screen key-hint/tab colors and sharpened people-pane dots | `task_57c838e3093644868d8a994952bb66d4` | `054d2ac` (merged `d715f56`) |
 | #22 | Enforce test evidence and subtask review workflow | `task_14e8d26b84a14f04a8ddab47fad1a377` | `ef11ef0` (merged `8837a59`) |
 | #22 | Python groups/subtasks client, `airc group`, subtask flags, and `--report` handoff guard | `task_8d8103743f6e4833b7ca34eacd432f2b` | `e8b2cfd`, `3b1f4f3` |
@@ -32,7 +33,7 @@ This checkpoint branch also resolves the stop-inspection race in `scripts/AircdS
 
 On `docs/sprint-2-checkpoint` (rebased onto `b164cc8`):
 
-- `cargo test --locked`: **170 passed**, 0 failed, 0 ignored (54.57s).
+- `cargo test --locked`: **178 passed**, 0 failed, 0 ignored.
 - `cargo build --release --locked`: passed (1m 22s), producing `target\release\aircd.exe`.
 - PowerShell Windows integration checks against `target\release\aircd.exe`:
   - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\Test-AircdService.ps1 -AircdExe target\release\aircd.exe`: **3/3 consecutive runs passed**.
