@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,6 +46,7 @@ your own rules.";
 const DEFAULT_COOLDOWN_SECONDS: i64 = 20;
 const DEFAULT_TIMEOUT_SECONDS: i64 = 1800;
 const DEFAULT_MAX_RUNS_PER_HOUR: i64 = 30;
+const MAX_DM_WAKE_DEPTH: u32 = 2;
 const LOG_TAIL_BYTES: usize = 4000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,7 +121,7 @@ pub struct WakeRun {
 }
 
 /// Why and where an account is being woken.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WakeContext {
     pub principal_id: String,
     pub nick: String,
@@ -130,6 +131,10 @@ pub struct WakeContext {
     pub repo_path: Option<String>,
     /// The account is the project manager of `channel`.
     pub is_pm: bool,
+    /// Event kind that triggered this wake (`"dm"`, `"message"`, `"task"`, etc.).
+    pub event: Option<String>,
+    /// Account id that caused the triggering event (for example, the DM sender).
+    pub triggered_by: Option<String>,
 }
 
 #[derive(Default)]
@@ -138,10 +143,17 @@ struct Slot {
     pending: Option<WakeContext>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct DmWakeState {
+    depth: u32,
+    woken_by: HashSet<String>,
+}
+
 #[derive(Clone)]
 pub struct WakeManager {
     db: Arc<Mutex<Connection>>,
     slots: Arc<Mutex<HashMap<String, Slot>>>,
+    dm_states: Arc<Mutex<HashMap<String, DmWakeState>>>,
     server_url: Arc<Mutex<String>>,
 }
 
@@ -306,6 +318,7 @@ impl WakeManager {
         Self {
             db,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            dm_states: Arc::new(Mutex::new(HashMap::new())),
             server_url: Arc::new(Mutex::new("http://127.0.0.1:6680".to_string())),
         }
     }
@@ -419,6 +432,13 @@ impl WakeManager {
                 params![principal_id],
             )
             .context("delete wake config")?;
+        drop(db);
+        if changed > 0 {
+            self.dm_states
+                .lock()
+                .expect("dm wake state mutex poisoned")
+                .remove(&principal_id.trim().to_ascii_lowercase());
+        }
         Ok(changed > 0)
     }
 
@@ -501,7 +521,100 @@ impl WakeManager {
                 params![enabled as i64, unix_timestamp(), principal_id],
             )
             .context("toggle wake config")?;
+        drop(db);
+        if changed > 0 && !enabled {
+            self.dm_states
+                .lock()
+                .expect("dm wake state mutex poisoned")
+                .remove(&principal_id.trim().to_ascii_lowercase());
+        }
         Ok(changed > 0)
+    }
+
+    /// Whether `principal_id` currently has an enabled launcher.
+    pub fn is_automated_account(&self, principal_id: &str) -> Result<bool> {
+        let clean = principal_id.trim().to_ascii_lowercase();
+        if clean.is_empty() {
+            return Ok(false);
+        }
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let enabled: Option<i64> = db
+            .query_row(
+                "SELECT enabled FROM wake_configs WHERE lower(principal_id) = ?1",
+                params![clean],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("check automated account wake config")?;
+        Ok(enabled.is_some_and(|v| v != 0))
+    }
+
+    /// Whether `ctx` represents a direct message between two accounts that
+    /// both have enabled launchers.
+    pub fn is_automated_dm(&self, ctx: &WakeContext) -> Result<bool> {
+        if !is_dm_context(ctx) {
+            return Ok(false);
+        }
+        let Some(sender) = ctx
+            .triggered_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(false);
+        };
+        Ok(self.is_automated_account(sender)? && self.is_automated_account(&ctx.principal_id)?)
+    }
+
+    /// Suppress automated account-to-account DM ping-pong loops while allowing
+    /// initial DMs, human/task interactions (which reset the recipient's DM
+    /// chain state), and channel mentions.
+    fn check_and_record_dm_wake(&self, ctx: &WakeContext) -> Result<Option<String>> {
+        let recipient = ctx.principal_id.trim().to_ascii_lowercase();
+        let is_task = ctx.event.as_deref() == Some("task") || ctx.task_id.is_some();
+        let sender = ctx
+            .triggered_by
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+
+        if self.is_automated_dm(ctx)? {
+            let sender_id = sender.expect("automated DM must have a sender");
+            let mut dm_states = self
+                .dm_states
+                .lock()
+                .expect("dm wake state mutex poisoned");
+            let sender_state = dm_states.get(&sender_id).cloned().unwrap_or_default();
+            if sender_state.woken_by.contains(&recipient) {
+                return Ok(Some(format!(
+                    "skipped: DM wake loop suppressed (@{sender_id} was woken by @{recipient} without intervening human/task interaction)"
+                )));
+            }
+            if sender_state.depth >= MAX_DM_WAKE_DEPTH {
+                return Ok(Some(format!(
+                    "skipped: DM wake loop suppressed (DM wake depth {} reached max {MAX_DM_WAKE_DEPTH})",
+                    sender_state.depth
+                )));
+            }
+            let recipient_state = dm_states.entry(recipient).or_default();
+            recipient_state.depth = sender_state.depth + 1;
+            recipient_state.woken_by.extend(sender_state.woken_by);
+            recipient_state.woken_by.insert(sender_id);
+            return Ok(None);
+        }
+
+        let sender_is_automated = match sender.as_deref() {
+            Some(s) => self.is_automated_account(s)?,
+            None => false,
+        };
+        if is_task || !sender_is_automated {
+            self.dm_states
+                .lock()
+                .expect("dm wake state mutex poisoned")
+                .remove(&recipient);
+        }
+
+        Ok(None)
     }
 
     /// Accounts that currently have an enabled launcher.
@@ -553,6 +666,12 @@ impl WakeManager {
         let Some(cfg) = self.get(&ctx.principal_id)?.filter(|cfg| cfg.enabled) else {
             return Ok(false);
         };
+        if let Some(note) = self.check_and_record_dm_wake(&ctx)? {
+            let run_id = format!("wake_{}", Uuid::new_v4().simple());
+            let now = unix_timestamp();
+            self.insert_run(&run_id, &ctx, "skipped", now, Some(now), None, Some(&note))?;
+            return Ok(false);
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return Ok(false);
         };
@@ -833,6 +952,11 @@ impl WakeManager {
     }
 }
 
+fn is_dm_context(ctx: &WakeContext) -> bool {
+    ctx.event.as_deref() == Some("dm")
+        || (ctx.event.is_none() && ctx.channel.starts_with("@dm:"))
+}
+
 /// Keep the end of the agent's output, on a character boundary.
 fn tail(text: &str) -> &str {
     if text.len() <= LOG_TAIL_BYTES {
@@ -1040,5 +1164,203 @@ mod tests {
         let kept = tail(&text);
         assert!(kept.len() <= LOG_TAIL_BYTES);
         assert!(kept.chars().all(|c| c == 'é'));
+    }
+
+    fn fast_launcher(enabled: bool) -> WakeConfigInput {
+        let (command, args) = if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), "echo".to_string(), "ok".to_string()],
+            )
+        } else {
+            ("echo".to_string(), vec!["ok".to_string()])
+        };
+        WakeConfigInput {
+            command,
+            args,
+            enabled: Some(enabled),
+            cooldown_seconds: Some(0),
+            timeout_seconds: Some(10),
+            ..Default::default()
+        }
+    }
+
+    fn dm_ctx(from: &str, to: &str) -> WakeContext {
+        let (left, right) = if from <= to { (from, to) } else { (to, from) };
+        WakeContext {
+            principal_id: to.to_string(),
+            nick: to.to_string(),
+            reason: format!("dm from @{from}"),
+            channel: format!("@dm:{left}:{right}"),
+            event: Some("dm".to_string()),
+            triggered_by: Some(from.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn channel_ctx(from: &str, to: &str, channel: &str) -> WakeContext {
+        WakeContext {
+            principal_id: to.to_string(),
+            nick: to.to_string(),
+            reason: format!("message in {channel} from @{from}: @{to} check this"),
+            channel: channel.to_string(),
+            event: Some("message".to_string()),
+            triggered_by: Some(from.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn task_ctx(from: &str, to: &str, task_id: &str) -> WakeContext {
+        WakeContext {
+            principal_id: to.to_string(),
+            nick: to.to_string(),
+            reason: format!("task {task_id} assigned to @{to}"),
+            channel: "#cams".to_string(),
+            task_id: Some(task_id.to_string()),
+            event: Some("task".to_string()),
+            triggered_by: Some(from.to_string()),
+            ..Default::default()
+        }
+    }
+
+    async fn wait_until_idle(wakes: &WakeManager, principal_id: &str) {
+        for _ in 0..100 {
+            let running = {
+                let slots = wakes.slots.lock().expect("wake slots mutex poisoned");
+                slots
+                    .get(principal_id)
+                    .is_some_and(|slot| slot.running || slot.pending.is_some())
+            };
+            if !running {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("wake slot for {principal_id} did not become idle in time");
+    }
+
+    #[test]
+    fn automated_dm_detection_distinguishes_agents_from_humans() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes.upsert("agent-a", fast_launcher(true))?;
+        wakes.upsert("agent-b", fast_launcher(true))?;
+        wakes.upsert("agent-off", fast_launcher(false))?;
+
+        assert!(wakes.is_automated_account("agent-a")?);
+        assert!(wakes.is_automated_account("AGENT-B")?);
+        assert!(!wakes.is_automated_account("agent-off")?);
+        assert!(!wakes.is_automated_account("tony")?);
+
+        assert!(wakes.is_automated_dm(&dm_ctx("agent-a", "agent-b"))?);
+        assert!(!wakes.is_automated_dm(&dm_ctx("tony", "agent-a"))?);
+        assert!(!wakes.is_automated_dm(&dm_ctx("agent-off", "agent-a"))?);
+        assert!(!wakes.is_automated_dm(&channel_ctx("agent-a", "agent-b", "#cams"))?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dm_wake_loop_suppresses_reciprocal_agent_dm() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes.upsert("agent-a", fast_launcher(true))?;
+        wakes.upsert("agent-b", fast_launcher(true))?;
+
+        assert!(wakes.request(dm_ctx("agent-a", "agent-b"))?);
+        wait_until_idle(&wakes, "agent-b").await;
+
+        assert!(!wakes.request(dm_ctx("agent-b", "agent-a"))?);
+        assert!(!wakes.request(dm_ctx("agent-b", "agent-a"))?);
+
+        let b_runs = wakes.runs(Some("agent-b"), 10)?;
+        assert_eq!(b_runs.len(), 1);
+        assert_eq!(b_runs[0].status, "ok");
+
+        let a_runs = wakes.runs(Some("agent-a"), 10)?;
+        assert_eq!(a_runs.len(), 2);
+        assert!(a_runs.iter().all(|run| run.status == "skipped"));
+        assert!(a_runs[0]
+            .log_tail
+            .as_deref()
+            .is_some_and(|note| note.contains("DM wake loop suppressed")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dm_wake_loop_resets_after_intervening_human_or_task_interaction() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes.upsert("agent-a", fast_launcher(true))?;
+        wakes.upsert("agent-b", fast_launcher(true))?;
+        wakes.upsert("pm-agent", fast_launcher(true))?;
+
+        // A -> B wakes B; B -> A is suppressed.
+        assert!(wakes.request(dm_ctx("agent-a", "agent-b"))?);
+        wait_until_idle(&wakes, "agent-b").await;
+        assert!(!wakes.request(dm_ctx("agent-b", "agent-a"))?);
+
+        // Intervening human DM resets B's DM wake state.
+        assert!(wakes.request(dm_ctx("tony", "agent-b"))?);
+        wait_until_idle(&wakes, "agent-b").await;
+
+        // Now B -> A wakes A, and A -> B is suppressed.
+        assert!(wakes.request(dm_ctx("agent-b", "agent-a"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+        assert!(!wakes.request(dm_ctx("agent-a", "agent-b"))?);
+
+        // Intervening task interaction (even triggered by an automated PM) resets A.
+        assert!(wakes.request(task_ctx("pm-agent", "agent-a", "task_1"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+
+        assert!(wakes.request(dm_ctx("agent-a", "agent-b"))?);
+        wait_until_idle(&wakes, "agent-b").await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dm_wake_depth_caps_multi_agent_chains_and_cycles() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        for id in ["agent-a", "agent-b", "agent-c", "agent-d"] {
+            wakes.upsert(id, fast_launcher(true))?;
+        }
+
+        assert!(wakes.request(dm_ctx("agent-a", "agent-b"))?);
+        assert!(wakes.request(dm_ctx("agent-b", "agent-c"))?);
+        // Cycle back to A or B and deeper chain to D are both suppressed.
+        assert!(!wakes.request(dm_ctx("agent-c", "agent-a"))?);
+        assert!(!wakes.request(dm_ctx("agent-c", "agent-b"))?);
+        assert!(!wakes.request(dm_ctx("agent-c", "agent-d"))?);
+
+        for id in ["agent-b", "agent-c"] {
+            wait_until_idle(&wakes, id).await;
+        }
+        assert!(wakes
+            .runs(Some("agent-a"), 10)?
+            .iter()
+            .all(|run| run.status == "skipped"));
+        assert!(wakes
+            .runs(Some("agent-d"), 10)?
+            .iter()
+            .all(|run| run.status == "skipped"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn human_to_agent_dms_and_channel_mentions_are_preserved() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes.upsert("agent-a", fast_launcher(true))?;
+        wakes.upsert("agent-b", fast_launcher(true))?;
+
+        // Repeated human DMs always wake the agent.
+        for _ in 0..3 {
+            assert!(wakes.request(dm_ctx("tony", "agent-a"))?);
+            wait_until_idle(&wakes, "agent-a").await;
+        }
+
+        // B wakes A via DM, then B mentions A in a channel: channel mention still wakes A,
+        // and does not clear A's DM wake-loop guard with B.
+        assert!(wakes.request(dm_ctx("agent-b", "agent-a"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+        assert!(wakes.request(channel_ctx("agent-b", "agent-a", "#cams"))?);
+        wait_until_idle(&wakes, "agent-a").await;
+        assert!(!wakes.request(dm_ctx("agent-a", "agent-b"))?);
+        Ok(())
     }
 }
