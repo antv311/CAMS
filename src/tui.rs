@@ -67,6 +67,7 @@ const HELP: &[&str] = &[
     "  Enter send · Tab complete @name · up/down channel · Esc dashboard",
     "  PageUp/PageDown scroll history · Home oldest · End latest",
     "  Mouse wheel scrolls history over the message pane",
+    "  Ctrl+D or click a name in People: direct message someone",
     "",
     "In a pop-up: up/down choose, Enter confirm, Esc cancel.",
 ];
@@ -75,6 +76,8 @@ const HELP: &[&str] = &[
 
 #[derive(Clone, Debug, Default)]
 pub struct Account {
+    /// Principal id: DM history names conversations by id.
+    pub id: String,
     pub nick: String,
     pub role: String,
     pub online: bool,
@@ -185,7 +188,10 @@ pub struct Snapshot {
     pub launchers: Vec<Launcher>,
     pub runs: Vec<String>,
     pub channels: Vec<String>,
+    /// Room history by channel; direct messages are keyed `@nick`.
     pub messages: BTreeMap<String, Vec<ChatLine>>,
+    /// Highest direct-message seq fetched so far.
+    pub dm_seq: i64,
     /// The task opened with Enter: its id and the lines to show.
     pub detail: Option<(String, Vec<String>)>,
     pub templates: Vec<TemplateView>,
@@ -252,6 +258,7 @@ pub enum Flow {
     NewAccountModel { channel: String, template: String },
     NewAccountName { channel: String, template: String, model: String },
     NewAccountRole { channel: String, template: String, model: String, nick: String },
+    OpenDm,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -284,6 +291,10 @@ pub struct App {
     pub home_cursor: usize,
     /// Last message seen in each room, for the unread counts.
     pub seen: HashMap<String, i64>,
+    /// Rooms first shown later count messages after this seq as unread.
+    pub seen_floor: Option<i64>,
+    /// Direct-message conversations opened here that have no history yet.
+    pub dm_open: Vec<String>,
     /// Wrapped rows above the latest messages; zero follows new messages.
     pub chat_scroll: usize,
     chat_max_scroll: usize,
@@ -293,6 +304,9 @@ pub struct App {
     channel_rows: Vec<(u16, usize)>,
     task_rows: Vec<(u16, usize)>,
     home_rows: Vec<(u16, usize)>,
+    /// People pane rows that open a direct message: (y, nick).
+    people_rows: Vec<(u16, String)>,
+    people_area: Rect,
     scroll: usize,
 }
 
@@ -307,6 +321,8 @@ impl Default for App {
             project: None,
             home_cursor: 0,
             seen: HashMap::new(),
+            seen_floor: None,
+            dm_open: Vec::new(),
             chat_scroll: 0,
             chat_max_scroll: 0,
             chat_content_height: 0,
@@ -315,9 +331,57 @@ impl Default for App {
             channel_rows: Vec::new(),
             task_rows: Vec::new(),
             home_rows: Vec::new(),
+            people_rows: Vec::new(),
+            people_area: Rect::default(),
             scroll: 0,
         }
     }
+}
+
+/// The rooms the chat lists: channels, then direct messages by name.
+pub fn chat_rooms(app: &App, snap: &Snapshot) -> Vec<String> {
+    let (mut rooms, mut dms): (Vec<String>, Vec<String>) = snap
+        .channels
+        .iter()
+        .cloned()
+        .partition(|room| !room.starts_with('@'));
+    dms.extend(app.dm_open.iter().cloned());
+    dms.sort_by_key(|dm| dm.to_ascii_lowercase());
+    dms.dedup();
+    rooms.extend(dms);
+    rooms
+}
+
+/// Open the direct-message conversation with `nick` in the chat.
+pub fn open_dm(app: &mut App, nick: &str) {
+    let room = format!("@{}", nick.trim_start_matches('@'));
+    if !app.dm_open.contains(&room) {
+        app.dm_open.push(room.clone());
+    }
+    // Drawing moves the selection to this room once it is listed.
+    app.chat_channel = Some(room);
+    app.chat_scroll = 0;
+    app.input.clear();
+    app.view = View::Chat;
+}
+
+/// Messages from others in `room` after the last one seen there.
+pub fn unread(app: &App, snap: &Snapshot, room: &str) -> usize {
+    let seen = app
+        .seen
+        .get(room)
+        .copied()
+        .or(app.seen_floor)
+        .unwrap_or(i64::MAX);
+    snap.messages
+        .get(room)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter(|line| line.seq > seen && !line.sender.eq_ignore_ascii_case(&snap.me))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// The project a room belongs to: its own channel or one of its sprint rooms.
@@ -588,6 +652,7 @@ async fn refresh(
             let id = text(&a["id"]);
             let launcher = launcher_state.get(&id);
             Account {
+                id: id.clone(),
                 nick: text(&a["nick"]),
                 role: text(&a["role"]),
                 online: a["online"].as_bool().unwrap_or(false),
@@ -746,6 +811,55 @@ async fn refresh(
         }
     }
 
+    // Direct messages: every conversation this account is in, keyed `@nick`.
+    let my_id = snap
+        .accounts
+        .iter()
+        .find(|a| a.nick.eq_ignore_ascii_case(&cfg.nick))
+        .map(|a| a.id.clone())
+        .unwrap_or_else(|| cfg.nick.clone());
+    loop {
+        let fetched = get(
+            client,
+            cfg,
+            &format!("/v1/messages?dm=all&after_seq={}&limit=500", snap.dm_seq),
+        )
+        .await?;
+        let batch = fetched["messages"].as_array().cloned().unwrap_or_default();
+        for message in &batch {
+            let seq = message["seq"].as_i64().unwrap_or(0);
+            snap.dm_seq = snap.dm_seq.max(seq);
+            let Some(peer) = dm_peer(&text(&message["channel"]), &my_id) else {
+                continue;
+            };
+            let nick = snap
+                .accounts
+                .iter()
+                .find(|a| a.id.eq_ignore_ascii_case(&peer))
+                .map(|a| a.nick.clone())
+                .unwrap_or(peer);
+            snap.messages
+                .entry(format!("@{nick}"))
+                .or_default()
+                .push(ChatLine {
+                    seq,
+                    sender: text(&message["sender_id"]),
+                    body: text(&message["body"]),
+                    time: message["created_at"].as_i64().unwrap_or(0),
+                });
+        }
+        if batch.len() < 500 {
+            break;
+        }
+    }
+    let dms: Vec<String> = snap
+        .messages
+        .keys()
+        .filter(|name| name.starts_with('@'))
+        .cloned()
+        .collect();
+    snap.channels.extend(dms);
+
     // Keep whatever an action wrote while this refresh was in flight.
     let mut guard = shared.lock().expect("snapshot mutex poisoned");
     snap.notice = guard.notice.clone();
@@ -773,6 +887,17 @@ async fn load_task(
         parent.as_ref().map(|p| &p["task"]),
         pm,
     ))
+}
+
+/// The other side of a stored DM channel `@dm:<id>:<id>`, as a principal id.
+pub fn dm_peer(channel: &str, me: &str) -> Option<String> {
+    let (left, right) = channel.strip_prefix("@dm:")?.split_once(':')?;
+    let peer = if left.eq_ignore_ascii_case(me) {
+        right
+    } else {
+        left
+    };
+    Some(peer.to_string())
 }
 
 /// Who reviews a task, and why: the parent task's lead or the project PM.
@@ -1158,6 +1283,10 @@ fn api(path: String, body: Value, done: &str) -> Option<Action> {
 /// return the request to send.
 fn advance(app: &mut App, flow: Flow, value: String, snap: &Snapshot) -> Option<Action> {
     match flow {
+        Flow::OpenDm => {
+            open_dm(app, &value);
+            None
+        }
         Flow::NewTitle { channel } => {
             if !value.trim().is_empty() {
                 app.modal = picker(
@@ -1496,6 +1625,16 @@ pub fn handle_key(
     if app.modal.is_some() {
         return handle_modal(app, code, snap);
     }
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('d')) {
+        let people: Vec<(String, String)> = snap
+            .accounts
+            .iter()
+            .filter(|a| !a.nick.eq_ignore_ascii_case(&snap.me))
+            .map(|a| (format!("@{}  {}", a.nick, a.role), a.nick.clone()))
+            .collect();
+        app.modal = picker("Direct message", people, Flow::OpenDm);
+        return None;
+    }
     match app.view {
         View::Home => handle_home_key(app, code, snap),
         View::Dashboard => handle_dashboard_key(app, code, snap),
@@ -1554,6 +1693,7 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
             };
             if let Some(index) = room.and_then(|r| snap.channels.iter().position(|c| *c == r)) {
                 app.channel_idx = index;
+                app.chat_channel = None;
             }
             app.chat_scroll = 0;
             app.view = View::Chat;
@@ -1717,12 +1857,14 @@ fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
         KeyCode::Esc => app.view = View::Dashboard,
         KeyCode::Up => {
             app.channel_idx = app.channel_idx.saturating_sub(1);
+            app.chat_channel = None;
             app.chat_scroll = 0;
         }
         KeyCode::Down => {
-            if app.channel_idx + 1 < snap.channels.len() {
+            if app.channel_idx + 1 < chat_rooms(app, snap).len() {
                 app.channel_idx += 1;
             }
+            app.chat_channel = None;
             app.chat_scroll = 0;
         }
         KeyCode::PageUp => {
@@ -1752,7 +1894,8 @@ fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
             let body = app.input.trim().to_string();
             app.input.clear();
             app.chat_scroll = 0;
-            if let (false, Some(target)) = (body.is_empty(), snap.channels.get(app.channel_idx)) {
+            let rooms = chat_rooms(app, snap);
+            if let (false, Some(target)) = (body.is_empty(), rooms.get(app.channel_idx)) {
                 return Some(Action::Send {
                     target: target.clone(),
                     body,
@@ -1792,7 +1935,14 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
         View::Chat if column < CHANNEL_PANE_WIDTH => {
             if let Some((_, index)) = app.channel_rows.iter().find(|(y, _)| *y == row) {
                 app.channel_idx = *index;
+                app.chat_channel = None;
                 app.chat_scroll = 0;
+            }
+        }
+        View::Chat if app.people_area.contains((column, row).into()) => {
+            if let Some((_, nick)) = app.people_rows.iter().find(|(y, _)| *y == row) {
+                let nick = nick.clone();
+                open_dm(app, &nick);
             }
         }
         View::Dashboard => {
@@ -1866,6 +2016,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
     ])
     .areas(frame.area());
 
+    // Rooms that first appear after this count their messages as unread.
+    if app.seen_floor.is_none() {
+        app.seen_floor = Some(
+            snap.messages
+                .values()
+                .filter_map(|lines| lines.last())
+                .map(|line| line.seq)
+                .max()
+                .unwrap_or(0),
+        );
+    }
+    match app.view {
+        View::Home => draw_home(frame, app, snap, body),
+        View::Dashboard => draw_dashboard(frame, app, snap, body),
+        View::Chat => draw_chat(frame, app, snap, body),
+    }
+
     let who = format!(
         "  CAMS  {}  you: @{} ({})",
         snap.server,
@@ -1876,19 +2043,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             &snap.my_role
         }
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(TABS, bold().fg(Color::Black).bg(Color::Cyan)),
-            Span::raw(who),
-        ])),
-        header,
-    );
-
-    match app.view {
-        View::Home => draw_home(frame, app, snap, body),
-        View::Dashboard => draw_dashboard(frame, app, snap, body),
-        View::Chat => draw_chat(frame, app, snap, body),
+    let mut header_spans = vec![
+        Span::styled(TABS, bold().fg(Color::Black).bg(Color::Cyan)),
+        Span::raw(who),
+    ];
+    let dm_unread: usize = snap
+        .messages
+        .keys()
+        .filter(|room| room.starts_with('@'))
+        .map(|room| unread(app, snap, room))
+        .sum();
+    if dm_unread > 0 {
+        header_spans.push(Span::styled(
+            format!("  [{dm_unread} new direct]"),
+            bold().fg(Color::Yellow),
+        ));
     }
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), header);
 
     let hints: &[(&str, &str)] = match app.view {
         View::Home => &[
@@ -1919,6 +2090,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("Enter", "send"),
             ("Tab", "complete @name"),
             ("Up/Down", "room"),
+            ("^D", "direct message"),
             ("PgUp/PgDn", "history"),
             ("End", "latest"),
             ("Esc", "dashboard"),
@@ -2091,11 +2263,15 @@ fn channel_tree(app: &mut App, snap: &Snapshot, area: Rect) -> Vec<Line<'static>
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut number = 0usize;
     let mut last_group: Option<String> = None;
-    for (index, name) in snap.channels.iter().enumerate() {
+    for (index, name) in chat_rooms(app, snap).iter().enumerate() {
         let project = project_for(snap, name);
-        let title = project
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "Hub".to_string());
+        let title = if name.starts_with('@') {
+            "Direct messages".to_string()
+        } else {
+            project
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "Hub".to_string())
+        };
         // A sprint room is listed by its label and title, indented.
         let shown: String = project
             .and_then(|p| p.rooms.iter().find(|r| &r.channel == name))
@@ -2119,16 +2295,10 @@ fn channel_tree(app: &mut App, snap: &Snapshot, area: Rect) -> Vec<Line<'static>
             .and_then(|m| m.last())
             .map(|m| m.seq)
             .unwrap_or(0);
-        let seen = app.seen.entry(name.clone()).or_insert(last_seq);
         if index == app.channel_idx {
-            *seen = last_seq;
+            app.seen.insert(name.clone(), last_seq);
         }
-        let seen = *seen;
-        let unread = snap
-            .messages
-            .get(name)
-            .map(|m| m.iter().filter(|line| line.seq > seen).count())
-            .unwrap_or(0);
+        let unread = unread(app, snap, name);
         let count = if unread > 0 {
             unread.to_string()
         } else {
@@ -2191,24 +2361,33 @@ pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color
 }
 
 /// Who is working in this room (above the line) and who is standing by.
-fn draw_people(frame: &mut Frame, snap: &Snapshot, channel: &str, area: Rect) {
+/// Clicking a name other than your own opens a direct message.
+fn draw_people(frame: &mut Frame, app: &mut App, snap: &Snapshot, channel: &str, area: Rect) {
     let names: Vec<String> = match project_for(snap, channel) {
         Some(project) => project.members.iter().map(|m| m.nick.clone()).collect(),
         None => snap.accounts.iter().map(|a| a.nick.clone()).collect(),
     };
     let mut lines: Vec<Line> = Vec::new();
     let mut standby: Vec<Line> = Vec::new();
+    let mut working_names: Vec<String> = Vec::new();
+    let mut standby_names: Vec<String> = Vec::new();
     for name in names {
         match member_state(snap, channel, &name) {
-            Some((color, label)) => lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(color)),
-                Span::styled(name, bold()),
-                Span::styled(format!(" {label}"), Style::default().fg(color)),
-            ])),
-            None => standby.push(Line::from(vec![
-                Span::styled("○ ", dim()),
-                Span::styled(name, dim()),
-            ])),
+            Some((color, label)) => {
+                working_names.push(name.clone());
+                lines.push(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(color)),
+                    Span::styled(name, bold()),
+                    Span::styled(format!(" {label}"), Style::default().fg(color)),
+                ]));
+            }
+            None => {
+                standby_names.push(name.clone());
+                standby.push(Line::from(vec![
+                    Span::styled("○ ", dim()),
+                    Span::styled(name, dim()),
+                ]));
+            }
         }
     }
     lines.push(Line::from(Span::styled(
@@ -2216,8 +2395,21 @@ fn draw_people(frame: &mut Frame, snap: &Snapshot, channel: &str, area: Rect) {
         dim(),
     )));
     lines.extend(standby);
+    app.people_area = area;
+    // Rows inside the border: working names, the rule, then standing by.
+    let below_rule = working_names.len() + 1;
+    app.people_rows = (working_names.into_iter().enumerate())
+        .chain(
+            standby_names
+                .into_iter()
+                .enumerate()
+                .map(|(at, n)| (at + below_rule, n)),
+        )
+        .filter(|(_, nick)| !nick.eq_ignore_ascii_case(&snap.me))
+        .map(|(at, nick)| (area.y + 1 + at as u16, nick))
+        .collect();
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" People ")),
+        Paragraph::new(lines).block(Block::bordered().title(" People (click: DM) ")),
         area,
     );
 }
@@ -2531,9 +2723,17 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
     let [messages_area, input_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(CHAT_INPUT_HEIGHT)]).areas(right);
 
-    app.channel_idx = app.channel_idx.min(snap.channels.len().saturating_sub(1));
-    let current = snap
-        .channels
+    let rooms = chat_rooms(app, snap);
+    // Stay in the same room when rooms are added or reordered.
+    if let Some(at) = app
+        .chat_channel
+        .as_ref()
+        .and_then(|room| rooms.iter().position(|r| r == room))
+    {
+        app.channel_idx = at;
+    }
+    app.channel_idx = app.channel_idx.min(rooms.len().saturating_sub(1));
+    let current = rooms
         .get(app.channel_idx)
         .cloned()
         .unwrap_or_else(|| "#general".to_string());
@@ -2611,7 +2811,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
     }
 
     draw_chat_input(frame, &app.input, &current, input_area);
-    draw_people(frame, snap, &current, people_area);
+    draw_people(frame, app, snap, &current, people_area);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -2967,6 +3167,7 @@ mod tests {
                 "#quest-video-s1".into(),
             ],
             messages,
+            dm_seq: 0,
             detail: None,
             templates: Vec::new(),
             models: None,
@@ -3800,6 +4001,144 @@ mod tests {
         press(&mut app, &snap, &[KeyCode::Down]);
         render(&mut app, &snap);
         assert_eq!(app.seen["#quest-video"], 2);
+    }
+
+    fn dm(seq: i64, sender: &str, body: &str) -> ChatLine {
+        ChatLine {
+            seq,
+            sender: sender.into(),
+            body: body.into(),
+            time: 0,
+        }
+    }
+
+    #[test]
+    fn dm_peer_is_the_other_side_of_the_stored_channel() {
+        assert_eq!(
+            dm_peer("@dm:flash3.8:tony", "tony").as_deref(),
+            Some("flash3.8")
+        );
+        assert_eq!(dm_peer("@dm:codex:tony", "Tony").as_deref(), Some("codex"));
+        assert_eq!(dm_peer("@dm:tony:tony", "tony").as_deref(), Some("tony"));
+        assert_eq!(dm_peer("#general", "tony"), None);
+    }
+
+    #[test]
+    fn direct_messages_list_after_the_rooms_and_reply_privately() {
+        let mut snap = fixture();
+        snap.channels.push("@flash3.8".into());
+        snap.messages.insert(
+            "@flash3.8".into(),
+            vec![dm(5, "flash3.8", "can you look at #19?")],
+        );
+        let mut app = App {
+            view: View::Chat,
+            channel_idx: 3,
+            ..App::default()
+        };
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Direct messages"), "{screen}");
+        assert!(screen.contains("can you look at #19?"), "{screen}");
+        assert!(screen.contains("Message @flash3.8"), "{screen}");
+        type_text(&mut app, &snap, "on it");
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::Send {
+                target: "@flash3.8".into(),
+                body: "on it".into()
+            })
+        );
+        // The last room is the last DM: Down stays there.
+        press(&mut app, &snap, &[KeyCode::Down]);
+        assert_eq!(app.channel_idx, 3);
+    }
+
+    #[test]
+    fn ctrl_d_picks_someone_and_opens_an_empty_conversation() {
+        let snap = fixture();
+        let mut app = App {
+            view: View::Chat,
+            ..App::default()
+        };
+        render(&mut app, &snap);
+        handle_key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL, &snap);
+        let Some(Modal::Picker { items, .. }) = &app.modal else {
+            panic!("no picker: {:?}", app.modal);
+        };
+        let nicks: Vec<&str> = items.iter().map(|(_, nick)| nick.as_str()).collect();
+        assert_eq!(nicks, ["flash3.8", "flash-lite"], "you cannot DM yourself");
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        assert!(app.modal.is_none());
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Message @flash-lite"), "{screen}");
+        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "@flash-lite");
+        type_text(&mut app, &snap, "hello");
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::Send {
+                target: "@flash-lite".into(),
+                body: "hello".into()
+            })
+        );
+    }
+
+    #[test]
+    fn clicking_a_person_opens_a_dm_but_not_with_yourself() {
+        let snap = fixture();
+        let mut app = App {
+            view: View::Chat,
+            ..App::default()
+        };
+        render(&mut app, &snap);
+        assert!(app.people_rows.iter().all(|(_, nick)| nick != "tony"));
+        let (row, nick) = app
+            .people_rows
+            .iter()
+            .find(|(_, nick)| nick == "flash-lite")
+            .cloned()
+            .unwrap();
+        let x = app.people_area.x + 2;
+        handle_click(&mut app, x, row);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains(&format!("Message @{nick}")), "{screen}");
+    }
+
+    #[test]
+    fn new_direct_messages_are_marked_unread_and_keep_your_place() {
+        let mut snap = fixture();
+        let mut app = App {
+            view: View::Dashboard,
+            ..App::default()
+        };
+        render(&mut app, &snap); // the hub as it was when the TUI opened
+        open_dm(&mut app, "zed");
+        render(&mut app, &snap);
+        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "@zed");
+
+        // A message from someone new sorts above @zed; you stay with @zed.
+        snap.channels.push("@codex".into());
+        snap.messages
+            .insert("@codex".into(), vec![dm(9, "codex", "need a review")]);
+        let screen = render(&mut app, &snap);
+        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "@zed");
+        assert!(screen.contains("[1 new direct]"), "{screen}");
+        let row = screen.lines().find(|l| l.contains("@codex")).unwrap();
+        let tree_row = row.split('│').nth(1).unwrap_or_default();
+        assert!(
+            tree_row.trim_end().ends_with(" 1"),
+            "unread count missing in {row:?}"
+        );
+
+        // Your own messages never count; opening the DM marks it read.
+        snap.messages
+            .get_mut("@codex")
+            .unwrap()
+            .push(dm(10, "tony", "sure"));
+        press(&mut app, &snap, &[KeyCode::Up]);
+        let screen = render(&mut app, &snap);
+        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "@codex");
+        assert!(!screen.contains("new direct"), "{screen}");
+        assert_eq!(app.seen["@codex"], 10);
     }
 
     #[test]
