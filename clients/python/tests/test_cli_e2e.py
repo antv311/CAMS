@@ -448,6 +448,55 @@ class AircdCliE2ETest(unittest.TestCase):
         self.assertTrue(removed["removed"])
         self.assertFalse(expected_wt.exists())
 
+    def test_05_repeated_login_rotate_for_same_account(self) -> None:
+        reg = json.loads(
+            self._run_cli(
+                "--profile", "rotator", "--json",
+                "register", "--nick", "rotator", "--channels", "#general",
+            ).stdout
+        )
+        initial_token = reg["token"]
+        self.assertTrue(initial_token.startswith("airc_"))
+
+        tokens = [initial_token]
+        for idx in range(3):
+            res = json.loads(
+                self._run_cli(
+                    "--profile", "rotator", "--json",
+                    "login", "--rotate", "--channels", "#general",
+                ).stdout
+            )
+            rotated = res.get("rotated_token")
+            self.assertIsNotNone(rotated, f"rotation #{idx + 1} did not return rotated_token")
+            self.assertNotIn(rotated, tokens, f"rotation #{idx + 1} reused an earlier token")
+            tokens.append(rotated)
+
+            saved = json.loads((self.cfg_dir / "profiles.json").read_text())["profiles"]["rotator"]["token"]
+            self.assertEqual(saved, rotated)
+
+            me = json.loads(self._run_cli("--profile", "rotator", "--json", "whoami").stdout)
+            self.assertEqual(me["principal"]["nick"], "rotator")
+
+        # Non-rotating login preserves current token, and a subsequent rotate still succeeds.
+        no_rot = json.loads(
+            self._run_cli(
+                "--profile", "rotator", "--json",
+                "login", "--channels", "#general",
+            ).stdout
+        )
+        self.assertIsNone(no_rot.get("rotated_token"))
+        saved_after_plain = json.loads((self.cfg_dir / "profiles.json").read_text())["profiles"]["rotator"]["token"]
+        self.assertEqual(saved_after_plain, tokens[-1])
+
+        res_after = json.loads(
+            self._run_cli(
+                "--profile", "rotator", "--json",
+                "login", "--rotate", "--channels", "#general",
+            ).stdout
+        )
+        self.assertIsNotNone(res_after.get("rotated_token"))
+        self.assertNotIn(res_after["rotated_token"], tokens)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -340,6 +341,8 @@ def cmd_owner_reissue(args: argparse.Namespace) -> int:
 def cmd_login(args: argparse.Namespace) -> int:
     server, token, prof = require_token(args)
     channels = [c.strip() for c in (args.channels or "#general").split(",") if c.strip()]
+    rotate = bool(args.rotate)
+    label = f"cli-login-{uuid.uuid4().hex[:12]}" if rotate else "cli-login"
     data = http_json(
         server,
         "POST",
@@ -347,8 +350,8 @@ def cmd_login(args: argparse.Namespace) -> int:
         token=token,
         payload={
             "channels": channels,
-            "rotate_token": bool(args.rotate),
-            "label": "cli-login",
+            "rotate_token": rotate,
+            "label": label,
         },
     )
     active_token = data.get("rotated_token") or token
