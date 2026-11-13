@@ -656,12 +656,18 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 0
     if args.task_cmd == "status":
         note = review_note(server, token, args) if args.status == "review" else args.note
+        payload = {"status": args.status, "note": note, "branch": args.branch}
+        report_id = (getattr(args, "report", None) or "").strip()
+        if args.status == "review" and report_id:
+            # The hub validates the report (assignee-authored, same task) and
+            # snapshots it into the task history.
+            payload["report_id"] = report_id
         data = http_json(
             server,
             "POST",
             f"/v1/tasks/{urllib.parse.quote(args.id)}/status",
             token=token,
-            payload={"status": args.status, "note": note, "branch": args.branch},
+            payload=payload,
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (branch={t.get('branch') or '-'})"])

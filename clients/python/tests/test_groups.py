@@ -326,6 +326,7 @@ class GroupCliTest(_HubCase):
         code, _, _ = self.run_cli("task", "status", "task_2", "testing")
         self.assertEqual(code, 0)
         self.assertEqual(self.hub.requests[0]["body"]["note"], None)
+        self.assertNotIn("report_id", self.hub.requests[0]["body"])
 
     def test_review_with_attached_report(self) -> None:
         report = {"id": "rep_1", "task_id": "task_2", "status": "completed", "title": "tests",
@@ -336,6 +337,7 @@ class GroupCliTest(_HubCase):
         fetch, move = self.hub.requests
         self.assertEqual(fetch["path"], "/v1/reports/rep_1")
         self.assertEqual(move["body"]["note"], "ran pytest\nreport rep_1 [completed]: tests - pytest: 40 passed")
+        self.assertEqual(move["body"]["report_id"], "rep_1")
 
     def test_review_rejects_report_for_another_task(self) -> None:
         self.reply((200, {"report": {"id": "rep_1", "task_id": "task_9", "title": "x"}}))
