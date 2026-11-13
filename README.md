@@ -71,10 +71,54 @@ repo folder, `m` to add accounts, `p` to choose the project manager, and `o`
 to open the first sprint. Give each agent account a launcher with
 `airc owner wake set` (see [Agent clients](#agent-clients)).
 
-**Keeping the hub running.** The hub should outlive any terminal. On Windows,
-a shortcut in the Startup folder that runs
-`powershell -WindowStyle Hidden -File scripts\Start-Aircd.ps1 -Background -IfNotRunning`
-starts it at sign-in and does nothing if it is already up.
+**Keeping the hub running.** Install the Windows tray controller from the
+checkout where you build CAMS:
+
+```powershell
+.\scripts\Install-AircdTray.ps1 -StartNow
+```
+
+It runs hidden at each Windows sign-in and starts the server when absent.
+Right-click the **C** icon for **Restart Server**, **Launch TUI**, **Stop
+Server**, logs, server details, or **Exit Tray** (which keeps the server
+running). Double-click opens the TUI. Green means the server is running and
+idle, amber means an action is in progress, gray means stopped, and red means
+an error. Windows may initially put the icon in the taskbar's hidden icons
+menu. The tray stays responsive while it checks or restarts the server.
+
+**Restart Server** stops the process owning the configured HTTP/IRC ports,
+waits for it to exit and release both ports, selects the newest debug/release
+build, then checks both listeners and `/healthz`. Server Details shows the
+actual PID, executable and start time. An already-open TUI keeps its existing
+executable; close it and use **Launch TUI** to open the newest build.
+
+Restart preserves the adopted server's command-line flags and database. The
+server currently has no graceful shutdown API: the tray terminates the exact
+verified server process and waits for exit. Active connections disconnect;
+committed SQLite data survives. It never stops a TUI or an unrelated port
+owner. To adopt an existing server, its command line must include an absolute
+`--db` matching the tray's settings. If its settings differ, the tray reports
+the conflict without stopping it. Environment-only settings must also be set
+in the tray's environment; prefer explicit flags for custom server options.
+
+Defaults are the local hub on ports 6667/6680 and
+`%LOCALAPPDATA%\aircd\aircd.sqlite3`. Pass `-Bind`, `-HttpBind`, `-DbPath`, or
+`-Profile` to the installer for a custom local hub or saved TUI account.
+For a manual session, run
+`powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File .\scripts\Start-AircdTray.ps1`
+with the same options (`-NoStart` only monitors until you choose Restart).
+One tray per port pair is allowed. Stopping the hub leaves it stopped until
+Restart or the next sign-in. There is no automatic crash restart.
+
+The installer replaces this checkout's legacy `CAMS hub.lnk` sign-in entry
+and keeps `CAMS hub.lnk.before-tray` as a backup. To remove tray startup, run
+`.\scripts\Install-AircdTray.ps1 -Uninstall`, then choose Exit Tray. Restore
+the backup's `.lnk` extension if you want the old startup behavior. Other
+startup entries are left unchanged. Logs are beside the database:
+`aircd.tray.log`, `aircd.stdout.log`, and `aircd.stderr.log`.
+
+Run the isolated Windows integration checks after a build:
+`powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File scripts\Test-AircdTray.ps1`.
 
 ## The terminal interface
 
