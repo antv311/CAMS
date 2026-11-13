@@ -2313,6 +2313,88 @@ fn chat_message<'a>(message: &'a ChatLine, me: &str) -> Text<'a> {
     Text::from(lines)
 }
 
+/// Height of the chat message bar: three text rows inside the border.
+const CHAT_INPUT_HEIGHT: u16 = 5;
+
+/// Word-wrap chat input to `width` columns. Returns the visual rows and the
+/// (column, row) where the cursor sits after the last typed character. The
+/// cursor row may be one past the last row when the last row is full.
+fn wrap_input(text: &str, width: usize) -> (Vec<String>, (usize, usize)) {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut len = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            rows.push(String::new());
+            len = 0;
+        }
+        let mut rest = line;
+        while !rest.is_empty() {
+            let is_space = rest.starts_with(char::is_whitespace);
+            let end = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace() != is_space)
+                .map_or(rest.len(), |(at, _)| at);
+            let (token, tail) = rest.split_at(end);
+            rest = tail;
+            let token_len = token.chars().count();
+            if is_space {
+                for c in token.chars() {
+                    if len < width {
+                        rows.last_mut().unwrap().push(c);
+                        len += 1;
+                    } else {
+                        // A space that overflows becomes the line break.
+                        rows.push(String::new());
+                        len = 0;
+                    }
+                }
+                continue;
+            }
+            if len + token_len > width && len > 0 {
+                rows.push(String::new());
+                len = 0;
+            }
+            for c in token.chars() {
+                if len == width {
+                    rows.push(String::new());
+                    len = 0;
+                }
+                rows.last_mut().unwrap().push(c);
+                len += 1;
+            }
+        }
+    }
+    let last = rows.len() - 1;
+    let cursor = if len >= width {
+        (0, last + 1)
+    } else {
+        (len, last)
+    };
+    (rows, cursor)
+}
+
+/// Draw the chat message bar with wrapped text, keeping the cursor row in view.
+fn draw_chat_input(frame: &mut Frame, input: &str, channel: &str, area: Rect) {
+    let block = Block::bordered().title(format!(" Message {channel} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let (rows, (col, row)) = wrap_input(input, usize::from(inner.width));
+    let visible = usize::from(inner.height);
+    let top = (row + 1).saturating_sub(visible);
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .skip(top)
+        .take(visible)
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+    frame.set_cursor_position((inner.x + col as u16, inner.y + (row - top) as u16));
+}
+
 fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
     let [channels_area, right, people_area] = Layout::horizontal([
         Constraint::Length(CHANNEL_PANE_WIDTH),
@@ -2321,7 +2403,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
     ])
     .areas(area);
     let [messages_area, input_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(right);
+        Layout::vertical([Constraint::Min(3), Constraint::Length(CHAT_INPUT_HEIGHT)]).areas(right);
 
     app.channel_idx = app.channel_idx.min(snap.channels.len().saturating_sub(1));
     let current = snap
@@ -2402,15 +2484,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
         );
     }
 
-    frame.render_widget(
-        Paragraph::new(app.input.clone())
-            .block(Block::bordered().title(format!(" Message {current} "))),
-        input_area,
-    );
-    let cursor_x = input_area.x
-        + 1
-        + (app.input.chars().count() as u16).min(input_area.width.saturating_sub(3));
-    frame.set_cursor_position((cursor_x, input_area.y + 1));
+    draw_chat_input(frame, &app.input, &current, input_area);
     draw_people(frame, snap, &current, people_area);
 }
 
@@ -2845,6 +2919,108 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "chat is missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn wrap_input_breaks_at_words_and_tracks_the_cursor() {
+        assert_eq!(wrap_input("", 10), (vec![String::new()], (0, 0)));
+        assert_eq!(wrap_input("hello", 10), (vec!["hello".to_string()], (5, 0)));
+        let (rows, cursor) = wrap_input("hello wide world", 10);
+        assert_eq!(rows, ["hello wide", "world"]);
+        assert_eq!(cursor, (5, 1));
+        let (rows, cursor) = wrap_input("hello abcdefghij", 10);
+        assert_eq!(rows, ["hello ", "abcdefghij"]);
+        assert_eq!(cursor, (0, 2), "a full last row moves the cursor down");
+        let (rows, cursor) = wrap_input("hello world", 10);
+        assert_eq!(rows, ["hello ", "world"]);
+        assert_eq!(cursor, (5, 1));
+        let (rows, cursor) = wrap_input("abcdefghij ", 10);
+        assert_eq!(
+            rows,
+            ["abcdefghij", ""],
+            "an overflowing space breaks the line"
+        );
+        assert_eq!(cursor, (0, 1));
+        let (rows, cursor) = wrap_input("hi abcdefghijklmn", 10);
+        assert_eq!(rows, ["hi ", "abcdefghij", "klmn"], "long words split");
+        assert_eq!(cursor, (4, 2));
+    }
+
+    fn render_chat_input(input: &str, width: u16) -> (String, (u16, u16), Rect) {
+        let snap = fixture();
+        let mut app = App {
+            view: View::Chat,
+            channel_idx: 1,
+            ..App::default()
+        };
+        app.input = input.to_string();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 32)).unwrap();
+        let mut input_area = Rect::default();
+        terminal.draw(|frame| draw(frame, &mut app, &snap)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> = buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+        if let Some(top) = lines
+            .iter()
+            .position(|line| line.contains(" Message #quest-video "))
+        {
+            let left = lines[top].chars().take_while(|c| *c != '┌').count() as u16;
+            input_area = Rect::new(left, top as u16, 0, CHAT_INPUT_HEIGHT);
+        }
+        let cursor = terminal.get_cursor_position().unwrap();
+        (lines.join("\n"), (cursor.x, cursor.y), input_area)
+    }
+
+    #[test]
+    fn chat_input_wraps_long_messages_and_the_cursor_follows() {
+        let words: Vec<String> = (0..12).map(|i| format!("word{i:02}")).collect();
+        let text = words.join(" ");
+        let (screen, cursor, bar) = render_chat_input(&text, 110);
+        assert_eq!(CHAT_INPUT_HEIGHT, 5);
+        let rows: Vec<&str> = screen.lines().collect();
+        let inside: Vec<String> = (1..4)
+            .map(|offset| rows[usize::from(bar.y + offset)].to_string())
+            .collect();
+        for word in &words {
+            assert!(
+                inside.iter().any(|row| row.contains(word.as_str())),
+                "message bar is missing {word:?}: {inside:#?}"
+            );
+        }
+        assert!(
+            inside.iter().filter(|row| row.contains("word")).count() >= 2,
+            "long input should span several rows: {inside:#?}"
+        );
+        assert!(
+            cursor.1 > bar.y + 1,
+            "cursor should follow the text down: {cursor:?}"
+        );
+        let cursor_row = rows[usize::from(cursor.1)];
+        let before: String = cursor_row.chars().take(usize::from(cursor.0)).collect();
+        assert!(
+            before.trim_end().ends_with("word11"),
+            "cursor row: {cursor_row:?}"
+        );
+    }
+
+    #[test]
+    fn chat_input_scrolls_to_keep_the_cursor_visible() {
+        let text = (0..60)
+            .map(|i| format!("w{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (screen, cursor, bar) = render_chat_input(&text, 110);
+        assert_eq!(cursor.1, bar.y + 3, "cursor sits on the last text row");
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(rows[usize::from(cursor.1)].contains("w59"));
+        assert!(
+            !screen.contains("w00 "),
+            "oldest text scrolls out of the bar"
+        );
     }
 
     fn chat_with_history(count: usize) -> (App, Snapshot) {
