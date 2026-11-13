@@ -17,7 +17,7 @@ use crate::rooms::{Room, RoomStore};
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
-use crate::store::{ClientTemplateStore, SharedConnection};
+use crate::store::{ClientTemplate, ClientTemplateStore, SharedConnection};
 use crate::tasks::{NewTask, Task, TaskStore, TERMINAL_STATUSES};
 use crate::wake::{WakeConfig, WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
@@ -28,11 +28,28 @@ pub struct CreatedAccount {
     pub principal: Principal,
     pub token: String,
     pub channel: String,
+    pub channels: Vec<String>,
     pub role: String,
     pub model: String,
     pub template: String,
     pub wake: WakeConfig,
 }
+
+#[derive(Debug)]
+pub(crate) enum SpawnError {
+    Forbidden(String),
+    TemplateNotFound(String),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forbidden(message) | Self::TemplateNotFound(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {}
 
 const SERVER_NAME: &str = "aircd";
 const METADATA_CAPABILITIES: &[&str] = &["message-tags", "echo-message"];
@@ -1900,19 +1917,123 @@ impl Server {
         if self.auth.resolve_by_name(&nick)?.is_some() {
             return Err(anyhow!("an account named '{nick}' already exists"));
         }
-        let launcher = template.launcher_for(model);
+        self.provision_account(template, model, &nick, &channel, &[channel.clone()], &role)
+    }
 
-        let (principal, token) = self.auth.register_principal(&nick, None, None)?;
-        self.join_channels(&principal, &["#general".to_string()])?;
-        let wake = self.wakes.upsert(&principal.id, launcher)?;
-        self.projects.set_role(&channel, &principal.id, &role)?;
-        self.join_channels(&principal, std::slice::from_ref(&channel))?;
-        self.join_rooms(&principal, &channel)?;
+    /// Spawn from an owner-defined template. `None` is reserved for an HTTP
+    /// caller that has already supplied the owner key. Bearer callers must
+    /// own the hub or manage every requested project; roles remain local to
+    /// those projects and the global account is always a member.
+    pub(crate) fn spawn_worker_from_template(
+        &self,
+        actor: Option<&Principal>,
+        template_id: &str,
+        raw_model: &str,
+        raw_nick: &str,
+        raw_channels: &[String],
+        raw_role: Option<&str>,
+    ) -> Result<CreatedAccount> {
+        let mut channels = Vec::new();
+        for raw in raw_channels {
+            let channel = normalize_channel(raw);
+            if raw.trim().is_empty()
+                || channel.len() < 2
+                || channel.chars().any(|c| {
+                    c.is_whitespace() || c.is_control() || matches!(c, ',' | ':' | '\u{7}')
+                })
+            {
+                return Err(anyhow!(
+                    "channels must be nonempty channel names without spaces, commas or colons"
+                ));
+            }
+            if !channels.contains(&channel) {
+                channels.push(channel);
+            }
+        }
+        if channels.is_empty() {
+            channels.push(CHAT_ONLY_CHANNEL.to_string());
+        }
+        if let Some(actor) = actor.filter(|actor| !Self::is_owner(actor)) {
+            for channel in &channels {
+                let project = self.project_of(channel);
+                if self.projects.get(&project)?.is_none()
+                    || !self.is_project_manager(actor, &project)?
+                {
+                    return Err(SpawnError::Forbidden(format!(
+                        "only the owner or a manager of {channel} can provision a worker there"
+                    ))
+                    .into());
+                }
+            }
+        }
+        let template = self.templates.get(template_id)?.ok_or_else(|| {
+            SpawnError::TemplateNotFound(format!("no client template named '{template_id}'"))
+        })?;
+        let model = raw_model.trim();
+        if !crate::store::valid_model(model) {
+            return Err(anyhow!("a model is required: one word without braces"));
+        }
+        let nick = crate::auth::validate_nick(raw_nick)?;
+        let role = crate::auth::normalize_role(raw_role.unwrap_or("member"))?;
+        self.provision_account(template, model, &nick, &channels[0], &channels, &role)
+    }
+
+    fn provision_account(
+        &self,
+        template: ClientTemplate,
+        model: &str,
+        nick: &str,
+        channel: &str,
+        requested_channels: &[String],
+        role: &str,
+    ) -> Result<CreatedAccount> {
+        let mut channels = vec![CHAT_ONLY_CHANNEL.to_string()];
+        let mut projects = Vec::new();
+        for channel in requested_channels {
+            if !channels.contains(channel) {
+                channels.push(channel.clone());
+            }
+            let project = self.project_of(channel);
+            if self.projects.get(&project)?.is_some() && !projects.contains(&project) {
+                if !channels.contains(&project) {
+                    channels.push(project.clone());
+                }
+                for room in self.rooms.list(Some(&project))? {
+                    if !channels.contains(&room.channel) {
+                        channels.push(room.channel);
+                    }
+                }
+                projects.push(project);
+            }
+        }
+
+        // A failed launcher/membership write must not strand an account whose
+        // only token was never returned to the caller. Nothing launches here.
+        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let tx = db.transaction().context("start worker provisioning")?;
+        let (principal, token) = AuthStore::register_principal_on(&tx, nick, None, None)?;
+        let wake = WakeManager::upsert_on(&tx, &principal.id, template.launcher_for(model))?;
+        for project in projects {
+            tx.execute(
+                "INSERT INTO project_roles (channel, principal_id, role, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![project, principal.id, role, unix_timestamp()],
+            )?;
+        }
+        for channel in &channels {
+            tx.execute(
+                "INSERT INTO channel_memberships (principal_id, channel, joined_at, last_seen_seq)
+                 VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(seq), 0) FROM messages WHERE channel = ?2))",
+                params![principal.id, channel, unix_timestamp()],
+            )?;
+        }
+        tx.commit().context("commit worker provisioning")?;
         Ok(CreatedAccount {
             principal,
             token,
-            channel,
-            role,
+            channel: channel.to_string(),
+            channels,
+            role: role.to_string(),
             model: model.to_string(),
             template: template.id,
             wake,

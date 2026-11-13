@@ -312,6 +312,16 @@ impl WakeManager {
     }
 
     pub fn upsert(&self, principal_id: &str, input: WakeConfigInput) -> Result<WakeConfig> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        Self::upsert_on(&db, principal_id, input)
+    }
+
+    /// Save a launcher as part of a larger provisioning transaction.
+    pub(crate) fn upsert_on(
+        db: &rusqlite::Connection,
+        principal_id: &str,
+        input: WakeConfigInput,
+    ) -> Result<WakeConfig> {
         let command = input.command.trim().to_string();
         if command.is_empty() {
             return Err(anyhow!("wake command is required"));
@@ -359,7 +369,6 @@ impl WakeManager {
             )?,
             updated_at: unix_timestamp(),
         };
-        let db = self.db.lock().expect("sqlite mutex poisoned");
         db.execute(
             "INSERT INTO wake_configs
                (principal_id, command, args_json, cwd, env_json, prompt, enabled,

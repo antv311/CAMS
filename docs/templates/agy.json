@@ -1,0 +1,7 @@
+{
+  "name": "Antigravity CLI",
+  "command": "agy",
+  "args": ["-p", "{prompt}", "--model", "{model}"],
+  "session_mode": "fresh",
+  "session_scope": "account"
+}

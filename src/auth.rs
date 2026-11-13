@@ -141,6 +141,21 @@ impl AuthStore {
         raw_role: Option<&str>,
         raw_team: Option<&str>,
     ) -> Result<(Principal, String)> {
+        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let tx = db.transaction().context("start registration transaction")?;
+        let created = Self::register_principal_on(&tx, raw_nick, raw_role, raw_team)?;
+        tx.commit().context("commit registration transaction")?;
+        Ok(created)
+    }
+
+    /// Register inside the caller's transaction, so provisioning can include
+    /// the token, memberships and launcher in the same commit.
+    pub(crate) fn register_principal_on(
+        db: &Connection,
+        raw_nick: &str,
+        raw_role: Option<&str>,
+        raw_team: Option<&str>,
+    ) -> Result<(Principal, String)> {
         let nick = validate_nick(raw_nick)?;
         let id = nick.to_ascii_lowercase();
         let role = normalize_role(raw_role.unwrap_or("member"))?;
@@ -153,7 +168,6 @@ impl AuthStore {
         let token_hash = tokens::hash(&secret).context("hash registration token")?;
         let sentinel = format!("__hashed__:{token_id_hex}");
 
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
         let existing: Option<String> = db
             .query_row(
                 "SELECT nick FROM principals WHERE LOWER(id) = LOWER(?1) OR LOWER(nick) = LOWER(?2)",
@@ -169,20 +183,18 @@ impl AuthStore {
             ))));
         }
 
-        let tx = db.transaction().context("start registration transaction")?;
-        tx.execute(
+        db.execute(
             "INSERT INTO principals (id, nick, token, team, role, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())",
             params![id, nick, sentinel, team, role],
         )
         .context("insert principal")?;
-        tx.execute(
+        db.execute(
             "INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
              VALUES (?1, ?2, ?3, 'register', unixepoch())",
             params![id, token_id_hex, token_hash],
         )
         .context("insert registration token")?;
-        tx.commit().context("commit registration transaction")?;
 
         Ok((
             Principal {

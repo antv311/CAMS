@@ -1,0 +1,7 @@
+{
+  "name": "Codex CLI",
+  "command": "codex",
+  "args": ["exec", "--model", "{model}", "{prompt}"],
+  "session_mode": "fresh",
+  "session_scope": "account"
+}
