@@ -10,6 +10,267 @@ use crate::tokens;
 
 pub type SharedConnection = Arc<Mutex<Connection>>;
 
+/// A reusable seat definition. Counts describe workers; the lead has one seat.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub template: String,
+    pub model: String,
+    #[serde(default = "one_seat")]
+    pub count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nick: Option<String>,
+}
+
+fn one_seat() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInput {
+    pub name: String,
+    pub description: Option<String>,
+    pub lead: GroupMember,
+    #[serde(default)]
+    pub workers: Vec<GroupMember>,
+    pub lead_prompt: Option<String>,
+    pub worker_prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Group {
+    #[serde(flatten)]
+    pub definition: GroupInput,
+    pub projects: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug)]
+pub enum GroupStoreError {
+    GroupNotFound(String),
+    ProjectNotFound(String),
+}
+
+impl std::fmt::Display for GroupStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GroupNotFound(name) => write!(f, "no group named '{name}'"),
+            Self::ProjectNotFound(channel) => write!(f, "no project named '{channel}'"),
+        }
+    }
+}
+
+impl std::error::Error for GroupStoreError {}
+
+/// Definition and attachment persistence only; does not create or launch accounts.
+#[derive(Clone)]
+pub struct GroupStore {
+    db: SharedConnection,
+}
+
+impl GroupStore {
+    pub fn new(db: SharedConnection) -> Self {
+        Self { db }
+    }
+
+    /// Full replacement by name, preserving original creation time and attachments.
+    pub fn upsert(&self, mut input: GroupInput) -> Result<Group> {
+        input.name = group_name(&input.name)?.to_string();
+        validate_group_member(&mut input.lead)?;
+        if input.lead.count != 1 {
+            return Err(anyhow!("a group must have exactly one lead"));
+        }
+        if input.workers.is_empty() {
+            return Err(anyhow!("a group needs at least one worker"));
+        }
+        for worker in &mut input.workers {
+            validate_group_member(worker)?;
+        }
+        for text in [&input.description, &input.lead_prompt, &input.worker_prompt]
+            .into_iter()
+            .flatten()
+        {
+            if text.contains('\0') {
+                return Err(anyhow!(
+                    "group description and prompts must not contain NUL"
+                ));
+            }
+        }
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        db.execute(
+            "INSERT INTO groups
+               (name, description, lead_json, workers_json, lead_prompt, worker_prompt,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(name) DO UPDATE SET
+               description = excluded.description, lead_json = excluded.lead_json,
+               workers_json = excluded.workers_json, lead_prompt = excluded.lead_prompt,
+               worker_prompt = excluded.worker_prompt, updated_at = excluded.updated_at",
+            params![
+                input.name,
+                input.description,
+                serde_json::to_string(&input.lead)?,
+                serde_json::to_string(&input.workers)?,
+                input.lead_prompt,
+                input.worker_prompt,
+                unix_timestamp(),
+            ],
+        )
+        .context("save group")?;
+        Self::get_locked(&db, &input.name)?.ok_or_else(|| anyhow!("group {} vanished", input.name))
+    }
+
+    pub fn get(&self, name: &str) -> Result<Option<Group>> {
+        let name = group_name(name)?;
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        Self::get_locked(&db, name)
+    }
+
+    pub fn list(&self) -> Result<Vec<Group>> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut statement = db.prepare("SELECT name FROM groups ORDER BY name ASC")?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        names
+            .into_iter()
+            .map(|name| {
+                Self::get_locked(&db, &name)?.ok_or_else(|| anyhow!("group {name} vanished"))
+            })
+            .collect()
+    }
+
+    /// Attach only to real projects. Repeated attachment leaves timestamps unchanged.
+    pub fn attach(&self, name: &str, channel: &str) -> Result<Group> {
+        let name = group_name(name)?;
+        let channel = channel.trim();
+        if channel.len() < 2
+            || !channel.starts_with('#')
+            || channel.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(anyhow!(
+                "project channel must start with '#' and contain no whitespace"
+            ));
+        }
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let group = Self::get_locked(&db, name)?
+            .ok_or_else(|| GroupStoreError::GroupNotFound(name.to_string()))?;
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE channel = ?1)",
+            [channel],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(GroupStoreError::ProjectNotFound(channel.to_string()).into());
+        }
+        let tx = db.unchecked_transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO group_projects (group_name, channel) VALUES (?1, ?2)",
+            params![name, channel],
+        )?;
+        if inserted == 0 {
+            return Ok(group);
+        }
+        tx.execute(
+            "UPDATE groups SET updated_at = ?2 WHERE name = ?1",
+            params![name, unix_timestamp()],
+        )?;
+        tx.commit()?;
+        Self::get_locked(&db, name)?.ok_or_else(|| anyhow!("group {name} vanished"))
+    }
+
+    pub fn delete(&self, name: &str) -> Result<bool> {
+        let name = group_name(name)?;
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let tx = db.unchecked_transaction()?;
+        tx.execute("DELETE FROM group_projects WHERE group_name = ?1", [name])?;
+        let changed = tx.execute("DELETE FROM groups WHERE name = ?1", [name])?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    fn get_locked(db: &Connection, name: &str) -> Result<Option<Group>> {
+        let group = db
+            .query_row(
+                "SELECT name, description, lead_json, workers_json, lead_prompt,
+                        worker_prompt, created_at, updated_at FROM groups WHERE name = ?1",
+                [name],
+                |row| {
+                    let lead: String = row.get(2)?;
+                    let workers: String = row.get(3)?;
+                    let decode_error = |index, error: serde_json::Error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            index,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    };
+                    Ok(Group {
+                        definition: GroupInput {
+                            name: row.get(0)?,
+                            description: row.get(1)?,
+                            lead: serde_json::from_str(&lead).map_err(|e| decode_error(2, e))?,
+                            workers: serde_json::from_str(&workers)
+                                .map_err(|e| decode_error(3, e))?,
+                            lead_prompt: row.get(4)?,
+                            worker_prompt: row.get(5)?,
+                        },
+                        projects: Vec::new(),
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .context("load group")?;
+        let Some(mut group) = group else {
+            return Ok(None);
+        };
+        let mut statement = db.prepare(
+            "SELECT channel FROM group_projects WHERE group_name = ?1 ORDER BY channel ASC",
+        )?;
+        group.projects = statement
+            .query_map([name], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(group))
+    }
+}
+
+fn group_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.chars().count() > 100
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+    {
+        return Err(anyhow!(
+            "group name must be one nonempty path segment of at most 100 characters"
+        ));
+    }
+    Ok(name)
+}
+
+fn validate_group_member(member: &mut GroupMember) -> Result<()> {
+    member.template = client_template_id(&member.template)?.to_string();
+    member.model = member.model.trim().to_string();
+    if !valid_model(&member.model) {
+        return Err(anyhow!(
+            "group member model must be one word of at most 100 characters without braces"
+        ));
+    }
+    if member.count == 0 {
+        return Err(anyhow!("group member count must be at least 1"));
+    }
+    if let Some(nick) = &member.nick {
+        if nick.trim().is_empty() || nick.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(anyhow!("group member nick must be one nonempty word"));
+        }
+    }
+    Ok(())
+}
+
 /// An owner-defined client launcher. Placeholders such as `{model}` and
 /// `{prompt}` are stored verbatim; the chosen model belongs to the worker,
 /// not to the template. Executable availability is runtime state and is not
@@ -617,6 +878,7 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
     migrate_wake_configs(connection)?;
     migrate_projects(connection)?;
     migrate_client_templates(connection)?;
+    migrate_groups(connection)?;
 
     if seed_demo {
         for (id, token, team) in DEMO_PRINCIPALS {
@@ -667,6 +929,31 @@ fn migrate_client_templates(connection: &Connection) -> Result<()> {
             )?;
         }
     }
+    Ok(())
+}
+
+/// Additive and safe to rerun on existing hubs.
+fn migrate_groups(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS groups (
+           name TEXT PRIMARY KEY NOT NULL,
+           description TEXT,
+           lead_json TEXT NOT NULL,
+           workers_json TEXT NOT NULL,
+           lead_prompt TEXT,
+           worker_prompt TEXT,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS group_projects (
+           group_name TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
+           channel TEXT NOT NULL REFERENCES projects(channel),
+           PRIMARY KEY (group_name, channel)
+         );
+         CREATE INDEX IF NOT EXISTS idx_group_projects_channel ON group_projects(channel);",
+        )
+        .context("migrate groups")?;
     Ok(())
 }
 
@@ -876,6 +1163,186 @@ fn backfill_principal_tokens(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn group_input(name: &str) -> GroupInput {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "description": "Reusable team",
+            "lead": {"template": "claude", "model": "opus", "nick": "dev-lead"},
+            "workers": [{"template": "ollama", "model": "qwen3:35b", "count": 3}],
+            "lead_prompt": "Split {task}.\nReview every result.\n",
+            "worker_prompt": "Write only the assigned code.\n"
+        }))
+        .unwrap()
+    }
+
+    fn group_project(db: &SharedConnection, channel: &str) -> Result<()> {
+        crate::projects::ProjectStore::new(db.clone()).create(channel, "Project", None, "owner")?;
+        Ok(())
+    }
+
+    #[test]
+    fn groups_crud_preserves_prompts_creation_and_sorted_attachments() -> Result<()> {
+        let db = open(":memory:")?;
+        let groups = GroupStore::new(db.clone());
+        assert!(groups.list()?.is_empty());
+        groups.upsert(group_input("zeta"))?;
+        let input = group_input("dev");
+        let created = groups.upsert(input.clone())?;
+        assert_eq!(created.definition, input);
+        assert_eq!(created.definition.lead.count, 1);
+        assert_eq!(groups.get(" dev ")?, Some(created.clone()));
+        assert_eq!(serde_json::to_value(&created)?["name"], "dev");
+        assert_eq!(groups.list()?[0], created);
+        for channel in ["#two", "#one"] {
+            group_project(&db, channel)?;
+            groups.attach("dev", channel)?;
+        }
+        let attached = groups.get("dev")?.unwrap();
+        assert_eq!(attached.projects, vec!["#one", "#two"]);
+        assert_eq!(groups.attach("dev", "#one")?, attached);
+        assert!(groups.get("zeta")?.unwrap().projects.is_empty());
+        db.lock().unwrap().execute(
+            "UPDATE groups SET created_at = 10, updated_at = 20 WHERE name = 'dev'",
+            [],
+        )?;
+        let mut replacement = group_input("dev");
+        replacement.description = None;
+        replacement.lead_prompt = None;
+        replacement.worker_prompt = Some("Replacement".to_string());
+        replacement.workers[0].count = 2;
+        let replaced = groups.upsert(replacement.clone())?;
+        assert_eq!(replaced.definition, replacement);
+        assert_eq!(replaced.created_at, 10);
+        assert!(replaced.updated_at >= 20);
+        assert_eq!(replaced.projects, attached.projects);
+        assert!(!groups.delete("missing")?);
+        assert!(groups.delete("dev")?);
+        assert!(groups.get("dev")?.is_none());
+        let links: i64 = db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM group_projects WHERE group_name = 'dev'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(links, 0);
+        assert!(groups.upsert(group_input("dev"))?.projects.is_empty());
+        assert!(crate::projects::ProjectStore::new(db)
+            .get("#one")?
+            .is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn groups_reject_invalid_definitions_and_attachments_without_mutation() -> Result<()> {
+        let db = open(":memory:")?;
+        group_project(&db, "#one")?;
+        let groups = GroupStore::new(db.clone());
+        groups.upsert(group_input("dev"))?;
+        groups.attach("dev", "#one")?;
+        let before = groups.list()?;
+        let mut invalid = Vec::new();
+        for name in [
+            " ",
+            ".",
+            "..",
+            "bad/name",
+            "bad\\name",
+            "bad\0name",
+            &"a".repeat(101),
+        ] {
+            invalid.push(group_input(name));
+        }
+        let mut input = group_input("dev");
+        input.lead.count = 2;
+        invalid.push(input);
+        let mut input = group_input("dev");
+        input.workers.clear();
+        invalid.push(input);
+        let mut input = group_input("dev");
+        input.workers[0].count = 0;
+        invalid.push(input);
+        let mut input = group_input("dev");
+        input.lead.template = "../bad".into();
+        invalid.push(input);
+        let mut input = group_input("dev");
+        input.workers[0].model = " ".into();
+        invalid.push(input);
+        let mut input = group_input("dev");
+        input.lead.nick = Some("two words".into());
+        invalid.push(input);
+        let mut input = group_input("dev");
+        input.worker_prompt = Some("bad\0prompt".into());
+        invalid.push(input);
+        for input in invalid {
+            assert!(groups.upsert(input).is_err());
+            assert_eq!(groups.list()?, before);
+        }
+        for channel in ["one", "#", "#bad channel", "#bad\0channel", "#missing"] {
+            assert!(groups.attach("dev", channel).is_err());
+            assert_eq!(groups.list()?, before);
+        }
+        assert!(groups
+            .attach("missing", "#one")
+            .unwrap_err()
+            .downcast_ref::<GroupStoreError>()
+            .is_some());
+        assert_eq!(groups.list()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn groups_migration_is_additive_idempotent_and_persistent() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("aircd-groups-{}.sqlite3", uuid::Uuid::new_v4()));
+        {
+            let connection = Connection::open(&path)?;
+            // A project from a hub predating groups and the PM migration.
+            connection.execute_batch(
+                "CREATE TABLE projects (channel TEXT PRIMARY KEY, name TEXT NOT NULL,
+                   description TEXT, created_by TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO projects VALUES ('#legacy', 'Keep me', 'History', 'owner', 7);",
+            )?;
+            init_with(&connection, false)?;
+            init_with(&connection, false)?;
+            let db = Arc::new(Mutex::new(connection));
+            let groups = GroupStore::new(db);
+            groups.upsert(group_input("dev"))?;
+            groups.attach("dev", "#legacy")?;
+        }
+        {
+            let db = open(&path)?;
+            let groups = GroupStore::new(db.clone());
+            assert_eq!(groups.list()?.len(), 1);
+            assert_eq!(groups.get("dev")?.unwrap().definition, group_input("dev"));
+            assert_eq!(groups.get("dev")?.unwrap().projects, vec!["#legacy"]);
+            let project = crate::projects::ProjectStore::new(db)
+                .get("#legacy")?
+                .unwrap();
+            assert_eq!((project.name.as_str(), project.created_at), ("Keep me", 7));
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn groups_surface_corrupt_json_without_changing_attachments() -> Result<()> {
+        let db = open(":memory:")?;
+        group_project(&db, "#one")?;
+        let groups = GroupStore::new(db.clone());
+        groups.upsert(group_input("dev"))?;
+        db.lock()
+            .unwrap()
+            .execute("UPDATE groups SET workers_json = 'corrupt'", [])?;
+        assert!(groups.get("dev").is_err());
+        assert!(groups.list().is_err());
+        assert!(groups.attach("dev", "#one").is_err());
+        let links: i64 =
+            db.lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM group_projects", [], |row| row.get(0))?;
+        assert_eq!(links, 0);
+        Ok(())
+    }
 
     fn template_input() -> ClientTemplateInput {
         ClientTemplateInput {
