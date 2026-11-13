@@ -1,13 +1,11 @@
 @echo off
 setlocal
 set "ROOT=%~dp0"
-if exist "%ROOT%target\release\aircd.exe" (
-  "%ROOT%target\release\aircd.exe" %*
-  exit /b %ERRORLEVEL%
-)
-if exist "%ROOT%target\debug\aircd.exe" (
-  "%ROOT%target\debug\aircd.exe" %*
-  exit /b %ERRORLEVEL%
-)
+set "EXE="
+for /f "usebackq delims=" %%I in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Get-AircdExecutable.ps1"`) do set "EXE=%%I"
+if not defined EXE goto build
+"%EXE%" %*
+exit /b %ERRORLEVEL%
+:build
 cargo run --manifest-path "%ROOT%Cargo.toml" -- %*
 exit /b %ERRORLEVEL%

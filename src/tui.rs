@@ -3622,6 +3622,31 @@ mod tests {
     }
 
     #[test]
+    fn lmstudio_account_picker_selects_a_discovered_link_model() {
+        let mut snap = with_templates(fixture());
+        let mut app = App::default();
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Down]);
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::LoadModels("lmstudio".into()))
+        );
+        snap.models = Some(("lmstudio".into(), Ok(vec![
+            ("qwen/qwen3-coder:30b".into(), Some("Qwen 3 Coder".into())),
+        ])));
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("qwen/qwen3-coder:30b  Qwen 3 Coder"), "{screen}");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(matches!(app.modal, Some(Modal::Prompt { ref title, .. })
+            if title == "Account name for qwen/qwen3-coder:30b"));
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(matches!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::CreateAccount { ref body })
+                if body["template"] == "lmstudio" && body["model"] == "qwen/qwen3-coder:30b"
+        ));
+    }
+
+    #[test]
     fn a_model_the_list_does_not_show_can_be_typed() {
         let mut snap = with_templates(fixture());
         snap.models = Some(("lmstudio".into(), Err("could not start 'lms'".into())));

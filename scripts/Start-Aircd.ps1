@@ -22,13 +22,9 @@ if ($DbDir -and !(Test-Path $DbDir)) {
     New-Item -ItemType Directory -Path $DbDir -Force | Out-Null
 }
 
-$ReleaseExe = Join-Path $RepoRoot "target\release\aircd.exe"
 $DebugExe = Join-Path $RepoRoot "target\debug\aircd.exe"
-if (Test-Path $ReleaseExe) {
-    $Exe = $ReleaseExe
-} elseif (Test-Path $DebugExe) {
-    $Exe = $DebugExe
-} else {
+$Exe = & (Join-Path $PSScriptRoot "Get-AircdExecutable.ps1") -RepoRoot $RepoRoot
+if (!$Exe) {
     Write-Host "Building aircd..."
     & cargo build --manifest-path (Join-Path $RepoRoot "Cargo.toml")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -46,4 +42,5 @@ if ($Background) {
     Write-Host "Logs:        $LogOut"
 } else {
     & $Exe @ArgList
+    exit $LASTEXITCODE
 }

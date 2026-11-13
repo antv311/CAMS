@@ -454,6 +454,12 @@ Any browser or agent opening `http://<server-ip>:6680/` (or `/?format=md` / `/v1
 .\airc.cmd git pr-report C:\path\to\repo --base main --status completed
 ```
 
+The Windows launchers use the newest `target\debug\aircd.exe` or
+`target\release\aircd.exe` build (release wins a timestamp tie). After building
+an update, restart the hub to load it; restarting only the TUI leaves the hub
+running its previous code. If LM Studio offers only manual model entry, check
+the discovery error in the model picker and restart the hub on the updated build.
+
 ## Run locally
 
 ```bash
