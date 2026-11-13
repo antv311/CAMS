@@ -3030,7 +3030,7 @@ mod tests {
             assert!(wake.enabled);
             assert_eq!(wake.cooldown_seconds, 20);
             assert_eq!(wake.timeout_seconds, 1800);
-            assert_eq!(wake.max_runs_per_hour, 12);
+            assert_eq!(wake.max_runs_per_hour, 30);
             let token = account["token"].as_str().unwrap();
             assert!(token.starts_with("airc_"));
             assert_eq!(api.server.auth().authenticate(token)?.id, nick);
@@ -4030,6 +4030,7 @@ mod tests {
         let (status, body) = call(&client, "POST", wake_url.clone(), "", keyed).await?;
         assert_eq!(status, 200);
         assert_eq!(body["wake"]["enabled"], true);
+        assert_eq!(body["wake"]["max_runs_per_hour"], 30);
 
         call(&client, "POST", format!("{base}/v1/projects"), owner,
             json!({"channel": "#quest"})).await?;
