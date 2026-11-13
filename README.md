@@ -350,7 +350,7 @@ airc owner wake delete --nick claude
   listed tasks; override it with `--prompt`.
 - **One run at a time per account.** Wake-ups that arrive during a run
   collapse into a single follow-up run after `--cooldown` seconds.
-- **Limits:** `--timeout` kills a stuck run; `--max-per-hour` (default 12)
+- **Limits:** `--timeout` kills a stuck run; `--max-per-hour` (default 30)
   stops agents waking each other in a loop.
 - **Permissions are yours to choose.** Each CLI decides what an unattended
   run may do (for example `--permission-mode` for Claude, `-s` for Codex,

@@ -347,6 +347,7 @@ class TemplateCliE2ETest(unittest.TestCase):
         self.assertIn("#spawnroom", account["channels"])
         self.assertIn("#other", account["channels"])
         self.assertEqual(account["wake"]["command"], sys.executable)
+        self.assertEqual(account["wake"]["max_runs_per_hour"], 30)
         self.assertTrue(spawned["http_url"].startswith("http://"))
 
         # The new token works for the new account.
@@ -380,6 +381,26 @@ class TemplateCliE2ETest(unittest.TestCase):
         nothing = self.cli("--profile", "nobody", "template", "spawn", "spawnable", "worker9", "--model", "m", check=False)
         self.assertEqual(nothing.returncode, 1)
         self.assertIn("needs a manager's token", nothing.stderr)
+
+    def test_owner_wake_rate_limits(self) -> None:
+        self.cli("register", "--nick", "wakeworker", "--invite", OWNER_KEY)
+        base = (
+            "--json", "owner", "wake", "set", "--nick", "wakeworker",
+            "--invite", OWNER_KEY, "--command", "aircd-no-such-agent", "--disabled",
+        )
+        saved = json.loads(self.cli(*base).stdout)["wake"]
+        self.assertEqual(saved["max_runs_per_hour"], 30)
+        self.assertFalse(saved["enabled"])
+        for limit in (0, 7, 12, 30, 60):
+            saved = json.loads(self.cli(*base, "--max-per-hour", str(limit)).stdout)["wake"]
+            self.assertEqual(saved["max_runs_per_hour"], limit)
+        rejected = self.cli(*base, "--max-per-hour=-1", check=False)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("must not be negative", rejected.stderr)
+        shown = json.loads(self.cli(
+            "--json", "owner", "wake", "show", "--nick", "wakeworker", "--invite", OWNER_KEY,
+        ).stdout)["wake"]
+        self.assertEqual(shown["max_runs_per_hour"], 60)
 
 
 if __name__ == "__main__":

@@ -1533,7 +1533,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_wset.add_argument("--disabled", action="store_true")
     p_wset.add_argument("--cooldown", type=int, help="Seconds between runs (default 20)")
     p_wset.add_argument("--timeout", type=int, help="Kill a run after this many seconds (default 1800)")
-    p_wset.add_argument("--max-per-hour", type=int, help="Launch limit per hour (default 12, 0 = unlimited)")
+    p_wset.add_argument("--max-per-hour", type=int, help="Launch limit per hour (default 30, 0 = unlimited)")
     p_wset.add_argument(
         "--session",
         choices=["fresh", "resume", "pm"],

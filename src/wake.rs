@@ -45,7 +45,7 @@ your own rules.";
 
 const DEFAULT_COOLDOWN_SECONDS: i64 = 20;
 const DEFAULT_TIMEOUT_SECONDS: i64 = 1800;
-const DEFAULT_MAX_RUNS_PER_HOUR: i64 = 12;
+const DEFAULT_MAX_RUNS_PER_HOUR: i64 = 30;
 const LOG_TAIL_BYTES: usize = 4000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -845,6 +845,46 @@ fn tail(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_rate_limit_defaults_to_30_and_preserves_explicit_limits() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        for (id, json) in [
+            ("omitted", serde_json::json!({"command": "agent"})),
+            (
+                "null",
+                serde_json::json!({"command": "agent", "max_runs_per_hour": null}),
+            ),
+        ] {
+            let saved = wakes.upsert(id, serde_json::from_value(json)?)?;
+            assert_eq!(saved.max_runs_per_hour, 30);
+            assert_eq!(wakes.get(id)?.unwrap().max_runs_per_hour, 30);
+        }
+        for limit in [0, 7, 12, 30, 60] {
+            let saved = wakes.upsert(
+                "explicit",
+                WakeConfigInput {
+                    command: "agent".into(),
+                    max_runs_per_hour: Some(limit),
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(saved.max_runs_per_hour, limit);
+            assert_eq!(wakes.get("explicit")?.unwrap().max_runs_per_hour, limit);
+        }
+        assert!(wakes
+            .upsert(
+                "explicit",
+                WakeConfigInput {
+                    command: "agent".into(),
+                    max_runs_per_hour: Some(-1),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        assert_eq!(wakes.get("explicit")?.unwrap().max_runs_per_hour, 60);
+        Ok(())
+    }
 
     #[test]
     fn expand_replaces_known_placeholders_and_keeps_unknown_ones() {
