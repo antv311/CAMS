@@ -106,6 +106,10 @@ pub struct TaskView {
     pub title: String,
     /// The sprint room the task belongs to.
     pub sprint: Option<String>,
+    /// Account that reviews the work: the parent's lead or the project PM.
+    pub reviewer: Option<String>,
+    /// The task this one is a subtask of.
+    pub parent: Option<String>,
 }
 
 /// A sprint room under a project.
@@ -331,7 +335,38 @@ pub fn rows(snap: &Snapshot, only: Option<&str>) -> Vec<Row> {
             continue;
         }
         out.push(Row::Project(p));
-        out.extend((0..project.tasks.len()).map(|t| Row::Task(p, t)));
+        out.extend(task_tree(project).into_iter().map(|(t, _)| Row::Task(p, t)));
+    }
+    out
+}
+
+/// A project's tasks in tree order: each task is followed by its subtasks.
+/// Returns `(task index, depth)`. Subtasks whose parent is not in the list
+/// show at the top level, and a parent cycle cannot loop forever.
+pub fn task_tree(project: &ProjectView) -> Vec<(usize, usize)> {
+    let tasks = &project.tasks;
+    let index_of = |id: &str| tasks.iter().position(|task| task.id == id);
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
+    let mut roots = Vec::new();
+    for (t, task) in tasks.iter().enumerate() {
+        match task.parent.as_deref().and_then(index_of) {
+            Some(parent) if parent != t => children[parent].push(t),
+            _ => roots.push(t),
+        }
+    }
+    let mut out = Vec::with_capacity(tasks.len());
+    let mut seen = vec![false; tasks.len()];
+    // Tasks caught in a parent cycle have no root; list them at the top level.
+    for start in roots.into_iter().chain(0..tasks.len()) {
+        let mut stack = vec![(start, 0)];
+        while let Some((t, depth)) = stack.pop() {
+            if seen[t] {
+                continue;
+            }
+            seen[t] = true;
+            out.push((t, depth));
+            stack.extend(children[t].iter().rev().map(|&c| (c, depth + 1)));
+        }
     }
     out
 }
@@ -613,6 +648,8 @@ async fn refresh(
                         .to_string(),
                     title: text(&t["title"]),
                     sprint: t["sprint"].as_str().map(str::to_owned),
+                    reviewer: t["reviewer"].as_str().map(str::to_owned),
+                    parent: t["parent_task_id"].as_str().map(str::to_owned),
                 })
                 .collect(),
             members: members["members"]
@@ -719,10 +756,53 @@ async fn refresh(
     Ok(())
 }
 
-async fn load_task(client: &reqwest::Client, cfg: &TuiConfig, id: &str) -> Result<Vec<String>> {
+async fn load_task(
+    client: &reqwest::Client,
+    cfg: &TuiConfig,
+    id: &str,
+    pm: Option<&str>,
+) -> Result<Vec<String>> {
     let body = get(client, cfg, &format!("/v1/tasks/{id}")).await?;
+    let parent = match body["task"]["parent_task_id"].as_str() {
+        // A parent we cannot read still shows by its id.
+        Some(parent) => get(client, cfg, &format!("/v1/tasks/{parent}")).await.ok(),
+        None => None,
+    };
+    Ok(task_detail_lines(
+        &body,
+        parent.as_ref().map(|p| &p["task"]),
+        pm,
+    ))
+}
+
+/// Who reviews a task, and why: the parent task's lead or the project PM.
+fn reviewer_text(reviewer: Option<&str>, parent: Option<&Value>, pm: Option<&str>) -> String {
+    let Some(reviewer) = reviewer else {
+        return "-".to_string();
+    };
+    let lead = parent.and_then(|p| p["assignee"].as_str());
+    let why = if lead.is_some_and(|lead| lead.eq_ignore_ascii_case(reviewer)) {
+        " (lead)"
+    } else if pm.is_some_and(|pm| pm.eq_ignore_ascii_case(reviewer)) {
+        " (PM)"
+    } else {
+        ""
+    };
+    format!("@{reviewer}{why}")
+}
+
+/// The lines of the task details window. `parent` is the parent task when it
+/// could be loaded, and `pm` is the project manager.
+pub fn task_detail_lines(body: &Value, parent: Option<&Value>, pm: Option<&str>) -> Vec<String> {
     let task = &body["task"];
     let or_dash = |value: &Value| value.as_str().unwrap_or("-").to_string();
+    let parent_text = match task["parent_task_id"].as_str() {
+        None => "-".to_string(),
+        Some(id) => match parent.and_then(|p| p["title"].as_str()) {
+            Some(title) => format!("{id} \"{title}\""),
+            None => id.to_string(),
+        },
+    };
     let mut lines = vec![
         format!("{}  [{}]", text(&task["title"]), text(&task["kind"])),
         format!(
@@ -736,6 +816,10 @@ async fn load_task(client: &reqwest::Client, cfg: &TuiConfig, id: &str) -> Resul
             or_dash(&task["repo"]),
             or_dash(&task["branch"]),
             or_dash(&task["issue_url"])
+        ),
+        format!(
+            "reviewer {}   parent {parent_text}",
+            reviewer_text(task["reviewer"].as_str(), parent, pm)
         ),
         String::new(),
     ];
@@ -765,7 +849,7 @@ async fn load_task(client: &reqwest::Client, cfg: &TuiConfig, id: &str) -> Resul
             text(&event["actor_id"])
         ));
     }
-    Ok(lines)
+    lines
 }
 
 async fn load_models(
@@ -908,7 +992,15 @@ async fn fetch_loop(
                         set_notice(ok, message);
                     }
                     Some(Action::LoadTask(id)) => {
-                        let lines = load_task(&client, &cfg, &id)
+                        // Knowing the PM lets the details say why someone reviews.
+                        let pm = {
+                            let snap = shared.lock().expect("snapshot mutex poisoned");
+                            snap.projects
+                                .iter()
+                                .find(|p| p.tasks.iter().any(|t| t.id == id))
+                                .and_then(|p| p.pm.clone())
+                        };
+                        let lines = load_task(&client, &cfg, &id, pm.as_deref())
                             .await
                             .unwrap_or_else(|err| vec![format!("Could not load the task: {err}")]);
                         shared.lock().expect("snapshot mutex poisoned").detail = Some((id, lines));
@@ -2240,6 +2332,18 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
         app.scroll = app.cursor + 1 - visible;
     }
     app.task_rows.clear();
+    // How deep each shown task sits under its parents.
+    let depths: HashMap<(usize, usize), usize> = snap
+        .projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| app.project.as_deref().is_none_or(|c| c == project.channel))
+        .flat_map(|(p, project)| {
+            task_tree(project)
+                .into_iter()
+                .map(move |(t, d)| ((p, t), d))
+        })
+        .collect();
 
     let mut lines: Vec<Line> = Vec::new();
     for (index, row) in all_rows
@@ -2254,6 +2358,19 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
             Row::Project(p) => project_line(&snap.projects[*p]),
             Row::Task(p, t) => {
                 let task = &snap.projects[*p].tasks[*t];
+                // Subtasks sit indented under their parent. One whose parent
+                // is not listed names the parent instead.
+                let depth = depths.get(&(*p, *t)).copied().unwrap_or(0);
+                let branch = match depth {
+                    0 => String::new(),
+                    _ => format!("{}└ ", "  ".repeat(depth - 1)),
+                };
+                let orphan = match task.parent.as_deref() {
+                    Some(parent) if depth == 0 => {
+                        format!("  sub of {}", parent.chars().take(13).collect::<String>())
+                    }
+                    _ => String::new(),
+                };
                 let sprint = task
                     .sprint
                     .as_deref()
@@ -2268,9 +2385,18 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
                     ),
                     Span::styled(format!("@{:<14}", task.assignee), bold()),
                     Span::styled(format!("{sprint:<4}"), Style::default().fg(Color::Magenta)),
+                    Span::styled(branch, dim()),
                     Span::raw(format!("[{}] {}", task.kind, task.title)),
                     Span::styled(
                         format!("  {}", task.id.chars().take(13).collect::<String>()),
+                        dim(),
+                    ),
+                    Span::styled(orphan, dim()),
+                    Span::styled(
+                        task.reviewer
+                            .as_deref()
+                            .map(|r| format!("  review @{r}"))
+                            .unwrap_or_default(),
                         dim(),
                     ),
                 ])
@@ -2797,6 +2923,7 @@ mod tests {
                     assignee: "codex".into(),
                     title: "Fix seek bar".into(),
                     sprint: Some("#quest-video-s1".into()),
+                    ..TaskView::default()
                 }],
                 members: vec![
                     Member {
@@ -3912,6 +4039,132 @@ mod tests {
                 json!({"channel": "#quest-video", "nick": "flash3.8", "role": "reviewer"}),
                 "@flash3.8 is now reviewer in #quest-video"
             )
+        );
+    }
+
+    fn task(id: &str, title: &str, parent: Option<&str>) -> TaskView {
+        TaskView {
+            id: id.into(),
+            kind: "task".into(),
+            status: "assigned".into(),
+            assignee: "codex".into(),
+            title: title.into(),
+            parent: parent.map(Into::into),
+            ..TaskView::default()
+        }
+    }
+
+    #[test]
+    fn subtasks_follow_their_parent_indented_and_cycles_terminate() {
+        let mut snap = fixture();
+        // Listed out of order: the subtasks come before their parent.
+        snap.projects[0].tasks = vec![
+            task("task_child2", "Second child", Some("task_parent")),
+            task("task_grand", "Grandchild", Some("task_child1")),
+            task("task_child1", "First child", Some("task_parent")),
+            task("task_parent", "Parent work", None),
+            task("task_orphan", "Lost subtask", Some("task_gone")),
+        ];
+        assert_eq!(
+            task_tree(&snap.projects[0]),
+            vec![(3, 0), (0, 1), (2, 1), (1, 2), (4, 0)]
+        );
+        assert_eq!(
+            rows(&snap, None)[1..],
+            [
+                Row::Task(0, 3),
+                Row::Task(0, 0),
+                Row::Task(0, 2),
+                Row::Task(0, 1),
+                Row::Task(0, 4)
+            ]
+        );
+
+        let screen = render(&mut App::default(), &snap);
+        let line = |title: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains(title))
+                .unwrap_or_else(|| panic!("no row for {title:?} in\n{screen}"))
+                .to_string()
+        };
+        let at = |title: &str| line(title).find(title).unwrap();
+        assert!(!line("Parent work").contains('└'));
+        assert!(line("Second child").contains("└ [task] Second child"));
+        assert!(line("Grandchild").contains("  └ [task] Grandchild"));
+        assert!(at("Grandchild") > at("First child"));
+        assert!(at("First child") > at("Parent work"));
+        // A subtask whose parent is not listed stays at the top and names it.
+        assert!(line("Lost subtask").contains("sub of task_gone"));
+        snap.projects[0].tasks[0].reviewer = Some("lead".into());
+        let screen = render(&mut App::default(), &snap);
+        assert!(screen
+            .lines()
+            .any(|l| l.contains("Second child") && l.contains("review @lead")));
+        let order: Vec<usize> = [
+            "Parent work",
+            "Second child",
+            "First child",
+            "Grandchild",
+            "Lost subtask",
+        ]
+        .iter()
+        .map(|title| screen.find(title).unwrap())
+        .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "rows out of order:\n{screen}"
+        );
+
+        // Selecting the second row picks the parent, not the first listed task.
+        let mut app = App::default();
+        press(&mut app, &snap, &[KeyCode::Down]);
+        assert_eq!(selected_task(&app, &snap).unwrap().id, "task_parent");
+
+        // A parent cycle still lists every task once.
+        snap.projects[0].tasks = vec![
+            task("task_a", "A", Some("task_b")),
+            task("task_b", "B", Some("task_a")),
+            task("task_self", "Self", Some("task_self")),
+        ];
+        let tree = task_tree(&snap.projects[0]);
+        assert_eq!(tree, vec![(2, 0), (0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn task_details_show_the_reviewer_and_the_parent_task() {
+        let body = |task: Value| json!({"task": task, "events": []});
+        let child = json!({
+            "title": "Child", "kind": "task", "channel": "#quest-video", "status": "assigned",
+            "assignee": "worker", "reviewer": "lead", "parent_task_id": "task_parent",
+        });
+        let parent = json!({"title": "Parent work", "assignee": "lead"});
+        let lines = task_detail_lines(&body(child.clone()), Some(&parent), Some("flash3.8"));
+        assert!(
+            lines.contains(
+                &"reviewer @lead (lead)   parent task_parent \"Parent work\"".to_string()
+            ),
+            "{lines:#?}"
+        );
+        // A parent that could not be loaded shows by id; the reviewer has no label.
+        let lines = task_detail_lines(&body(child), None, None);
+        assert!(
+            lines.contains(&"reviewer @lead   parent task_parent".to_string()),
+            "{lines:#?}"
+        );
+
+        // A top-level task is reviewed by the project manager.
+        let top = json!({"title": "Top", "kind": "task", "reviewer": "flash3.8"});
+        let lines = task_detail_lines(&body(top), None, Some("flash3.8"));
+        assert!(
+            lines.contains(&"reviewer @flash3.8 (PM)   parent -".to_string()),
+            "{lines:#?}"
+        );
+        let none = json!({"title": "Unassigned", "kind": "task"});
+        let lines = task_detail_lines(&body(none), None, Some("flash3.8"));
+        assert!(
+            lines.contains(&"reviewer -   parent -".to_string()),
+            "{lines:#?}"
         );
     }
 }
