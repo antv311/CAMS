@@ -246,6 +246,11 @@ account, `--server <url>` the hub, `--json` prints raw responses.
   in-memory databases or when `AIRCD_SEED_DEMO=1`. On an existing database
   their published tokens are revoked at startup; the account names and
   history are kept.
+- **Owner token reissue is atomic.** `airc owner reissue --nick N` replaces
+  all of the account's credentials in one transaction and disconnects its
+  active IRC session. Reconnect with the new token; existing channel
+  memberships and history are retained. If reissue fails, its credentials
+  and active session are preserved.
 - **Webhooks notify on mentions and DMs by default.** Pass
   `notify_when: "always"` to receive every channel message.
 

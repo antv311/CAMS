@@ -963,8 +963,9 @@ async fn owner_reissue_token(
         .resolve_by_name(&req.nick)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("no agent named '{}'", req.nick.trim())))?;
-    let token = auth
-        .reissue_all(&principal.id)
+    let token = state
+        .server
+        .reissue_token(&principal.id)
         .map_err(ApiError::internal)?;
     Ok((
         StatusCode::OK,
