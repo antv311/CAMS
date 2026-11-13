@@ -525,56 +525,127 @@ function Get-AircdServiceListeners {
     })
 }
 
+function Stop-AircdVerifiedProcess {
+    param([System.Diagnostics.Process]$Process, [int]$ProcessId)
+    if ($null -eq $Process) { return }
+    try {
+        if ($Process.HasExited) { return }
+        $Process.Kill()
+    } catch [System.InvalidOperationException] {
+        # Process already exited between HasExited and Kill().
+        return
+    } catch [System.ComponentModel.Win32Exception] {
+        # TerminateProcess returns Access Denied when the process is already terminating.
+        if ($Process.WaitForExit(2000)) { return }
+        throw
+    }
+    if (-not $Process.WaitForExit(10000)) {
+        throw "aircd PID $ProcessId did not exit within 10 seconds."
+    }
+}
+
 function Get-AircdServiceServer {
     param($Config)
-    $Listeners = @(Get-AircdServiceListeners $Config)
-    if ($Listeners.Count -eq 0) { return $null }
-    $Owners = @($Listeners.OwningProcess | Sort-Object -Unique)
-    if ($Owners.Count -ne 1) {
-        throw 'Configured ports belong to different processes; no process was stopped.'
-    }
-    $OwnerId = [int]$Owners[0]
-    $Info = Get-CimInstance Win32_Process -Filter "ProcessId = $OwnerId" -ErrorAction Stop
-    $ProcName = if ($Info -and $Info.Name) { $Info.Name } else { '' }
-    if (-not $Info -or $ProcName -ine 'aircd.exe') {
-        throw "Port belongs to an unrecognized process (PID $OwnerId); no process was stopped."
-    }
-    if (-not $Info.ExecutablePath -or -not $Info.CommandLine) {
-        throw "Port belongs to aircd.exe (PID $OwnerId), but its command line cannot be inspected from this session. Run as Administrator or stop it manually."
-    }
     Initialize-AircdServiceNative
-    $Argv = [AircdService.Native]::Split($Info.CommandLine)
-    $ArgsOnly = @($Argv | Select-Object -Skip 1)
-    if ($ArgsOnly.Count -gt 0 -and $ArgsOnly[0] -eq 'tui') {
-        throw 'Refusing to control a TUI process.'
-    }
-    $Settings = @{ '--bind' = '127.0.0.1:6667'; '--http-bind' = '127.0.0.1:6680'; '--db' = '' }
-    for ($Index = 0; $Index -lt $ArgsOnly.Count; $Index++) {
-        if ($Settings.ContainsKey($ArgsOnly[$Index]) -and ($Index + 1) -lt $ArgsOnly.Count) {
-            $Settings[$ArgsOnly[$Index]] = $ArgsOnly[$Index + 1]
-            $Index++
+    $MaxAttempts = 20
+    for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+        $Listeners = @(Get-AircdServiceListeners $Config)
+        if ($Listeners.Count -eq 0) { return $null }
+        $Owners = @($Listeners.OwningProcess | Sort-Object -Unique)
+        if ($Owners.Count -ne 1) {
+            throw 'Configured ports belong to different processes; no process was stopped.'
         }
-    }
-    if ($Settings['--bind'] -ne $Config.Bind -or $Settings['--http-bind'] -ne $Config.HttpBind -or
-        -not [IO.Path]::IsPathRooted($Settings['--db']) -or
-        [IO.Path]::GetFullPath($Settings['--db']) -ine $Config.DbPath) {
-        throw 'Listening aircd uses different bind/database settings. Pass matching -Bind, -HttpBind, and -DbPath; no process was stopped.'
-    }
+        $OwnerId = [int]$Owners[0]
+        if ($OwnerId -le 0) {
+            if ($Attempt -lt $MaxAttempts) { Start-Sleep -Milliseconds 50; continue }
+            throw "Port belongs to an unrecognized process (PID $OwnerId); no process was stopped."
+        }
+        $Info = Get-CimInstance Win32_Process -Filter "ProcessId = $OwnerId" -ErrorAction SilentlyContinue
+        if (-not $Info) {
+            # Process exited after Get-NetTCPConnection while socket teardown is still completing.
+            if ($Attempt -lt $MaxAttempts) { Start-Sleep -Milliseconds 50; continue }
+            $ListenersAfter = @(Get-AircdServiceListeners $Config)
+            if ($ListenersAfter.Count -eq 0) { return $null }
+            throw "Port belongs to an exited process (PID $OwnerId); retry."
+        }
+        $ProcName = if ($Info.Name) { $Info.Name } else { '' }
+        if ($ProcName -ine 'aircd.exe') {
+            throw "Port belongs to an unrecognized process (PID $OwnerId); no process was stopped."
+        }
+        if (-not $Info.ExecutablePath -or -not $Info.CommandLine) {
+            $Probe = Get-Process -Id $OwnerId -ErrorAction SilentlyContinue
+            $ProbeExited = (-not $Probe) -or $Probe.HasExited
+            if ($Probe) { $Probe.Dispose() }
+            if ($ProbeExited -and $Attempt -lt $MaxAttempts) {
+                Start-Sleep -Milliseconds 50
+                continue
+            }
+            throw "Port belongs to aircd.exe (PID $OwnerId), but its command line cannot be inspected from this session. Run as Administrator or stop it manually."
+        }
+        $Argv = [AircdService.Native]::Split($Info.CommandLine)
+        $ArgsOnly = @($Argv | Select-Object -Skip 1)
+        if ($ArgsOnly.Count -gt 0 -and $ArgsOnly[0] -eq 'tui') {
+            throw 'Refusing to control a TUI process.'
+        }
+        $Settings = @{ '--bind' = '127.0.0.1:6667'; '--http-bind' = '127.0.0.1:6680'; '--db' = '' }
+        for ($Index = 0; $Index -lt $ArgsOnly.Count; $Index++) {
+            if ($Settings.ContainsKey($ArgsOnly[$Index]) -and ($Index + 1) -lt $ArgsOnly.Count) {
+                $Settings[$ArgsOnly[$Index]] = $ArgsOnly[$Index + 1]
+                $Index++
+            }
+        }
+        if ($Settings['--bind'] -ne $Config.Bind -or $Settings['--http-bind'] -ne $Config.HttpBind -or
+            -not [IO.Path]::IsPathRooted($Settings['--db']) -or
+            [IO.Path]::GetFullPath($Settings['--db']) -ine $Config.DbPath) {
+            throw 'Listening aircd uses different bind/database settings. Pass matching -Bind, -HttpBind, and -DbPath; no process was stopped.'
+        }
 
-    $Process = Get-Process -Id $OwnerId -ErrorAction Stop
-    $null = $Process.Handle
-    if ($Process.HasExited -or $Process.Path -ine $Info.ExecutablePath -or
-        [Math]::Abs(($Process.StartTime.ToUniversalTime() - $Info.CreationDate.ToUniversalTime()).TotalMilliseconds) -gt 1) {
-        $Process.Dispose()
-        throw 'Server identity changed during inspection; retry. No process was stopped.'
-    }
-    [pscustomobject]@{
-        Process    = $Process
-        Id         = $OwnerId
-        Executable = $Info.ExecutablePath
-        Arguments  = $ArgsOnly
-        Started    = $Process.StartTime
-        BothPorts  = (@($Listeners.LocalPort | Sort-Object -Unique).Count -eq 2)
+        $Process = Get-Process -Id $OwnerId -ErrorAction SilentlyContinue
+        if (-not $Process) {
+            if ($Attempt -lt $MaxAttempts) { Start-Sleep -Milliseconds 50; continue }
+            $ListenersAfter = @(Get-AircdServiceListeners $Config)
+            if ($ListenersAfter.Count -eq 0) { return $null }
+            throw 'Server exited during inspection; retry. No process was stopped.'
+        }
+        $ExitedDuringInspect = $false
+        $ProcPath = $null
+        $ProcStartUtc = $null
+        try {
+            $null = $Process.Handle
+            $ExitedDuringInspect = $Process.HasExited
+            if (-not $ExitedDuringInspect) {
+                $ProcPath = $Process.Path
+                $ProcStartUtc = $Process.StartTime.ToUniversalTime()
+                $ExitedDuringInspect = $Process.HasExited
+            }
+        } catch {
+            if ($Process.HasExited) {
+                $ExitedDuringInspect = $true
+            } else {
+                $Process.Dispose()
+                throw
+            }
+        }
+        if ($ExitedDuringInspect) {
+            $Process.Dispose()
+            if ($Attempt -lt $MaxAttempts) { Start-Sleep -Milliseconds 50; continue }
+            $ListenersAfter = @(Get-AircdServiceListeners $Config)
+            if ($ListenersAfter.Count -eq 0) { return $null }
+            throw 'Server exited during inspection; retry. No process was stopped.'
+        }
+        if ($ProcPath -ine $Info.ExecutablePath -or
+            [Math]::Abs(($ProcStartUtc - $Info.CreationDate.ToUniversalTime()).TotalMilliseconds) -gt 1) {
+            $Process.Dispose()
+            throw 'Server identity changed during inspection; retry. No process was stopped.'
+        }
+        return [pscustomobject]@{
+            Process    = $Process
+            Id         = $OwnerId
+            Executable = $Info.ExecutablePath
+            Arguments  = $ArgsOnly
+            Started    = $Process.StartTime
+            BothPorts  = (@($Listeners.LocalPort | Sort-Object -Unique).Count -eq 2)
+        }
     }
 }
 
@@ -762,56 +833,58 @@ function Stop-AircdServiceInstance {
 
     # Inspect port ownership first so an unrelated listener is never touched.
     $Server = Get-AircdServiceServer $Config
-
-    if ($Installation.Installed) {
-        if ($Installation.Mode -eq 'Service') {
-            $Svc = Get-Service -Name $Config.Name -ErrorAction SilentlyContinue
-            if ($Svc -and $Svc.Status -ne 'Stopped') {
-                Stop-Service -Name $Config.Name -Force -ErrorAction Stop
-                $Svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
-            }
-        } elseif ($Installation.Mode -eq 'ScheduledTask') {
-            $Signaled = Invoke-AircdServiceStopEvent -Config $Config -Installation $Installation
-            if ($Signaled) {
-                $Deadline = [datetime]::UtcNow.AddSeconds(5)
-                while ([datetime]::UtcNow -lt $Deadline) {
-                    $TaskNow = Get-ScheduledTask -TaskName $Config.Name -TaskPath $Config.TaskPath -ErrorAction SilentlyContinue
-                    if (-not $TaskNow -or $TaskNow.State -ne 'Running') { break }
-                    Start-Sleep -Milliseconds 150
+    try {
+        if ($Installation.Installed) {
+            if ($Installation.Mode -eq 'Service') {
+                $Svc = Get-Service -Name $Config.Name -ErrorAction SilentlyContinue
+                if ($Svc -and $Svc.Status -ne 'Stopped') {
+                    Stop-Service -Name $Config.Name -Force -ErrorAction Stop
+                    $Svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+                }
+            } elseif ($Installation.Mode -eq 'ScheduledTask') {
+                $Signaled = Invoke-AircdServiceStopEvent -Config $Config -Installation $Installation
+                if ($Signaled) {
+                    $Deadline = [datetime]::UtcNow.AddSeconds(5)
+                    while ([datetime]::UtcNow -lt $Deadline) {
+                        $TaskNow = Get-ScheduledTask -TaskName $Config.Name -TaskPath $Config.TaskPath -ErrorAction SilentlyContinue
+                        if (-not $TaskNow -or $TaskNow.State -ne 'Running') { break }
+                        Start-Sleep -Milliseconds 150
+                    }
+                }
+                $TaskNow = Get-ScheduledTask -TaskName $Config.Name -TaskPath $Config.TaskPath -ErrorAction SilentlyContinue
+                if ($TaskNow -and $TaskNow.State -eq 'Running') {
+                    Stop-ScheduledTask -TaskName $Config.Name -TaskPath $Config.TaskPath -ErrorAction SilentlyContinue
                 }
             }
-            $TaskNow = Get-ScheduledTask -TaskName $Config.Name -TaskPath $Config.TaskPath -ErrorAction SilentlyContinue
-            if ($TaskNow -and $TaskNow.State -eq 'Running') {
-                Stop-ScheduledTask -TaskName $Config.Name -TaskPath $Config.TaskPath -ErrorAction SilentlyContinue
-            }
         }
-    }
 
-    # Re-check and cleanly terminate the verified aircd.exe if still alive.
-    $Remaining = Get-AircdServiceServer $Config
-    if ($Remaining) {
-        $null = $Remaining.Process.Handle
-        if (-not $Remaining.Process.HasExited) {
-            $Remaining.Process.Kill()
-            if (-not $Remaining.Process.WaitForExit(10000)) {
-                throw "aircd PID $($Remaining.Id) did not exit within 10 seconds."
+        # Wait for the already-verified server process before re-inspecting listeners
+        # so we don't race against aircd.exe exiting after the stop event.
+        if ($Server -and -not $Server.Process.HasExited) {
+            if (-not $Server.Process.WaitForExit(5000)) {
+                Stop-AircdVerifiedProcess -Process $Server.Process -ProcessId $Server.Id
             }
         }
-    } elseif ($Server -and -not $Server.Process.HasExited) {
-        if (-not $Server.Process.WaitForExit(5000)) {
-            $Server.Process.Kill()
-            if (-not $Server.Process.WaitForExit(10000)) {
-                throw "aircd PID $($Server.Id) did not exit within 10 seconds."
-            }
-        }
-    }
 
-    $PortDeadline = [datetime]::UtcNow.AddSeconds(10)
-    while (@(Get-AircdServiceListeners $Config).Count -gt 0) {
-        if ([datetime]::UtcNow -ge $PortDeadline) {
-            throw 'Server ports remain occupied after stop.'
+        # Re-check and cleanly terminate a replacement aircd.exe if still alive.
+        $Remaining = Get-AircdServiceServer $Config
+        if ($Remaining) {
+            try {
+                Stop-AircdVerifiedProcess -Process $Remaining.Process -ProcessId $Remaining.Id
+            } finally {
+                if ($Remaining.Process) { $Remaining.Process.Dispose() }
+            }
         }
-        Start-Sleep -Milliseconds 150
+
+        $PortDeadline = [datetime]::UtcNow.AddSeconds(10)
+        while (@(Get-AircdServiceListeners $Config).Count -gt 0) {
+            if ([datetime]::UtcNow -ge $PortDeadline) {
+                throw 'Server ports remain occupied after stop.'
+            }
+            Start-Sleep -Milliseconds 150
+        }
+    } finally {
+        if ($Server -and $Server.Process) { $Server.Process.Dispose() }
     }
 }
 

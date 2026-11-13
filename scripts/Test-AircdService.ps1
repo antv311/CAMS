@@ -28,23 +28,7 @@ function Assert($Condition, [string]$Message) {
 }
 
 function Assert-Throws([scriptblock]$Action, [string]$Pattern) {
-    function Invoke-InstallerCli {
-    param([string[]]$Arguments)
-    $PrevPref = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
     try {
-        $Raw = & powershell.exe @Arguments 2>&1
-        $Code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $PrevPref
-    }
-    [pscustomobject]@{
-        ExitCode = $Code
-        Output   = (($Raw | ForEach-Object { "$_" }) -join "`n").Trim()
-    }
-}
-
-try {
         & $Action
     } catch {
         Assert ($_.Exception.Message -like "*$Pattern*") "Unexpected error: $($_.Exception.Message)"
@@ -74,6 +58,31 @@ function Invoke-InstallerCli {
     [pscustomobject]@{
         ExitCode = $Code
         Output   = (($Raw | ForEach-Object { "$_" }) -join "`n").Trim()
+    }
+}
+
+function Stop-TestProcesses {
+    param([string]$ImageName, [string]$RootPrefix)
+    $Matches = @(Get-CimInstance Win32_Process -Filter "Name = '$ImageName'" -ErrorAction SilentlyContinue | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)
+    })
+    foreach ($ProcInfo in $Matches) {
+        $P = Get-Process -Id $ProcInfo.ProcessId -ErrorAction SilentlyContinue
+        if (-not $P) { continue }
+        try {
+            if (-not $P.HasExited) {
+                try {
+                    $P.Kill()
+                } catch [System.InvalidOperationException] {
+                } catch [System.ComponentModel.Win32Exception] {
+                    # Process may already be terminating (Access Denied during teardown).
+                }
+            }
+            $null = $P.WaitForExit(10000)
+        } catch {
+        } finally {
+            $P.Dispose()
+        }
     }
 }
 
@@ -267,44 +276,22 @@ try {
 
     Write-Host 'PASS: service config validation, elevation guards, Windows Service host class, real Scheduled Task lifecycle (start, session-independent svchost parent, persistence, idempotent reinstall, newest-build restart, port protection, stop, and uninstall preserving DB/logs).'
 } finally {
-    if ($Unrelated) { $Unrelated.Stop() }
-    if ($OtherProc -and -not $OtherProc.HasExited) { $OtherProc.Kill() }
+    if ($Unrelated) { try { $Unrelated.Stop() } catch {} }
+    if ($OtherProc) {
+        try {
+            if (-not $OtherProc.HasExited) { $OtherProc.Kill() }
+        } catch {}
+    }
     if ($Config) {
-        function Invoke-InstallerCli {
-    param([string[]]$Arguments)
-    $PrevPref = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $Raw = & powershell.exe @Arguments 2>&1
-        $Code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $PrevPref
-    }
-    [pscustomobject]@{
-        ExitCode = $Code
-        Output   = (($Raw | ForEach-Object { "$_" }) -join "`n").Trim()
-    }
-}
-
-try {
+        try {
             $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
             if ($ExistingTask) {
                 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             }
         } catch {}
-        Get-CimInstance Win32_Process -Filter "Name = 'aircd.exe'" -ErrorAction SilentlyContinue | Where-Object {
-            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($TestRoot + '\', [StringComparison]::OrdinalIgnoreCase)
-        } | ForEach-Object {
-            $P = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
-            if ($P) { $P.Kill(); $null = $P.WaitForExit(10000); $P.Dispose() }
-        }
-        Get-CimInstance Win32_Process -Filter "Name = 'aircd-service-host.exe'" -ErrorAction SilentlyContinue | Where-Object {
-            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($TestRoot + '\', [StringComparison]::OrdinalIgnoreCase)
-        } | ForEach-Object {
-            $P = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
-            if ($P) { $P.Kill(); $null = $P.WaitForExit(10000); $P.Dispose() }
-        }
+        Stop-TestProcesses -ImageName 'aircd-service-host.exe' -RootPrefix ($TestRoot + '\')
+        Stop-TestProcesses -ImageName 'aircd.exe' -RootPrefix ($TestRoot + '\')
     }
     $ResolvedTestRoot = [IO.Path]::GetFullPath($TestRoot)
     if (-not $ResolvedTestRoot.StartsWith($TempRoot, [StringComparison]::OrdinalIgnoreCase) -or
@@ -312,6 +299,14 @@ try {
         throw 'Refusing unexpected test cleanup path.'
     }
     if (Test-Path -LiteralPath $ResolvedTestRoot) {
-        Remove-Item -LiteralPath $ResolvedTestRoot -Recurse -Force
+        for ($Attempt = 1; $Attempt -le 10; $Attempt++) {
+            try {
+                Remove-Item -LiteralPath $ResolvedTestRoot -Recurse -Force -ErrorAction Stop
+                break
+            } catch {
+                if ($Attempt -ge 10) { throw }
+                Start-Sleep -Milliseconds 150
+            }
+        }
     }
 }
