@@ -4317,6 +4317,10 @@ mod tests {
                 json!({"channel": "#quest", "nick": nick, "role": role})).await?;
             assert_eq!(status, 200);
         }
+        let (status, _) = call(&client, "POST", format!("{base}/v1/gits"), owner, json!({
+            "name": "quest-player", "channel": "#quest", "local_path": "/tmp/quest-player",
+        })).await?;
+        assert_eq!(status, 201);
 
         // Work cannot be assigned to an account outside the project,
         // and a plain member cannot assign work to someone else.
@@ -5139,6 +5143,124 @@ mod tests {
             .send()
             .await?;
         assert_eq!(refused.status().as_u16(), 403);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_creation_validates_repo_against_project_git_repos() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let pm = tokens["pm"].as_str();
+        let tasks_url = format!("{}/v1/tasks", api.base);
+        let gits_url = format!("{}/v1/gits", api.base);
+
+        // No git repos are attached to #one yet -> passing repo fails with HTTP 400.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            tasks_url.clone(),
+            pm,
+            json!({"channel": "#one", "title": "Needs repo", "repo": "alpha"}),
+        )
+        .await?;
+        assert_eq!(status, 400, "{body}");
+        let err = body["error"].as_str().unwrap();
+        assert!(err.contains("alpha") && err.contains("#one"), "unexpected error: {err}");
+
+        // Register repo "beta" on #two and "alpha" on #one.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            gits_url.clone(),
+            pm,
+            json!({"name": "beta", "channel": "#two", "local_path": "/tmp/beta"}),
+        )
+        .await?;
+        assert_eq!(status, 201);
+
+        // Repo registered for #two is rejected when creating a task in #one.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            tasks_url.clone(),
+            pm,
+            json!({"channel": "#one", "title": "Wrong project repo", "repo": "beta"}),
+        )
+        .await?;
+        assert_eq!(status, 400, "{body}");
+        let err = body["error"].as_str().unwrap();
+        assert!(err.contains("beta") && err.contains("#two") && err.contains("#one"), "unexpected error: {err}");
+
+        // Register "alpha" on #one.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            gits_url,
+            pm,
+            json!({"name": "alpha", "channel": "#one", "local_path": "/tmp/alpha"}),
+        )
+        .await?;
+        assert_eq!(status, 201);
+
+        // Unknown repo when #one has "alpha" lists #one's registered repos in HTTP 400.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            tasks_url.clone(),
+            pm,
+            json!({"channel": "#one", "title": "Missing repo", "repo": "gamma"}),
+        )
+        .await?;
+        assert_eq!(status, 400, "{body}");
+        let err = body["error"].as_str().unwrap();
+        assert!(err.contains("gamma") && err.contains("alpha"), "unexpected error: {err}");
+
+        // Case-insensitive match succeeds and stores the canonical registered repo name.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            tasks_url.clone(),
+            pm,
+            json!({"channel": "#one", "title": "Valid repo", "repo": "ALPHA"}),
+        )
+        .await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["task"]["repo"], "alpha");
+
+        // Sprint rooms resolve to their parent project's registered repos.
+        let (status, room_body) = call(
+            &api.client,
+            "POST",
+            format!("{}/v1/rooms", api.base),
+            pm,
+            json!({"project": "#one", "title": "Sprint 1"}),
+        )
+        .await?;
+        assert_eq!(status, 201, "{room_body}");
+        let sprint_channel = room_body["room"]["channel"].as_str().unwrap();
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            tasks_url.clone(),
+            pm,
+            json!({"channel": sprint_channel, "title": "Sprint repo task", "repo": "alpha"}),
+        )
+        .await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["task"]["channel"], "#one");
+        assert_eq!(body["task"]["repo"], "alpha");
+
+        // Omitting or sending blank repo remains allowed.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            tasks_url,
+            pm,
+            json!({"channel": "#one", "title": "No repo", "repo": "   "}),
+        )
+        .await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["task"]["repo"], Value::Null);
+
         Ok(())
     }
 

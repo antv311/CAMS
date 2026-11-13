@@ -2079,6 +2079,51 @@ impl Server {
         Ok(target.id)
     }
 
+    /// A task's `repo` must name a git repo attached to the task's project channel.
+    fn resolve_project_repo(&self, channel: &str, raw_repo: &str) -> Result<String> {
+        let project = self.project_of(channel);
+        let channel = project.as_str();
+        self.require_project(channel)?;
+        let repos = self.gits.list()?;
+        let project_repos: Vec<&GitRepo> = repos.iter().filter(|r| r.channel == channel).collect();
+        if let Some(matched) = project_repos
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(raw_repo))
+        {
+            return Ok(matched.name.clone());
+        }
+        if let Some(other) = repos.iter().find(|r| r.name.eq_ignore_ascii_case(raw_repo)) {
+            if project_repos.is_empty() {
+                return Err(anyhow!(
+                    "repo '{raw_repo}' is registered for {}, not project {channel}; no git repos are attached to {channel}",
+                    other.channel
+                ));
+            }
+            let allowed = project_repos
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow!(
+                "repo '{raw_repo}' is registered for {}, not project {channel} (registered for {channel}: {allowed})",
+                other.channel
+            ));
+        }
+        if project_repos.is_empty() {
+            return Err(anyhow!(
+                "repo '{raw_repo}' is not registered for project {channel}; no git repos are attached to {channel} (register one with POST /v1/gits)"
+            ));
+        }
+        let allowed = project_repos
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(anyhow!(
+            "repo '{raw_repo}' is not registered for project {channel} (registered for {channel}: {allowed})"
+        ))
+    }
+
     pub fn create_task_full_api(&self, actor: &Principal, mut new: NewTask) -> Result<Task> {
         let title = new.title.trim().to_string();
         if title.is_empty() {
@@ -2098,6 +2143,15 @@ impl Server {
                 "{CHAT_ONLY_CHANNEL} is chat only; create the task in a project channel"
             ));
         }
+        new.repo = match new
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => Some(self.resolve_project_repo(&channel, name)?),
+            None => None,
+        };
         new.parent_task_id = new
             .parent_task_id
             .map(|id| id.trim().to_string())
@@ -2921,7 +2975,11 @@ impl Server {
         let channel = project.as_str();
         let repos = self.gits.list().ok()?;
         repo_name
-            .and_then(|name| repos.iter().find(|r| r.name.eq_ignore_ascii_case(name)))
+            .and_then(|name| {
+                repos
+                    .iter()
+                    .find(|r| r.channel == channel && r.name.eq_ignore_ascii_case(name))
+            })
             .or_else(|| repos.iter().find(|r| r.channel == channel))
             .map(|r| r.local_path.clone())
     }
@@ -3785,6 +3843,53 @@ mod tests {
                 .filter(|r| r.status == "ok")
                 .count(),
             2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_repo_validation_and_repo_path_stay_scoped_to_project() -> Result<()> {
+        let server = test_server()?;
+        let (owner, _) = server
+            .auth()
+            .register_principal("repo-owner", Some("leader"), None)?;
+        server.create_project_api(&owner, "#one", "One", None)?;
+        server.create_project_api(&owner, "#two", "Two", None)?;
+        server.gits().upsert("repo-one", "#one", "/repos/one", None, Some("main"), None)?;
+        server.gits().upsert("repo-two", "#two", "/repos/two", None, Some("main"), None)?;
+
+        let err = server
+            .create_task_full_api(
+                &owner,
+                crate::tasks::NewTask {
+                    channel: "#one".to_string(),
+                    title: "Cross-project repo".to_string(),
+                    repo: Some("repo-two".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("#two"));
+        assert!(err.to_string().contains("#one"));
+
+        let created = server.create_task_full_api(
+            &owner,
+            crate::tasks::NewTask {
+                channel: "#one".to_string(),
+                title: "Valid repo".to_string(),
+                repo: Some("REPO-ONE".to_string()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(created.repo.as_deref(), Some("repo-one"));
+        assert_eq!(
+            server.repo_path_for("#one", Some("repo-one")).as_deref(),
+            Some("/repos/one")
+        );
+        assert_eq!(
+            server.repo_path_for("#one", Some("repo-two")).as_deref(),
+            Some("/repos/one"),
+            "repo_path_for should not resolve a repo attached to another project"
         );
         Ok(())
     }
