@@ -1213,11 +1213,14 @@ fn advance(app: &mut App, flow: Flow, value: String, snap: &Snapshot) -> Option<
             );
             None
         }
-        Flow::AddMemberRole { channel, nick } => api(
-            "/v1/projects/members".to_string(),
-            json!({"channel": channel, "nick": nick, "role": value}),
-            "Member added",
-        ),
+        Flow::AddMemberRole { channel, nick } => {
+            let done = format!("@{nick} is now {value} in {channel}");
+            api(
+                "/v1/projects/members".to_string(),
+                json!({"channel": channel, "nick": nick, "role": value}),
+                &done,
+            )
+        }
         Flow::AnswerPick => {
             let question = snap
                 .waiting
@@ -1513,23 +1516,36 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
         }
         KeyCode::Char('m') => {
             if let Some(project) = selected_project(app, snap) {
-                let mut items = vec![(
-                    "+ create a new account (client and model)".to_string(),
-                    NEW_ACCOUNT.to_string(),
-                )];
+                // Every account, members first showing their role (choosing
+                // one changes it), then the rest, then a new account.
+                let role_of = |nick: &str| {
+                    project
+                        .members
+                        .iter()
+                        .find(|m| m.nick.eq_ignore_ascii_case(nick))
+                        .map(|m| m.role.clone())
+                };
+                let mut items: Vec<(String, String)> = snap
+                    .accounts
+                    .iter()
+                    .filter_map(|a| {
+                        role_of(&a.nick).map(|role| {
+                            (format!("@{}  ({role}, change role)", a.nick), a.nick.clone())
+                        })
+                    })
+                    .collect();
                 items.extend(
                     snap.accounts
                         .iter()
-                        .filter(|a| {
-                            !project
-                                .members
-                                .iter()
-                                .any(|m| m.nick.eq_ignore_ascii_case(&a.nick))
-                        })
-                        .map(|a| (format!("@{}", a.nick), a.nick.clone())),
+                        .filter(|a| role_of(&a.nick).is_none())
+                        .map(|a| (format!("@{}  (add)", a.nick), a.nick.clone())),
                 );
+                items.push((
+                    "+ new account (client and model)".to_string(),
+                    NEW_ACCOUNT.to_string(),
+                ));
                 app.modal = picker(
-                    format!("Add to {}", project.channel),
+                    format!("Members of {}", project.channel),
                     items,
                     Flow::AddMember {
                         channel: project.channel.clone(),
@@ -2911,12 +2927,19 @@ mod tests {
                 "Project manager set"
             )
         );
-        // Add member: creating an account comes first, then only accounts
-        // that are not members yet.
+        // Members: every account, members first with their role, then the
+        // others, then a new account.
         press(&mut app, &snap, &[KeyCode::Char('m')]);
         let screen = render(&mut app, &snap);
-        assert!(screen.contains("@flash-lite") && screen.contains("Add to #quest-video"));
-        assert!(screen.contains("+ create a new account"));
+        assert!(screen.contains("Members of #quest-video"), "{screen}");
+        assert!(screen.contains("@flash3.8  (coordinator, change role)"), "{screen}");
+        assert!(screen.contains("@flash-lite  (add)"), "{screen}");
+        assert!(screen.contains("+ new account (client and model)"), "{screen}");
+        assert!(
+            screen.find("@flash3.8  (coordinator").unwrap() < screen.find("@tony  (add)").unwrap()
+                && screen.find("@flash-lite  (add)").unwrap() < screen.find("+ new account").unwrap(),
+            "{screen}"
+        );
         assert_eq!(
             press(
                 &mut app,
@@ -2926,7 +2949,7 @@ mod tests {
             sent(
                 "/v1/projects/members",
                 json!({"channel": "#quest-video", "nick": "flash-lite", "role": "builder"}),
-                "Member added"
+                "@flash-lite is now builder in #quest-video"
             )
         );
         // Answer the waiting question.
@@ -3205,7 +3228,7 @@ mod tests {
         let mut snap = with_templates(fixture());
         let mut app = App::default();
         // m, then "+ create a new account", then the client.
-        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter]);
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
         let screen = render(&mut app, &snap);
         assert!(screen.contains("New account for #quest-video: client"), "{screen}");
         assert!(screen.contains("LM Studio  (not installed)"), "{screen}");
@@ -3255,7 +3278,7 @@ mod tests {
         let mut snap = with_templates(fixture());
         snap.models = Some(("lmstudio".into(), Err("could not start 'lms'".into())));
         let mut app = App::default();
-        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter, KeyCode::Down]);
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Down]);
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Enter]),
             Some(Action::LoadModels("lmstudio".into()))
@@ -3283,7 +3306,7 @@ mod tests {
     fn without_templates_create_account_says_so() {
         let snap = fixture();
         let mut app = App::default();
-        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter]);
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
         assert!(render(&mut app, &snap).contains("No client templates on the hub yet"));
         assert_eq!(press(&mut app, &snap, &[KeyCode::Enter]), None);
         assert!(app.modal.is_none());
@@ -3325,5 +3348,21 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path)?, "not json");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn m_changes_a_members_role() {
+        let snap = fixture();
+        let mut app = App::default();
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter]);
+        assert!(render(&mut app, &snap).contains("Role for @flash3.8"));
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]),
+            sent(
+                "/v1/projects/members",
+                json!({"channel": "#quest-video", "nick": "flash3.8", "role": "reviewer"}),
+                "@flash3.8 is now reviewer in #quest-video"
+            )
+        );
     }
 }
