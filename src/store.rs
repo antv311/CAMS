@@ -718,6 +718,8 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         ("branch", "TEXT"),
         ("issue_url", "TEXT"),
         ("sprint", "TEXT"),
+        ("reviewer", "TEXT"),
+        ("parent_task_id", "TEXT"),
     ];
 
     for (column, definition) in columns {
@@ -737,6 +739,14 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
 
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks (assignee, status)",
+        [],
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_reviewer ON tasks (reviewer, status)",
+        [],
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks (parent_task_id)",
         [],
     )?;
 
@@ -884,6 +894,64 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         init_with(&connection, false)?;
         Ok(ClientTemplateStore::new(Arc::new(Mutex::new(connection))))
+    }
+
+    #[test]
+    fn task_workflow_migration_preserves_legacy_rows_and_round_trips_reviewers() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, channel TEXT NOT NULL, title TEXT NOT NULL,
+                status TEXT NOT NULL, claimed_by TEXT, lease_expires_at INTEGER,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );
+             INSERT INTO tasks VALUES ('legacy', '#one', 'Keep me', 'claimed', 'worker', 42, 10, 20);",
+        )?;
+        init_with(&connection, false)?;
+        init_with(&connection, false)?;
+        for column in ["reviewer", "parent_task_id"] {
+            let definition: (String, i64) = connection.query_row(
+                "SELECT type, [notnull] FROM pragma_table_info('tasks') WHERE name = ?1",
+                [column],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(definition, ("TEXT".to_string(), 0));
+        }
+        let tasks = crate::tasks::TaskStore::new(Arc::new(Mutex::new(connection)), 60);
+        let legacy = tasks.get("legacy")?.unwrap();
+        assert_eq!(legacy.title, "Keep me");
+        assert_eq!(legacy.status, "claimed");
+        assert_eq!(legacy.claimed_by.as_deref(), Some("worker"));
+        assert_eq!(legacy.lease_expires_at, Some(42));
+        assert_eq!((legacy.created_at, legacy.updated_at), (10, 20));
+        assert!(legacy.reviewer.is_none());
+        assert!(legacy.parent_task_id.is_none());
+
+        let child = tasks.create_full(crate::tasks::NewTask {
+            channel: "#one".to_string(),
+            title: "Child".to_string(),
+            assignee: Some("worker".to_string()),
+            reviewer: Some("lead".to_string()),
+            parent_task_id: Some("legacy".to_string()),
+            ..Default::default()
+        })?;
+        let reloaded = tasks.get(&child.id)?.unwrap();
+        assert_eq!(reloaded.reviewer.as_deref(), Some("lead"));
+        assert_eq!(reloaded.parent_task_id.as_deref(), Some("legacy"));
+        assert_eq!(tasks.inbox("worker")?.len(), 2);
+        tasks.set_status(
+            &child.id,
+            "assigned",
+            "review",
+            "worker",
+            Some("tests pass"),
+            None,
+        )?;
+        assert_eq!(
+            tasks.review_queue("#one")?[0].reviewer.as_deref(),
+            Some("lead")
+        );
+        Ok(())
     }
 
     #[test]
