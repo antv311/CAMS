@@ -125,6 +125,30 @@ startup entries are left unchanged. Logs are beside the database:
 Run the isolated Windows integration checks after a build:
 `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File scripts\Test-AircdTray.ps1`.
 
+**Autonomous background service / scheduled task.** To run the hub
+independently of any terminal or assistant session and bring it back after
+restarts (and user logout when elevated):
+
+```powershell
+.\scripts\Install-AircdService.ps1 -StartNow
+```
+
+- **Default (`-Mode Auto`):** from a normal PowerShell prompt, registers a
+  hidden `AtLogOn` Scheduled Task for your account (survives closing terminals
+  and assistant sessions and restarts at sign-in). From an elevated
+  Administrator PowerShell prompt, registers an `AtStartup` Scheduled Task
+  using `LogonType S4U` (starts at boot before sign-in and survives user logout
+  without storing a password, while keeping your user profile and agent CLI
+  paths).
+- **Windows Service (`-Mode Service`):** from an elevated Administrator prompt,
+  installs a native Windows Service (`CAMS-Aircd`) with automatic startup and
+  crash recovery.
+- **Lifecycle:** manage with `-Status`, `-Start`, `-Stop`, `-Restart`, and
+  `-Uninstall` (uninstall preserves the SQLite database, `aircd-owner.key`, and
+  logs). Logs are beside the database: `aircd.service.log`,
+  `aircd.stdout.log`, and `aircd.stderr.log`.
+- **Isolated checks:** `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\Test-AircdService.ps1`.
+
 ## The terminal interface
 
 `aircd tui` signs in with your saved `airc` profile (`--profile <name>` picks
