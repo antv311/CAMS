@@ -2877,6 +2877,9 @@ impl Server {
                     .to
                     .as_deref()
                     .is_some_and(|to| to.eq_ignore_ascii_case(&principal_id));
+            if event.event == "dm" && !is_dm {
+                continue;
+            }
             let addressed = is_dm
                 || mentions.contains(&lowered)
                 || role_mentions.contains(&lowered)
@@ -2903,6 +2906,8 @@ impl Server {
                 channel: event.channel.clone(),
                 task_id: task_id.clone(),
                 repo_path: self.repo_path_for(&event.channel, task_repo.as_deref()),
+                event: Some(event.event.clone()),
+                triggered_by: Some(event.from.clone()),
             };
             if let Err(err) = self.wakes.request(ctx) {
                 eprintln!("wake request error: {err:#}");
@@ -2955,6 +2960,8 @@ impl Server {
             reason: reason.to_string(),
             channel,
             task_id: None,
+            event: Some("owner".to_string()),
+            triggered_by: None,
         })
     }
 
@@ -3689,6 +3696,95 @@ mod tests {
         assert!(
             reconnected_rx.try_recv().is_err(),
             "re-joining already online channel should not emit duplicate JOIN/NAMES"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_dm_wake_loop_is_suppressed_while_channel_and_human_wakes_work() -> Result<()> {
+        let server = test_server()?;
+        let (human, _) = server.auth().register_principal("dm-loop-human", None, None)?;
+        let (agent_a, _) = server.auth().register_principal("dm-loop-a", None, None)?;
+        let (agent_b, _) = server.auth().register_principal("dm-loop-b", None, None)?;
+
+        let (command, args) = if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), "echo".to_string(), "ok".to_string()],
+            )
+        } else {
+            ("echo".to_string(), vec!["ok".to_string()])
+        };
+        for id in [&agent_a.id, &agent_b.id] {
+            server.wakes().upsert(
+                id,
+                crate::wake::WakeConfigInput {
+                    command: command.clone(),
+                    args: args.clone(),
+                    cooldown_seconds: Some(0),
+                    timeout_seconds: Some(10),
+                    ..Default::default()
+                },
+            )?;
+        }
+
+        // Agent A sends DM to Agent B -> B wakes.
+        server.post_message(&agent_a, "@dm-loop-b", "hello from a")?;
+        for _ in 0..100 {
+            let runs = server.wakes().runs(Some(&agent_b.id), 10)?;
+            if runs.len() == 1 && runs[0].status == "ok" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(server.wakes().runs(Some(&agent_b.id), 10)?[0].status, "ok");
+
+        // Agent B replies via DM to Agent A -> suppressed (recorded as skipped).
+        server.post_message(&agent_b, "@dm-loop-a", "reply from b")?;
+        let a_runs = server.wakes().runs(Some(&agent_a.id), 10)?;
+        assert_eq!(a_runs.len(), 1);
+        assert_eq!(a_runs[0].status, "skipped");
+
+        // Channel mention from Agent B to Agent A still wakes A.
+        server.post_message(&agent_b, "#cams", "@dm-loop-a check channel")?;
+        for _ in 0..100 {
+            let runs = server.wakes().runs(Some(&agent_a.id), 10)?;
+            if runs.iter().any(|r| r.status == "ok") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(server
+            .wakes()
+            .runs(Some(&agent_a.id), 10)?
+            .iter()
+            .any(|r| r.status == "ok"));
+
+        // Human DM to Agent B resets B so B can wake A again.
+        server.post_message(&human, "@dm-loop-b", "human check-in")?;
+        for _ in 0..100 {
+            let runs = server.wakes().runs(Some(&agent_b.id), 10)?;
+            if runs.len() == 2 && runs.iter().all(|r| r.status == "ok") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        server.post_message(&agent_b, "@dm-loop-a", "fresh dm after human")?;
+        for _ in 0..100 {
+            let runs = server.wakes().runs(Some(&agent_a.id), 10)?;
+            if runs.iter().filter(|r| r.status == "ok").count() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            server
+                .wakes()
+                .runs(Some(&agent_a.id), 10)?
+                .iter()
+                .filter(|r| r.status == "ok")
+                .count(),
+            2
         );
         Ok(())
     }
