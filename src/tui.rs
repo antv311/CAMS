@@ -38,6 +38,10 @@ const STATUS_CHOICES: &[&str] = &[
 ];
 const ROLE_CHOICES: &[&str] = &["member", "builder", "reviewer", "tester", "coordinator"];
 const KIND_CHOICES: &[&str] = &["task", "bug", "feature"];
+/// Picker values that start a step instead of naming an account or model.
+/// Account names cannot start with `+`.
+const NEW_ACCOUNT: &str = "+new";
+const TYPE_MODEL: &str = "+type";
 const HELP: &[&str] = &[
     "Home",
     "  up/down     choose a project      Enter  open its dashboard",
@@ -53,7 +57,8 @@ const HELP: &[&str] = &[
     "  a           assign or reassign the selected task",
     "  s           move the selected task to another status",
     "  p           choose the selected project's manager (owner)",
-    "  m           add an account to the selected project",
+    "  m           add an account to the selected project, or create one",
+    "              for a client and model (owner)",
     "  w           answer a question that is waiting on you",
     "  l           switch an account's launcher on or off (owner)",
     "  c           chat      r  refresh      q  quit",
@@ -151,6 +156,17 @@ pub struct ChatLine {
     pub time: i64,
 }
 
+/// A client template an account can be created from.
+#[derive(Clone, Debug, Default)]
+pub struct TemplateView {
+    pub id: String,
+    pub name: String,
+    pub installed: bool,
+}
+
+/// A model a client can run: its id and, when the client gave one, a label.
+pub type ModelItem = (String, Option<String>);
+
 /// Everything the screens show, refreshed from the server in the background.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -166,6 +182,9 @@ pub struct Snapshot {
     pub messages: BTreeMap<String, Vec<ChatLine>>,
     /// The task opened with Enter: its id and the lines to show.
     pub detail: Option<(String, Vec<String>)>,
+    pub templates: Vec<TemplateView>,
+    /// The models last listed for a template, or why they could not be.
+    pub models: Option<(String, Result<Vec<ModelItem>, String>)>,
     /// The result of the last action: (succeeded, text, when).
     pub notice: Option<(bool, String, Instant)>,
     /// The hub could not be reached or refused the refresh.
@@ -188,6 +207,10 @@ pub enum Action {
     /// POST `body` to `path`. `owner` adds the owner key from this machine.
     Api { path: String, body: Value, owner: bool, done: String },
     LoadTask(String),
+    /// Ask the hub which models a client template offers.
+    LoadModels(String),
+    /// Create an account from a template (owner) and save its airc profile.
+    CreateAccount { body: Value },
     /// Several requests in order; stops at the first that fails.
     Many(Vec<Action>),
 }
@@ -219,6 +242,10 @@ pub enum Flow {
     NewProjectRepo { name: String },
     TestAgent,
     OpenSprint { channel: String },
+    NewAccountClient { channel: String },
+    NewAccountModel { channel: String, template: String },
+    NewAccountName { channel: String, template: String, model: String },
+    NewAccountRole { channel: String, template: String, model: String, nick: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -227,6 +254,8 @@ pub enum Modal {
     Picker { title: String, items: Vec<(String, String)>, idx: usize, flow: Flow },
     /// Type a line of text.
     Prompt { title: String, text: String, flow: Flow },
+    /// Choose a model of `template`; the list arrives from the hub.
+    Models { channel: String, template: String, idx: usize },
     Detail { task_id: String },
     Help,
 }
@@ -529,6 +558,21 @@ async fn refresh(
         snap.my_role = me.role.clone();
     }
 
+    // Older hubs have no templates; that only hides account creation.
+    snap.templates = match get(client, cfg, "/v1/templates").await {
+        Ok(body) => body["templates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| TemplateView {
+                id: text(&t["id"]),
+                name: text(&t["name"]),
+                installed: t["installed"].as_bool().unwrap_or(false),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
     let projects = get(client, cfg, "/v1/projects").await?;
     let gits = get(client, cfg, "/v1/gits").await?;
     let rooms = get(client, cfg, "/v1/rooms").await?;
@@ -656,6 +700,7 @@ async fn refresh(
     let mut guard = shared.lock().expect("snapshot mutex poisoned");
     snap.notice = guard.notice.clone();
     snap.detail = guard.detail.clone();
+    snap.models = guard.models.clone();
     snap.error = None;
     *guard = snap;
     Ok(())
@@ -708,6 +753,76 @@ async fn load_task(client: &reqwest::Client, cfg: &TuiConfig, id: &str) -> Resul
         ));
     }
     Ok(lines)
+}
+
+async fn load_models(
+    client: &reqwest::Client,
+    cfg: &TuiConfig,
+    template: &str,
+) -> Result<Vec<ModelItem>> {
+    let key = cfg
+        .owner_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("the owner key is not on this machine"))?;
+    let body = json!({"invite": key, "template": template});
+    let listed = request(client, cfg, "/v1/owner/models", Some(&body)).await?;
+    Ok(listed["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| (text(&m["id"]), m["label"].as_str().map(str::to_owned)))
+        .filter(|(id, _)| !id.is_empty())
+        .collect())
+}
+
+/// Create the account, then save its token as the airc profile named after
+/// it, so `airc --profile <nick>` works for the agent straight away.
+async fn create_account(client: &reqwest::Client, cfg: &TuiConfig, mut body: Value) -> (bool, String) {
+    match cfg.owner_key.as_deref() {
+        Some(key) => body["invite"] = json!(key),
+        None => return (false, "the owner key is not on this machine".to_string()),
+    }
+    let created = match request(client, cfg, "/v1/owner/accounts", Some(&body)).await {
+        Ok(created) => created,
+        Err(err) => return (false, format!("{err}")),
+    };
+    let account = &created["account"];
+    let nick = text(&account["principal"]["nick"]);
+    let channel = text(&account["channel"]);
+    match save_profile(&config_dir(), &nick, &cfg.server, &text(&account["token"])) {
+        Ok(()) => (true, format!("Created @{nick} in {channel}; its airc profile is saved")),
+        Err(err) => (
+            false,
+            format!("Created @{nick} in {channel}, but its airc profile was not saved: {err:#}"),
+        ),
+    }
+}
+
+/// Add or replace one profile in `profiles.json`, leaving the default and
+/// every other profile as they were.
+pub fn save_profile(dir: &std::path::Path, nick: &str, server: &str, token: &str) -> Result<()> {
+    if nick.is_empty() || token.is_empty() {
+        return Err(anyhow!("the hub did not return the new account's token"));
+    }
+    let path = dir.join("profiles.json");
+    let mut data: Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => json!({"default": nick}),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    if !data.is_object() {
+        return Err(anyhow!("{} is not a profile file", path.display()));
+    }
+    if !data["profiles"].is_object() {
+        data["profiles"] = json!({});
+    }
+    data["profiles"][nick] = json!({"server": server, "token": token, "nick": nick});
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let temp = dir.join("profiles.json.tmp");
+    std::fs::write(&temp, serde_json::to_string_pretty(&data)? + "\n")
+        .with_context(|| format!("write {}", temp.display()))?;
+    std::fs::rename(&temp, &path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
 }
 
 /// Send one request for an action; returns whether it worked and the line
@@ -768,6 +883,16 @@ async fn fetch_loop(
                             }
                         }
                         set_notice(outcome.0, outcome.1);
+                    }
+                    Some(Action::LoadModels(template)) => {
+                        shared.lock().expect("snapshot mutex poisoned").models = None;
+                        let listed = load_models(&client, &cfg, &template).await;
+                        shared.lock().expect("snapshot mutex poisoned").models =
+                            Some((template, listed.map_err(|err| format!("{err}"))));
+                    }
+                    Some(Action::CreateAccount { body }) => {
+                        let (ok, message) = create_account(&client, &cfg, body).await;
+                        set_notice(ok, message);
                     }
                     Some(Action::LoadTask(id)) => {
                         let lines = load_task(&client, &cfg, &id)
@@ -839,6 +964,52 @@ fn prompt(title: impl Into<String>, flow: Flow) -> Option<Modal> {
         text: String::new(),
         flow,
     })
+}
+
+fn prompt_with(title: impl Into<String>, text: impl Into<String>, flow: Flow) -> Option<Modal> {
+    Some(Modal::Prompt {
+        title: title.into(),
+        text: text.into(),
+        flow,
+    })
+}
+
+/// A model id turned into a usable account name: letters, digits, `.`, `_`
+/// and `-`, at most 32 characters.
+pub fn nick_for_model(model: &str) -> String {
+    let nick: String = model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .take(32)
+        .collect();
+    nick.trim_matches('-').to_string()
+}
+
+/// The model picker's rows: `None` while the hub is still listing them.
+/// The last row always lets you type a model the list does not show.
+pub fn model_items(snap: &Snapshot, template: &str) -> Option<(Vec<(String, String)>, Option<String>)> {
+    let (listed_for, listed) = snap.models.as_ref()?;
+    if listed_for != template {
+        return None;
+    }
+    let (mut items, problem) = match listed {
+        Ok(models) => (
+            models
+                .iter()
+                .map(|(id, label)| {
+                    let shown = match label {
+                        Some(label) => format!("{id}  {label}"),
+                        None => id.clone(),
+                    };
+                    (shown, id.clone())
+                })
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(err) => (Vec::new(), Some(err.clone())),
+    };
+    items.push(("Type a model name...".to_string(), TYPE_MODEL.to_string()));
+    Some((items, problem))
 }
 
 fn choices(values: &[&str]) -> Vec<(String, String)> {
@@ -961,6 +1132,76 @@ fn advance(app: &mut App, flow: Flow, value: String, snap: &Snapshot) -> Option<
             json!({"channel": channel, "nick": value}),
             "Project manager set",
         ),
+        Flow::AddMember { channel } if value == NEW_ACCOUNT => {
+            app.modal = if snap.templates.is_empty() {
+                picker(
+                    "No client templates on the hub yet",
+                    vec![("(close)".to_string(), String::new())],
+                    Flow::NewAccountClient { channel },
+                )
+            } else {
+                picker(
+                    format!("New account for {channel}: client"),
+                    snap.templates
+                        .iter()
+                        .map(|t| {
+                            let missing = if t.installed { "" } else { "  (not installed)" };
+                            (format!("{}{missing}", t.name), t.id.clone())
+                        })
+                        .collect(),
+                    Flow::NewAccountClient { channel },
+                )
+            };
+            None
+        }
+        Flow::NewAccountClient { channel } => {
+            if value.is_empty() {
+                return None;
+            }
+            app.modal = Some(Modal::Models {
+                channel,
+                template: value.clone(),
+                idx: 0,
+            });
+            Some(Action::LoadModels(value))
+        }
+        Flow::NewAccountModel { channel, template } => {
+            if value == TYPE_MODEL {
+                app.modal = prompt(
+                    "Model name, exactly as the client expects it",
+                    Flow::NewAccountModel { channel, template },
+                );
+                return None;
+            }
+            let model = value.trim().to_string();
+            if model.is_empty() {
+                return None;
+            }
+            app.modal = prompt_with(
+                format!("Account name for {model}"),
+                nick_for_model(&model),
+                Flow::NewAccountName { channel, template, model },
+            );
+            None
+        }
+        Flow::NewAccountName { channel, template, model } => {
+            let nick = value.trim().trim_start_matches('@').to_string();
+            if nick.is_empty() {
+                return None;
+            }
+            app.modal = picker(
+                format!("Role for @{nick} in {channel}"),
+                choices(ROLE_CHOICES),
+                Flow::NewAccountRole { channel, template, model, nick },
+            );
+            None
+        }
+        Flow::NewAccountRole { channel, template, model, nick } => Some(Action::CreateAccount {
+            body: json!({
+                "template": template, "model": model, "nick": nick,
+                "channel": channel, "role": value,
+            }),
+        }),
         Flow::AddMember { channel } => {
             app.modal = picker(
                 format!("Role for @{value}"),
@@ -1107,6 +1348,30 @@ fn handle_modal(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action>
                 None
             }
         },
+        Modal::Models {
+            channel,
+            template,
+            mut idx,
+        } => {
+            let items = model_items(snap, &template).map(|(items, _)| items);
+            match (code, items) {
+                (KeyCode::Esc, _) => None,
+                (KeyCode::Enter, Some(items)) => {
+                    let value = items.get(idx).map(|(_, v)| v.clone()).unwrap_or_default();
+                    advance(app, Flow::NewAccountModel { channel, template }, value, snap)
+                }
+                (other, items) => {
+                    let last = items.map(|i| i.len().saturating_sub(1)).unwrap_or(0);
+                    match other {
+                        KeyCode::Up | KeyCode::Char('k') => idx = idx.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Char('j') => idx = (idx + 1).min(last),
+                        _ => {}
+                    }
+                    app.modal = Some(Modal::Models { channel, template, idx });
+                    None
+                }
+            }
+        }
         Modal::Detail { .. } | Modal::Help => None,
     }
 }
@@ -1248,8 +1513,11 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
         }
         KeyCode::Char('m') => {
             if let Some(project) = selected_project(app, snap) {
-                app.modal = picker(
-                    format!("Add to {}", project.channel),
+                let mut items = vec![(
+                    "+ create a new account (client and model)".to_string(),
+                    NEW_ACCOUNT.to_string(),
+                )];
+                items.extend(
                     snap.accounts
                         .iter()
                         .filter(|a| {
@@ -1258,8 +1526,11 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
                                 .iter()
                                 .any(|m| m.nick.eq_ignore_ascii_case(&a.nick))
                         })
-                        .map(|a| (format!("@{}", a.nick), a.nick.clone()))
-                        .collect(),
+                        .map(|a| (format!("@{}", a.nick), a.nick.clone())),
+                );
+                app.modal = picker(
+                    format!("Add to {}", project.channel),
+                    items,
                     Flow::AddMember {
                         channel: project.channel.clone(),
                     },
@@ -2086,6 +2357,50 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, snap: &Snapshot, area: Rect) {
                 rect.x + 1 + (text.chars().count() as u16).min(rect.width.saturating_sub(3));
             frame.set_cursor_position((cursor_x, rect.y + 1));
         }
+        Modal::Models { template, idx, .. } => {
+            let (mut lines, problem): (Vec<Line>, Option<String>) = match model_items(snap, template) {
+                None => (vec![Line::from("  Asking the hub for the models...")], None),
+                Some((items, problem)) => (
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (label, _))| {
+                            if i == *idx {
+                                Line::from(Span::styled(
+                                    format!("> {label}"),
+                                    bold().fg(Color::Black).bg(Color::Cyan),
+                                ))
+                            } else {
+                                Line::from(format!("  {label}"))
+                            }
+                        })
+                        .collect(),
+                    problem,
+                ),
+            };
+            let mut skip_from = *idx;
+            if let Some(problem) = problem {
+                lines.insert(
+                    0,
+                    Line::from(Span::styled(format!("  {problem}"), Style::default().fg(Color::Yellow))),
+                );
+                skip_from += 1;
+            }
+            let widest = lines.iter().map(|l| l.width()).max().unwrap_or(30).max(40);
+            let rect = centered(area, widest as u16 + 6, lines.len() as u16 + 2);
+            let visible = rect.height.saturating_sub(2) as usize;
+            let first = skip_from.saturating_sub(visible.saturating_sub(1));
+            let shown: Vec<Line> = lines.into_iter().skip(first).take(visible).collect();
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(shown).block(
+                    Block::bordered()
+                        .border_style(frame_style)
+                        .title(format!(" Model for {template} ")),
+                ),
+                rect,
+            );
+        }
         Modal::Detail { task_id } => {
             let lines: Vec<Line> = match &snap.detail {
                 Some((id, lines)) if id == task_id => {
@@ -2330,6 +2645,8 @@ mod tests {
             ],
             messages,
             detail: None,
+            templates: Vec::new(),
+            models: None,
             notice: None,
             error: None,
         }
@@ -2594,15 +2911,17 @@ mod tests {
                 "Project manager set"
             )
         );
-        // Add member: only accounts that are not members yet are offered.
+        // Add member: creating an account comes first, then only accounts
+        // that are not members yet.
         press(&mut app, &snap, &[KeyCode::Char('m')]);
         let screen = render(&mut app, &snap);
         assert!(screen.contains("@flash-lite") && screen.contains("Add to #quest-video"));
+        assert!(screen.contains("+ create a new account"));
         assert_eq!(
             press(
                 &mut app,
                 &snap,
-                &[KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter]
+                &[KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter]
             ),
             sent(
                 "/v1/projects/members",
@@ -2871,5 +3190,140 @@ mod tests {
                 "Sprint opened"
             )
         );
+    }
+
+    fn with_templates(mut snap: Snapshot) -> Snapshot {
+        snap.templates = vec![
+            TemplateView { id: "agy".into(), name: "Antigravity".into(), installed: true },
+            TemplateView { id: "lmstudio".into(), name: "LM Studio".into(), installed: false },
+        ];
+        snap
+    }
+
+    #[test]
+    fn m_creates_an_account_from_a_client_and_model() {
+        let mut snap = with_templates(fixture());
+        let mut app = App::default();
+        // m, then "+ create a new account", then the client.
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter]);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("New account for #quest-video: client"), "{screen}");
+        assert!(screen.contains("LM Studio  (not installed)"), "{screen}");
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::LoadModels("agy".into()))
+        );
+        // Keys wait while the hub lists the models.
+        assert!(render(&mut app, &snap).contains("Asking the hub for the models"));
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]), None);
+        assert!(matches!(app.modal, Some(Modal::Models { .. })));
+
+        snap.models = Some((
+            "agy".into(),
+            Ok(vec![
+                ("gemini-4-argon-high".into(), Some("Gemini 4 Argon (High)".into())),
+                ("gemini-3.8-flash-low".into(), None),
+            ]),
+        ));
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("gemini-4-argon-high  Gemini 4 Argon (High)"), "{screen}");
+        assert!(screen.contains("Type a model name..."), "{screen}");
+        // The account name starts as the model and can be edited.
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Prompt { ref text, .. }) if text == "gemini-3.8-flash-low"
+        ));
+        type_text(&mut app, &snap, "-2");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(render(&mut app, &snap).contains("Role for @gemini-3.8-flash-low-2 in #quest-video"));
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]),
+            Some(Action::CreateAccount {
+                body: json!({
+                    "template": "agy", "model": "gemini-3.8-flash-low",
+                    "nick": "gemini-3.8-flash-low-2", "channel": "#quest-video",
+                    "role": "builder",
+                }),
+            })
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn a_model_the_list_does_not_show_can_be_typed() {
+        let mut snap = with_templates(fixture());
+        snap.models = Some(("lmstudio".into(), Err("could not start 'lms'".into())));
+        let mut app = App::default();
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter, KeyCode::Down]);
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::LoadModels("lmstudio".into()))
+        );
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("could not start 'lms'"), "{screen}");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(render(&mut app, &snap).contains("Model name, exactly as the client expects it"));
+        type_text(&mut app, &snap, "qwen/qwen3-coder:30b");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Prompt { ref text, .. }) if text == "qwen-qwen3-coder-30b"
+        ));
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(matches!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::CreateAccount { ref body })
+                if body["model"] == "qwen/qwen3-coder:30b" && body["nick"] == "qwen-qwen3-coder-30b"
+                    && body["role"] == "member"
+        ));
+    }
+
+    #[test]
+    fn without_templates_create_account_says_so() {
+        let snap = fixture();
+        let mut app = App::default();
+        press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter]);
+        assert!(render(&mut app, &snap).contains("No client templates on the hub yet"));
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Enter]), None);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn nick_for_model_keeps_only_name_characters() {
+        assert_eq!(nick_for_model("gemini-3.8-flash-medium"), "gemini-3.8-flash-medium");
+        assert_eq!(nick_for_model("qwen/qwen3:30b"), "qwen-qwen3-30b");
+        assert_eq!(nick_for_model("@odd model@"), "odd-model");
+        assert_eq!(nick_for_model(&"x".repeat(40)).len(), 32);
+    }
+
+    #[test]
+    fn save_profile_adds_one_profile_and_keeps_the_rest() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("aircd-tui-profile-{}", uuid::Uuid::new_v4()));
+        save_profile(&dir, "first", "http://127.0.0.1:6680", "tok-1")?;
+        let path = dir.join("profiles.json");
+        let data: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(data["default"], "first");
+        // An existing file keeps its default, other profiles and other keys.
+        std::fs::write(
+            &path,
+            r#"{"default": "tony", "extra": 1, "profiles": {"tony": {"token": "t", "nick": "tony", "server": "s"}}}"#,
+        )?;
+        save_profile(&dir, "new-model", "http://127.0.0.1:6680", "tok-2")?;
+        let data: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(data["default"], "tony");
+        assert_eq!(data["extra"], 1);
+        assert_eq!(data["profiles"]["tony"]["token"], "t");
+        assert_eq!(
+            data["profiles"]["new-model"],
+            json!({"server": "http://127.0.0.1:6680", "token": "tok-2", "nick": "new-model"})
+        );
+        assert!(!dir.join("profiles.json.tmp").exists());
+        // A broken file is left alone rather than replaced.
+        std::fs::write(&path, "not json")?;
+        assert!(save_profile(&dir, "other", "s", "tok-3").is_err());
+        assert_eq!(std::fs::read_to_string(&path)?, "not json");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

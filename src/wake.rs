@@ -167,6 +167,103 @@ pub fn command_found(command: &str) -> bool {
     })
 }
 
+/// One model a client can run: the id passed to it and, when the client
+/// printed one, a readable label.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ModelChoice {
+    pub id: String,
+    pub label: Option<String>,
+}
+
+/// Read a model listing. A model API's JSON (`{"data": [{"id": ...}]}`, as
+/// the Anthropic and OpenAI model lists return) gives each `id`, labelled by
+/// its `display_name` when there is one. Anything else is read as one model
+/// per line, the id first and an optional label after whitespace. Blank
+/// lines and duplicates are skipped.
+pub fn parse_models(output: &str) -> Vec<ModelChoice> {
+    let mut out: Vec<ModelChoice> = Vec::new();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(output.trim()) {
+        let list = json
+            .get("data")
+            .or_else(|| json.get("models"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for entry in list {
+            let Some(id) = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|id| crate::store::valid_model(id))
+            else {
+                continue;
+            };
+            if out.iter().any(|m| m.id == id) {
+                continue;
+            }
+            let label = entry
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && *l != id)
+                .map(str::to_owned);
+            out.push(ModelChoice {
+                id: id.to_string(),
+                label,
+            });
+        }
+        return out;
+    }
+    for line in output.lines() {
+        let line = line.trim();
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let Some(id) = parts.next().filter(|id| crate::store::valid_model(id)) else {
+            continue;
+        };
+        if out.iter().any(|m| m.id == id) {
+            continue;
+        }
+        let label = parts
+            .next()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned);
+        out.push(ModelChoice {
+            id: id.to_string(),
+            label,
+        });
+    }
+    out
+}
+
+/// Run a template's model listing command (program first, no shell) and
+/// read the models it prints. Only the owner can ask for this, and only with
+/// a command the owner saved in a template.
+pub async fn list_models(argv: &[String]) -> Result<Vec<ModelChoice>> {
+    let (command, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("no model listing command"))?;
+    let mut child = tokio::process::Command::new(command);
+    child
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(30), child.output())
+        .await
+        .map_err(|_| anyhow!("'{command}' did not list its models within 30 seconds"))?
+        .with_context(|| format!("could not start '{command}'"))?;
+    if !output.status.success() {
+        return Err(anyhow!("'{command}' failed to list its models ({})", output.status));
+    }
+    let models = parse_models(&String::from_utf8_lossy(&output.stdout));
+    if models.is_empty() {
+        // Typically a model API refusing the request (a missing or wrong key).
+        return Err(anyhow!("'{command}' printed no models"));
+    }
+    Ok(models)
+}
+
 /// Read a conversation id from agent output: the run of letters, digits,
 /// `-` and `_` that follows `marker`, skipping quotes, colons and spaces.
 pub fn capture_after(text: &str, marker: &str) -> Option<String> {
@@ -747,6 +844,48 @@ mod tests {
             &[("nick", "qwen-1"), ("channel", "#quest")],
         );
         assert_eq!(out, "qwen-1 in #quest keeps {other}");
+    }
+
+    #[test]
+    fn parse_models_reads_a_model_api_list() {
+        let anthropic = r#"{"data": [
+            {"type": "model", "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5"},
+            {"type": "model", "id": "claude-haiku-5-5", "display_name": "claude-haiku-5-5"},
+            {"type": "model", "id": "bad id"}
+        ], "has_more": false}"#;
+        let openai = r#"{"object": "list", "data": [{"id": "gpt-x-codex", "object": "model"}]}"#;
+        let pairs = |output: &str| -> Vec<(String, Option<String>)> {
+            parse_models(output).into_iter().map(|m| (m.id, m.label)).collect()
+        };
+        assert_eq!(
+            pairs(anthropic),
+            [
+                ("claude-opus-5-5".to_string(), Some("Claude Opus 5.5".to_string())),
+                ("claude-haiku-5-5".to_string(), None),
+            ]
+        );
+        assert_eq!(pairs(openai), [("gpt-x-codex".to_string(), None)]);
+        // An API error is JSON with no list: no models, not its words as models.
+        assert!(parse_models(r#"{"error": {"message": "invalid x-api-key"}}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_models_reads_the_id_and_label_of_each_line() {
+        let listed = parse_models(
+            "model-a-high\tModel A (High)\n\n  model.b  \nmodel-a-high\tagain\nnot{valid}\r\nmodel-c   C  label\n",
+        );
+        let pairs: Vec<(&str, Option<&str>)> = listed
+            .iter()
+            .map(|m| (m.id.as_str(), m.label.as_deref()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("model-a-high", Some("Model A (High)")),
+                ("model.b", None),
+                ("model-c", Some("C  label")),
+            ]
+        );
     }
 
     #[test]

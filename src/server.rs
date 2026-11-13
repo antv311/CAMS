@@ -19,8 +19,20 @@ use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
 use crate::store::{ClientTemplateStore, SharedConnection};
 use crate::tasks::{NewTask, Task, TaskStore, TERMINAL_STATUSES};
-use crate::wake::{WakeContext, WakeManager};
+use crate::wake::{WakeConfig, WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
+
+/// An account made from a client template. `token` is shown once.
+#[derive(Debug, Serialize)]
+pub struct CreatedAccount {
+    pub principal: Principal,
+    pub token: String,
+    pub channel: String,
+    pub role: String,
+    pub model: String,
+    pub template: String,
+    pub wake: WakeConfig,
+}
 
 const SERVER_NAME: &str = "aircd";
 const METADATA_CAPABILITIES: &[&str] = &["message-tags", "echo-message"];
@@ -1857,6 +1869,53 @@ impl Server {
         Ok(ProjectMember {
             principal_id: target.id,
             role,
+        })
+    }
+
+    /// Owner action: create an account that runs `model` through a client
+    /// template, give it the template's launcher with the model filled in and
+    /// add it to a project. Everything is checked before anything is written.
+    pub fn create_account_from_template(
+        &self,
+        template_id: &str,
+        raw_model: &str,
+        raw_nick: Option<&str>,
+        raw_channel: &str,
+        raw_role: Option<&str>,
+    ) -> Result<CreatedAccount> {
+        let template = self
+            .templates
+            .get(template_id)?
+            .ok_or_else(|| anyhow!("no client template named '{}'", template_id.trim()))?;
+        let model = raw_model.trim();
+        if !crate::store::valid_model(model) {
+            return Err(anyhow!("a model is required: one word without braces"));
+        }
+        let channel = self.project_of(&normalize_channel(raw_channel));
+        self.require_project(&channel)?;
+        let role = crate::auth::normalize_role(raw_role.unwrap_or("member"))?;
+        let nick = crate::auth::validate_nick(
+            raw_nick.map(str::trim).filter(|n| !n.is_empty()).unwrap_or(model),
+        )?;
+        if self.auth.resolve_by_name(&nick)?.is_some() {
+            return Err(anyhow!("an account named '{nick}' already exists"));
+        }
+        let launcher = template.launcher_for(model);
+
+        let (principal, token) = self.auth.register_principal(&nick, None, None)?;
+        self.join_channels(&principal, &["#general".to_string()])?;
+        let wake = self.wakes.upsert(&principal.id, launcher)?;
+        self.projects.set_role(&channel, &principal.id, &role)?;
+        self.join_channels(&principal, std::slice::from_ref(&channel))?;
+        self.join_rooms(&principal, &channel)?;
+        Ok(CreatedAccount {
+            principal,
+            token,
+            channel,
+            role,
+            model: model.to_string(),
+            template: template.id,
+            wake,
         })
     }
 

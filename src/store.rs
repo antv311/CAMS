@@ -28,6 +28,12 @@ pub struct ClientTemplate {
     pub resume_args: Vec<String>,
     pub session_marker: Option<String>,
     pub session_scope: String,
+    /// Models offered when an account is created from this template.
+    pub models: Vec<String>,
+    /// A command, program first, that prints the models: one per line with
+    /// the id first (`["agy", "models"]`), or a model API's JSON with a `data`
+    /// list of `id`s (a `curl` call). Empty when the list is kept by hand.
+    pub models_command: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -47,6 +53,8 @@ pub struct ClientTemplateInput {
     pub resume_args: Vec<String>,
     pub session_marker: Option<String>,
     pub session_scope: Option<String>,
+    pub models: Vec<String>,
+    pub models_command: Vec<String>,
 }
 
 /// Persistence only: callers enforce owner/PM permissions and provision accounts.
@@ -57,7 +65,8 @@ pub struct ClientTemplateStore {
 
 const CLIENT_TEMPLATE_SELECT: &str =
     "SELECT id, name, command, args_json, cwd, env_json, prompt, session_mode,
-            resume_args_json, session_marker, session_scope, created_at, updated_at
+            resume_args_json, session_marker, session_scope, created_at, updated_at,
+            models_json, models_command_json
      FROM client_templates";
 
 impl ClientTemplateStore {
@@ -92,12 +101,21 @@ impl ClientTemplateStore {
             &["account", "channel"],
             "session_scope",
         )?;
+        let models = template_models(&input.models)?;
+        if input
+            .models_command
+            .first()
+            .is_some_and(|program| program.trim().is_empty() || program.contains('\0'))
+        {
+            return Err(anyhow!("models_command must start with the program to run"));
+        }
         let db = self.db.lock().expect("sqlite mutex poisoned");
         db.execute(
             "INSERT INTO client_templates
                (id, name, command, args_json, cwd, env_json, prompt, session_mode,
-                resume_args_json, session_marker, session_scope, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                resume_args_json, session_marker, session_scope, created_at, updated_at,
+                models_json, models_command_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, command = excluded.command,
                args_json = excluded.args_json, cwd = excluded.cwd,
@@ -105,7 +123,9 @@ impl ClientTemplateStore {
                session_mode = excluded.session_mode,
                resume_args_json = excluded.resume_args_json,
                session_marker = excluded.session_marker,
-               session_scope = excluded.session_scope, updated_at = excluded.updated_at",
+               session_scope = excluded.session_scope, updated_at = excluded.updated_at,
+               models_json = excluded.models_json,
+               models_command_json = excluded.models_command_json",
             params![
                 id,
                 name,
@@ -122,6 +142,8 @@ impl ClientTemplateStore {
                 input.session_marker.filter(|s| !s.trim().is_empty()),
                 session_scope,
                 unix_timestamp(),
+                serde_json::to_string(&models)?,
+                serde_json::to_string(&input.models_command)?,
             ],
         )
         .context("save client template")?;
@@ -196,8 +218,62 @@ impl ClientTemplateStore {
             session_scope: row.get(10)?,
             created_at: row.get(11)?,
             updated_at: row.get(12)?,
+            models: json(row, 13)?,
+            models_command: json(row, 14)?,
         })
     }
+}
+
+impl ClientTemplate {
+    /// The launcher an account created from this template gets: every
+    /// `{model}` becomes `model`; the launch-time placeholders such as
+    /// `{prompt}` and `{nick}` stay for the launcher to fill in.
+    pub fn launcher_for(&self, model: &str) -> crate::wake::WakeConfigInput {
+        let fill = |text: &str| text.replace("{model}", model);
+        crate::wake::WakeConfigInput {
+            command: fill(&self.command),
+            args: self.args.iter().map(|a| fill(a)).collect(),
+            cwd: self.cwd.as_deref().map(fill),
+            env: self
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_deref().map(fill)))
+                .collect(),
+            prompt: self.prompt.as_deref().map(fill),
+            enabled: Some(true),
+            session_mode: Some(self.session_mode.clone()),
+            resume_args: self.resume_args.iter().map(|a| fill(a)).collect(),
+            session_marker: self.session_marker.clone(),
+            session_scope: Some(self.session_scope.clone()),
+            ..Default::default()
+        }
+    }
+}
+
+/// A model name ends up in launch arguments and, by default, as an account
+/// name, so it must be one plain token.
+pub fn valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 100
+        && !model
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '{' | '}'))
+}
+
+fn template_models(models: &[String]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for model in models {
+        let model = model.trim();
+        if !valid_model(model) {
+            return Err(anyhow!(
+                "model names must be one word of at most 100 characters without braces: {model:?}"
+            ));
+        }
+        if !out.iter().any(|m| m == model) {
+            out.push(model.to_string());
+        }
+    }
+    Ok(out)
 }
 
 fn client_template_id(id: &str) -> Result<&str> {
@@ -578,6 +654,19 @@ fn migrate_client_templates(connection: &Connection) -> Result<()> {
          );",
         )
         .context("migrate client templates")?;
+    for column in ["models_json", "models_command_json"] {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('client_templates') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            connection.execute(
+                &format!("ALTER TABLE client_templates ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -827,8 +916,12 @@ mod tests {
             ],
             session_marker: Some("\"session_id\":".to_string()),
             session_scope: Some("channel".to_string()),
+            models: vec!["model-a".to_string(), "model.b_2".to_string()],
+            models_command: vec!["example-client".to_string(), "models".to_string()],
         };
         let saved = store.upsert("example", input.clone())?;
+        assert_eq!(saved.models, input.models);
+        assert_eq!(saved.models_command, input.models_command);
         assert_eq!(saved.name, input.name);
         assert_eq!(saved.command, input.command);
         assert_eq!(saved.args, input.args);
@@ -968,6 +1061,73 @@ mod tests {
             assert_eq!(saved.session_mode, mode);
             assert_eq!(saved.session_scope, scope);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn client_template_launcher_fills_in_the_model_only() -> Result<()> {
+        let store = template_store()?;
+        let mut input = template_input();
+        input.env = BTreeMap::from([
+            ("MODEL".to_string(), Some("{model}".to_string())),
+            ("DROP".to_string(), None),
+        ]);
+        input.prompt = Some("You are @{nick} on {model}".to_string());
+        input.session_mode = Some("pm".to_string());
+        input.resume_args = vec!["--model".into(), "{model}".into(), "{session_id}".into()];
+        input.session_marker = Some("conversation_id".to_string());
+        let template = store.upsert("example", input)?;
+        let launcher = template.launcher_for("big-model-high");
+        assert_eq!(launcher.command, "example-client");
+        assert_eq!(launcher.args, ["--model", "big-model-high", "{prompt}"]);
+        assert_eq!(launcher.resume_args, ["--model", "big-model-high", "{session_id}"]);
+        assert_eq!(launcher.env["MODEL"].as_deref(), Some("big-model-high"));
+        assert_eq!(launcher.env["DROP"], None);
+        assert_eq!(launcher.prompt.as_deref(), Some("You are @{nick} on big-model-high"));
+        assert_eq!(launcher.session_mode.as_deref(), Some("pm"));
+        assert_eq!(launcher.session_marker.as_deref(), Some("conversation_id"));
+        assert_eq!(launcher.enabled, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn client_template_models_are_trimmed_deduplicated_and_checked() -> Result<()> {
+        let store = template_store()?;
+        let mut input = template_input();
+        input.models = vec![" a-1 ".into(), "b.2".into(), "a-1".into()];
+        assert_eq!(store.upsert("example", input)?.models, ["a-1", "b.2"]);
+        for bad in ["", "two words", "{model}", "tab\tbed"] {
+            let mut input = template_input();
+            input.models = vec![bad.to_string()];
+            assert!(store.upsert("bad", input).is_err(), "{bad:?}");
+        }
+        assert!(store.get("bad")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn client_templates_from_before_model_lists_gain_empty_lists() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        // The first template table, without model columns.
+        connection.execute_batch(
+            "CREATE TABLE client_templates (
+               id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, command TEXT NOT NULL,
+               args_json TEXT NOT NULL DEFAULT '[]', cwd TEXT,
+               env_json TEXT NOT NULL DEFAULT '{}', prompt TEXT,
+               session_mode TEXT NOT NULL DEFAULT 'fresh',
+               resume_args_json TEXT NOT NULL DEFAULT '[]', session_marker TEXT,
+               session_scope TEXT NOT NULL DEFAULT 'account',
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );
+             INSERT INTO client_templates (id, name, command, created_at, updated_at)
+               VALUES ('old', 'Old', 'old-client', 5, 6);",
+        )?;
+        init_with(&connection, false)?;
+        init_with(&connection, false)?;
+        let store = ClientTemplateStore::new(Arc::new(Mutex::new(connection)));
+        let old = store.get("old")?.unwrap();
+        assert!(old.models.is_empty() && old.models_command.is_empty());
+        assert_eq!((old.created_at, old.updated_at), (5, 6));
         Ok(())
     }
 

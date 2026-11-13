@@ -180,6 +180,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/register", post(register_agent))
         .route("/v1/owner/reissue", post(owner_reissue_token))
         .route("/v1/owner/wake", post(owner_wake))
+        .route("/v1/owner/models", post(owner_models))
+        .route("/v1/owner/accounts", post(owner_create_account))
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
         .route("/v1/templates", get(list_templates))
@@ -554,6 +556,105 @@ async fn delete_template(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "deleted": true })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct OwnerModelsReq {
+    invite: Option<String>,
+    template: String,
+}
+
+/// Owner-only: the models a template offers. The template's own list comes
+/// first, then whatever its listing command prints. The command runs on the
+/// hub's machine, which is why this needs the owner key.
+async fn owner_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OwnerModelsReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let template = state
+        .server
+        .templates()
+        .get(&req.template)
+        .map_err(template_store_error)?
+        .ok_or_else(|| ApiError::not_found(format!("no client template named '{}'", req.template.trim())))?;
+    let mut models: Vec<crate::wake::ModelChoice> = template
+        .models
+        .iter()
+        .map(|id| crate::wake::ModelChoice { id: id.clone(), label: None })
+        .collect();
+    let mut warning = None;
+    if !template.models_command.is_empty() {
+        match crate::wake::list_models(&template.models_command).await {
+            Ok(listed) => {
+                for choice in listed {
+                    if !models.iter().any(|m| m.id == choice.id) {
+                        models.push(choice);
+                    }
+                }
+            }
+            Err(err) => warning = Some(err.to_string()),
+        }
+    }
+    if models.is_empty() {
+        return Err(ApiError::bad_request(warning.unwrap_or_else(|| {
+            format!("template '{}' lists no models; add some to its models list", template.id)
+        })));
+    }
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "template": template.id, "models": models, "warning": warning })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct OwnerCreateAccountReq {
+    invite: Option<String>,
+    template: String,
+    model: String,
+    /// Defaults to the model name.
+    nick: Option<String>,
+    channel: String,
+    role: Option<String>,
+}
+
+/// Owner-only: create an account that runs one model through a client
+/// template and add it to a project. The response carries the account's
+/// token, once, for the caller to save as an `airc` profile.
+async fn owner_create_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OwnerCreateAccountReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let created = state
+        .server
+        .create_account_from_template(
+            &req.template,
+            &req.model,
+            req.nick.as_deref(),
+            &req.channel,
+            req.role.as_deref(),
+        )
+        .map_err(|err| {
+            if err.downcast_ref::<DuplicatePrincipalError>().is_some() {
+                ApiError::conflict(err.to_string())
+            } else {
+                ApiError::bad_request(err.to_string())
+            }
+        })?;
+    let host = resolve_request_host(&headers, &state.info);
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "account": created,
+            "http_url": format!("http://{}:{}", host, state.info.http_port),
+        })),
     ))
 }
 
@@ -3884,6 +3985,101 @@ mod tests {
             .await?;
         assert_eq!(header_ok.status().as_u16(), 201);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_creates_an_account_from_a_template_and_model() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some("owner-key-123".to_string());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let key = "owner-key-123";
+
+        let res: Value = client
+            .post(format!("{base}/v1/register"))
+            .json(&json!({"nick": "boss", "role": "leader", "invite": key}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let boss = res["token"].as_str().unwrap().to_string();
+        let (status, _) = call(&client, "POST", format!("{base}/v1/projects"), &boss,
+            json!({"channel": "#quest"})).await?;
+        assert_eq!(status, 201);
+        let (status, _) = call(&client, "POST", format!("{base}/v1/templates/client-x"), &boss,
+            json!({
+                "invite": key, "name": "Client X", "command": "aircd-uninstalled-client-x",
+                "args": ["--model", "{model}", "{prompt}"],
+                "models": ["model-a", "model-b"],
+                "models_command": ["aircd-uninstalled-lister", "models"],
+            })).await?;
+        assert_eq!(status, 200);
+
+        // Listing models and creating accounts need the owner key.
+        let (status, _) = call(&client, "POST", format!("{base}/v1/owner/models"), &boss,
+            json!({"template": "client-x"})).await?;
+        assert_eq!(status, 403);
+        let (status, _) = call(&client, "POST", format!("{base}/v1/owner/accounts"), &boss,
+            json!({"template": "client-x", "model": "model-b", "channel": "#quest"})).await?;
+        assert_eq!(status, 403);
+
+        // The listing command is not installed: the saved list still comes back.
+        let (status, body) = call(&client, "POST", format!("{base}/v1/owner/models"), &boss,
+            json!({"invite": key, "template": "client-x"})).await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["models"], json!([
+            {"id": "model-a", "label": null}, {"id": "model-b", "label": null},
+        ]));
+        assert!(body["warning"].as_str().unwrap().contains("aircd-uninstalled-lister"));
+
+        // Nothing is created when the project is wrong.
+        let (status, _) = call(&client, "POST", format!("{base}/v1/owner/accounts"), &boss,
+            json!({"invite": key, "template": "client-x", "model": "model-a",
+                   "nick": "ghost", "channel": "#nope"})).await?;
+        assert_eq!(status, 400);
+        let (status, _) = call(&client, "POST", format!("{base}/v1/owner/wake"), &boss,
+            json!({"invite": key, "action": "show", "nick": "ghost"})).await?;
+        assert_eq!(status, 404);
+
+        let (status, body) = call(&client, "POST", format!("{base}/v1/owner/accounts"), &boss,
+            json!({"invite": key, "template": "client-x", "model": "model-b",
+                   "channel": "quest", "role": "builder"})).await?;
+        assert_eq!(status, 201, "{body}");
+        let account = &body["account"];
+        assert_eq!(account["principal"]["nick"], "model-b");
+        assert_eq!(account["channel"], "#quest");
+        assert_eq!(account["role"], "builder");
+        assert_eq!(account["wake"]["args"], json!(["--model", "model-b", "{prompt}"]));
+        assert_eq!(account["wake"]["enabled"], true);
+        let token = account["token"].as_str().unwrap().to_string();
+        let (status, me) = call(&client, "GET", format!("{base}/v1/me"), &token, Value::Null).await?;
+        assert_eq!(status, 200);
+        assert_eq!(me["principal"]["nick"], "model-b");
+
+        let (_, members) = call(&client, "GET",
+            format!("{base}/v1/projects/members?channel=%23quest"), &boss, Value::Null).await?;
+        assert!(members["members"].as_array().unwrap().iter()
+            .any(|m| m["principal_id"] == "model-b" && m["role"] == "builder"), "{members}");
+
+        // A second account for the same model needs its own name.
+        let (status, body) = call(&client, "POST", format!("{base}/v1/owner/accounts"), &boss,
+            json!({"invite": key, "template": "client-x", "model": "model-b",
+                   "channel": "#quest"})).await?;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("already exists"));
+        let (status, body) = call(&client, "POST", format!("{base}/v1/owner/accounts"), &boss,
+            json!({"invite": key, "template": "client-x", "model": "model-b",
+                   "nick": "model-b-2", "channel": "#quest"})).await?;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["account"]["role"], "member");
         Ok(())
     }
 
