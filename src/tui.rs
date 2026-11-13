@@ -7,12 +7,12 @@
 use anyhow::{anyhow, Context, Result};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::{json, Value};
@@ -65,6 +65,8 @@ const HELP: &[&str] = &[
     "",
     "Chat",
     "  Enter send · Tab complete @name · up/down channel · Esc dashboard",
+    "  PageUp/PageDown scroll history · Home oldest · End latest",
+    "  Mouse wheel scrolls history over the message pane",
     "",
     "In a pop-up: up/down choose, Enter confirm, Esc cancel.",
 ];
@@ -278,6 +280,12 @@ pub struct App {
     pub home_cursor: usize,
     /// Last message seen in each room, for the unread counts.
     pub seen: HashMap<String, i64>,
+    /// Wrapped rows above the latest messages; zero follows new messages.
+    pub chat_scroll: usize,
+    chat_max_scroll: usize,
+    chat_content_height: usize,
+    chat_area: Rect,
+    chat_channel: Option<String>,
     channel_rows: Vec<(u16, usize)>,
     task_rows: Vec<(u16, usize)>,
     home_rows: Vec<(u16, usize)>,
@@ -295,6 +303,11 @@ impl Default for App {
             project: None,
             home_cursor: 0,
             seen: HashMap::new(),
+            chat_scroll: 0,
+            chat_max_scroll: 0,
+            chat_content_height: 0,
+            chat_area: Rect::default(),
+            chat_channel: None,
             channel_rows: Vec::new(),
             task_rows: Vec::new(),
             home_rows: Vec::new(),
@@ -1450,6 +1463,7 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
             if let Some(index) = room.and_then(|r| snap.channels.iter().position(|c| *c == r)) {
                 app.channel_idx = index;
             }
+            app.chat_scroll = 0;
             app.view = View::Chat;
         }
         KeyCode::Char('r') | KeyCode::Char('R') => return Some(Action::Refresh),
@@ -1609,23 +1623,43 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
 fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
     match code {
         KeyCode::Esc => app.view = View::Dashboard,
-        KeyCode::Up => app.channel_idx = app.channel_idx.saturating_sub(1),
+        KeyCode::Up => {
+            app.channel_idx = app.channel_idx.saturating_sub(1);
+            app.chat_scroll = 0;
+        }
         KeyCode::Down => {
             if app.channel_idx + 1 < snap.channels.len() {
                 app.channel_idx += 1;
             }
+            app.chat_scroll = 0;
         }
+        KeyCode::PageUp => {
+            app.chat_scroll = app
+                .chat_scroll
+                .saturating_add(usize::from(app.chat_area.height).max(1))
+                .min(app.chat_max_scroll);
+        }
+        KeyCode::PageDown => {
+            app.chat_scroll = app
+                .chat_scroll
+                .saturating_sub(usize::from(app.chat_area.height).max(1));
+        }
+        KeyCode::Home => app.chat_scroll = app.chat_max_scroll,
+        KeyCode::End => app.chat_scroll = 0,
         KeyCode::Backspace => {
             app.input.pop();
+            app.chat_scroll = 0;
         }
         KeyCode::Tab => {
             if let Some(done) = complete_mention(&app.input, &snap.accounts) {
                 app.input = done;
+                app.chat_scroll = 0;
             }
         }
         KeyCode::Enter => {
             let body = app.input.trim().to_string();
             app.input.clear();
+            app.chat_scroll = 0;
             if let (false, Some(target)) = (body.is_empty(), snap.channels.get(app.channel_idx)) {
                 return Some(Action::Send {
                     target: target.clone(),
@@ -1633,7 +1667,10 @@ fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
                 });
             }
         }
-        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Char(c) => {
+            app.input.push(c);
+            app.chat_scroll = 0;
+        }
         _ => {}
     }
     None
@@ -1663,6 +1700,7 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
         View::Chat if column < CHANNEL_PANE_WIDTH => {
             if let Some((_, index)) = app.channel_rows.iter().find(|(y, _)| *y == row) {
                 app.channel_idx = *index;
+                app.chat_scroll = 0;
             }
         }
         View::Dashboard => {
@@ -1678,6 +1716,28 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
         _ => {}
     }
     None
+}
+
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Option<Action> {
+    if app.modal.is_some() {
+        return None;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => handle_click(app, mouse.column, mouse.row),
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if app.view == View::Chat
+                && app.chat_area.contains((mouse.column, mouse.row).into()) =>
+        {
+            app.chat_scroll = match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    app.chat_scroll.saturating_add(3).min(app.chat_max_scroll)
+                }
+                _ => app.chat_scroll.saturating_sub(3),
+            };
+            None
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- drawing
@@ -1767,6 +1827,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("Enter", "send"),
             ("Tab", "complete @name"),
             ("Up/Down", "room"),
+            ("PgUp/PgDn", "history"),
+            ("End", "latest"),
             ("Esc", "dashboard"),
         ],
     };
@@ -2233,6 +2295,24 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
     );
 }
 
+fn chat_message<'a>(message: &'a ChatLine, me: &str) -> Text<'a> {
+    let name_color = if message.sender == "aircd" {
+        Color::DarkGray
+    } else if message.sender.eq_ignore_ascii_case(me) {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+    let mut body = Text::from(message.body.as_str()).lines.into_iter();
+    let mut first = Line::from(vec![
+        Span::styled(clock(message.time), dim()),
+        Span::styled(format!(" {}: ", message.sender), bold().fg(name_color)),
+    ]);
+    first.spans.extend(body.next().unwrap_or_default().spans);
+    let lines: Vec<Line> = std::iter::once(first).chain(body).collect();
+    Text::from(lines)
+}
+
 fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
     let [channels_area, right, people_area] = Layout::horizontal([
         Constraint::Length(CHANNEL_PANE_WIDTH),
@@ -2244,55 +2324,83 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
         Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(right);
 
     app.channel_idx = app.channel_idx.min(snap.channels.len().saturating_sub(1));
+    let current = snap
+        .channels
+        .get(app.channel_idx)
+        .cloned()
+        .unwrap_or_else(|| "#general".to_string());
+    if app.chat_channel.as_deref() != Some(&current) {
+        app.chat_scroll = 0;
+    }
     let channel_lines = channel_tree(app, snap, channels_area);
     frame.render_widget(
         Paragraph::new(channel_lines).block(Block::bordered().title(" Rooms ")),
         channels_area,
     );
 
-    let current = snap
-        .channels
-        .get(app.channel_idx)
-        .cloned()
-        .unwrap_or_else(|| "#general".to_string());
-    let width = messages_area.width.saturating_sub(2).max(10) as usize;
-    let height = messages_area.height.saturating_sub(2) as usize;
-    // Take messages from the newest back until the pane is full, allowing
-    // for wrapped lines.
-    let mut picked: Vec<Line> = Vec::new();
-    let mut used = 0usize;
-    for message in snap.messages.get(&current).into_iter().flatten().rev() {
-        let prefix = format!("{} {}: ", clock(message.time), message.sender);
-        let rows = (prefix.chars().count() + message.body.chars().count())
-            .div_ceil(width)
-            .max(1);
-        if used + rows > height && !picked.is_empty() {
+    let block = Block::bordered();
+    let inner = block.inner(messages_area);
+    let messages: Vec<_> = snap
+        .messages
+        .get(&current)
+        .into_iter()
+        .flatten()
+        .flat_map(|message| chat_message(message, &snap.me).lines)
+        .map(|line| {
+            let paragraph = Paragraph::new(line).wrap(Wrap { trim: false });
+            let rows = paragraph.line_count(inner.width);
+            (paragraph, rows)
+        })
+        .collect();
+    let total_rows: usize = messages.iter().map(|(_, rows)| rows).sum();
+    // Keep the same history in view when refresh appends messages.
+    if app.chat_scroll > 0 && inner.width == app.chat_area.width {
+        app.chat_scroll = app
+            .chat_scroll
+            .saturating_add(total_rows.saturating_sub(app.chat_content_height));
+    }
+    app.chat_content_height = total_rows;
+    app.chat_max_scroll = total_rows.saturating_sub(usize::from(inner.height));
+    app.chat_scroll = app.chat_scroll.min(app.chat_max_scroll);
+    app.chat_area = inner;
+    app.chat_channel = Some(current.clone());
+    let title = if app.chat_scroll == 0 {
+        format!(" {current}  (times UTC) ")
+    } else {
+        format!(" {current}  [{} lines up] ", app.chat_scroll)
+    };
+    frame.render_widget(block.title(title), messages_area);
+
+    let mut skipped = app.chat_max_scroll.saturating_sub(app.chat_scroll);
+    let mut remaining = inner;
+    // Render each source line separately so a long history can exceed the
+    // paragraph widget's u16 scroll range.
+    for (paragraph, rows) in messages {
+        if skipped >= rows {
+            skipped -= rows;
+            continue;
+        }
+        let height = (rows - skipped).min(usize::from(remaining.height)) as u16;
+        frame.render_widget(
+            paragraph.scroll((skipped as u16, 0)),
+            Rect {
+                height,
+                ..remaining
+            },
+        );
+        remaining.y += height;
+        remaining.height -= height;
+        skipped = 0;
+        if remaining.height == 0 {
             break;
         }
-        used += rows;
-        let name_color = if message.sender == "aircd" {
-            Color::DarkGray
-        } else if message.sender.eq_ignore_ascii_case(&snap.me) {
-            Color::Green
-        } else {
-            Color::Cyan
-        };
-        picked.push(Line::from(vec![
-            Span::styled(clock(message.time), dim()),
-            Span::styled(format!(" {}: ", message.sender), bold().fg(name_color)),
-            Span::raw(message.body.clone()),
-        ]));
     }
-    picked.reverse();
-    if picked.is_empty() {
-        picked.push(Line::from(Span::styled("No messages here yet.", dim())));
+    if total_rows == 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled("No messages here yet.", dim())),
+            inner,
+        );
     }
-    frame.render_widget(
-        Paragraph::new(picked)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(format!(" {current}  (times UTC) "))),
-        messages_area,
-    );
 
     frame.render_widget(
         Paragraph::new(app.input.clone())
@@ -2471,9 +2579,7 @@ fn ui_loop(shared: Arc<Mutex<Snapshot>>, commands: UnboundedSender<Action>) -> R
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key(&mut app, key.code, key.modifiers, &snap)
                 }
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                    handle_click(&mut app, mouse.column, mouse.row)
-                }
+                Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 _ => None,
             };
             match action {
@@ -2739,6 +2845,248 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "chat is missing {expected:?}");
         }
+    }
+
+    fn chat_with_history(count: usize) -> (App, Snapshot) {
+        let mut snap = fixture();
+        snap.messages.insert(
+            "#quest-video".into(),
+            (0..count)
+                .map(|index| ChatLine {
+                    seq: index as i64 + 1,
+                    sender: "codex".into(),
+                    body: format!("message-{index:03}"),
+                    time: 0,
+                })
+                .collect(),
+        );
+        let app = App {
+            view: View::Chat,
+            channel_idx: 1,
+            ..App::default()
+        };
+        (app, snap)
+    }
+
+    #[test]
+    fn chat_page_keys_show_history_and_clamp_at_both_ends() {
+        let (mut app, snap) = chat_with_history(80);
+        let latest = render(&mut app, &snap);
+        assert!(latest.contains("message-079"));
+        assert!(!latest.contains("message-000"));
+        assert_eq!(app.chat_scroll, 0);
+        let page = usize::from(app.chat_area.height);
+        assert_eq!(app.chat_max_scroll, 80 - page);
+
+        press(&mut app, &snap, &[KeyCode::PageUp]);
+        assert_eq!(app.chat_scroll, page);
+        let history = render(&mut app, &snap);
+        assert!(!history.contains("message-079"));
+        assert!(history.contains(&format!("[{page} lines up]")));
+
+        press(&mut app, &snap, &[KeyCode::Home, KeyCode::PageUp]);
+        assert_eq!(app.chat_scroll, app.chat_max_scroll);
+        assert!(render(&mut app, &snap).contains("message-000"));
+        press(&mut app, &snap, &[KeyCode::PageDown]);
+        assert_eq!(app.chat_scroll, app.chat_max_scroll - page);
+        press(&mut app, &snap, &[KeyCode::End, KeyCode::PageDown]);
+        assert_eq!(app.chat_scroll, 0);
+        assert!(render(&mut app, &snap).contains("message-079"));
+    }
+
+    #[test]
+    fn chat_refresh_keeps_history_in_place_and_follows_the_latest_at_bottom() {
+        let (mut app, mut snap) = chat_with_history(80);
+        render(&mut app, &snap);
+        press(&mut app, &snap, &[KeyCode::PageUp]);
+        let before = render(&mut app, &snap);
+        let offset = app.chat_scroll;
+        snap.messages
+            .get_mut("#quest-video")
+            .unwrap()
+            .push(ChatLine {
+                seq: 81,
+                sender: "codex".into(),
+                body: "newest arrival".into(),
+                time: 0,
+            });
+        let after = render(&mut app, &snap);
+        assert_eq!(app.chat_scroll, offset + 1);
+        let pane = |screen: &str| {
+            screen
+                .lines()
+                .skip(usize::from(app.chat_area.y))
+                .take(usize::from(app.chat_area.height))
+                .map(|line| {
+                    line.chars()
+                        .skip(usize::from(app.chat_area.x))
+                        .take(usize::from(app.chat_area.width))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pane(&before), pane(&after));
+        render(&mut app, &snap);
+        assert_eq!(app.chat_scroll, offset + 1);
+
+        press(&mut app, &snap, &[KeyCode::End]);
+        assert!(render(&mut app, &snap).contains("newest arrival"));
+        snap.messages
+            .get_mut("#quest-video")
+            .unwrap()
+            .push(ChatLine {
+                seq: 82,
+                sender: "codex".into(),
+                body: "next arrival".into(),
+                time: 0,
+            });
+        assert!(render(&mut app, &snap).contains("next arrival"));
+        assert_eq!(app.chat_scroll, 0);
+    }
+
+    #[test]
+    fn chat_input_edits_completion_and_send_snap_to_latest() {
+        let (mut app, snap) = chat_with_history(80);
+        render(&mut app, &snap);
+        for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Tab] {
+            app.input = "hi @fl".into();
+            app.chat_scroll = 5;
+            press(&mut app, &snap, &[key]);
+            assert_eq!(app.chat_scroll, 0, "input key {key:?}");
+        }
+        app.input = "hello".into();
+        app.chat_scroll = 5;
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::Send {
+                target: "#quest-video".into(),
+                body: "hello".into()
+            })
+        );
+        assert_eq!(app.chat_scroll, 0);
+        assert!(app.input.is_empty());
+        app.chat_scroll = 5;
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Enter]), None);
+        assert_eq!(app.chat_scroll, 0);
+    }
+
+    #[test]
+    fn chat_room_navigation_and_clicks_reset_history() {
+        let (mut app, snap) = chat_with_history(80);
+        render(&mut app, &snap);
+        for key in [KeyCode::Up, KeyCode::Down] {
+            app.chat_scroll = 5;
+            press(&mut app, &snap, &[key]);
+            assert_eq!(app.chat_scroll, 0);
+        }
+        app.chat_scroll = 5;
+        let (row, _) = app.channel_rows[0];
+        handle_click(&mut app, 3, row);
+        assert_eq!(app.channel_idx, 0);
+        assert_eq!(app.chat_scroll, 0);
+        assert!(render(&mut app, &snap).contains("No messages here yet."));
+        press(&mut app, &snap, &[KeyCode::Home, KeyCode::PageUp]);
+        assert_eq!(app.chat_scroll, 0);
+    }
+
+    #[test]
+    fn chat_mouse_wheel_scrolls_only_over_the_message_pane() {
+        let (mut app, snap) = chat_with_history(80);
+        render(&mut app, &snap);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: app.chat_area.x,
+            row: app.chat_area.y,
+            modifiers: NONE,
+        };
+        assert_eq!(handle_mouse(&mut app, mouse), None);
+        assert_eq!(app.chat_scroll, 3);
+        handle_mouse(&mut app, MouseEvent { column: 0, ..mouse });
+        assert_eq!(app.chat_scroll, 3);
+        app.modal = Some(Modal::Help);
+        handle_mouse(&mut app, mouse);
+        assert_eq!(app.chat_scroll, 3);
+        app.modal = None;
+        app.view = View::Dashboard;
+        handle_mouse(&mut app, mouse);
+        assert_eq!(app.chat_scroll, 3);
+        app.view = View::Chat;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                ..mouse
+            },
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                ..mouse
+            },
+        );
+        assert_eq!(app.chat_scroll, 0);
+        app.chat_scroll = app.chat_max_scroll;
+        handle_mouse(&mut app, mouse);
+        assert_eq!(app.chat_scroll, app.chat_max_scroll);
+    }
+
+    #[test]
+    fn chat_scrolls_within_wrapped_unicode_and_multiline_messages() {
+        let (mut app, mut snap) = chat_with_history(1);
+        snap.messages.get_mut("#quest-video").unwrap()[0].body = format!(
+            "FIRST\n{}\nLAST",
+            "界界界 alpha beta gamma delta epsilon ".repeat(100)
+        );
+        let latest = render(&mut app, &snap);
+        assert!(latest.contains("LAST"));
+        assert!(!latest.contains("FIRST"));
+        assert!(app.chat_max_scroll > 0);
+        press(&mut app, &snap, &[KeyCode::Home]);
+        let oldest = render(&mut app, &snap);
+        assert!(oldest.contains("FIRST"));
+        assert!(!oldest.contains("LAST"));
+        press(&mut app, &snap, &[KeyCode::PageDown]);
+        let middle = render(&mut app, &snap);
+        assert!(!middle.contains("FIRST"));
+        assert!(!middle.contains("LAST"));
+        // The text dump includes the continuation cell of each wide glyph.
+        assert!(middle.contains("界 界 界"), "{middle}");
+    }
+
+    #[test]
+    fn chat_history_can_exceed_the_paragraph_scroll_range() {
+        let (mut app, mut snap) = chat_with_history(1);
+        snap.messages.get_mut("#quest-video").unwrap()[0].body = (0..66_000)
+            .map(|index| format!("row-{index:05}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let latest = render(&mut app, &snap);
+        assert!(latest.contains("row-65999"));
+        assert!(app.chat_max_scroll > usize::from(u16::MAX));
+        press(&mut app, &snap, &[KeyCode::Home]);
+        assert!(render(&mut app, &snap).contains("row-00000"));
+        press(&mut app, &snap, &[KeyCode::End]);
+        assert!(render(&mut app, &snap).contains("row-65999"));
+    }
+
+    #[test]
+    fn chat_resizing_and_shortened_history_clamp_scroll_without_panicking() {
+        let (mut app, mut snap) = chat_with_history(40);
+        render(&mut app, &snap);
+        press(&mut app, &snap, &[KeyCode::Home]);
+        assert!(app.chat_scroll > 0);
+        render_to_text(&mut app, &snap, 180, 80).unwrap();
+        assert_eq!(app.chat_scroll, 0);
+        for (width, height) in [(110, 32), (60, 10), (20, 6), (1, 1)] {
+            render_to_text(&mut app, &snap, width, height).unwrap();
+            assert!(app.chat_scroll <= app.chat_max_scroll);
+        }
+        render(&mut app, &snap);
+        press(&mut app, &snap, &[KeyCode::Home]);
+        snap.messages.get_mut("#quest-video").unwrap().truncate(1);
+        assert!(render(&mut app, &snap).contains("message-000"));
+        assert_eq!(app.chat_scroll, 0);
     }
 
     #[test]
