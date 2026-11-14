@@ -3401,6 +3401,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn set_task_status_revision_api(
         &self,
         actor: &Principal,
