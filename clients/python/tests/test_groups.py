@@ -7,6 +7,7 @@ the hub's group and subtask endpoints are built to:
     POST /v1/groups                  {name, lead, workers, description?,
                                       lead_prompt?, worker_prompt?} -> {"group"}
     POST /v1/groups/{name}/attach    {"channel": "#proj"} -> {"group"}
+    PATCH /v1/groups/{name}          {lead?, add_workers?, remove_workers?} -> {"group"}
     POST /v1/tasks                   ... + parent_task_id?, reviewer?
 
 where lead and each worker are {"template", "model", "count", "nick"?}.
@@ -119,6 +120,32 @@ class TaskPayloadTest(unittest.TestCase):
 
 
 class GroupHttpClientTest(_HubCase):
+    def test_update_group_sends_only_changes_and_owner_key(self) -> None:
+        self.reply((200, {"group": GROUP_REPLY}))
+        update = {"add_workers": [{"template": "c", "model": "m", "nick": "worker1"}],
+                  "remove_workers": [{"template": "ollama", "model": "gemma3", "count": 2}]}
+        group = AircdHttpClient(self.url, token="tok", invite="owner").update_group("dev team", update)
+        self.assertEqual(group.projects, ["#cams"])
+        req = self.hub.requests[0]
+        self.assertEqual((req["method"], req["path"]), ("PATCH", "/v1/groups/dev%20team"))
+        self.assertEqual(req["body"], update)
+        self.assertEqual(req["headers"]["x-aircd-invite"], "owner")
+
+    def test_update_group_validation_and_errors(self) -> None:
+        hub = AircdHttpClient(self.url, token="tok")
+        for update in ({}, {"add_workers": []}, {"workers": []}, {"invite": "owner"}):
+            with self.subTest(update=update), self.assertRaises(AircdHttpError):
+                hub.update_group("dev", update)
+        with self.assertRaises(AircdHttpError):
+            hub.update_group(" ", {"lead": {"template": "c", "model": "m"}})
+        self.assertEqual(self.hub.requests, [])
+        self.reply((404, {"error": "no group named dev"}))
+        with self.assertRaises(AircdHttpError) as caught:
+            hub.update_group("dev", {"lead": {"template": "c", "model": "m"}})
+        self.assertEqual(caught.exception.status, 404)
+        self.assertEqual(self.hub.requests[0]["headers"]["authorization"], "Bearer tok")
+        self.assertNotIn("x-aircd-invite", self.hub.requests[0]["headers"])
+
     def test_list_groups(self) -> None:
         self.reply((200, {"groups": [GROUP_REPLY]}))
         groups = AircdHttpClient(self.url, token="tok").list_groups()
@@ -202,6 +229,55 @@ class GroupCliTest(_HubCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(argv)
         return code, out.getvalue(), err.getvalue()
+
+    def test_group_update_flags(self) -> None:
+        self.reply((200, {"group": GROUP_REPLY}))
+        code, out, err = self.run_cli(
+            "group", "update", "dev", "--add-worker", "ollama:gemma3*2",
+            "--add-worker", "claude:sonnet", "--remove-worker", "ollama:qwen3*3",
+            "--lead", "claude:opus", "--invite", "owner",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("Updated group:", out)
+        req = self.hub.requests[0]
+        self.assertEqual((req["method"], req["path"]), ("PATCH", "/v1/groups/dev"))
+        self.assertEqual(req["headers"]["x-aircd-invite"], "owner")
+        self.assertEqual(req["body"], {
+            "lead": {"template": "claude", "model": "opus", "count": 1},
+            "add_workers": [{"template": "ollama", "model": "gemma3", "count": 2},
+                            {"template": "claude", "model": "sonnet", "count": 1}],
+            "remove_workers": [{"template": "ollama", "model": "qwen3", "count": 3}],
+        })
+
+    def test_group_update_file_and_flags(self) -> None:
+        self.reply((200, {"group": GROUP_REPLY}))
+        update = {"lead": {"template": "claude", "model": "opus", "nick": "new-lead"},
+                  "remove_workers": [{"template": "c", "model": "m", "nick": "worker1"}],
+                  "add_workers": [{"template": "old", "model": "m"}]}
+        path = Path(self.cfg.name) / "update.json"
+        path.write_text(json.dumps(update), encoding="utf-8")
+        code, out, err = self.run_cli("--json", "group", "update", "dev", "--file", str(path), "--add-worker", "ollama:qwen3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["group"]["name"], "dev")
+        update["add_workers"] = [{"template": "ollama", "model": "qwen3", "count": 1}]
+        self.assertEqual(self.hub.requests[0]["body"], update)
+
+    def test_group_update_validation(self) -> None:
+        for flags, message in [
+            ([], "group update needs"),
+            (["--lead", "c:m*2"], "exactly one lead"),
+            (["--add-worker", "c:m*0"], "at least 1"),
+            (["--remove-worker", "bad"], "TEMPLATE:MODEL"),
+            (["--file", "/no/such/update.json"], "cannot read group update JSON"),
+        ]:
+            with self.subTest(flags=flags):
+                code, _, err = self.run_cli("group", "update", "dev", *flags)
+                self.assertEqual(code, 1)
+                self.assertIn(message, err)
+        for raw in ("[]", "bad json", '{"workers": []}'):
+            with self.subTest(raw=raw), mock.patch.object(sys, "stdin", io.StringIO(raw)):
+                self.assertEqual(self.run_cli("group", "update", "dev", "--file", "-")[0], 1)
+        self.assertEqual(self.hub.requests, [])
 
     def test_group_list(self) -> None:
         self.reply((200, {"groups": [GROUP_REPLY]}), (200, {"groups": []}))
@@ -450,6 +526,25 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         self.assertEqual(repeated["group"], attached["group"])
         listed = json.loads(self.cli("--json", "group", "list").stdout)
         self.assertIn(attached["group"], listed["groups"])
+        denied = self.cli("group", "update", "itest", "--add-worker", "c:m", check=False)
+        self.assertEqual(denied.returncode, 1)
+        self.assertIn("HTTP 403", denied.stderr)
+        updated = json.loads(self.cli(
+            "--json", "group", "update", "itest", "--remove-worker", "ollama:gemma3",
+            "--add-worker", "claude:sonnet*2", "--invite", OWNER_KEY,
+        ).stdout)["group"]
+        self.assertEqual(updated["workers"], [
+            {"template": "ollama", "model": "gemma3", "count": 1},
+            {"template": "claude", "model": "sonnet", "count": 2},
+        ])
+        self.assertEqual(updated["projects"], ["#grp2"])
+        self.assertEqual(updated["lead_prompt"], created["lead_prompt"])
+        self.assertEqual(updated["worker_prompt"], created["worker_prompt"])
+        failed = self.cli("group", "update", "itest", "--remove-worker", "claude:sonnet*3", "--invite", OWNER_KEY, check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("HTTP 400", failed.stderr)
+        listed = json.loads(self.cli("--json", "group", "list").stdout)
+        self.assertIn(updated, listed["groups"])
 
 
 if __name__ == "__main__":

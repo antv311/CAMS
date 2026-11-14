@@ -61,7 +61,7 @@ class _FakeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    do_GET = do_POST = do_DELETE = _handle
+    do_GET = do_POST = do_PATCH = do_DELETE = _handle
 
     def log_message(self, *_args: Any) -> None:
         pass

@@ -994,7 +994,7 @@ def review_note(server: str, token: str, args: argparse.Namespace) -> str:
 
 
 def group_client(args: argparse.Namespace) -> AircdHttpClient:
-    """Reads use the account token; create and attach also send the owner key when given."""
+    """Reads use the account token; writes also send the owner key when given."""
     server, token, _prof = resolve_connection(args)
     invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
     if not token and not invite:
@@ -1051,6 +1051,30 @@ def _text_or_file(value: str | None) -> str | None:
         raise CliError(f"cannot read prompt file {value[1:]}: {err}") from None
 
 
+def group_update_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    update: dict[str, Any] = {}
+    if args.file:
+        try:
+            raw = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+            update = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as err:
+            raise CliError(f"cannot read group update JSON from {args.file}: {err}") from None
+        if not isinstance(update, dict):
+            raise CliError("group update JSON must be an object")
+    try:
+        if args.lead:
+            lead = GroupMember.parse(args.lead)
+            if lead.count != 1:
+                raise CliError("a group has exactly one lead; drop the count from --lead")
+            update["lead"] = lead.to_dict()
+        for key, specs in (("add_workers", args.add_worker), ("remove_workers", args.remove_worker)):
+            if specs:
+                update[key] = [GroupMember.parse(spec).to_dict() for spec in specs]
+    except ValueError as err:
+        raise CliError(str(err)) from None
+    return update
+
+
 def group_lines(g: Group) -> list[str]:
     lines = [
         f"{g.name}: lead {g.lead.label()}, {g.worker_count} worker(s)" + (f"  {g.description}" if g.description else ""),
@@ -1082,6 +1106,10 @@ def cmd_group(args: argparse.Namespace) -> int:
             group = hub.attach_group(args.name, args.channel)
             data = {"ok": True, "group": {**group.to_dict(), "projects": group.projects}}
             lines = [f"Attached group {group.name} to {args.channel}.", *group_lines(group)]
+        elif action == "update":
+            group = hub.update_group(args.name, group_update_from_args(args))
+            data = {"ok": True, "group": {**group.to_dict(), "projects": group.projects}}
+            lines = ["Updated group:", *group_lines(group)]
         else:
             raise CliError(f"Unsupported group subcommand: {action}")
     except AircdHttpError as err:
@@ -2166,7 +2194,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ga = group_sub.add_parser("attach", help="Attach a group to a project channel")
     p_ga.add_argument("name")
     p_ga.add_argument("channel")
-    for group_parser in (p_gl, p_gc, p_ga):
+    p_gu = group_sub.add_parser("update", help="Add/remove worker seats or replace an existing group's lead")
+    p_gu.add_argument("name")
+    p_gu.add_argument("--lead", metavar="TEMPLATE:MODEL", help="Replace the lead, preserving role prompts")
+    p_gu.add_argument("--add-worker", action="append", metavar="TEMPLATE:MODEL[*N]", help="Add worker seats; repeat for each kind")
+    p_gu.add_argument("--remove-worker", action="append", metavar="TEMPLATE:MODEL[*N]", help="Remove matching unnamed worker seats; repeat for each kind")
+    p_gu.add_argument("--file", help="Membership update JSON, including optional seat nicks ('-' reads stdin); flags override matching fields")
+    for group_parser in (p_gl, p_gc, p_ga, p_gu):
         group_parser.add_argument("--invite", help="Owner key (or set AIRC_INVITE); omit to use this profile's token")
         group_parser.set_defaults(func=cmd_group)
 
