@@ -693,6 +693,17 @@ AIRCD_TASK_LEASE_SECONDS=1 cargo run
 - **Windows Application Event Log** (Windows only): `--windows-event-log` / `AIRCD_WINDOWS_EVENT_LOG=1` / `windows_event_log = true` in `aircd.toml`, with optional source name `--windows-event-log-source` (`AIRCD_WINDOWS_EVENT_LOG_SOURCE`, default `aircd`).
 - **Syslog daemon**: `--syslog-target` / `AIRCD_SYSLOG_TARGET` / `syslog_target` accepting `udp://host:port`, `tcp://host:port`, `host:port` (UDP), or `unix:///path` (Unix). Supports `--syslog-format` (`rfc5424` default, or `rfc3164`) and `--syslog-facility` (`auto` = `daemon` for errors / `auth` for security, or `kern`, `user`, `daemon`, `auth`, `syslog`, `authpriv`, `local0`..`local7`).
 
+### Automated database snapshot backups
+
+For file-backed databases, `aircd` runs a scheduled snapshot backup worker that uses SQLite `VACUUM INTO` to capture a point-in-time standalone SQLite snapshot, verifies `PRAGMA integrity_check` and token/webhook key-ring counts, preserves sidecar key files (`aircd-owner.key`, plus configured TLS cert/key) with SHA-256 checksums in `manifest.json`, and prunes old snapshots according to retention:
+
+- `--backup-dir <dir>` / `AIRCD_BACKUP_DIR` / `backup_dir` (default: `<db_dir>/backups`)
+- `--backup-interval-secs <n>` / `AIRCD_BACKUP_INTERVAL_SECS` / `backup_interval_secs` (default: `3600`; `0` disables the periodic timer)
+- `--backup-retention <n>` / `AIRCD_BACKUP_RETENTION` / `backup_retention` (default: `10`, minimum `1`)
+- `--backup-on-startup` / `AIRCD_BACKUP_ON_STARTUP=1` / `backup_on_startup = true` (forces a snapshot on every startup; otherwise an initial snapshot is captured when none exists or the latest snapshot is older than the interval)
+- `--no-backups` / `AIRCD_BACKUP_ENABLED=0` / `backup_enabled = false` (disables the automated worker)
+- Owner HTTP endpoints (require the owner key via `X-AirCD-Invite` or JSON `invite`): `GET /v1/owner/backups` lists snapshots and worker status; `POST /v1/owner/backup` supports `{"action":"run"|"verify"|"list","snapshot_id":"..."}`.
+
 ## Startup scripts
 
 For local human + agent workflows, the repository now includes small helper

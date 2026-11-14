@@ -13,6 +13,11 @@ param(
     [string]$SyslogTarget = "",
     [string]$SyslogFormat = "",
     [string]$SyslogFacility = "",
+    [switch]$NoBackups,
+    [string]$BackupDir = "",
+    [string]$BackupIntervalSecs = "",
+    [string]$BackupRetention = "",
+    [switch]$BackupOnStartup,
     [string]$ExecutablePath = "",
     [switch]$Background,
     # Do nothing when a hub is already listening (used by the sign-in shortcut).
@@ -25,11 +30,12 @@ $ConfigModule = Join-Path $PSScriptRoot "AircdConfig.psm1"
 if (Test-Path -LiteralPath $ConfigModule -PathType Leaf) {
     Import-Module $ConfigModule -Force
     $Overrides = @{}
-    foreach ($Key in @("Bind", "HttpBind", "DbPath", "OpenRegistration", "RegisterKey", "TlsCert", "TlsKey", "TlsBind", "WindowsEventLog", "WindowsEventLogSource", "SyslogTarget", "SyslogFormat", "SyslogFacility", "ExecutablePath")) {
+    foreach ($Key in @("Bind", "HttpBind", "DbPath", "OpenRegistration", "RegisterKey", "TlsCert", "TlsKey", "TlsBind", "WindowsEventLog", "WindowsEventLogSource", "SyslogTarget", "SyslogFormat", "SyslogFacility", "BackupDir", "BackupIntervalSecs", "BackupRetention", "BackupOnStartup", "ExecutablePath")) {
         if ($PSBoundParameters.ContainsKey($Key)) {
             $Overrides[$Key] = $PSBoundParameters[$Key]
         }
     }
+    if ($NoBackups) { $Overrides["BackupEnabled"] = $false }
     $ResolvedCfg = Resolve-AircdWindowsConfig -RepoRoot $RepoRoot -ConfigPath $ConfigPath -Overrides $Overrides
     $Bind = $ResolvedCfg.Bind
     $HttpBind = $ResolvedCfg.HttpBind
@@ -44,8 +50,14 @@ if (Test-Path -LiteralPath $ConfigModule -PathType Leaf) {
     $SyslogTarget = $ResolvedCfg.SyslogTarget
     $SyslogFormat = $ResolvedCfg.SyslogFormat
     $SyslogFacility = $ResolvedCfg.SyslogFacility
+    $BackupEnabled = [bool]$ResolvedCfg.BackupEnabled
+    $BackupDir = $ResolvedCfg.BackupDir
+    $BackupIntervalSecs = $ResolvedCfg.BackupIntervalSecs
+    $BackupRetention = $ResolvedCfg.BackupRetention
+    $BackupOnStartup = [bool]$ResolvedCfg.BackupOnStartup
     $ExecutablePath = $ResolvedCfg.ExecutablePath
 } else {
+    $BackupEnabled = -not $NoBackups
     if (-not $PSBoundParameters.ContainsKey("Bind") -and $env:AIRCD_BIND) { $Bind = $env:AIRCD_BIND }
     if (-not $PSBoundParameters.ContainsKey("HttpBind") -and $env:AIRCD_HTTP_BIND) { $HttpBind = $env:AIRCD_HTTP_BIND }
     if (-not $PSBoundParameters.ContainsKey("DbPath")) {
@@ -106,6 +118,11 @@ if (-not [string]::IsNullOrWhiteSpace($WindowsEventLogSource)) { $ArgList += @("
 if (-not [string]::IsNullOrWhiteSpace($SyslogTarget)) { $ArgList += @("--syslog-target", $SyslogTarget) }
 if (-not [string]::IsNullOrWhiteSpace($SyslogFormat)) { $ArgList += @("--syslog-format", $SyslogFormat) }
 if (-not [string]::IsNullOrWhiteSpace($SyslogFacility)) { $ArgList += @("--syslog-facility", $SyslogFacility) }
+if (-not $BackupEnabled) { $ArgList += "--no-backups" }
+if (-not [string]::IsNullOrWhiteSpace($BackupDir)) { $ArgList += @("--backup-dir", $BackupDir) }
+if (-not [string]::IsNullOrWhiteSpace($BackupIntervalSecs)) { $ArgList += @("--backup-interval-secs", $BackupIntervalSecs) }
+if (-not [string]::IsNullOrWhiteSpace($BackupRetention)) { $ArgList += @("--backup-retention", $BackupRetention) }
+if ($BackupOnStartup) { $ArgList += "--backup-on-startup" }
 if ($Background) {
     $LogDir = if ($DbDir) { $DbDir } else { $RepoRoot }
     $LogOut = Join-Path $LogDir "aircd.stdout.log"

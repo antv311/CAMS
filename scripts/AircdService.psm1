@@ -79,15 +79,21 @@ function New-AircdServiceConfig {
         [string]$SyslogTarget = '',
         [string]$SyslogFormat = '',
         [string]$SyslogFacility = '',
+        [switch]$NoBackups,
+        [string]$BackupDir = '',
+        [string]$BackupIntervalSecs = '',
+        [string]$BackupRetention = '',
+        [switch]$BackupOnStartup,
         [string]$ExecutablePath = ''
     )
 
     $Overrides = @{}
-    foreach ($Key in @('Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'WindowsEventLog', 'WindowsEventLogSource', 'SyslogTarget', 'SyslogFormat', 'SyslogFacility', 'ExecutablePath')) {
+    foreach ($Key in @('Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'WindowsEventLog', 'WindowsEventLogSource', 'SyslogTarget', 'SyslogFormat', 'SyslogFacility', 'BackupDir', 'BackupIntervalSecs', 'BackupRetention', 'BackupOnStartup', 'ExecutablePath')) {
         if ($PSBoundParameters.ContainsKey($Key)) {
             $Overrides[$Key] = $PSBoundParameters[$Key]
         }
     }
+    if ($NoBackups) { $Overrides['BackupEnabled'] = $false }
 
     $ResolvedCfg = Resolve-AircdWindowsConfig -RepoRoot $RepoRoot -ConfigPath $ConfigPath -Overrides $Overrides
     $Name = $ResolvedCfg.Name
@@ -105,6 +111,11 @@ function New-AircdServiceConfig {
     $SyslogTarget = $ResolvedCfg.SyslogTarget
     $SyslogFormat = $ResolvedCfg.SyslogFormat
     $SyslogFacility = $ResolvedCfg.SyslogFacility
+    $BackupEnabled = [bool]$ResolvedCfg.BackupEnabled
+    $BackupDir = $ResolvedCfg.BackupDir
+    $BackupIntervalSecs = $ResolvedCfg.BackupIntervalSecs
+    $BackupRetention = $ResolvedCfg.BackupRetention
+    $BackupOnStartup = [bool]$ResolvedCfg.BackupOnStartup
     $ExecutablePath = $ResolvedCfg.ExecutablePath
 
     if ([string]::IsNullOrWhiteSpace($Name) -or $Name -notmatch '^[A-Za-z0-9._-]{1,64}$') {
@@ -144,6 +155,11 @@ function New-AircdServiceConfig {
     if (-not [string]::IsNullOrWhiteSpace($SyslogTarget)) { $ServerArgs += @('--syslog-target', $SyslogTarget) }
     if (-not [string]::IsNullOrWhiteSpace($SyslogFormat)) { $ServerArgs += @('--syslog-format', $SyslogFormat) }
     if (-not [string]::IsNullOrWhiteSpace($SyslogFacility)) { $ServerArgs += @('--syslog-facility', $SyslogFacility) }
+    if (-not $BackupEnabled) { $ServerArgs += '--no-backups' }
+    if (-not [string]::IsNullOrWhiteSpace($BackupDir)) { $ServerArgs += @('--backup-dir', [IO.Path]::GetFullPath($BackupDir)) }
+    if (-not [string]::IsNullOrWhiteSpace($BackupIntervalSecs)) { $ServerArgs += @('--backup-interval-secs', $BackupIntervalSecs) }
+    if (-not [string]::IsNullOrWhiteSpace($BackupRetention)) { $ServerArgs += @('--backup-retention', $BackupRetention) }
+    if ($BackupOnStartup) { $ServerArgs += '--backup-on-startup' }
 
     $ResolvedExe = ''
     if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {

@@ -1,4 +1,5 @@
 mod auth;
+mod backup;
 mod config;
 mod gits;
 mod history;
@@ -131,12 +132,18 @@ async fn main() -> Result<()> {
                        --windows-event-log-source <name>  Windows Event Log source name (default aircd)\n  \
                        --syslog-target <target> Forward server errors and security audits to syslog (udp://host:port, tcp://host:port, unix:///path)\n  \
                        --syslog-format <fmt>    Syslog message format: rfc5424 (default) or rfc3164\n  \
-                       --syslog-facility <fac>  Syslog facility: auto (default), daemon, auth, authpriv, user, syslog, or local0..local7"
+                       --syslog-facility <fac>  Syslog facility: auto (default), daemon, auth, authpriv, user, syslog, or local0..local7\n  \
+                       --backup-dir <dir>       Snapshot backup directory (env AIRCD_BACKUP_DIR, default <db_dir>/backups)\n  \
+                       --backup-interval-secs <n>  Seconds between scheduled backups (env AIRCD_BACKUP_INTERVAL_SECS, default 3600; 0 disables timer)\n  \
+                       --backup-retention <n>   Number of snapshots to retain (env AIRCD_BACKUP_RETENTION, default 10)\n  \
+                       --backup-on-startup      Capture a snapshot immediately on startup (env AIRCD_BACKUP_ON_STARTUP=1)\n  \
+                       --no-backups             Disable automated snapshot backup worker (env AIRCD_BACKUP_ENABLED=0)"
                 );
         return Ok(());
     }
     let server_config = config::ServerConfig::load(&argv)?;
     let log_config = server_config.to_log_config()?;
+    let backup_config = server_config.to_backup_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
     let config::ServerConfig {
         bind: bind_addr,
@@ -153,8 +160,9 @@ async fn main() -> Result<()> {
     let (register_key, register_note) =
         resolve_register_key(register_key, open_registration, &db_path)?;
     let db = store::open(db_path)?;
-    let server = Server::with_logger(db, logger.clone());
+    let server = Server::with_logger_and_backup(db, logger.clone(), backup_config.clone());
     let _webhook_worker = server.webhooks().spawn_worker();
+    let _backup_worker = server.backups().spawn_worker();
 
     let tls_port = if tls_cert.is_some() && tls_key.is_some() {
         tls_bind
@@ -174,6 +182,16 @@ async fn main() -> Result<()> {
         .wakes()
         .set_server_url(&format!("http://{wake_host}:{}", runtime_info.http_port));
     println!("  registration: {register_note}");
+    if backup_config.enabled {
+        if let Some(dir) = backup_config.effective_backup_dir() {
+            println!(
+                "  backups:      {} (interval={}s, retention={})",
+                dir.display(),
+                backup_config.interval_secs,
+                backup_config.retention
+            );
+        }
+    }
     for host in &runtime_info.detected_hosts {
         println!(
             "  welcome/API: http://{}:{}   IRC: {}:{}",

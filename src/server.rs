@@ -9,6 +9,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthStore, Principal};
+use crate::backup::{BackupConfig, BackupManager};
 use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
 use crate::locks::{LockStore, ResourceLock};
@@ -71,6 +72,7 @@ pub struct Server {
     rooms: RoomStore,
     templates: ClientTemplateStore,
     groups: GroupStore,
+    backups: BackupManager,
     logger: EventForwarder,
     // Lock before db/inner: registration, command effects, reissue and cleanup
     // must agree on which session owns a principal across credential changes.
@@ -140,6 +142,14 @@ impl Server {
     }
 
     pub fn with_logger(db: SharedConnection, logger: EventForwarder) -> Self {
+        Self::with_logger_and_backup(db, logger, BackupConfig::default())
+    }
+
+    pub fn with_logger_and_backup(
+        db: SharedConnection,
+        logger: EventForwarder,
+        backup_config: BackupConfig,
+    ) -> Self {
         let lease_seconds = std::env::var("AIRCD_TASK_LEASE_SECONDS")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -160,6 +170,7 @@ impl Server {
             rooms: RoomStore::new(db.clone()),
             templates: ClientTemplateStore::new(db.clone()),
             groups: GroupStore::new(db.clone()),
+            backups: BackupManager::new(db.clone(), backup_config, logger.clone()),
             logger: logger.clone(),
             db,
             session_gate: Arc::new(Mutex::new(())),
@@ -237,6 +248,10 @@ impl Server {
 
     pub fn logger(&self) -> &EventForwarder {
         &self.logger
+    }
+
+    pub fn backups(&self) -> &BackupManager {
+        &self.backups
     }
 
     /// Commit the credential reset before invalidating the active IRC session.
