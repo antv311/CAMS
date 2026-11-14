@@ -129,6 +129,45 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Apply a unified diff (as produced by `diff -u` or `git diff`) to one or "
+                "more files. Hunks are located by their context and removed lines, so "
+                "line numbers in @@ headers may be approximate or omitted (`@@ @@`). "
+                "Use `--- /dev/null` to create a file and `+++ /dev/null` to delete one. "
+                "All hunks must apply or no file is changed. Returns JSON describing "
+                "each file changed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": (
+                            "Unified diff text with ---/+++ file headers and @@ hunks; "
+                            "context lines start with a space, removals with '-', "
+                            "additions with '+'."
+                        ),
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Optional target file for a single-file patch; required when "
+                            "the patch has no ---/+++ headers and overrides the header path."
+                        ),
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Validate the patch and report the result without writing.",
+                    },
+                },
+                "required": ["patch"],
+            },
+        },
+    },
 ]
 
 
@@ -365,7 +404,7 @@ def resolve_path(cwd: str, path_str: str, workspace_root: Optional[str] = None) 
 
 
 APPROVAL_MODES = ("auto", "prompt", "read-only")
-MUTATING_TOOLS = frozenset({"run_command", "write_file", "edit_file"})
+MUTATING_TOOLS = frozenset({"run_command", "write_file", "edit_file", "apply_patch"})
 
 # Splits a command line into quoted strings, shell operators, and bare words.
 _CMD_TOKEN_RE = re.compile(r'"[^"]*"?|\'[^\']*\'?|&&|\|\||>>|[|;&<>()]|[^\s"\'|;&<>()]+')
@@ -441,6 +480,338 @@ def check_command(command: str, cwd: str, workspace_root: Optional[str] = None) 
     return None
 
 
+class PatchError(ValueError):
+    """Raised when a unified diff cannot be parsed or applied."""
+
+
+_DEV_NULL = "/dev/null"
+_HUNK_HEADER_RE = re.compile(r"^@@+\s*(?:-(\d+)(?:,(\d+))?)?\s*(?:\+(\d+)(?:,(\d+))?)?\s*@@+")
+_HUNK_LINE_PREFIXES = (" ", "-", "+", "\\")
+
+
+@dataclass
+class _Hunk:
+    old_start: Optional[int]
+    lines: list[tuple[str, str]]
+    old_no_eol: bool = False
+    new_no_eol: bool = False
+
+    @property
+    def old_lines(self) -> list[str]:
+        return [text for tag, text in self.lines if tag in (" ", "-")]
+
+    @property
+    def new_lines(self) -> list[str]:
+        return [text for tag, text in self.lines if tag in (" ", "+")]
+
+
+@dataclass
+class _FilePatch:
+    old_path: Optional[str]
+    new_path: Optional[str]
+    hunks: list[_Hunk]
+
+
+def _header_path(raw: str) -> Optional[str]:
+    # Drop a trailing "\t<timestamp>" and surrounding quotes from ---/+++ headers.
+    value = raw.split("\t", 1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    if not value or value == _DEV_NULL:
+        return None
+    return value
+
+
+def parse_unified_diff(text: str) -> list[_FilePatch]:
+    """Parse unified diff text into file patches.
+
+    Lenient towards model output: ``@@`` line numbers are optional, blank lines
+    inside a hunk are read as blank context, and git metadata lines are skipped.
+    A hunk with no ---/+++ header before it gets ``old_path``/``new_path`` of
+    ``""``, meaning "use the caller-supplied path".
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise PatchError("patch must be a non-empty string")
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    files: list[_FilePatch] = []
+    current: Optional[_FilePatch] = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            current = _FilePatch(_header_path(line[4:]), _header_path(lines[i + 1][4:]), [])
+            files.append(current)
+            i += 2
+            continue
+        match = _HUNK_HEADER_RE.match(line)
+        if not match:
+            i += 1  # "diff --git", "index ...", mode lines, or prose around the diff
+            continue
+        if current is None:
+            current = _FilePatch("", "", [])
+            files.append(current)
+        old_start = int(match.group(1)) if match.group(1) is not None else None
+        old_left = int(match.group(2) or 1) if match.group(1) is not None else None
+        new_left = int(match.group(4) or 1) if match.group(3) is not None else None
+        counted = old_left is not None and new_left is not None
+        hunk = _Hunk(old_start, [])
+        i += 1
+        while i < len(lines):
+            body = lines[i]
+            if _HUNK_HEADER_RE.match(body):
+                break
+            if body.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+                break
+            # Model-written @@ counts are often wrong, so they never cut a hunk short;
+            # they only decide whether a blank line is context or the end of the hunk.
+            exhausted = counted and old_left <= 0 and new_left <= 0
+            if body == "" and (exhausted or i + 1 == len(lines)):
+                break
+            if body == "":
+                tag, content = " ", ""
+            elif body[0] in _HUNK_LINE_PREFIXES:
+                tag, content = body[0], body[1:]
+            else:
+                break
+            if tag == "\\":
+                if hunk.lines:
+                    last_tag = hunk.lines[-1][0]
+                    if last_tag in (" ", "-"):
+                        hunk.old_no_eol = True
+                    if last_tag in (" ", "+"):
+                        hunk.new_no_eol = True
+            else:
+                hunk.lines.append((tag, content))
+                if counted:
+                    if tag in (" ", "-"):
+                        old_left -= 1
+                    if tag in (" ", "+"):
+                        new_left -= 1
+            i += 1
+        if not hunk.lines:
+            raise PatchError(f"hunk {len(current.hunks) + 1} is empty")
+        current.hunks.append(hunk)
+
+    files = [f for f in files if f.hunks]
+    if not files:
+        raise PatchError("patch contains no @@ hunks")
+    return files
+
+
+def _find_block(
+    lines: list[str], block: list[str], start: int, preferred: Optional[int]
+) -> tuple[int, int]:
+    """Locate ``block`` in ``lines[start:]``; return (index, fuzz level).
+
+    Fuzz 0 is an exact match, 1 ignores trailing whitespace and 2 ignores all
+    leading/trailing whitespace. With several candidates the one nearest
+    ``preferred`` wins; without a line hint an ambiguous match is an error.
+    """
+    normalizers: list[Callable[[str], str]] = [lambda s: s, str.rstrip, str.strip]
+    n = len(block)
+    for fuzz, norm in enumerate(normalizers):
+        want = [norm(s) for s in block]
+        hits = [
+            idx
+            for idx in range(start, len(lines) - n + 1)
+            if [norm(s) for s in lines[idx : idx + n]] == want
+        ]
+        if not hits:
+            continue
+        if preferred is None:
+            if len(hits) > 1:
+                raise PatchError(
+                    f"context matches {len(hits)} places (lines {', '.join(str(h + 1) for h in hits[:5])}); "
+                    "add more context or @@ line numbers"
+                )
+            return hits[0], fuzz
+        return min(hits, key=lambda h: (abs(h - preferred), h)), fuzz
+    raise PatchError("context/removed lines not found in file")
+
+
+def _apply_hunks(
+    lines: list[str], final_newline: bool, hunks: list[_Hunk], label: str
+) -> tuple[list[str], bool, list[dict[str, Any]]]:
+    out = list(lines)
+    cursor = 0
+    delta = 0
+    report: list[dict[str, Any]] = []
+    for number, hunk in enumerate(hunks, 1):
+        old_block = hunk.old_lines
+        new_block = hunk.new_lines
+        preferred = None if hunk.old_start is None else max(0, hunk.old_start - 1 + delta)
+        if not old_block:
+            if preferred is None and out:
+                raise PatchError(f"{label}: hunk {number} has no context lines; add context or an @@ line number")
+            # "@@ -N,0 +M,k @@" inserts after old line N (N=0: at the top).
+            idx = 0 if hunk.old_start is None else min(max(0, hunk.old_start + delta), len(out))
+            preferred, fuzz = idx, 0
+        else:
+            try:
+                idx, fuzz = _find_block(out, old_block, cursor, preferred)
+            except PatchError as err:
+                first = next((s for s in old_block if s.strip()), old_block[0])
+                raise PatchError(f"{label}: hunk {number}: {err} (first expected line: {first!r})") from err
+        out[idx : idx + len(old_block)] = new_block
+        entry: dict[str, Any] = {"hunk": number, "line": idx + 1}
+        if fuzz:
+            entry["fuzz"] = "trailing-whitespace" if fuzz == 1 else "whitespace"
+        if preferred is not None and idx != preferred:
+            entry["offset"] = idx - preferred
+        report.append(entry)
+        cursor = idx + len(new_block)
+        delta += len(new_block) - len(old_block)
+        if idx + len(new_block) == len(out):
+            if hunk.new_no_eol:
+                final_newline = False
+            elif hunk.old_no_eol:
+                final_newline = True
+    return out, final_newline, report
+
+
+def _split_text(text: str) -> tuple[list[str], bool, str]:
+    eol = "\r\n" if "\r\n" in text else "\n"
+    norm = text.replace("\r\n", "\n")
+    if norm == "":
+        return [], True, eol
+    final_newline = norm.endswith("\n")
+    body = norm[:-1] if final_newline else norm
+    return body.split("\n"), final_newline, eol
+
+
+def _join_text(lines: list[str], final_newline: bool, eol: str) -> str:
+    if not lines:
+        return ""
+    return eol.join(lines) + (eol if final_newline else "")
+
+
+def _patch_target(cwd: str, root: str, raw: str) -> Path:
+    # git-style a/ and b/ prefixes are dropped unless the prefixed path itself exists.
+    if raw[:2] in ("a/", "b/"):
+        stripped = raw[2:]
+        if not Path(cwd, raw).exists() or Path(cwd, stripped).exists():
+            raw = stripped
+    return resolve_path(cwd, raw, root)
+
+
+def _plan_patch(args: dict[str, Any], cwd: str, root: str) -> list[tuple[_FilePatch, Optional[Path], Optional[Path]]]:
+    """Parse the patch and resolve every source/destination path inside the jail."""
+    files = parse_unified_diff(args.get("patch"))  # type: ignore[arg-type]
+    override = args.get("path")
+    if override is not None and not isinstance(override, str):
+        raise PatchError("apply_patch 'path' must be a string")
+    override = (override or "").strip() or None
+    if override and len(files) > 1:
+        raise PatchError("'path' can only be used with a single-file patch")
+    plan = []
+    for fp in files:
+        old_raw, new_raw = fp.old_path, fp.new_path
+        if override:
+            old_raw = override if old_raw is not None else None
+            new_raw = override if new_raw is not None else None
+        if old_raw == "" or new_raw == "":
+            raise PatchError("patch has no ---/+++ file headers; pass 'path'")
+        if old_raw is None and new_raw is None:
+            raise PatchError("patch header has /dev/null on both sides")
+        src = _patch_target(cwd, root, old_raw) if old_raw is not None else None
+        dst = _patch_target(cwd, root, new_raw) if new_raw is not None else None
+        plan.append((fp, src, dst))
+    return plan
+
+
+def apply_patch_plan(
+    plan: list[tuple[_FilePatch, Optional[Path], Optional[Path]]], *, dry_run: bool = False
+) -> dict[str, Any]:
+    """Apply a planned patch atomically: every hunk must apply before any write."""
+    state: dict[Path, Optional[tuple[list[str], bool, str]]] = {}
+    originals: dict[Path, Optional[bytes]] = {}
+
+    def load(path: Path) -> Optional[tuple[list[str], bool, str]]:
+        if path not in state:
+            if path.is_dir():
+                raise PatchError(f"path is a directory: {path}")
+            if path.exists():
+                raw = path.read_bytes()
+                originals[path] = raw
+                try:
+                    state[path] = _split_text(raw.decode("utf-8"))
+                except UnicodeDecodeError as err:
+                    raise PatchError(f"{path} is not valid UTF-8 text") from err
+            else:
+                originals[path] = None
+                state[path] = None
+        return state[path]
+
+    report: list[dict[str, Any]] = []
+    for fp, src, dst in plan:
+        added = sum(1 for h in fp.hunks for tag, _ in h.lines if tag == "+")
+        removed = sum(1 for h in fp.hunks for tag, _ in h.lines if tag == "-")
+        if src is None:
+            assert dst is not None
+            existing = load(dst)
+            if existing is not None and existing[0]:
+                raise PatchError(f"{dst}: patch creates the file but it already exists")
+            lines, final_nl, eol = existing or ([], True, "\n")
+            action = "created"
+        else:
+            existing = load(src)
+            if existing is None:
+                raise PatchError(f"file not found: {src}")
+            lines, final_nl, eol = existing
+            action = "modified" if dst == src else ("deleted" if dst is None else "renamed")
+        new_lines, final_nl, hunk_report = _apply_hunks(lines, final_nl, fp.hunks, str(src or dst))
+        if dst is None:
+            if new_lines:
+                raise PatchError(f"{src}: patch deletes the file but {len(new_lines)} line(s) would remain")
+            state[src] = None  # type: ignore[index]
+        else:
+            if src is not None and src != dst:
+                if load(dst) is not None:
+                    raise PatchError(f"{dst}: rename target already exists")
+                state[src] = None
+            state[dst] = (new_lines, final_nl, eol)
+        entry: dict[str, Any] = {
+            "path": str(dst or src),
+            "action": action,
+            "hunks": hunk_report,
+            "added": added,
+            "removed": removed,
+        }
+        if action == "renamed":
+            entry["from"] = str(src)
+        report.append(entry)
+
+    if not dry_run:
+        written: list[Path] = []
+        try:
+            for path, value in state.items():
+                if value is None:
+                    if originals.get(path) is not None:
+                        written.append(path)
+                        path.unlink()
+                    continue
+                data = _join_text(*value).encode("utf-8")
+                if data == originals.get(path):
+                    continue
+                written.append(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+        except OSError as err:
+            for path in written:  # best-effort rollback
+                try:
+                    if originals.get(path) is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.write_bytes(originals[path])  # type: ignore[arg-type]
+                except OSError:
+                    pass
+            raise PatchError(f"failed writing patch result: {err}") from err
+    return {"ok": True, "dry_run": dry_run, "files": report}
+
+
 def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
     if name == "run_command":
         return f"run_command: {args.get('command')}"
@@ -450,6 +821,9 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
         return f"write_file: {args.get('path')} ({size} chars)"
     if name == "edit_file":
         return f"edit_file: {args.get('path')}"
+    if name == "apply_patch":
+        files = args.get("_files") or ([args.get("path")] if args.get("path") else [])
+        return f"apply_patch: {', '.join(str(f) for f in files) or '(patch)'}"
     return f"{name}: {json.dumps(args)[:200]}"
 
 
@@ -549,6 +923,15 @@ def _exec_tool_jailed(
                 reason = check_command(cmd, cwd, root)
                 if reason:
                     raise WorkspaceViolation(reason)
+        elif name == "apply_patch":
+            try:
+                plan = _plan_patch(args, cwd, root)
+            except PatchError as err:
+                return json.dumps({"error": f"apply_patch: {err}"})
+            files = sorted({str(p) for _, src, dst in plan for p in (src, dst) if p is not None})
+            args = {**args, "_files": files}
+            if bool(args.get("dry_run")):
+                approval = "auto"  # a dry run writes nothing, so it never needs approval
         else:
             resolve_path(cwd, str(args.get("path") or ""), root)
         if approval == "prompt":
@@ -640,6 +1023,15 @@ def _exec_tool_jailed(
         updated = original.replace(target_text, replacement, 1)
         target.write_text(updated, encoding="utf-8")
         return json.dumps({"ok": True, "path": str(target)})
+
+    if name == "apply_patch":
+        try:
+            plan = _plan_patch(args, cwd, root)
+            if log:
+                log(f"[tool] {_describe_tool_call(name, args)}")
+            return json.dumps(apply_patch_plan(plan, dry_run=bool(args.get("dry_run"))))
+        except PatchError as err:
+            return json.dumps({"error": f"apply_patch: {err}"})
 
     if name == "read_file":
         target = resolve_path(cwd, str(args.get("path") or ""), root)
@@ -798,7 +1190,7 @@ def build_system_prompt(
         )
     else:
         tool_line = (
-            "Use the provided tools (run_command, read_file, write_file, edit_file) "
+            "Use the provided tools (run_command, read_file, write_file, edit_file, apply_patch) "
             "to inspect files, make changes, run coordination commands (such as `airc`), "
             "and verify tests before replying."
         )
@@ -811,7 +1203,8 @@ def build_system_prompt(
         ),
         tool_line,
         (
-            "Read files before modifying them, prefer edit_file for targeted changes, "
+            "Read files before modifying them, prefer apply_patch (unified diff) or edit_file "
+            "for targeted changes instead of rewriting whole files with write_file, "
             "and never fabricate command output or file contents. When finished, give "
             "a concise, accurate final answer."
         ),
@@ -1020,7 +1413,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=APPROVAL_MODES,
         help=(
             "Tool approval mode: auto runs jailed tools unattended, prompt asks on the "
-            "terminal before each run_command/write_file/edit_file (denied when no terminal), "
+            "terminal before each run_command/write_file/edit_file/apply_patch (denied when no terminal), "
             "read-only exposes only read_file (env: BIONIC_APPROVAL, default: auto)"
         ),
     )
