@@ -23,6 +23,12 @@ const TRANSITION_ACTIONS: &[&str] = &[
     "ask",
     "answer",
     "timeout",
+    "condition_activate",
+    "condition_skip",
+    "parent_skip",
+    "parent_block",
+    "parent_cancel",
+    "parent_resume",
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -64,7 +70,11 @@ pub fn compute(task: &Task, events: &[TaskEvent], now: i64) -> TaskMetrics {
         .first()
         .map(|(from, _, _)| *from)
         .filter(|from| !from.is_empty())
-        .unwrap_or("open")
+        .unwrap_or(if task.status == "dormant" {
+            "dormant"
+        } else {
+            "open"
+        })
         .to_string();
     let mut since = task.created_at;
     for &(_, to, at) in &transitions {
@@ -187,6 +197,24 @@ pub fn summarize(rows: &[(&Task, &TaskMetrics)]) -> Summary {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dormant_and_skipped_branches_record_waiting_without_started_or_successful_work() {
+        let waiting = task("dormant", 10, 10);
+        let metrics = compute(&waiting, &[], 40);
+        assert_eq!(metrics.time_in_status["dormant"], 30);
+        assert_eq!(metrics.started_at, None);
+        let skipped = task("skipped", 10, 30);
+        let metrics = compute(
+            &skipped,
+            &[ev("condition_skip", "dormant", "skipped", 30)],
+            90,
+        );
+        assert_eq!(metrics.time_in_status["dormant"], 20);
+        assert_eq!(metrics.started_at, None);
+        assert_eq!(metrics.completed_at, None);
+        assert_eq!(metrics.lead_time_seconds, None);
+    }
+
     fn task(status: &str, created_at: i64, updated_at: i64) -> Task {
         Task {
             id: "t".into(),
@@ -212,6 +240,10 @@ mod tests {
             parent_task_id: None,
             review_round: None,
             blocked_by: Vec::new(),
+            condition: None,
+            optional: false,
+            optional_enabled: false,
+            output: None,
         }
     }
 

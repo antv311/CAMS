@@ -1270,6 +1270,10 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         ("review_round_json", "TEXT"),
         ("timeout_seconds", "INTEGER CHECK(timeout_seconds > 0)"),
         ("execution_heartbeat_at", "INTEGER"),
+        ("condition_json", "TEXT"),
+        ("optional", "INTEGER NOT NULL DEFAULT 0"),
+        ("optional_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("output_json", "TEXT"),
     ];
 
     for (column, definition) in columns {

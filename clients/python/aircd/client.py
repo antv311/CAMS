@@ -736,6 +736,8 @@ class AircdHttpClient:
         reviewer: Optional[str] = None,
         blocked_by: Optional[list[str]] = None,
         timeout_seconds: Optional[int] = None,
+        condition: Optional[dict[str, Any]] = None,
+        optional: bool = False,
     ) -> dict[str, Any]:
         """Create a task and return it. ``parent`` makes it a subtask of that task
         id; ``reviewer`` names who reviews it (the hub defaults to the parent's
@@ -743,7 +745,7 @@ class AircdHttpClient:
         payload = task_create_payload(
             channel, title, body=body, kind=kind, priority=priority, assignee=assignee,
             repo=repo, branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
-            blocked_by=blocked_by, timeout_seconds=timeout_seconds,
+            blocked_by=blocked_by, timeout_seconds=timeout_seconds, condition=condition, optional=optional,
         )
         return self._request("POST", "/v1/tasks", payload=payload)["task"]
 
@@ -811,6 +813,7 @@ class AircdHttpClient:
         note: Optional[str] = None,
         branch: Optional[str] = None,
         commit: Optional[str] = None,
+        output: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Move a task and return it. Moving to ``review`` needs a test report as ``note``."""
         if status == "review" and not (note or "").strip():
@@ -819,7 +822,19 @@ class AircdHttpClient:
         payload = {"status": status, "note": note, "branch": branch}
         if commit is not None:
             payload["commit"] = commit
+        if output is not None:
+            payload["output"] = output
         return self._request("POST", path, payload=payload)["task"]
+
+    def enable_optional_task(self, task_id: str) -> dict[str, Any]:
+        """Enable dormant optional work as the parent lead or a project manager."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/enable"
+        return self._request("POST", path, payload={})["task"]
+
+    def done_task(self, task_id: str, *, output: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Finish a task leased by this account, atomically recording immutable output."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/done"
+        return self._request("POST", path, payload={} if output is None else {"output": output})["task"]
 
     def peer_review_task(
         self, task_id: str, revision: str, decision: str, *, note: str,
@@ -1001,6 +1016,8 @@ def task_create_payload(
     reviewer: Optional[str] = None,
     blocked_by: Optional[list[str]] = None,
     timeout_seconds: Optional[int] = None,
+    condition: Optional[dict[str, Any]] = None,
+    optional: bool = False,
 ) -> dict[str, Any]:
     """The POST /v1/tasks body. ``parent_task_id``, ``reviewer``, ``priority``,
     and ``blocked_by`` are only sent when set, so a hub without those features
@@ -1017,6 +1034,10 @@ def task_create_payload(
     }
     if timeout_seconds is not None:
         payload["timeout_seconds"] = timeout_seconds
+    if condition is not None:
+        payload["condition"] = condition
+    if optional:
+        payload["optional"] = True
     priority = (priority or "").strip().lower()
     if priority:
         payload["priority"] = priority

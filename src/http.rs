@@ -587,6 +587,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
             delete(remove_task_dependency),
         )
         .route("/v1/tasks/{id}/status", post(set_task_status))
+        .route("/v1/tasks/{id}/enable", post(enable_optional_task))
         .route("/v1/tasks/{id}/peer-review", post(peer_review_task))
         .route("/v1/tasks/{id}/ask", post(ask_task))
         .route("/v1/tasks/{id}/answer", post(answer_task))
@@ -3165,6 +3166,9 @@ async fn export_tasks(
 
 #[derive(Deserialize)]
 struct CreateTaskReq {
+    condition: Option<crate::tasks::TaskCondition>,
+    #[serde(default)]
+    optional: bool,
     timeout_seconds: Option<u32>,
     channel: Option<String>,
     title: String,
@@ -3221,6 +3225,8 @@ impl CreateTaskReq {
             parent_task_id: self.parent_task_id,
             blocked_by: self.blocked_by.unwrap_or_default(),
             timeout_seconds: self.timeout_seconds,
+            condition: self.condition,
+            optional: self.optional,
         })
     }
 }
@@ -3600,6 +3606,8 @@ async fn remove_task_dependency(
 
 #[derive(Deserialize)]
 struct TaskStatusReq {
+    #[serde(default, deserialize_with = "crate::tasks::deserialize_output")]
+    output: Option<Value>,
     status: String,
     note: Option<String>,
     branch: Option<String>,
@@ -3628,7 +3636,7 @@ async fn set_task_status(
     .principal;
     let task = state
         .server
-        .set_task_status_revision_api(
+        .set_task_status_output_api(
             &actor,
             &id,
             &req.status,
@@ -3637,6 +3645,7 @@ async fn set_task_status(
             req.report_body.as_deref(),
             req.report_id.as_deref(),
             req.commit.as_deref(),
+            req.output,
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
@@ -4219,18 +4228,48 @@ async fn done_task(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: Option<Json<DoneTaskReq>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor =
         authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/done")?
             .principal;
     let task = state
         .server
-        .done_task_api(&actor, &id)
+        .done_task_output_api(
+            &actor,
+            &id,
+            body.as_ref().and_then(|req| req.output.as_ref()),
+        )
         .map_err(|err| ApiError::conflict(err.to_string()))?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DoneTaskReq {
+    #[serde(default, deserialize_with = "crate::tasks::deserialize_output")]
+    output: Option<Value>,
+}
+
+async fn enable_optional_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/enable")?
+        .principal;
+    let task = state
+        .server
+        .enable_optional_task_api(&actor, &id)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok":true, "task":task})),
     ))
 }
 
@@ -5261,6 +5300,7 @@ mod tests {
     include!("http_task_cascade_tests.rs");
     include!("http_task_timeout_tests.rs");
     include!("http_task_batch_tests.rs");
+    include!("http_task_condition_tests.rs");
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
     include!("http_alerts_tests.rs");

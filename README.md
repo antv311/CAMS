@@ -399,6 +399,12 @@ place is the task: it names its project channel, repo and branch.
   or coordinator moves `review` to `merged` or `changes_requested`.
   `airc task assign <id> <nick>` reassigns, for example when an agent is out
   of quota; the task's description, branch and history move with it.
+- **Conditional and optional subtasks.** Add a declarative `condition` on parent
+  JSON output or sibling success, and/or `optional: true`. These children stay
+  `dormant` until their gates pass; false branches become terminal `skipped`.
+  Record immutable completion output with `--output-json` and enable optional
+  work with `airc task enable ID`. See [conditional workflows](docs/conditional-tasks.md)
+  for schemas, permissions, SDK methods, and batch behavior.
 - **Subtasks and reviewers.** Set `parent_task_id` when creating a subtask;
   the parent must be active and belong to the same project. Its assignee
   can delegate and reassign subtasks. When the parent assignee is the named
@@ -476,6 +482,7 @@ place is the task: it names its project channel, repo and branch.
 | `POST /v1/tasks/bulk-status` | Atomically apply 1..100 workflow updates in request order ([batch API](docs/task-batches.md)) |
 | `GET /v1/tasks/{id}` | Task with its history, pending question, direct subtasks, dependencies and dependents |
 | `POST /v1/tasks/{id}/assign` | Assign, reassign, or unassign (`assignee: null`) |
+| `POST /v1/tasks/{id}/enable` | Parent lead or PM: enable a dormant optional child |
 | `POST /v1/tasks/{id}/priority` | Update priority (`urgent`, `high`, `normal`, `low`) on an active task |
 | `GET/POST/PUT /v1/tasks/{id}/dependencies` | Inspect, add, or replace `blocked_by` task dependencies (with cycle and blocker validation) |
 | `DELETE /v1/tasks/{id}/dependencies/{dep_id}` | Remove a single `blocked_by` dependency |
