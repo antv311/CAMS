@@ -1408,7 +1408,7 @@ impl Server {
             _ => None,
         };
         let ids = match (action, task.status.as_str()) {
-            ("create" | "assign" | "answer", _)
+            ("create" | "assign" | "answer" | "unblocked", _)
             | ("priority", "assigned" | "in_progress" | "testing" | "changes_requested")
             | ("status", "changes_requested" | "merged" | "cancelled") => {
                 task.assignee.iter().cloned().collect()
@@ -2792,7 +2792,7 @@ impl Server {
 
         self.join_channels(actor, std::slice::from_ref(&channel))?;
         let task = self.tasks.create_full(new)?;
-        let text = match &assignee_id {
+        let mut text = match &assignee_id {
             Some(assignee) => format!(
                 "TASK {} created by @{} and assigned to @{}: {}",
                 task.id, actor.nick, assignee, task.title
@@ -2802,6 +2802,9 @@ impl Server {
                 task.id, actor.nick, task.title
             ),
         };
+        if !task.blocked_by.is_empty() {
+            text.push_str(&format!(" (blocked_by: {})", task.blocked_by.join(", ")));
+        }
         self.broadcast_task_event(&task, "create", "success", &actor.nick, text)?;
         Ok(task)
     }
@@ -2926,6 +2929,133 @@ impl Server {
             self.broadcast_task_event(&task, "priority", "success", &actor.nick, text)?;
         }
         Ok(task)
+    }
+
+    fn require_dependency_manager(&self, actor: &Principal, current: &Task) -> Result<()> {
+        let parent = current
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        let is_lead = parent
+            .as_ref()
+            .is_some_and(|task| task.assignee.as_deref() == Some(actor.id.as_str()));
+        if !is_lead && !self.is_project_manager(actor, &current.channel)? {
+            return Err(anyhow!(
+                "only the parent task's assignee or a project manager can change task dependencies"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn set_task_dependencies_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        blocked_by: &[String],
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        self.require_dependency_manager(actor, &current)?;
+        let (task, changed) = self
+            .tasks
+            .set_dependencies(&current.id, blocked_by, &actor.id)?;
+        if changed {
+            let summary = if task.blocked_by.is_empty() {
+                "-".to_string()
+            } else {
+                task.blocked_by.join(", ")
+            };
+            let text = format!(
+                "TASK {} dependencies set to [{}] by @{}: {}",
+                task.id, summary, actor.nick, task.title
+            );
+            self.broadcast_task_event(&task, "dependencies", "success", &actor.nick, text)?;
+        }
+        Ok(task)
+    }
+
+    pub fn add_task_dependencies_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        blocked_by: &[String],
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        self.require_dependency_manager(actor, &current)?;
+        let (task, changed) = self
+            .tasks
+            .add_dependencies(&current.id, blocked_by, &actor.id)?;
+        if changed {
+            let text = format!(
+                "TASK {} dependencies updated ([{}]) by @{}: {}",
+                task.id,
+                task.blocked_by.join(", "),
+                actor.nick,
+                task.title
+            );
+            self.broadcast_task_event(&task, "dependencies", "success", &actor.nick, text)?;
+        }
+        Ok(task)
+    }
+
+    pub fn remove_task_dependency_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        depends_on_task_id: &str,
+    ) -> Result<(Task, bool)> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        self.require_dependency_manager(actor, &current)?;
+        let (task, removed) = self.tasks.remove_dependency(
+            &current.id,
+            depends_on_task_id,
+            &actor.id,
+        )?;
+        if removed {
+            let text = format!(
+                "TASK {} unlinked dependency {} by @{}: {}",
+                task.id,
+                depends_on_task_id.trim(),
+                actor.nick,
+                task.title
+            );
+            self.broadcast_task_event(&task, "dependencies", "success", &actor.nick, text)?;
+        }
+        Ok((task, removed))
+    }
+
+    fn notify_unblocked_dependents(&self, completed_task: &Task, actor_nick: &str) {
+        if !crate::tasks::is_dependency_resolved(&completed_task.status) {
+            return;
+        }
+        let Ok(dependents) = self.tasks.dependents(&completed_task.id) else {
+            return;
+        };
+        for dep in dependents {
+            let Ok(Some(dep_task)) = self.tasks.get(&dep.task_id) else {
+                continue;
+            };
+            if TERMINAL_STATUSES.contains(&dep_task.status.as_str()) {
+                continue;
+            }
+            if let Ok(remaining) = self.tasks.unresolved_blockers(&dep_task.id) {
+                if remaining.is_empty() {
+                    let _ = self.broadcast_task_event(
+                        &dep_task,
+                        "unblocked",
+                        "success",
+                        actor_nick,
+                        format!(
+                            "TASK {} unblocked by completion of {}: {}",
+                            dep_task.id, completed_task.id, dep_task.title
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     /// Move a task through its review workflow.
@@ -3099,6 +3229,7 @@ impl Server {
             text.push_str(&format!(" - {note}"));
         }
         self.broadcast_task_event(&task, "status", "success", &actor.nick, text)?;
+        self.notify_unblocked_dependents(&task, &actor.nick);
         Ok(task)
     }
 
@@ -3235,6 +3366,13 @@ impl Server {
     /// each task belongs to. This is the one call an agent makes on wake-up.
     pub fn inbox_api(&self, actor: &Principal) -> Result<serde_json::Value> {
         let mine = self.tasks.inbox(&actor.id)?;
+        let mine_ids: Vec<String> = mine.iter().map(|t| t.id.clone()).collect();
+        let unresolved_map = self.tasks.unresolved_blockers_map(&mine_ids)?;
+        let dispatch_queue: Vec<&Task> = mine
+            .iter()
+            .filter(|t| unresolved_map.get(&t.id).is_none_or(|b| b.is_empty()))
+            .collect();
+        let blocked_task_count = mine.len() - dispatch_queue.len();
         let roles: HashMap<String, String> =
             self.projects.projects_of(&actor.id)?.into_iter().collect();
         let repos = self.gits.list()?;
@@ -3293,6 +3431,7 @@ impl Server {
             question_count += questions.len();
             let top_task_rank = tasks
                 .iter()
+                .filter(|t| unresolved_map.get(&t.id).is_none_or(|b| b.is_empty()))
                 .map(|t| crate::tasks::priority_rank(&t.priority))
                 .min()
                 .unwrap_or(u8::MAX);
@@ -3333,10 +3472,12 @@ impl Server {
         Ok(serde_json::json!({
             "account": actor.id,
             "task_count": mine.len(),
+            "ready_task_count": dispatch_queue.len(),
+            "blocked_task_count": blocked_task_count,
             "review_count": review_count,
             "question_count": question_count,
-            "next_task": mine.first(),
-            "dispatch_queue": mine,
+            "next_task": dispatch_queue.first().copied(),
+            "dispatch_queue": dispatch_queue,
             "needs_you": needs_you,
             "projects": projects,
         }))
@@ -3369,6 +3510,7 @@ impl Server {
                 task.id, actor.nick, task.title
             ),
         )?;
+        self.notify_unblocked_dependents(&task, &actor.nick);
         Ok(task)
     }
 

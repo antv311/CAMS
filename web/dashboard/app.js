@@ -897,6 +897,8 @@
       const events = data.events || [];
       const q = data.question;
       const subtasks = data.subtasks || [];
+      const dependencies = data.dependencies || [];
+      const dependents = data.dependents || [];
       const attachments = data.attachments || [];
       const issueHref = safeHttpUrl(t.issue_url);
 
@@ -945,6 +947,50 @@
                     <div class="small">${esc(t.review_round.evidence)}</div>
                     ${(t.review_round.votes || []).map((v) => `<div class="small">@${esc(v.reviewer)}: <strong>${esc(v.decision)}</strong> — ${esc(v.note)}</div>`).join('')}
                   </div>
+                </div>
+              </div>`
+            : ''
+        }
+
+        ${
+          dependencies.length > 0
+            ? `<div>
+                <h3>Blocked By (${dependencies.length})</h3>
+                <div class="timeline" style="margin-top:6px">
+                  ${dependencies
+                    .map(
+                      (dep) => `
+                      <div class="timeline-item">
+                        <div style="display:flex;justify-content:space-between;gap:8px">
+                          <button type="button" class="link-btn modal-task-link" data-task-id="${esc(dep.task_id)}">${esc(dep.title)}</button>
+                          <span class="badge ${statusBadgeClass(dep.status)}">${esc(dep.status)}</span>
+                        </div>
+                        <div class="small muted mono">${esc(dep.task_id)} · ${esc(dep.channel)}${dep.repo ? ' · repo ' + esc(dep.repo) : ''}${dep.cross_repo ? ' · cross-repo' : ''}</div>
+                      </div>`
+                    )
+                    .join('')}
+                </div>
+              </div>`
+            : ''
+        }
+
+        ${
+          dependents.length > 0
+            ? `<div>
+                <h3>Blocks (${dependents.length})</h3>
+                <div class="timeline" style="margin-top:6px">
+                  ${dependents
+                    .map(
+                      (dep) => `
+                      <div class="timeline-item">
+                        <div style="display:flex;justify-content:space-between;gap:8px">
+                          <button type="button" class="link-btn modal-task-link" data-task-id="${esc(dep.task_id)}">${esc(dep.title)}</button>
+                          <span class="badge ${statusBadgeClass(dep.status)}">${esc(dep.status)}</span>
+                        </div>
+                        <div class="small muted mono">${esc(dep.task_id)} · ${esc(dep.channel)}${dep.repo ? ' · repo ' + esc(dep.repo) : ''}${dep.cross_repo ? ' · cross-repo' : ''}</div>
+                      </div>`
+                    )
+                    .join('')}
                 </div>
               </div>`
             : ''

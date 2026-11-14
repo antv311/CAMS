@@ -1038,6 +1038,32 @@ pub fn task_detail_lines(body: &Value, parent: Option<&Value>, pm: Option<&str>)
         ),
         String::new(),
     ];
+    if let Some(deps) = body["dependencies"].as_array().filter(|d| !d.is_empty()) {
+        lines.push("Blocked by:".to_string());
+        for dep in deps {
+            let state = if dep["resolved"].as_bool() == Some(true) {
+                "resolved"
+            } else {
+                "blocking"
+            };
+            lines.push(format!(
+                "  {} [{}/{}] repo={} {}: {}",
+                text(&dep["task_id"]),
+                text(&dep["status"]),
+                state,
+                or_dash(&dep["repo"]),
+                text(&dep["channel"]),
+                text(&dep["title"])
+            ));
+        }
+        lines.push(String::new());
+    } else if let Some(ids) = task["blocked_by"].as_array().filter(|d| !d.is_empty()) {
+        lines.push(format!(
+            "blocked_by: {}",
+            ids.iter().map(text).collect::<Vec<_>>().join(", ")
+        ));
+        lines.push(String::new());
+    }
     if let Some(round) = task["review_round"].as_object() {
         lines.push(format!(
             "Peer review {}   commit {}   quorum {}",

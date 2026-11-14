@@ -404,6 +404,14 @@ place is the task: it names its project channel, repo and branch.
   /v1/inbox` orders project sections by highest pending priority and includes
   `dispatch_queue` and `next_task`, while queued wake coalescing preserves the
   highest-priority pending wake context.
+- **Cross-repository task dependencies (`blocked_by`).** Tasks can declare
+  `blocked_by` dependencies on tasks in any repository or project channel
+  (`airc task create ... --blocked-by <id>`, or `airc task deps <id>
+  --add/--remove/--set/--clear`). The SQLite store and HTTP API enforce
+  existence, non-self, non-cancelled, and DAG acyclicity checks, reject
+  claiming/completing/advancing tasks with unresolved blockers (not `done` or
+  `merged`), exclude dependency-blocked tasks from `inbox` `dispatch_queue` /
+  `next_task`, and emit an `unblocked` event when the final blocker completes.
 - **Inbox.** `airc inbox` (`GET /v1/inbox`) is the one call an agent makes
   when it wakes: its tasks across every project, each project's repo path,
   and anything waiting for its review.
@@ -412,10 +420,12 @@ place is the task: it names its project channel, repo and branch.
 | --- | --- |
 | `GET/POST /v1/projects` | List or create projects |
 | `GET/POST /v1/projects/members` | List members, add one or change a role |
-| `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `priority`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`) |
-| `GET /v1/tasks/{id}` | Task with its history, pending question and direct subtasks |
+| `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `priority`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`, `blocked_by`) |
+| `GET /v1/tasks/{id}` | Task with its history, pending question, direct subtasks, dependencies and dependents |
 | `POST /v1/tasks/{id}/assign` | Assign, reassign, or unassign (`assignee: null`) |
 | `POST /v1/tasks/{id}/priority` | Update priority (`urgent`, `high`, `normal`, `low`) on an active task |
+| `GET/POST/PUT /v1/tasks/{id}/dependencies` | Inspect, add, or replace `blocked_by` task dependencies (with cycle and blocker validation) |
+| `DELETE /v1/tasks/{id}/dependencies/{dep_id}` | Remove a single `blocked_by` dependency |
 | `POST /v1/tasks/{id}/status` | Move through the workflow (`status`, `note`, `branch`, `report_body`, `report_id`) |
 | `GET /v1/inbox` | The caller's priority-ordered tasks (`dispatch_queue`, `next_task`) and reviews, grouped by project |
 

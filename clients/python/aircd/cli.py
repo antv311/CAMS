@@ -29,6 +29,7 @@ from aircd.client import (
     AircdHttpError,
     Group,
     GroupMember,
+    _clean_dep_ids,
     build_ssl_context,
     task_create_payload,
 )
@@ -886,6 +887,7 @@ def cmd_task(args: argparse.Namespace) -> int:
                 issue_url=args.issue,
                 parent=args.parent,
                 reviewer=args.reviewer,
+                blocked_by=getattr(args, "blocked_by", None),
             ),
         )
         t = data["task"]
@@ -896,6 +898,8 @@ def cmd_task(args: argparse.Namespace) -> int:
             lines.append(f"  subtask of {t['parent_task_id']}")
         if t.get("reviewer"):
             lines.append(f"  reviewer @{t['reviewer']}")
+        if t.get("blocked_by"):
+            lines.append(f"  blocked_by {', '.join(t['blocked_by'])}")
         print_out(args, data, lines)
         return 0
     if args.task_cmd == "assign":
@@ -919,6 +923,58 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} priority -> {t.get('priority', 'normal')}"])
+        return 0
+    if args.task_cmd == "deps":
+        quoted_id = urllib.parse.quote(args.id, safe="")
+        data: dict[str, Any]
+        if getattr(args, "clear", False):
+            data = http_json(
+                server, "PUT", f"/v1/tasks/{quoted_id}/dependencies", token=token, payload={"blocked_by": []}
+            )
+        elif getattr(args, "set_deps", None) is not None:
+            data = http_json(
+                server,
+                "PUT",
+                f"/v1/tasks/{quoted_id}/dependencies",
+                token=token,
+                payload={"blocked_by": _clean_dep_ids(args.set_deps)},
+            )
+        elif getattr(args, "add", None) or getattr(args, "remove", None):
+            data = {}
+            add_ids = _clean_dep_ids(getattr(args, "add", None))
+            if add_ids:
+                data = http_json(
+                    server,
+                    "POST",
+                    f"/v1/tasks/{quoted_id}/dependencies",
+                    token=token,
+                    payload={"blocked_by": add_ids},
+                )
+            for dep_id in _clean_dep_ids(getattr(args, "remove", None)):
+                data = http_json(
+                    server,
+                    "DELETE",
+                    f"/v1/tasks/{quoted_id}/dependencies/{urllib.parse.quote(dep_id, safe='')}",
+                    token=token,
+                )
+        else:
+            data = http_json(server, "GET", f"/v1/tasks/{quoted_id}/dependencies", token=token)
+        deps = data.get("dependencies") or []
+        dependents = data.get("dependents") or []
+        blocked_flag = "blocked" if data.get("is_blocked") else "ready"
+        lines = [f"Task {args.id} ({blocked_flag}): {len(deps)} dependency(ies), {len(dependents)} dependent(s)"]
+        for d in deps:
+            state = "resolved" if d.get("resolved") else "BLOCKING"
+            cross = " [cross-repo]" if d.get("cross_repo") else ""
+            lines.append(
+                f"  blocked_by {d['task_id']} [{d['status']}/{state}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+            )
+        for d in dependents:
+            cross = " [cross-repo]" if d.get("cross_repo") else ""
+            lines.append(
+                f"  blocks {d['task_id']} [{d['status']}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+            )
+        print_out(args, data, lines)
         return 0
     if args.task_cmd == "status":
         note = review_note(server, token, args) if args.status == "review" else args.note
@@ -980,6 +1036,20 @@ def cmd_task(args: argparse.Namespace) -> int:
         ]
         if t.get("parent_task_id") or t.get("reviewer"):
             lines.append(f"parent={t.get('parent_task_id') or '-'} reviewer={t.get('reviewer') or '-'}")
+        if data.get("dependencies"):
+            for d in data["dependencies"]:
+                state = "resolved" if d.get("resolved") else "BLOCKING"
+                cross = " [cross-repo]" if d.get("cross_repo") else ""
+                lines.append(
+                    f"  blocked_by {d['task_id']} [{d['status']}/{state}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+                )
+        elif t.get("blocked_by"):
+            lines.append(f"blocked_by={','.join(t['blocked_by'])}")
+        for d in data.get("dependents") or []:
+            cross = " [cross-repo]" if d.get("cross_repo") else ""
+            lines.append(
+                f"  blocks {d['task_id']} [{d['status']}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+            )
         if t.get("review_round"):
             r = t["review_round"]
             lines.append(f"peer revision={r['revision']} commit={r['commit']} quorum={r['quorum']} peers={','.join(r['peer_reviewers'])}")
@@ -1060,13 +1130,21 @@ def cmd_task(args: argparse.Namespace) -> int:
         params = {"channel": args.channel}
         if getattr(args, "priority", None):
             params["priority"] = args.priority
+        if getattr(args, "repo", None):
+            params["repo"] = args.repo
+        if getattr(args, "blocked", False):
+            params["blocked"] = "true"
+        elif getattr(args, "ready", False):
+            params["blocked"] = "false"
         qs = urllib.parse.urlencode(params)
         data = http_json(server, "GET", f"/v1/tasks?{qs}", token=token)
-        lines = [
-            f"{t['id']} [{t.get('priority') or 'normal'}/{t['status']}] "
-            f"assignee={t.get('assignee') or t.get('claimed_by') or '-'}: {t['title']}"
-            for t in data.get("tasks", [])
-        ]
+        lines = []
+        for t in data.get("tasks", []):
+            deps = f" blocked_by={','.join(t['blocked_by'])}" if t.get("blocked_by") else ""
+            lines.append(
+                f"{t['id']} [{t.get('priority') or 'normal'}/{t['status']}] "
+                f"assignee={t.get('assignee') or t.get('claimed_by') or '-'}{deps}: {t['title']}"
+            )
         print_out(args, data, lines or [f"No tasks in {args.channel}."])
         return 0
     if args.task_cmd in ("claim", "done", "release"):
@@ -1534,8 +1612,9 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         for repo in proj.get("repos", []):
             lines.append(f"  repo {repo['name']}: {repo['local_path']}")
         for t in proj.get("tasks", []):
+            deps = f" blocked_by={','.join(t['blocked_by'])}" if t.get("blocked_by") else ""
             lines.append(
-                f"  {t['id']} [{t['kind']}/{t['status']}] priority={t.get('priority') or 'normal'} sprint={t.get('sprint') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
+                f"  {t['id']} [{t['kind']}/{t['status']}] priority={t.get('priority') or 'normal'} sprint={t.get('sprint') or '-'} branch={t.get('branch') or '-'}{deps}: {t['title']}"
             )
         for t in proj.get("to_review", []):
             lines.append(
@@ -2874,6 +2953,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--issue", metavar="URL", help="Linked GitHub issue")
     p_tc.add_argument("--parent", metavar="TASK_ID", help="Make this a subtask of TASK_ID (a group lead splitting work)")
     p_tc.add_argument("--reviewer", metavar="NICK", help="Who reviews it (default: the parent's assignee, else the PM)")
+    p_tc.add_argument("--blocked-by", action="append", metavar="TASK_ID", help="Dependency task ID (cross-repo supported; repeatable or comma-separated)")
     p_tc.set_defaults(func=cmd_task)
 
     p_tas = task_sub.add_parser("assign", help="Assign or reassign a task; omit NICK to return it to the pool")
@@ -2885,6 +2965,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_tpr_set.add_argument("id")
     p_tpr_set.add_argument("priority", choices=["urgent", "high", "normal", "low"])
     p_tpr_set.set_defaults(func=cmd_task)
+
+    p_tdep = task_sub.add_parser("deps", help="Show or update cross-repo blocked-by dependencies for a task")
+    p_tdep.add_argument("id")
+    p_tdep.add_argument("--add", action="append", metavar="TASK_ID", help="Add a blocked-by dependency (repeatable)")
+    p_tdep.add_argument("--remove", action="append", metavar="TASK_ID", help="Remove a blocked-by dependency (repeatable)")
+    p_tdep.add_argument("--set", dest="set_deps", nargs="+", metavar="TASK_ID", help="Replace all blocked-by dependencies")
+    p_tdep.add_argument("--clear", action="store_true", help="Remove all blocked-by dependencies")
+    p_tdep.set_defaults(func=cmd_task)
 
     p_tst = task_sub.add_parser("status", help="Move a task: in_progress, testing, review (needs --note with your test report), changes_requested, merged, cancelled")
     p_tst.add_argument("id")
@@ -2940,6 +3028,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_tl = task_sub.add_parser("list")
     p_tl.add_argument("channel", nargs="?", default="#general")
     p_tl.add_argument("--priority", choices=["urgent", "high", "normal", "low"], help="Filter by priority")
+    p_tl.add_argument("--repo", help="Filter by repository name")
+    p_tl_blk = p_tl.add_mutually_exclusive_group()
+    p_tl_blk.add_argument("--blocked", action="store_true", help="Only tasks with unresolved dependencies")
+    p_tl_blk.add_argument("--ready", action="store_true", help="Only tasks with no unresolved dependencies")
     p_tl.set_defaults(func=cmd_task)
 
     for action in ("claim", "done", "release"):
