@@ -230,11 +230,19 @@ impl BackupManager {
         self.status.lock().expect("backup status lock poisoned").clone()
     }
 
+    #[allow(dead_code)]
     pub fn spawn_worker(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_worker_with_shutdown(crate::shutdown::never_stop_rx())
+    }
+
+    pub fn spawn_worker_with_shutdown(
+        &self,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let manager = self.clone();
         tokio::spawn(async move {
             let cfg = manager.config();
-            if !cfg.enabled || cfg.effective_backup_dir().is_none() {
+            if !cfg.enabled || cfg.effective_backup_dir().is_none() || *stop_rx.borrow() {
                 return;
             }
 
@@ -260,7 +268,7 @@ impl BackupManager {
                 }
             };
 
-            if should_run_startup {
+            if should_run_startup && !*stop_rx.borrow() {
                 if let Err(err) = manager.run_once("startup").await {
                     manager.logger.log_error(
                         "backup.startup_failed",
@@ -270,19 +278,28 @@ impl BackupManager {
             }
 
             loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
                 let cfg = manager.config();
                 if !cfg.enabled || cfg.interval_secs == 0 || cfg.effective_backup_dir().is_none() {
                     break;
                 }
                 let wait_secs = manager.next_wait_secs(&cfg);
                 tokio::select! {
+                    biased;
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
                     _ = tokio::time::sleep(Duration::from_secs(wait_secs.max(1))) => {}
                     _ = manager.notify.notified() => {
                         continue;
                     }
                 }
                 let latest_cfg = manager.config();
-                if !latest_cfg.enabled || latest_cfg.interval_secs == 0 {
+                if !latest_cfg.enabled || latest_cfg.interval_secs == 0 || *stop_rx.borrow() {
                     break;
                 }
                 if let Err(err) = manager.run_once("scheduled").await {

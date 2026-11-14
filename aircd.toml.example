@@ -103,3 +103,10 @@ open_registration = false
 # disk_pressure_for_secs = 60
 # disk_pressure_severity = "critical"
 # disk_path = "."                         # optional filesystem path override (defaults to DB path)
+
+# Graceful zero-downtime worker draining on hub shutdown (SIGINT/SIGTERM/Windows control events).
+# [shutdown]
+# drain_timeout_secs = 30                 # max seconds to wait for running wake workers (0 skips wait)
+# http_drain_timeout_secs = 5             # max seconds for in-flight HTTP requests to finish
+# checkpoint_leases_on_drain = true       # extend claimed leases & refresh execution heartbeats on drain
+# lease_checkpoint_extension_secs = 300   # seconds to extend claimed task leases during drain checkpoint

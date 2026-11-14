@@ -200,19 +200,45 @@ impl VacuumManager {
         self.notify.notify_one();
     }
 
+    #[allow(dead_code)]
     pub fn spawn_worker(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_worker_with_shutdown(crate::shutdown::never_stop_rx())
+    }
+
+    pub fn spawn_worker_with_shutdown(
+        &self,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let manager = self.clone();
         tokio::spawn(async move {
             loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
                 let cfg = manager.config();
                 if !cfg.enabled || cfg.interval_secs == 0 {
                     // Wait until config is updated or worker is woken.
-                    manager.notify.notified().await;
-                    if !manager.pending_check.swap(false, Ordering::AcqRel) {
-                        continue;
+                    tokio::select! {
+                        biased;
+                        res = stop_rx.changed() => {
+                            if res.is_err() || *stop_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = manager.notify.notified() => {
+                            if !manager.pending_check.swap(false, Ordering::AcqRel) {
+                                continue;
+                            }
+                        }
                     }
                 } else {
                     tokio::select! {
+                        biased;
+                        res = stop_rx.changed() => {
+                            if res.is_err() || *stop_rx.borrow() {
+                                break;
+                            }
+                        }
                         _ = tokio::time::sleep(Duration::from_secs(cfg.interval_secs.max(1))) => {}
                         _ = manager.notify.notified() => {
                             if !manager.pending_check.swap(false, Ordering::AcqRel) {
@@ -223,7 +249,7 @@ impl VacuumManager {
                 }
 
                 let latest_cfg = manager.config();
-                if !latest_cfg.enabled {
+                if !latest_cfg.enabled || *stop_rx.borrow() {
                     continue;
                 }
                 if let Err(err) = manager.run_once("scheduled").await {
