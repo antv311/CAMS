@@ -181,7 +181,14 @@ you, and the recent launches.
 | `a` | Assign or reassign, or return the task to the pool |
 | `s` | Move the task to another status, with an optional note |
 | `o`, `m`, `p`, `w`, `l` | As on Home |
+| `g` | Open the Groups topology view |
 | `Esc` | Back to Home |
+
+**Groups** shows configured groups on the left, the selected group's topology
+(lead, worker seats, live worker states, review policy, and active tasks) on the
+top right, and current non-terminal subtasks on the bottom right. `Tab`
+switches focus between Groups and Current Subtasks, `Enter` opens subtask
+details, and `d` or `Esc` returns to the dashboard.
 
 **Chat** has the rooms on the left as a tree (a header per project, its rooms
 underneath, unread counts), the messages in the middle and the people on the

@@ -26,9 +26,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const NOTICE_FOR: Duration = Duration::from_secs(6);
-const TABS: &str = " [H]ome  [D]ashboard  [C]hat  [Q]uit ";
+const TABS: &str = " [H]ome  [D]ashboard  [G]roups  [C]hat  [Q]uit ";
 const CHANNEL_PANE_WIDTH: u16 = 26;
 const PEOPLE_PANE_WIDTH: u16 = 26;
+const GROUPS_PANE_WIDTH: u16 = 34;
 const STATUS_CHOICES: &[&str] = &[
     "in_progress",
     "testing",
@@ -63,9 +64,15 @@ const HELP: &[&str] = &[
     "              for a client and model (owner)",
     "  w           answer a question that is waiting on you",
     "  l           switch an account's launcher on or off (owner)",
-    "  c           chat      r  refresh      q  quit",
+    "  g           groups    c  chat      r  refresh      q  quit",
     "  S           start the hub on this machine when it is not running",
     "              (Ctrl+S in chat)",
+    "",
+    "Groups  (g from Home/Dashboard)",
+    "  Tab / <- -> switch between Groups and Current Subtasks",
+    "  up/down     move within the focused pane",
+    "  Enter       open the selected subtask details",
+    "  d / Esc     dashboard   c  chat   r  refresh   q  quit",
     "",
     "Chat",
     "  Enter send · Tab complete @name · up/down channel · Esc dashboard",
@@ -178,6 +185,34 @@ pub struct TemplateView {
     pub installed: bool,
 }
 
+/// A lead or worker seat in a group definition.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupSeatView {
+    pub template: String,
+    pub model: String,
+    pub count: u32,
+    pub nick: Option<String>,
+}
+
+/// Peer review configuration for a group.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupReviewPolicyView {
+    pub peer_reviewers: Vec<String>,
+    pub quorum: Option<u32>,
+}
+
+/// A group definition and its attached projects.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupView {
+    pub name: String,
+    pub description: Option<String>,
+    pub lead: GroupSeatView,
+    pub workers: Vec<GroupSeatView>,
+    pub projects: Vec<String>,
+    pub review_policy: Option<GroupReviewPolicyView>,
+    pub inactivity_timeout_secs: Option<i64>,
+}
+
 /// A model a client can run: its id and, when the client gave one, a label.
 pub type ModelItem = (String, Option<String>);
 
@@ -189,6 +224,7 @@ pub struct Snapshot {
     pub my_role: String,
     pub accounts: Vec<Account>,
     pub projects: Vec<ProjectView>,
+    pub groups: Vec<GroupView>,
     pub waiting: Vec<Waiting>,
     pub launchers: Vec<Launcher>,
     pub runs: Vec<String>,
@@ -252,7 +288,15 @@ pub enum Action {
 pub enum View {
     Home,
     Dashboard,
+    Groups,
     Chat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GroupsFocus {
+    #[default]
+    Groups,
+    Subtasks,
 }
 
 /// Where a pop-up's answer goes next.
@@ -310,6 +354,13 @@ pub struct App {
     /// The project opened from Home; the dashboard shows only its tasks.
     pub project: Option<String>,
     pub home_cursor: usize,
+    /// Selected group index and scroll offset in `View::Groups`.
+    pub group_idx: usize,
+    pub group_scroll: usize,
+    /// Selected subtask index and scroll offset in `View::Groups`.
+    pub group_subtask_cursor: usize,
+    pub group_subtask_scroll: usize,
+    pub groups_focus: GroupsFocus,
     /// Last message seen in each room, for the unread counts.
     pub seen: HashMap<String, i64>,
     /// Rooms first shown later count messages after this seq as unread.
@@ -325,6 +376,8 @@ pub struct App {
     channel_rows: Vec<(u16, usize)>,
     task_rows: Vec<(u16, usize)>,
     home_rows: Vec<(u16, usize)>,
+    group_rows: Vec<(u16, usize)>,
+    group_subtask_rows: Vec<(u16, usize)>,
     /// People pane rows that open a direct message: (y, nick).
     people_rows: Vec<(u16, String)>,
     people_area: Rect,
@@ -341,6 +394,11 @@ impl Default for App {
             modal: None,
             project: None,
             home_cursor: 0,
+            group_idx: 0,
+            group_scroll: 0,
+            group_subtask_cursor: 0,
+            group_subtask_scroll: 0,
+            groups_focus: GroupsFocus::Groups,
             seen: HashMap::new(),
             seen_floor: None,
             dm_open: Vec::new(),
@@ -352,6 +410,8 @@ impl Default for App {
             channel_rows: Vec::new(),
             task_rows: Vec::new(),
             home_rows: Vec::new(),
+            group_rows: Vec::new(),
+            group_subtask_rows: Vec::new(),
             people_rows: Vec::new(),
             people_area: Rect::default(),
             scroll: 0,
@@ -472,6 +532,233 @@ fn selected_task<'a>(app: &App, snap: &'a Snapshot) -> Option<&'a TaskView> {
     match rows(snap, app.project.as_deref()).get(app.cursor)? {
         Row::Task(p, t) => snap.projects.get(*p)?.tasks.get(*t),
         Row::Project(_) => None,
+    }
+}
+
+fn clean_nick(nick: &str) -> &str {
+    nick.trim().trim_start_matches('@')
+}
+
+fn nicks_match(a: &str, b: &str) -> bool {
+    clean_nick(a).eq_ignore_ascii_case(clean_nick(b))
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "done" | "merged" | "cancelled")
+}
+
+/// Rank a task's activity state for member/worker status indicators.
+fn task_activity_rank(snap: &Snapshot, task: &TaskView) -> (u8, Color, &'static str) {
+    // An open question counts whatever status the task shows.
+    let question = snap.waiting.iter().find(|w| w.task_id == task.id);
+    match (question, task.status.as_str()) {
+        (Some(w), _) if w.escalated => (0, Color::Red, "needs you"),
+        (Some(_), _) | (None, "blocked") => (1, Color::Yellow, "waiting on PM"),
+        (None, "testing") => (2, Color::Magenta, "testing"),
+        (None, "review") => (3, Color::Blue, "in review"),
+        (None, "super_review") => (3, Color::Blue, "PM review"),
+        (None, "changes_requested") => (3, Color::Yellow, "changes req"),
+        (None, "in_progress" | "claimed") => (4, Color::Green, "coding"),
+        _ => (5, Color::White, "has work"),
+    }
+}
+
+/// Live activity summary for a named group member across the group's projects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupMemberState {
+    pub color: Color,
+    pub label: String,
+    pub active: bool,
+}
+
+/// Compute a group member's live state from tasks in the group's attached
+/// projects and the member's account/launcher state.
+pub fn group_member_state(snap: &Snapshot, group: &GroupView, nick: &str) -> GroupMemberState {
+    let mut best: Option<(u8, Color, &'static str)> = None;
+    for project in snap.projects.iter().filter(|p| {
+        group
+            .projects
+            .iter()
+            .any(|ch| ch.eq_ignore_ascii_case(&p.channel))
+    }) {
+        for task in project
+            .tasks
+            .iter()
+            .filter(|t| !is_terminal_status(&t.status) && nicks_match(&t.assignee, nick))
+        {
+            let state = task_activity_rank(snap, task);
+            if best.is_none_or(|current| state.0 < current.0) {
+                best = Some(state);
+            }
+        }
+    }
+    let account = snap.accounts.iter().find(|a| nicks_match(&a.nick, nick));
+    if account.is_some_and(|a| a.running) && best.is_none_or(|(rank, _, _)| rank > 4) {
+        return GroupMemberState {
+            color: Color::Green,
+            label: "working".to_string(),
+            active: true,
+        };
+    }
+    if let Some((_, color, label)) = best {
+        return GroupMemberState {
+            color,
+            label: label.to_string(),
+            active: true,
+        };
+    }
+    match account {
+        Some(acc) if acc.online => GroupMemberState {
+            color: Color::Green,
+            label: "online".to_string(),
+            active: false,
+        },
+        Some(acc) => {
+            let (status, color) = account_status(acc);
+            GroupMemberState {
+                color,
+                label: status,
+                active: false,
+            }
+        }
+        None => GroupMemberState {
+            color: Color::DarkGray,
+            label: "unregistered".to_string(),
+            active: false,
+        },
+    }
+}
+
+/// A non-terminal subtask associated with a group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSubtaskItem {
+    pub task_id: String,
+    pub channel: String,
+    pub status: String,
+    pub priority: String,
+    pub kind: String,
+    pub assignee: String,
+    pub title: String,
+    pub parent_id: String,
+    pub parent_title: Option<String>,
+    pub reviewer: Option<String>,
+}
+
+fn group_named_members(group: &GroupView) -> Vec<&str> {
+    std::iter::once(group.lead.nick.as_deref())
+        .chain(group.workers.iter().map(|w| w.nick.as_deref()))
+        .flatten()
+        .map(clean_nick)
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Current (non-terminal) subtasks belonging to `group` across its attached projects.
+pub fn group_subtasks(snap: &Snapshot, group: &GroupView) -> Vec<GroupSubtaskItem> {
+    let members = group_named_members(group);
+    let is_member = |nick: &str| members.iter().any(|m| nicks_match(m, nick));
+    let lead_nick = group.lead.nick.as_deref().map(clean_nick);
+    let mut out = Vec::new();
+    for project in snap.projects.iter().filter(|p| {
+        group
+            .projects
+            .iter()
+            .any(|ch| ch.eq_ignore_ascii_case(&p.channel))
+    }) {
+        for task in &project.tasks {
+            let Some(parent_id) = task.parent.as_deref() else {
+                continue;
+            };
+            if is_terminal_status(&task.status) {
+                continue;
+            }
+            let parent = project.tasks.iter().find(|t| t.id == parent_id);
+            let belongs = (!task.assignee.is_empty()
+                && task.assignee != "-"
+                && is_member(&task.assignee))
+                || (lead_nick.is_some()
+                    && task
+                        .reviewer
+                        .as_deref()
+                        .is_some_and(|r| nicks_match(r, lead_nick.unwrap())))
+                || parent.is_some_and(|p| is_member(&p.assignee));
+            if !belongs {
+                continue;
+            }
+            out.push(GroupSubtaskItem {
+                task_id: task.id.clone(),
+                channel: project.channel.clone(),
+                status: task.status.clone(),
+                priority: task.priority.clone(),
+                kind: task.kind.clone(),
+                assignee: task.assignee.clone(),
+                title: task.title.clone(),
+                parent_id: parent_id.to_string(),
+                parent_title: parent.map(|p| p.title.clone()),
+                reviewer: task.reviewer.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Non-terminal tasks assigned to a specific member across `group`'s attached projects.
+fn group_member_tasks<'a>(snap: &'a Snapshot, group: &GroupView, nick: &str) -> Vec<&'a TaskView> {
+    let mut tasks = Vec::new();
+    for project in snap.projects.iter().filter(|p| {
+        group
+            .projects
+            .iter()
+            .any(|ch| ch.eq_ignore_ascii_case(&p.channel))
+    }) {
+        for task in &project.tasks {
+            if !is_terminal_status(&task.status) && nicks_match(&task.assignee, nick) {
+                tasks.push(task);
+            }
+        }
+    }
+    tasks
+}
+
+/// Count `(active_named_workers, total_worker_seats)` for a group.
+pub fn group_active_worker_count(snap: &Snapshot, group: &GroupView) -> (usize, usize) {
+    let total: usize = group.workers.iter().map(|w| w.count as usize).sum();
+    let mut seen: Vec<String> = Vec::new();
+    let mut active = 0usize;
+    for worker in &group.workers {
+        let Some(nick) = worker.nick.as_deref().map(clean_nick) else {
+            continue;
+        };
+        if nick.is_empty() || seen.iter().any(|s| s.eq_ignore_ascii_case(nick)) {
+            continue;
+        }
+        seen.push(nick.to_string());
+        if group_member_state(snap, group, nick).active {
+            active += 1;
+        }
+    }
+    (active, total)
+}
+
+fn select_project_group(app: &mut App, snap: &Snapshot) {
+    let Some(channel) = app.project.as_deref() else {
+        return;
+    };
+    let current_matches = snap.groups.get(app.group_idx).is_some_and(|g| {
+        g.projects
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(channel))
+    });
+    if !current_matches {
+        if let Some(pos) = snap.groups.iter().position(|g| {
+            g.projects
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(channel))
+        }) {
+            app.group_idx = pos;
+            app.group_subtask_cursor = 0;
+            app.group_subtask_scroll = 0;
+        }
     }
 }
 
@@ -646,6 +933,57 @@ fn waiting_from(question: &Value, escalated: bool) -> Waiting {
     }
 }
 
+fn group_seat_view(value: &Value) -> GroupSeatView {
+    GroupSeatView {
+        template: text(&value["template"]),
+        model: text(&value["model"]),
+        count: value["count"].as_u64().unwrap_or(1) as u32,
+        nick: value["nick"]
+            .as_str()
+            .map(clean_nick)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    }
+}
+
+fn group_view(value: &Value) -> GroupView {
+    let review_policy = value.get("review_policy").and_then(|rp| {
+        rp.as_object().map(|_| GroupReviewPolicyView {
+            peer_reviewers: rp["peer_reviewers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .map(clean_nick)
+                .map(str::to_owned)
+                .collect(),
+            quorum: rp["quorum"].as_u64().map(|q| q as u32),
+        })
+    });
+    GroupView {
+        name: text(&value["name"]),
+        description: value["description"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        lead: group_seat_view(&value["lead"]),
+        workers: value["workers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(group_seat_view)
+            .collect(),
+        projects: value["projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str().map(str::to_owned))
+            .collect(),
+        review_policy,
+        inactivity_timeout_secs: value["inactivity_timeout_secs"].as_i64(),
+    }
+}
+
 /// Check an attached repo on this machine: no network, no git process.
 fn repo_view(repo: &Value) -> RepoView {
     let path = text(&repo["local_path"]);
@@ -765,6 +1103,17 @@ async fn refresh(
                 name: text(&t["name"]),
                 installed: t["installed"].as_bool().unwrap_or(false),
             })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // Older hubs may not expose /v1/groups; fall back to an empty list.
+    snap.groups = match get(client, cfg, "/v1/groups").await {
+        Ok(body) => body["groups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(group_view)
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -1906,6 +2255,7 @@ pub fn handle_key(
     match app.view {
         View::Home => handle_home_key(app, code, snap),
         View::Dashboard => handle_dashboard_key(app, code, snap),
+        View::Groups => handle_groups_key(app, code, snap),
         View::Chat => handle_chat_key(app, code, snap),
     }
 }
@@ -1952,6 +2302,10 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => return Some(Action::Quit),
         KeyCode::Esc => app.view = View::Home,
+        KeyCode::Char('g') | KeyCode::Char('G') => {
+            select_project_group(app, snap);
+            app.view = View::Groups;
+        }
         KeyCode::Char('c') | KeyCode::Char('C') => {
             // Chat opens in the room of the project you are looking at.
             let room = if app.view == View::Home {
@@ -2120,6 +2474,114 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
     None
 }
 
+fn handle_groups_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
+    let group_last = snap.groups.len().saturating_sub(1);
+    app.group_idx = app.group_idx.min(group_last);
+    let subtasks = snap
+        .groups
+        .get(app.group_idx)
+        .map(|g| group_subtasks(snap, g))
+        .unwrap_or_default();
+    let subtask_last = subtasks.len().saturating_sub(1);
+    app.group_subtask_cursor = app.group_subtask_cursor.min(subtask_last);
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => return Some(Action::Quit),
+        KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => app.view = View::Dashboard,
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            let room = snap
+                .groups
+                .get(app.group_idx)
+                .and_then(|g| g.projects.first().cloned())
+                .or_else(|| app.project.clone());
+            if let Some(index) = room.and_then(|r| snap.channels.iter().position(|c| *c == r)) {
+                app.channel_idx = index;
+                app.chat_channel = None;
+            }
+            app.chat_scroll = 0;
+            app.view = View::Chat;
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => return Some(Action::Refresh),
+        KeyCode::Char('?') | KeyCode::Char('h') => app.modal = Some(Modal::Help),
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.groups_focus = match app.groups_focus {
+                GroupsFocus::Groups => GroupsFocus::Subtasks,
+                GroupsFocus::Subtasks => GroupsFocus::Groups,
+            };
+        }
+        KeyCode::Right => app.groups_focus = GroupsFocus::Subtasks,
+        KeyCode::Left => app.groups_focus = GroupsFocus::Groups,
+        KeyCode::Down | KeyCode::Char('j') => match app.groups_focus {
+            GroupsFocus::Groups => {
+                let next = (app.group_idx + 1).min(group_last);
+                if next != app.group_idx {
+                    app.group_idx = next;
+                    app.group_subtask_cursor = 0;
+                    app.group_subtask_scroll = 0;
+                }
+            }
+            GroupsFocus::Subtasks => {
+                app.group_subtask_cursor = (app.group_subtask_cursor + 1).min(subtask_last);
+            }
+        },
+        KeyCode::Up | KeyCode::Char('k') => match app.groups_focus {
+            GroupsFocus::Groups => {
+                let next = app.group_idx.saturating_sub(1);
+                if next != app.group_idx {
+                    app.group_idx = next;
+                    app.group_subtask_cursor = 0;
+                    app.group_subtask_scroll = 0;
+                }
+            }
+            GroupsFocus::Subtasks => {
+                app.group_subtask_cursor = app.group_subtask_cursor.saturating_sub(1);
+            }
+        },
+        KeyCode::PageDown => match app.groups_focus {
+            GroupsFocus::Groups => {
+                let next = (app.group_idx + 10).min(group_last);
+                if next != app.group_idx {
+                    app.group_idx = next;
+                    app.group_subtask_cursor = 0;
+                    app.group_subtask_scroll = 0;
+                }
+            }
+            GroupsFocus::Subtasks => {
+                app.group_subtask_cursor = (app.group_subtask_cursor + 10).min(subtask_last);
+            }
+        },
+        KeyCode::PageUp => match app.groups_focus {
+            GroupsFocus::Groups => {
+                let next = app.group_idx.saturating_sub(10);
+                if next != app.group_idx {
+                    app.group_idx = next;
+                    app.group_subtask_cursor = 0;
+                    app.group_subtask_scroll = 0;
+                }
+            }
+            GroupsFocus::Subtasks => {
+                app.group_subtask_cursor = app.group_subtask_cursor.saturating_sub(10);
+            }
+        },
+        KeyCode::Enter => match app.groups_focus {
+            GroupsFocus::Groups if !subtasks.is_empty() => {
+                app.groups_focus = GroupsFocus::Subtasks;
+            }
+            GroupsFocus::Subtasks => {
+                if let Some(sub) = subtasks.get(app.group_subtask_cursor) {
+                    app.modal = Some(Modal::Detail {
+                        task_id: sub.task_id.clone(),
+                    });
+                    return Some(Action::LoadTask(sub.task_id.clone()));
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    None
+}
+
 fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
     match code {
         KeyCode::Esc => app.view = View::Dashboard,
@@ -2192,6 +2654,8 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
             app.view = View::Home;
         } else if within("[D]ashboard") {
             app.view = View::Dashboard;
+        } else if within("[G]roups") {
+            app.view = View::Groups;
         } else if within("[C]hat") {
             app.view = View::Chat;
         } else if within("[Q]uit") {
@@ -2211,6 +2675,21 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
             if let Some((_, nick)) = app.people_rows.iter().find(|(y, _)| *y == row) {
                 let nick = nick.clone();
                 open_dm(app, &nick);
+            }
+        }
+        View::Groups => {
+            if column < GROUPS_PANE_WIDTH {
+                if let Some((_, index)) = app.group_rows.iter().find(|(y, _)| *y == row) {
+                    if app.group_idx != *index {
+                        app.group_idx = *index;
+                        app.group_subtask_cursor = 0;
+                        app.group_subtask_scroll = 0;
+                    }
+                    app.groups_focus = GroupsFocus::Groups;
+                }
+            } else if let Some((_, index)) = app.group_subtask_rows.iter().find(|(y, _)| *y == row) {
+                app.group_subtask_cursor = *index;
+                app.groups_focus = GroupsFocus::Subtasks;
             }
         }
         View::Dashboard => {
@@ -2298,21 +2777,21 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
     match app.view {
         View::Home => draw_home(frame, app, snap, body),
         View::Dashboard => draw_dashboard(frame, app, snap, body),
+        View::Groups => draw_groups(frame, app, snap, body),
         View::Chat => draw_chat(frame, app, snap, body),
     }
 
     let who = format!(
-        "  CAMS  {}  you: @{} ({})",
-        snap.server,
+        "  you: @{} ({})  CAMS  {}",
         snap.me,
         if snap.my_role.is_empty() {
             "?"
         } else {
             &snap.my_role
-        }
+        },
+        snap.server,
     );
     let mut header_spans = tab_spans(app.view);
-    header_spans.push(Span::raw(who));
     let dm_unread: usize = snap
         .messages
         .keys()
@@ -2325,6 +2804,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             bold().fg(Color::Yellow),
         ));
     }
+    header_spans.push(Span::raw(who));
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header);
 
     let hints: &[(&str, &str)] = match app.view {
@@ -2349,6 +2829,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("o", "sprint"),
             ("c", "chat"),
             ("Esc", "home"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        View::Groups => &[
+            ("Tab", "pane"),
+            ("Up/Down", "select"),
+            ("Enter", "task"),
+            ("d", "dashboard"),
+            ("c", "chat"),
+            ("r", "refresh"),
+            ("Esc", "back"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -2577,6 +3068,7 @@ fn tab_spans(view: View) -> Vec<Span<'static>> {
     let tabs = [
         ("[H]", "ome", Some(View::Home)),
         ("[D]", "ashboard", Some(View::Dashboard)),
+        ("[G]", "roups", Some(View::Groups)),
         ("[C]", "hat", Some(View::Chat)),
         ("[Q]", "uit", None),
     ];
@@ -2682,17 +3174,7 @@ pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color
             t.assignee.eq_ignore_ascii_case(nick)
                 && (!in_sprint_room || t.sprint.as_deref() == Some(channel))
         }) {
-            // An open question counts whatever status the task shows.
-            let question = snap.waiting.iter().find(|w| w.task_id == task.id);
-            let state = match (question, task.status.as_str()) {
-                (Some(w), _) if w.escalated => (0, Color::Red, "needs you"),
-                (Some(_), _) | (None, "blocked") => (1, Color::Yellow, "waiting on PM"),
-                (None, "testing") => (2, Color::Magenta, "testing"),
-                (None, "review") => (3, Color::Blue, "in review"),
-                (None, "super_review") => (3, Color::Blue, "PM review"),
-                (None, "in_progress" | "claimed") => (4, Color::Green, "coding"),
-                _ => (5, Color::White, "has work"),
-            };
+            let state = task_activity_rank(snap, task);
             if best.is_none_or(|current| state.0 < current.0) {
                 best = Some(state);
             }
@@ -2969,6 +3451,430 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
             " Projects and tasks  (Enter details · n new · a assign · s status · p PM · m member) ",
         )),
         bottom,
+    );
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(13).collect()
+}
+
+fn priority_span(priority: &str) -> Span<'static> {
+    match priority {
+        "urgent" => Span::styled(
+            "[urgent] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        "high" => Span::styled("[high] ", Style::default().fg(Color::Yellow)),
+        "low" => Span::styled("[low] ", dim()),
+        _ => Span::raw(""),
+    }
+}
+
+fn seat_spec(seat: &GroupSeatView) -> String {
+    match (seat.template.is_empty(), seat.model.is_empty()) {
+        (true, true) => "-".to_string(),
+        (false, true) => seat.template.clone(),
+        (true, false) => seat.model.clone(),
+        (false, false) => format!("{}:{}", seat.template, seat.model),
+    }
+}
+
+fn group_topology_lines(
+    snap: &Snapshot,
+    group: &GroupView,
+    subtasks: &[GroupSubtaskItem],
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let attached = if group.projects.is_empty() {
+        "(unattached)".to_string()
+    } else {
+        group.projects.join(", ")
+    };
+    let mut meta = Vec::new();
+    if let Some(desc) = &group.description {
+        meta.push(Span::raw(format!("{desc}  ·  ")));
+    }
+    meta.push(Span::styled("projects: ", dim()));
+    meta.push(Span::styled(
+        attached,
+        if group.projects.is_empty() {
+            dim()
+        } else {
+            Style::default().fg(Color::Cyan)
+        },
+    ));
+    lines.push(Line::from(meta));
+
+    if group.review_policy.is_some() || group.inactivity_timeout_secs.is_some() {
+        let mut policy_spans = Vec::new();
+        if let Some(rp) = &group.review_policy {
+            let quorum = match rp.quorum {
+                Some(q) => format!("quorum {q}"),
+                None => "all peers".to_string(),
+            };
+            let peers = rp
+                .peer_reviewers
+                .iter()
+                .map(|p| format!("@{p}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            policy_spans.push(Span::styled(
+                format!("policy: {quorum} ({peers})"),
+                dim(),
+            ));
+        }
+        if let Some(secs) = group.inactivity_timeout_secs {
+            if !policy_spans.is_empty() {
+                policy_spans.push(Span::styled("  ·  ", dim()));
+            }
+            policy_spans.push(Span::styled(format!("timeout: {secs}s"), dim()));
+        }
+        lines.push(Line::from(policy_spans));
+    }
+
+    // Lead node at the root of the group topology.
+    let lead_spec = seat_spec(&group.lead);
+    let lead_tasks = match group.lead.nick.as_deref() {
+        Some(nick) => group_member_tasks(snap, group, nick),
+        None => Vec::new(),
+    };
+    let mut shown_task_ids: HashSet<&str> = HashSet::new();
+    match group.lead.nick.as_deref() {
+        Some(nick) => {
+            let state = group_member_state(snap, group, nick);
+            lines.push(Line::from(vec![
+                Span::styled("★ ", Style::default().fg(Color::Yellow)),
+                Span::styled(format!("@{nick}"), bold()),
+                Span::styled(format!("  ({lead_spec})  "), dim()),
+                Span::styled(state.label, Style::default().fg(state.color)),
+            ]));
+            let cont = if group.workers.is_empty() && subtasks.is_empty() {
+                "   "
+            } else {
+                "│  "
+            };
+            for task in &lead_tasks {
+                shown_task_ids.insert(task.id.as_str());
+                let role_tag = if task.parent.is_some() {
+                    "[subtask]"
+                } else {
+                    "[parent]"
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{cont}◆ "), dim()),
+                    Span::styled(format!("{role_tag} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("{} ", task.status),
+                        Style::default().fg(status_color(&task.status)),
+                    ),
+                    Span::raw(task.title.clone()),
+                    Span::styled(format!("  {}", short_id(&task.id)), dim()),
+                ]));
+            }
+        }
+        None => {
+            lines.push(Line::from(vec![
+                Span::styled("★ ", Style::default().fg(Color::Yellow)),
+                Span::styled("(unnamed lead)", dim()),
+                Span::styled(format!("  ({lead_spec})"), dim()),
+            ]));
+        }
+    }
+
+    // Collect subtasks not assigned to any named worker seat (e.g., unassigned
+    // or assigned to a non-listed seat) so nothing is hidden from the topology.
+    let worker_nicks: Vec<&str> = group
+        .workers
+        .iter()
+        .filter_map(|w| w.nick.as_deref())
+        .collect();
+    let other_subtasks: Vec<&GroupSubtaskItem> = subtasks
+        .iter()
+        .filter(|sub| {
+            !shown_task_ids.contains(sub.task_id.as_str())
+                && !worker_nicks.iter().any(|w| nicks_match(w, &sub.assignee))
+        })
+        .collect();
+
+    for (i, worker) in group.workers.iter().enumerate() {
+        let has_more = i + 1 < group.workers.len() || !other_subtasks.is_empty();
+        let branch = if has_more { "├─ " } else { "└─ " };
+        let cont = if has_more { "│  " } else { "   " };
+        let spec = seat_spec(worker);
+        let count_suffix = if worker.count > 1 {
+            format!(" ×{}", worker.count)
+        } else {
+            String::new()
+        };
+
+        match worker.nick.as_deref() {
+            Some(nick) => {
+                let state = group_member_state(snap, group, nick);
+                let dot = if state.active || state.label == "online" {
+                    "● "
+                } else {
+                    "○ "
+                };
+                let name_style = if state.active { bold() } else { dim() };
+                lines.push(Line::from(vec![
+                    Span::styled(branch, dim()),
+                    Span::styled(dot, Style::default().fg(state.color)),
+                    Span::styled(format!("@{nick}"), name_style),
+                    Span::styled(format!("  ({spec}{count_suffix})  "), dim()),
+                    Span::styled(state.label, Style::default().fg(state.color)),
+                ]));
+                let worker_tasks = group_member_tasks(snap, group, nick);
+                for (j, task) in worker_tasks.iter().enumerate() {
+                    let sub_branch = if j + 1 < worker_tasks.len() {
+                        "├─ "
+                    } else {
+                        "└─ "
+                    };
+                    let kind_label = if task.parent.is_some() {
+                        format!("sub/{}", task.kind)
+                    } else {
+                        task.kind.clone()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{cont}  {sub_branch}"), dim()),
+                        Span::styled(
+                            format!("{:<12} ", task.status),
+                            Style::default().fg(status_color(&task.status)),
+                        ),
+                        priority_span(&task.priority),
+                        Span::raw(format!("[{kind_label}] {}", task.title)),
+                        Span::styled(format!("  {}", short_id(&task.id)), dim()),
+                    ]));
+                }
+            }
+            None => {
+                let pool_tag = if worker.count == 1 {
+                    "[pool]".to_string()
+                } else {
+                    format!("[pool ×{}]", worker.count)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(branch, dim()),
+                    Span::styled("○ ", dim()),
+                    Span::styled(format!("{pool_tag} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(spec, dim()),
+                ]));
+            }
+        }
+    }
+
+    if !other_subtasks.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("└─ ", dim()),
+            Span::styled("○ ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("(unassigned / other)  {} subtask(s)", other_subtasks.len()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+
+    lines
+}
+
+fn draw_groups(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
+    app.group_rows.clear();
+    app.group_subtask_rows.clear();
+    app.group_idx = app.group_idx.min(snap.groups.len().saturating_sub(1));
+
+    let groups_width = if area.width < 70 {
+        Constraint::Percentage(35)
+    } else {
+        Constraint::Length(GROUPS_PANE_WIDTH)
+    };
+    let [groups_area, right] = Layout::horizontal([groups_width, Constraint::Min(10)]).areas(area);
+
+    let groups_border = if app.groups_focus == GroupsFocus::Groups {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let groups_block = Block::bordered()
+        .border_style(groups_border)
+        .title(format!(" Groups ({}) ", snap.groups.len()));
+
+    if snap.groups.is_empty() {
+        let empty = vec![
+            Line::from(Span::styled("No groups configured yet.", dim())),
+            Line::from(""),
+            Line::from(Span::styled("Create one with:", dim())),
+            Line::from(Span::styled("  airc group create <name>", dim())),
+            Line::from(Span::styled("    --lead <tpl>:<model>", dim())),
+            Line::from(Span::styled("    --worker <tpl>:<model>", dim())),
+        ];
+        frame.render_widget(Paragraph::new(empty).block(groups_block), groups_area);
+        let [topo_area, subtasks_area] =
+            Layout::vertical([Constraint::Percentage(55), Constraint::Min(0)]).areas(right);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Select a group to view its topology.",
+                dim(),
+            )))
+            .block(Block::bordered().title(" Topology ")),
+            topo_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("No active subtasks.", dim())))
+                .block(Block::bordered().title(" Current Subtasks (0) ")),
+            subtasks_area,
+        );
+        return;
+    }
+
+    let visible_groups = (groups_area.height.saturating_sub(2) as usize / 2).max(1);
+    if app.group_idx < app.group_scroll {
+        app.group_scroll = app.group_idx;
+    } else if app.group_idx >= app.group_scroll + visible_groups {
+        app.group_scroll = app.group_idx + 1 - visible_groups;
+    }
+
+    let mut group_lines: Vec<Line> = Vec::new();
+    for (index, group) in snap
+        .groups
+        .iter()
+        .enumerate()
+        .skip(app.group_scroll)
+        .take(visible_groups)
+    {
+        let (active_workers, total_workers) = group_active_worker_count(snap, group);
+        let subtask_count = group_subtasks(snap, group).len();
+        let lead_label = group
+            .lead
+            .nick
+            .as_deref()
+            .map(|n| format!("@{n}"))
+            .unwrap_or_else(|| "(unnamed)".to_string());
+        let projects_label = if group.projects.is_empty() {
+            "(unattached)".to_string()
+        } else {
+            group.projects.join(", ")
+        };
+        let marker = if index == app.group_idx { "> " } else { "  " };
+        let mut line1 = Line::from(vec![
+            Span::raw(marker),
+            Span::styled(group.name.clone(), bold().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(
+                projects_label,
+                if group.projects.is_empty() {
+                    dim()
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ),
+        ]);
+        let active_style = if active_workers > 0 {
+            Style::default().fg(Color::Green)
+        } else {
+            dim()
+        };
+        let mut line2 = Line::from(vec![
+            Span::styled(format!("  {lead_label} · "), dim()),
+            Span::styled(format!("{active_workers}/{total_workers} active"), active_style),
+            Span::styled(format!(" · {subtask_count} sub"), dim()),
+        ]);
+        if index == app.group_idx {
+            line1 = line1.style(Style::default().bg(Color::DarkGray));
+            line2 = line2.style(Style::default().bg(Color::DarkGray));
+        }
+        let base_y = groups_area.y + 1 + group_lines.len() as u16;
+        app.group_rows.push((base_y, index));
+        app.group_rows.push((base_y + 1, index));
+        group_lines.push(line1);
+        group_lines.push(line2);
+    }
+    frame.render_widget(Paragraph::new(group_lines).block(groups_block), groups_area);
+
+    let group = &snap.groups[app.group_idx];
+    let subtasks = group_subtasks(snap, group);
+    let topo_lines = group_topology_lines(snap, group, &subtasks);
+    let max_topo_h = (right.height * 3 / 5).max(6).min(right.height);
+    let topo_h = (topo_lines.len() as u16 + 2).clamp(6.min(right.height), max_topo_h);
+    let [topo_area, subtasks_area] =
+        Layout::vertical([Constraint::Length(topo_h), Constraint::Min(0)]).areas(right);
+
+    frame.render_widget(
+        Paragraph::new(topo_lines)
+            .block(Block::bordered().title(format!(" Topology: {} ", group.name))),
+        topo_area,
+    );
+
+    let subtasks_border = if app.groups_focus == GroupsFocus::Subtasks {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    app.group_subtask_cursor = app
+        .group_subtask_cursor
+        .min(subtasks.len().saturating_sub(1));
+    let visible_subtasks = (subtasks_area.height.saturating_sub(2) as usize / 2).max(1);
+    if app.group_subtask_cursor < app.group_subtask_scroll {
+        app.group_subtask_scroll = app.group_subtask_cursor;
+    } else if app.group_subtask_cursor >= app.group_subtask_scroll + visible_subtasks {
+        app.group_subtask_scroll = app.group_subtask_cursor + 1 - visible_subtasks;
+    }
+
+    let mut subtask_lines: Vec<Line> = Vec::new();
+    for (index, sub) in subtasks
+        .iter()
+        .enumerate()
+        .skip(app.group_subtask_scroll)
+        .take(visible_subtasks)
+    {
+        let base_y = subtasks_area.y + 1 + subtask_lines.len() as u16;
+        app.group_subtask_rows.push((base_y, index));
+        app.group_subtask_rows.push((base_y + 1, index));
+        let parent_text = match &sub.parent_title {
+            Some(title) => format!("parent: {} \"{title}\"", short_id(&sub.parent_id)),
+            None => format!("parent: {}", short_id(&sub.parent_id)),
+        };
+        let review_text = sub
+            .reviewer
+            .as_deref()
+            .map(|r| format!(" · review @{r}"))
+            .unwrap_or_default();
+        let mut line1 = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{:<15}", sub.status),
+                Style::default().fg(status_color(&sub.status)),
+            ),
+            Span::styled(format!("@{:<12} ", sub.assignee), bold()),
+            priority_span(&sub.priority),
+            Span::raw(format!("[{}] {}", sub.kind, sub.title)),
+        ]);
+        let mut line2 = Line::from(vec![
+            Span::styled(
+                format!("    {} · {parent_text}{review_text}", short_id(&sub.task_id)),
+                dim(),
+            ),
+        ]);
+        if app.groups_focus == GroupsFocus::Subtasks && index == app.group_subtask_cursor {
+            line1 = line1.style(Style::default().bg(Color::DarkGray));
+            line2 = line2.style(Style::default().bg(Color::DarkGray));
+        }
+        subtask_lines.push(line1);
+        subtask_lines.push(line2);
+    }
+    if subtasks.is_empty() {
+        subtask_lines.push(Line::from(Span::styled(
+            "No active subtasks for this group.",
+            dim(),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(subtask_lines).block(
+            Block::bordered().border_style(subtasks_border).title(format!(
+                " Current Subtasks ({})  (Tab pane · Enter details) ",
+                subtasks.len()
+            )),
+        ),
+        subtasks_area,
     );
 }
 
@@ -3432,6 +4338,10 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             },
             App::default(),
             App {
+                view: View::Groups,
+                ..App::default()
+            },
+            App {
                 view: View::Chat,
                 channel_idx: last_channel,
                 ..App::default()
@@ -3529,6 +4439,7 @@ mod tests {
                     title: Some("Local playback".into()),
                 }],
             }],
+            groups: Vec::new(),
             waiting: vec![Waiting {
                 task_id: "task_abc123".into(),
                 channel: "#sample-app".into(),
@@ -4391,7 +5302,7 @@ mod tests {
 
         // The tab bar keeps the exact TABS text, so clicks still line up,
         // and highlights the open view.
-        for view in [View::Home, View::Dashboard, View::Chat] {
+        for view in [View::Home, View::Dashboard, View::Groups, View::Chat] {
             let text: String = tab_spans(view).iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(text, TABS);
         }
@@ -5175,5 +6086,301 @@ mod tests {
             tls_insecure: false,
         };
         assert!(build_http_client(&valid_cfg).is_ok());
+    }
+
+    fn groups_fixture() -> Snapshot {
+        let mut snap = fixture();
+        snap.accounts.extend([
+            Account {
+                id: "lead".into(),
+                nick: "lead".into(),
+                role: "leader".into(),
+                online: true,
+                running: true,
+                launcher: Some(true),
+                command_found: true,
+                last_run: Some("ok".into()),
+            },
+            Account {
+                id: "worker1".into(),
+                nick: "worker1".into(),
+                role: "builder".into(),
+                online: true,
+                running: true,
+                launcher: Some(true),
+                command_found: true,
+                last_run: Some("ok".into()),
+            },
+            Account {
+                id: "worker2".into(),
+                nick: "worker2".into(),
+                role: "builder".into(),
+                online: false,
+                running: false,
+                launcher: Some(true),
+                command_found: true,
+                last_run: Some("ok".into()),
+            },
+        ]);
+        snap.projects[0].tasks = vec![
+            TaskView {
+                id: "task_parent".into(),
+                kind: "feature".into(),
+                priority: "high".into(),
+                status: "in_progress".into(),
+                assignee: "lead".into(),
+                title: "Parent topology epic".into(),
+                ..TaskView::default()
+            },
+            TaskView {
+                id: "task_sub1".into(),
+                kind: "task".into(),
+                priority: "normal".into(),
+                status: "in_progress".into(),
+                assignee: "worker1".into(),
+                title: "Build tree renderer".into(),
+                reviewer: Some("lead".into()),
+                parent: Some("task_parent".into()),
+                ..TaskView::default()
+            },
+            TaskView {
+                id: "task_sub2".into(),
+                kind: "bug".into(),
+                priority: "urgent".into(),
+                status: "review".into(),
+                assignee: "worker1".into(),
+                title: "Fix scroll clamp".into(),
+                reviewer: Some("lead".into()),
+                parent: Some("task_parent".into()),
+                ..TaskView::default()
+            },
+            TaskView {
+                id: "task_done".into(),
+                kind: "task".into(),
+                priority: "normal".into(),
+                status: "merged".into(),
+                assignee: "worker2".into(),
+                title: "Completed subtask".into(),
+                reviewer: Some("lead".into()),
+                parent: Some("task_parent".into()),
+                ..TaskView::default()
+            },
+        ];
+        snap.groups = vec![
+            GroupView {
+                name: "dev".into(),
+                description: Some("Opus lead with local workers".into()),
+                lead: GroupSeatView {
+                    template: "claude".into(),
+                    model: "opus".into(),
+                    count: 1,
+                    nick: Some("lead".into()),
+                },
+                workers: vec![
+                    GroupSeatView {
+                        template: "claude".into(),
+                        model: "sonnet".into(),
+                        count: 1,
+                        nick: Some("worker1".into()),
+                    },
+                    GroupSeatView {
+                        template: "codex".into(),
+                        model: "gpt-5".into(),
+                        count: 1,
+                        nick: Some("worker2".into()),
+                    },
+                    GroupSeatView {
+                        template: "ollama".into(),
+                        model: "qwen3:35b".into(),
+                        count: 3,
+                        nick: None,
+                    },
+                ],
+                projects: vec!["#sample-app".into()],
+                review_policy: Some(GroupReviewPolicyView {
+                    peer_reviewers: vec!["lead".into(), "worker1".into()],
+                    quorum: Some(1),
+                }),
+                inactivity_timeout_secs: Some(300),
+            },
+            GroupView {
+                name: "ops".into(),
+                description: None,
+                lead: GroupSeatView {
+                    template: "gemini".into(),
+                    model: "pro".into(),
+                    count: 1,
+                    nick: Some("ops-lead".into()),
+                },
+                workers: vec![GroupSeatView {
+                    template: "gemini".into(),
+                    model: "flash".into(),
+                    count: 2,
+                    nick: None,
+                }],
+                projects: Vec::new(),
+                review_policy: None,
+                inactivity_timeout_secs: None,
+            },
+        ];
+        snap
+    }
+
+    #[test]
+    fn groups_panel_renders_topology_lead_active_workers_and_subtasks() {
+        let snap = groups_fixture();
+        let mut app = App {
+            view: View::Groups,
+            ..App::default()
+        };
+        let screen = render(&mut app, &snap);
+        for expected in [
+            "Groups (2)",
+            "dev  #sample-app",
+            "@lead · 1/5 active · 2 sub",
+            "ops  (unattached)",
+            "@ops-lead · 0/2 active · 0 sub",
+            "Topology: dev",
+            "Opus lead with local workers  ·  projects: #sample-app",
+            "policy: quorum 1 (@lead, @worker1)  ·  timeout: 300s",
+            "★ @lead  (claude:opus)  coding",
+            "[parent] in_progress Parent topology epic",
+            "● @worker1  (claude:sonnet)  in review",
+            "[sub/task] Build tree renderer",
+            "[sub/bug] Fix scroll clamp",
+            "○ @worker2  (codex:gpt-5)  ready",
+            "○ [pool ×3] ollama:qwen3:35b",
+            "Current Subtasks (2)",
+            "@worker1",
+            "[urgent] [bug] Fix scroll clamp",
+            "parent: task_parent \"Parent topology epic\"",
+            "review @lead",
+        ] {
+            assert!(screen.contains(expected), "groups view is missing {expected:?}\n{screen}");
+        }
+        // Terminal subtasks must not show up as current subtasks.
+        assert!(
+            !screen.contains("Completed subtask"),
+            "terminal subtask should be excluded:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn groups_panel_navigation_focus_click_and_subtask_detail() {
+        let mut snap = groups_fixture();
+        snap.projects.push(ProjectView {
+            channel: "#other".into(),
+            name: "Other".into(),
+            ..ProjectView::default()
+        });
+        snap.groups[1].projects = vec!["#other".into()];
+
+        // Pressing 'g' from Dashboard jumps to the group attached to the open project.
+        let mut app = App {
+            view: View::Dashboard,
+            project: Some("#other".into()),
+            ..App::default()
+        };
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Char('g')]), None);
+        assert_eq!(app.view, View::Groups);
+        assert_eq!(app.group_idx, 1);
+
+        // Moving up selects the first group ("dev") and resets subtask cursor.
+        press(&mut app, &snap, &[KeyCode::Up]);
+        assert_eq!(app.group_idx, 0);
+        assert_eq!(app.groups_focus, GroupsFocus::Groups);
+
+        // Tab switches focus to Current Subtasks; Down moves to the second subtask;
+        // Enter opens its task detail modal and dispatches LoadTask.
+        press(&mut app, &snap, &[KeyCode::Tab, KeyCode::Down]);
+        assert_eq!(app.groups_focus, GroupsFocus::Subtasks);
+        assert_eq!(app.group_subtask_cursor, 1);
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::LoadTask("task_sub2".into()))
+        );
+        assert_eq!(
+            app.modal,
+            Some(Modal::Detail {
+                task_id: "task_sub2".into()
+            })
+        );
+        press(&mut app, &snap, &[KeyCode::Esc]);
+        assert!(app.modal.is_none());
+
+        // Clicking a group row and a subtask row updates selection and focus.
+        render(&mut app, &snap);
+        let (group2_y, _) = app.group_rows.iter().find(|(_, i)| *i == 1).copied().unwrap();
+        handle_click(&mut app, 4, group2_y);
+        assert_eq!(app.group_idx, 1);
+        assert_eq!(app.groups_focus, GroupsFocus::Groups);
+
+        let (group1_y, _) = app.group_rows.iter().find(|(_, i)| *i == 0).copied().unwrap();
+        handle_click(&mut app, 4, group1_y);
+        render(&mut app, &snap);
+        let (sub1_y, _) = app.group_subtask_rows[0];
+        handle_click(&mut app, GROUPS_PANE_WIDTH + 5, sub1_y);
+        assert_eq!(app.groups_focus, GroupsFocus::Subtasks);
+        assert_eq!(app.group_subtask_cursor, 0);
+
+        // 'c' opens Chat in the selected group's attached project room.
+        press(&mut app, &snap, &[KeyCode::Char('c')]);
+        assert_eq!(app.view, View::Chat);
+        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "#sample-app");
+
+        // Clicking the [G]roups tab switches back to Groups; 'd' returns to Dashboard.
+        let groups_x = TABS.find("[G]roups").unwrap() as u16 + 1;
+        handle_click(&mut app, groups_x, 0);
+        assert_eq!(app.view, View::Groups);
+        press(&mut app, &snap, &[KeyCode::Char('d')]);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn groups_panel_handles_empty_groups_and_small_terminal_sizes() {
+        let empty_snap = fixture();
+        let mut app = App {
+            view: View::Groups,
+            ..App::default()
+        };
+        let screen = render(&mut app, &empty_snap);
+        assert!(screen.contains("No groups configured yet."), "{screen}");
+        assert!(screen.contains("No active subtasks."), "{screen}");
+
+        let populated = groups_fixture();
+        for (width, height) in [(110, 32), (60, 10), (20, 6), (1, 1)] {
+            render_to_text(&mut app, &populated, width, height).unwrap();
+        }
+    }
+
+    #[test]
+    fn group_view_parses_http_json_and_handles_missing_fields() {
+        let parsed = group_view(&json!({
+            "name": "dev",
+            "description": "Opus lead with local workers",
+            "lead": {"template": "claude", "model": "opus", "count": 1, "nick": "@Lead"},
+            "workers": [
+                {"template": "claude", "model": "sonnet", "nick": "worker1"},
+                {"template": "ollama", "model": "qwen3:35b", "count": 3}
+            ],
+            "review_policy": {"peer_reviewers": ["@Lead", "worker1"], "quorum": 1},
+            "inactivity_timeout_secs": 300,
+            "projects": ["#cams"]
+        }));
+        assert_eq!(parsed.name, "dev");
+        assert_eq!(parsed.lead.nick.as_deref(), Some("Lead"));
+        assert_eq!(parsed.workers.len(), 2);
+        assert_eq!(parsed.workers[0].count, 1);
+        assert_eq!(parsed.workers[1].count, 3);
+        assert_eq!(parsed.workers[1].nick, None);
+        assert_eq!(parsed.projects, vec!["#cams"]);
+        assert_eq!(
+            parsed.review_policy,
+            Some(GroupReviewPolicyView {
+                peer_reviewers: vec!["Lead".into(), "worker1".into()],
+                quorum: Some(1),
+            })
+        );
+        assert_eq!(parsed.inactivity_timeout_secs, Some(300));
     }
 }
