@@ -296,6 +296,166 @@ class BionicToolsTests(unittest.TestCase):
         self.assertIn("timed out", res["error"])
 
 
+class BionicApplyPatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = self.tmp.name
+        self.src = "".join(f"line{i}\n" for i in range(1, 21))
+        Path(self.cwd, "f.txt").write_bytes(self.src.encode("utf-8"))
+
+    def _patch(self, patch: str, **extra: Any) -> dict[str, Any]:
+        return json.loads(bionic.exec_tool("apply_patch", {"patch": patch, **extra}, self.cwd))
+
+    def _read(self, name: str) -> str:
+        return Path(self.cwd, name).read_bytes().decode("utf-8")
+
+    def test_git_style_multi_hunk_patch(self) -> None:
+        patch = (
+            "diff --git a/f.txt b/f.txt\n"
+            "index 111..222 100644\n"
+            "--- a/f.txt\n"
+            "+++ b/f.txt\n"
+            "@@ -2,3 +2,3 @@\n"
+            " line2\n"
+            "-line3\n"
+            "+LINE3\n"
+            " line4\n"
+            "@@ -15,3 +15,4 @@\n"
+            " line15\n"
+            " line16\n"
+            "+inserted\n"
+            " line17\n"
+        )
+        res = self._patch(patch)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["files"][0]["action"], "modified")
+        self.assertEqual((res["files"][0]["added"], res["files"][0]["removed"]), (2, 1))
+        expected = self.src.replace("line3\n", "LINE3\n").replace("line16\n", "line16\ninserted\n")
+        self.assertEqual(self._read("f.txt"), expected)
+
+    def test_wrong_or_missing_line_numbers_still_apply(self) -> None:
+        res = self._patch("--- f.txt\n+++ f.txt\n@@ -90,2 +90,2 @@\n line10\n-line11\n+eleven\n")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["files"][0]["hunks"][0]["line"], 10)
+        self.assertIn("offset", res["files"][0]["hunks"][0])
+        res = self._patch("@@ @@\n-line12\n+twelve\n", path="f.txt")
+        self.assertTrue(res["ok"], res)
+        self.assertIn("line10\neleven\ntwelve\nline13\n", self._read("f.txt"))
+
+    def test_whitespace_fuzz_and_crlf_preserved(self) -> None:
+        Path(self.cwd, "w.py").write_bytes(b"def f():\r\n    return 1  \r\n\r\nx = 2\r\n")
+        res = self._patch("@@ -1,2 +1,2 @@\n def f():\n-    return 1\n+    return 42\n", path="w.py")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["files"][0]["hunks"][0]["fuzz"], "trailing-whitespace")
+        self.assertEqual(Path(self.cwd, "w.py").read_bytes(), b"def f():\r\n    return 42\r\n\r\nx = 2\r\n")
+
+    def test_create_delete_and_rename(self) -> None:
+        Path(self.cwd, "gone.txt").write_bytes("a\nb\n".encode("utf-8"))
+        Path(self.cwd, "old.txt").write_bytes("keep\nmove\n".encode("utf-8"))
+        patch = (
+            "--- /dev/null\n+++ b/pkg/new.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\n"
+            "--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n"
+            "--- a/old.txt\n+++ b/renamed.txt\n@@ -1,2 +1,2 @@\n keep\n-move\n+moved\n"
+        )
+        res = self._patch(patch)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([f["action"] for f in res["files"]], ["created", "deleted", "renamed"])
+        self.assertEqual(self._read("pkg/new.txt"), "hello\nworld\n")
+        self.assertFalse(Path(self.cwd, "gone.txt").exists())
+        self.assertFalse(Path(self.cwd, "old.txt").exists())
+        self.assertEqual(self._read("renamed.txt"), "keep\nmoved\n")
+
+    def test_no_newline_markers(self) -> None:
+        Path(self.cwd, "n.txt").write_bytes("a\nb".encode("utf-8"))
+        res = self._patch(
+            "--- n.txt\n+++ n.txt\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+c\n"
+        )
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self._read("n.txt"), "a\nc\n")
+        res = self._patch(
+            "--- n.txt\n+++ n.txt\n@@ -1,2 +1,2 @@\n a\n-c\n+d\n\\ No newline at end of file\n"
+        )
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self._read("n.txt"), "a\nd")
+
+    def test_failures_are_atomic_and_descriptive(self) -> None:
+        Path(self.cwd, "g.txt").write_bytes("one\ntwo\n".encode("utf-8"))
+        patch = (
+            "--- g.txt\n+++ g.txt\n@@ -1 +1 @@\n-one\n+ONE\n"
+            "--- f.txt\n+++ f.txt\n@@ -1 +1 @@\n-not there\n+x\n"
+        )
+        res = self._patch(patch)
+        self.assertIn("not found", res["error"])
+        self.assertIn("hunk 1", res["error"])
+        self.assertIn("not there", res["error"])
+        self.assertEqual(self._read("g.txt"), "one\ntwo\n")
+        self.assertEqual(self._read("f.txt"), self.src)
+
+        Path(self.cwd, "dup.txt").write_bytes("x\ny\nx\ny\n".encode("utf-8"))
+        res = self._patch("@@ @@\n x\n-y\n+z\n", path="dup.txt")
+        self.assertIn("matches 2 places", res["error"])
+        res = self._patch("@@ -3,2 +3,2 @@\n x\n-y\n+z\n", path="dup.txt")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self._read("dup.txt"), "x\ny\nx\nz\n")
+
+        for bad, needle in (
+            ("", "non-empty"),
+            ("just prose\n", "no @@ hunks"),
+            ("@@ @@\n-a\n+b\n", "pass 'path'"),
+            ("--- /dev/null\n+++ f.txt\n@@ -0,0 +1 @@\n+x\n", "already exists"),
+            ("--- missing.txt\n+++ missing.txt\n@@ @@\n-a\n+b\n", "file not found"),
+        ):
+            with self.subTest(patch=bad):
+                self.assertIn(needle, self._patch(bad)["error"])
+
+    def test_wrong_hunk_counts_do_not_drop_lines(self) -> None:
+        res = self._patch("--- f.txt\n+++ f.txt\n@@ -6,1 +6,1 @@\n line6\n-line7\n+seven\n+extra\n line8\n")
+        self.assertTrue(res["ok"], res)
+        self.assertIn("line6\nseven\nextra\nline8\n", self._read("f.txt"))
+
+    def test_dry_run_writes_nothing(self) -> None:
+        res = self._patch("@@ @@\n-line5\n+five\n", path="f.txt", dry_run=True)
+        self.assertTrue(res["ok"] and res["dry_run"], res)
+        self.assertEqual(self._read("f.txt"), self.src)
+
+    def test_jail_and_approval(self) -> None:
+        outer = Path(self.cwd).resolve() / "repo"
+        outer.mkdir()
+        secret = Path(self.cwd) / "secret.txt"
+        secret.write_bytes("s\n".encode("utf-8"))
+        for patch in (
+            "--- ../secret.txt\n+++ ../secret.txt\n@@ @@\n-s\n+pwned\n",
+            f"--- /dev/null\n+++ {Path(self.cwd).resolve() / 'planted.txt'}\n@@ -0,0 +1 @@\n+x\n",
+            "--- a/inside.txt\n+++ b/../../escape.txt\n@@ @@\n-x\n+y\n",
+        ):
+            with self.subTest(patch=patch):
+                res = json.loads(bionic.exec_tool("apply_patch", {"patch": patch}, str(outer)))
+                self.assertTrue(res.get("denied"), res)
+        self.assertEqual(secret.read_text(encoding="utf-8"), "s\n")
+        self.assertFalse((Path(self.cwd) / "planted.txt").exists())
+
+        seen: list[dict[str, Any]] = []
+
+        def deny(name: str, args: dict[str, Any]) -> bool:
+            seen.append(args)
+            return False
+
+        patch = {"patch": "@@ @@\n-line1\n+one\n", "path": "f.txt"}
+        res = json.loads(bionic.exec_tool("apply_patch", patch, self.cwd, approval="prompt", approver=deny))
+        self.assertIn("rejected", res["error"])
+        self.assertIn("f.txt", bionic._describe_tool_call("apply_patch", seen[0]))
+        res = json.loads(
+            bionic.exec_tool("apply_patch", {**patch, "dry_run": True}, self.cwd, approval="prompt", approver=deny)
+        )
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(len(seen), 1)
+        res = json.loads(bionic.exec_tool("apply_patch", patch, self.cwd, approval="read-only"))
+        self.assertTrue(res["denied"])
+        self.assertEqual(self._read("f.txt"), self.src)
+        self.assertNotIn("apply_patch", {t["function"]["name"] for t in bionic.tools_for_approval("read-only")})
+
+
 class BionicWorkspaceJailTests(unittest.TestCase):
     """Workspace root jail and tool approval modes."""
 

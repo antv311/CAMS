@@ -11,12 +11,35 @@ The [`lmstudio`](templates/lmstudio.json) preset invokes `lms chat -y -p "{promp
 tests, or execute `airc` coordination commands.
 
 `airc-bionic` runs a multi-turn tool-calling loop against `/v1/chat/completions`
-and exposes four tools to any tool-capable local model:
+and exposes five tools to any tool-capable local model:
 
 - `run_command` — execute shell commands in the task working directory (`airc`, `cargo`, `python`, `git`, test suites).
 - `read_file` — read UTF-8 files with optional `start_line` / `end_line` ranges.
 - `write_file` — write full file contents and create parent directories.
 - `edit_file` — perform unique search-and-replace edits on existing files.
+- `apply_patch` — apply a unified diff to one or more files (see below).
+
+### Patch tool
+
+`apply_patch` takes a unified diff in `patch` (the `diff -u` / `git diff`
+format) so a model can change a few lines without rewriting the whole file:
+
+- Hunks are located by their context and `-` lines, not by line number alone.
+  `@@` line numbers may be wrong or left out (`@@ @@`); when the context matches
+  more than once, the match nearest the `@@` line number wins, and with no line
+  number an ambiguous match is an error. If no exact match exists, a match that
+  ignores trailing whitespace, then one that ignores indentation, is tried; the
+  result reports any `offset` or `fuzz` used.
+- `--- /dev/null` creates a file, `+++ /dev/null` deletes one (every line must
+  be removed), and different `---`/`+++` paths rename. `a/` and `b/` prefixes
+  are stripped, and `\ No newline at end of file` markers are honored.
+- A file's CRLF or LF line endings are kept.
+- The patch is all-or-nothing: if any hunk in any file fails, nothing is written
+  and the error names the file, the hunk and its first expected line.
+- `path` sets the target file of a single-file patch (needed when the patch has
+  no `---`/`+++` headers). `dry_run: true` validates and reports without
+  writing, and is never prompted for in `prompt` mode.
+- Every source and destination path is checked against the workspace root.
 
 ## Installation
 
@@ -121,7 +144,7 @@ lead seats in a CAMS group:
    airc group attach local-dev "#my-project" --invite <owner-key>
    ```
 
-3. When assigned a task or subtask, `aircd` wakes the seat with `airc-bionic --model <model> -p "<expanded role prompt>"`. The local model calls `run_command`, `read_file`, `edit_file`, and `write_file` to inspect the task, edit the repo on a branch, run tests, commit with the task ID, and submit for review via `airc task status <id> review`.
+3. When assigned a task or subtask, `aircd` wakes the seat with `airc-bionic --model <model> -p "<expanded role prompt>"`. The local model calls `run_command`, `read_file`, `apply_patch`, `edit_file`, and `write_file` to inspect the task, edit the repo on a branch, run tests, commit with the task ID, and submit for review via `airc task status <id> review`.
 
 ### Optional conversation resume / PM mode
 
@@ -154,7 +177,7 @@ adjust `--max-turns` and `--command-timeout` as needed for your workload.
 Every tool call is confined to the workspace root (`--workspace-root`, default
 the working directory, which `aircd` sets to the task's `{repo_path}`):
 
-- `read_file`, `write_file` and `edit_file` resolve the requested path fully,
+- `read_file`, `write_file`, `edit_file` and `apply_patch` resolve the requested path fully,
   collapsing `..` and following symlinks and Windows junctions, then refuse it
   unless the result is inside the root. Absolute paths, `~`, drive-relative
   (`D:x`) and rooted (`\x`) Windows paths, and links that point out of the
@@ -179,7 +202,7 @@ run the worker as a restricted OS user or inside a container.
 | Mode | Behavior |
 | --- | --- |
 | `auto` (default) | Calls that pass the jail check run without asking. Use for unattended `aircd` wakes. |
-| `prompt` | Before each `run_command`, `write_file` or `edit_file`, asks `Allow ...? [y/N]` on the controlling terminal (`/dev/tty` or `CONIN$`). If no terminal is attached, the call is denied. Reads never prompt. |
+| `prompt` | Before each `run_command`, `write_file`, `edit_file` or `apply_patch`, asks `Allow ...? [y/N]` on the controlling terminal (`/dev/tty` or `CONIN$`). If no terminal is attached, the call is denied. Reads never prompt. |
 | `read-only` | Only `read_file` is offered to the model; mutating tools are refused. Use for review or analysis seats. |
 
 Set the mode per template with `"env": {"BIONIC_APPROVAL": "read-only"}` or by
