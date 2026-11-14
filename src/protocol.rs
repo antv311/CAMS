@@ -58,6 +58,7 @@ pub enum Command {
         topic: Option<String>,
     },
     List(Option<String>),
+    Channels(Option<String>),
     Whois(String),
     Ison(Vec<String>),
     Userhost(Vec<String>),
@@ -124,6 +125,7 @@ pub fn parse_command(line: &str) -> Command {
             topic: trailing,
         },
         "LIST" => Command::List(parts.next().map(str::to_string).filter(|s| !s.is_empty())),
+        "CHANNELS" => Command::Channels(parts.next().map(str::to_string).filter(|s| !s.is_empty())),
         "WHOIS" => Command::Whois(parts.next().unwrap_or_default().to_string()),
         "ISON" => Command::Ison(
             trailing

@@ -870,6 +870,9 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
               token_id TEXT UNIQUE NOT NULL,
               token_hash TEXT NOT NULL,
               label TEXT,
+              scopes TEXT NOT NULL DEFAULT '[\"admin\"]',
+              ttl_seconds INTEGER,
+              expires_at INTEGER,
               created_at INTEGER NOT NULL,
               revoked_at INTEGER
             );
@@ -1068,6 +1071,7 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
         .context("initialize sqlite schema")?;
 
     migrate_principals(connection)?;
+    migrate_principal_tokens(connection)?;
     migrate_channel_memberships(connection)?;
     migrate_tasks(connection)?;
     migrate_wake_configs(connection)?;
@@ -1330,6 +1334,38 @@ fn migrate_principals(connection: &Connection) -> Result<()> {
             )?;
         }
     }
+
+    Ok(())
+}
+
+/// Additive and idempotent for databases created before token scopes and TTL.
+/// Existing rows default to non-expiring (`expires_at = NULL`) with `["admin"]` scope.
+fn migrate_principal_tokens(connection: &Connection) -> Result<()> {
+    let columns = [
+        ("scopes", "TEXT NOT NULL DEFAULT '[\"admin\"]'"),
+        ("ttl_seconds", "INTEGER"),
+        ("expires_at", "INTEGER"),
+    ];
+
+    for (column, definition) in columns {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('principal_tokens') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?;
+
+        if exists == 0 {
+            connection.execute(
+                &format!("ALTER TABLE principal_tokens ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_principal_tokens_expires ON principal_tokens (expires_at)",
+        [],
+    )?;
 
     Ok(())
 }
@@ -2401,6 +2437,48 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(role, "member");
+        Ok(())
+    }
+
+    #[test]
+    fn migration_adds_token_scope_and_ttl_columns_with_safe_defaults() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE principals (
+               id TEXT PRIMARY KEY,
+               nick TEXT NOT NULL,
+               token TEXT UNIQUE NOT NULL,
+               team TEXT,
+               created_at INTEGER NOT NULL
+             );
+             CREATE TABLE principal_tokens (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+               token_id TEXT UNIQUE NOT NULL,
+               token_hash TEXT NOT NULL,
+               label TEXT,
+               created_at INTEGER NOT NULL,
+               revoked_at INTEGER
+             );
+             INSERT INTO principals (id, nick, token, team, created_at)
+             VALUES ('legacy-user', 'legacy-user', 'legacy-secret', 'core', 100);
+             INSERT INTO principal_tokens (principal_id, token_id, token_hash, label, created_at)
+             VALUES ('legacy-user', 'toklegacy1', 'dummyhash', 'cli', 100);",
+        )?;
+
+        // Running init_with twice verifies additive migration idempotency.
+        init_with(&connection, false)?;
+        init_with(&connection, false)?;
+
+        let (scopes, ttl_seconds, expires_at): (String, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT scopes, ttl_seconds, expires_at FROM principal_tokens WHERE token_id = 'toklegacy1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(scopes, r#"["admin"]"#);
+        assert_eq!(ttl_seconds, None);
+        assert_eq!(expires_at, None);
         Ok(())
     }
 }

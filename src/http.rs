@@ -12,7 +12,9 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, UdpSocket};
 use tokio::net::TcpListener;
 
-use crate::auth::{DuplicatePrincipalError, Principal};
+use crate::auth::{
+    AuthContext, DuplicatePrincipalError, DuplicateTokenLabelError, Scope, TokenExpiredError,
+};
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::locks::LockConflictError;
 use crate::logging::{LogEvent, Severity};
@@ -61,6 +63,10 @@ impl ApiError {
 
     fn unauthorized(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, message)
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, message)
     }
 
     fn conflict(message: impl Into<String>) -> Self {
@@ -226,6 +232,9 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/owner/db", get(owner_db_status))
         .route("/v1/owner/db/checkpoint", post(owner_db_checkpoint))
         .route("/v1/login", post(login_agent))
+        .route("/v1/tokens", get(list_tokens_api).post(issue_token_api))
+        .route("/v1/tokens/refresh", post(refresh_token_api))
+        .route("/v1/tokens/{token_id}", delete(revoke_token_api))
         .route("/v1/me", get(get_me))
         .route("/v1/templates", get(list_templates))
         .route("/v1/groups", get(list_groups).post(upsert_group))
@@ -430,6 +439,8 @@ struct RegisterReq {
     team: Option<String>,
     channels: Option<Vec<String>>,
     invite: Option<String>,
+    scopes: Option<Vec<String>>,
+    ttl_seconds: Option<u64>,
 }
 
 async fn register_agent(
@@ -460,10 +471,16 @@ async fn register_agent(
             ));
         }
     }
-    let (principal, token) = state
+    let (principal, issued) = state
         .server
         .auth()
-        .register_principal(&req.nick, req.role.as_deref(), req.team.as_deref())
+        .register_principal_with_options(
+            &req.nick,
+            req.role.as_deref(),
+            req.team.as_deref(),
+            req.scopes.as_deref(),
+            req.ttl_seconds,
+        )
         .map_err(|err| {
             if err.downcast_ref::<DuplicatePrincipalError>().is_some() {
                 ApiError::conflict(err.to_string())
@@ -501,7 +518,11 @@ async fn register_agent(
         Json(json!({
             "ok": true,
             "principal": principal,
-            "token": token,
+            "token": issued.token,
+            "token_id": issued.token_id,
+            "scopes": issued.scopes,
+            "ttl_seconds": issued.ttl_seconds,
+            "expires_at": issued.expires_at,
             "irc_host": host,
             "irc_port": state.info.irc_port,
             "http_url": format!("http://{}:{}", host, state.info.http_port),
@@ -575,7 +596,13 @@ async fn get_group_memory(
     headers: HeaderMap,
     Path((name, kind)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/groups/{name}/memory/{kind}",
+    )?
+    .principal;
     let memory = state
         .server
         .groups()
@@ -603,7 +630,13 @@ async fn write_group_memory(
     Path((name, kind)): Path<(String, String)>,
     Json(req): Json<WriteGroupMemoryReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Write,
+        "/v1/groups/{name}/memory/{kind}",
+    )?
+    .principal;
     let memory = state
         .server
         .groups()
@@ -627,7 +660,7 @@ async fn list_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    authenticate_request(&state, &headers)?;
+    authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/groups")?;
     let groups = state.server.groups().list().map_err(ApiError::internal)?;
     Ok((
         StatusCode::OK,
@@ -753,7 +786,7 @@ async fn list_templates(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    authenticate_request(&state, &headers)?;
+    authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/templates")?;
     let templates: Vec<TemplateResponse> = state
         .server
         .templates()
@@ -774,7 +807,7 @@ async fn get_template(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    authenticate_request(&state, &headers)?;
+    authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/templates")?;
     let template = state
         .server
         .templates()
@@ -878,7 +911,7 @@ async fn spawn_template_worker(
         require_owner(&state, &headers, req.invite.as_deref())?;
         None
     } else {
-        Some(authenticate_request(&state, &headers)?)
+        Some(authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/templates/spawn")?.principal)
     };
     let created = state
         .server
@@ -1224,6 +1257,8 @@ async fn owner_wake(
 struct OwnerReissueReq {
     nick: String,
     invite: Option<String>,
+    scopes: Option<Vec<String>>,
+    ttl_seconds: Option<u64>,
 }
 
 /// Owner-only: revoke all of an agent's tokens and hand back a fresh one.
@@ -1275,14 +1310,28 @@ async fn owner_reissue_token(
         .resolve_by_name(&req.nick)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("no agent named '{}'", req.nick.trim())))?;
-    let token = state
+    let issued = state
         .server
-        .reissue_token(&principal.id)
-        .map_err(ApiError::internal)?;
+        .reissue_token_with_options(&principal.id, req.scopes.as_deref(), req.ttl_seconds)
+        .map_err(|err| {
+            if err.downcast_ref::<rusqlite::Error>().is_some() {
+                ApiError::internal(err)
+            } else {
+                ApiError::bad_request(err.to_string())
+            }
+        })?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
-        Json(json!({ "ok": true, "principal": principal, "token": token })),
+        Json(json!({
+            "ok": true,
+            "principal": principal,
+            "token": issued.token,
+            "token_id": issued.token_id,
+            "scopes": issued.scopes,
+            "ttl_seconds": issued.ttl_seconds,
+            "expires_at": issued.expires_at,
+        })),
     ))
 }
 
@@ -1441,6 +1490,7 @@ struct LoginReq {
     channels: Option<Vec<String>>,
     rotate_token: Option<bool>,
     label: Option<String>,
+    ttl_seconds: Option<u64>,
 }
 
 async fn login_agent(
@@ -1448,19 +1498,50 @@ async fn login_agent(
     headers: HeaderMap,
     body: Option<Json<LoginReq>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let raw_token = extract_bearer_token(&headers).ok_or_else(|| {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "auth.http_failed",
+            "failure",
+            None,
+            None,
+            Some("/v1/login"),
+            "HTTP authentication failed: missing bearer token",
+        );
+        ApiError::unauthorized(
+            "Missing Authorization: Bearer <token> header; register via POST /v1/register first",
+        )
+    })?;
+    let ctx = authenticate_token_context(&state, raw_token)?;
+    let principal = ctx.principal;
     let req = body.map(|b| b.0).unwrap_or_default();
+    if req.ttl_seconds == Some(0) {
+        return Err(ApiError::bad_request("ttl_seconds must be at least 1"));
+    }
     let channels = req.channels.unwrap_or_else(|| vec!["#general".to_string()]);
     let joined = state
         .server
         .join_channels(&principal, &channels)
         .map_err(ApiError::internal)?;
-    let rotated = if req.rotate_token.unwrap_or(false) {
-        let token = state
+
+    let (rotated, token_id, scopes, expires_at) = if req.rotate_token.unwrap_or(false) {
+        let issued = state
             .server
             .auth()
-            .issue_token(&principal.id, req.label.as_deref(), false)
-            .map_err(ApiError::internal)?;
+            .issue_token_with_scopes(
+                &principal.id,
+                req.label.as_deref(),
+                false,
+                &ctx.token.scopes,
+                req.ttl_seconds.or(ctx.token.ttl_seconds),
+            )
+            .map_err(|err| {
+                if err.downcast_ref::<DuplicateTokenLabelError>().is_some() {
+                    ApiError::conflict(err.to_string())
+                } else {
+                    ApiError::internal(err)
+                }
+            })?;
         state.server.logger().log_security(
             Severity::Info,
             "token.rotated",
@@ -1470,9 +1551,24 @@ async fn login_agent(
             Some("/v1/login"),
             format!("Issued rotated token for @{}", principal.nick),
         );
-        Some(token)
+        (
+            Some(issued.token),
+            Some(issued.token_id),
+            issued.scopes,
+            issued.expires_at,
+        )
     } else {
-        None
+        let (_, refreshed) = state
+            .server
+            .auth()
+            .refresh_token(raw_token, req.ttl_seconds, false)
+            .map_err(ApiError::internal)?;
+        (
+            None,
+            ctx.token.token_id,
+            refreshed.scopes,
+            refreshed.expires_at,
+        )
     };
     let webhook = state
         .server
@@ -1488,7 +1584,286 @@ async fn login_agent(
             "channels": joined,
             "webhook": webhook,
             "rotated_token": rotated,
+            "token_id": token_id,
+            "scopes": scopes,
+            "expires_at": expires_at,
         })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct IssueTokenReq {
+    invite: Option<String>,
+    nick: Option<String>,
+    label: Option<String>,
+    scopes: Option<Vec<String>>,
+    ttl_seconds: Option<u64>,
+    revoke_existing: Option<bool>,
+}
+
+async fn issue_token_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<IssueTokenReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = if headers.contains_key("x-aircd-invite") || req.invite.is_some() {
+        require_owner(&state, &headers, req.invite.as_deref())?;
+        None
+    } else {
+        Some(authenticate_scoped_request(
+            &state,
+            &headers,
+            Scope::Admin,
+            "/v1/tokens",
+        )?)
+    };
+
+    let target = match req.nick.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(nick) => state
+            .server
+            .auth()
+            .resolve_by_name(nick)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("no agent named '{nick}'")))?,
+        None => actor
+            .as_ref()
+            .map(|ctx| ctx.principal.clone())
+            .ok_or_else(|| ApiError::bad_request("nick is required when authenticating with the owner key"))?,
+    };
+
+    let issued = state
+        .server
+        .auth()
+        .issue_token_with_options(
+            &target.id,
+            req.label.as_deref(),
+            req.revoke_existing.unwrap_or(false),
+            req.scopes.as_deref(),
+            req.ttl_seconds,
+        )
+        .map_err(|err| {
+            if err.downcast_ref::<DuplicateTokenLabelError>().is_some() {
+                ApiError::conflict(err.to_string())
+            } else if err.downcast_ref::<rusqlite::Error>().is_some() {
+                ApiError::internal(err)
+            } else {
+                ApiError::bad_request(err.to_string())
+            }
+        })?;
+
+    state.server.logger().log_security(
+        Severity::Info,
+        "token.issued",
+        "success",
+        actor.as_ref().map(|a| a.principal.id.as_str()).or(Some("owner")),
+        Some(&target.id),
+        Some("/v1/tokens"),
+        format!(
+            "Issued token '{}' for @{} (scopes={:?}, expires_at={:?})",
+            issued.token_id, target.nick, issued.scopes, issued.expires_at
+        ),
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "principal": target,
+            "token": issued.token,
+            "token_id": issued.token_id,
+            "label": issued.label,
+            "scopes": issued.scopes,
+            "ttl_seconds": issued.ttl_seconds,
+            "expires_at": issued.expires_at,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct TokensQuery {
+    nick: Option<String>,
+}
+
+async fn list_tokens_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TokensQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let ctx = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/tokens")?;
+    let target = match q.nick.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(nick)
+            if !nick
+                .trim_start_matches('@')
+                .eq_ignore_ascii_case(&ctx.principal.id)
+                && !nick
+                    .trim_start_matches('@')
+                    .eq_ignore_ascii_case(&ctx.principal.nick) =>
+        {
+            if !ctx.token.has_scope(Scope::Admin) {
+                state.server.logger().log_security(
+                    Severity::Warning,
+                    "auth.scope_denied",
+                    "failure",
+                    Some(&ctx.principal.id),
+                    Some(nick),
+                    Some("/v1/tokens"),
+                    format!(
+                        "HTTP GET /v1/tokens?nick={nick} denied for @{}: token lacks required scope 'admin'",
+                        ctx.principal.nick
+                    ),
+                );
+                return Err(ApiError::forbidden(
+                    "token lacks required scope 'admin' to list another account's tokens",
+                ));
+            }
+            state
+                .server
+                .auth()
+                .resolve_by_name(nick)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found(format!("no agent named '{nick}'")))?
+        }
+        _ => ctx.principal,
+    };
+
+    let tokens = state
+        .server
+        .auth()
+        .list_tokens(&target.id)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "principal": target,
+            "tokens": tokens,
+        })),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+struct RefreshTokenReq {
+    ttl_seconds: Option<u64>,
+    rotate: Option<bool>,
+}
+
+async fn refresh_token_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<RefreshTokenReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let raw_token = extract_bearer_token(&headers).ok_or_else(|| {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "auth.http_failed",
+            "failure",
+            None,
+            None,
+            Some("/v1/tokens/refresh"),
+            "HTTP authentication failed: missing bearer token",
+        );
+        ApiError::unauthorized(
+            "Missing Authorization: Bearer <token> header; register via POST /v1/register first",
+        )
+    })?;
+    let req = body.map(|b| b.0).unwrap_or_default();
+    if req.ttl_seconds == Some(0) {
+        return Err(ApiError::bad_request("ttl_seconds must be at least 1"));
+    }
+    let rotate = req.rotate.unwrap_or(false);
+    let (principal, refreshed) = state
+        .server
+        .auth()
+        .refresh_token(raw_token, req.ttl_seconds, rotate)
+        .map_err(|err| {
+            if err.downcast_ref::<TokenExpiredError>().is_some() {
+                ApiError::unauthorized("Bearer token has expired")
+            } else if err.to_string().contains("invalid token") {
+                state.server.logger().log_security(
+                    Severity::Warning,
+                    "auth.http_failed",
+                    "failure",
+                    None,
+                    None,
+                    Some("/v1/tokens/refresh"),
+                    "HTTP authentication failed: invalid bearer token",
+                );
+                ApiError::unauthorized("Invalid bearer token")
+            } else {
+                ApiError::bad_request(err.to_string())
+            }
+        })?;
+
+    state.server.logger().log_security(
+        Severity::Info,
+        "token.refreshed",
+        "success",
+        Some(&principal.id),
+        Some(&principal.id),
+        Some("/v1/tokens/refresh"),
+        format!(
+            "Refreshed token '{}' for @{} (rotate={}, expires_at={:?})",
+            refreshed.token_id, principal.nick, rotate, refreshed.expires_at
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "principal": principal,
+            "token": refreshed.token,
+            "token_id": refreshed.token_id,
+            "label": refreshed.label,
+            "scopes": refreshed.scopes,
+            "ttl_seconds": refreshed.ttl_seconds,
+            "expires_at": refreshed.expires_at,
+        })),
+    ))
+}
+
+async fn revoke_token_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = if headers.contains_key("x-aircd-invite") {
+        require_owner(&state, &headers, None)?;
+        None
+    } else {
+        Some(authenticate_scoped_request(
+            &state,
+            &headers,
+            Scope::Admin,
+            "/v1/tokens/{token_id}",
+        )?)
+    };
+    let revoked = state
+        .server
+        .auth()
+        .revoke_token(&token_id)
+        .map_err(ApiError::internal)?;
+    if !revoked {
+        return Err(ApiError::not_found(format!(
+            "no active token with id '{token_id}'"
+        )));
+    }
+    state.server.logger().log_security(
+        Severity::Info,
+        "token.revoked",
+        "success",
+        actor.as_ref().map(|a| a.principal.id.as_str()).or(Some("owner")),
+        Some(&token_id),
+        Some("/v1/tokens"),
+        format!("Revoked token '{token_id}'"),
+    );
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "revoked": true, "token_id": token_id })),
     ))
 }
 
@@ -1496,19 +1871,20 @@ async fn get_me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let ctx = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/me")?;
     let webhook = state
         .server
         .webhooks()
-        .get(&principal.id)
+        .get(&ctx.principal.id)
         .map_err(ApiError::internal)?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({
             "ok": true,
-            "principal": principal,
+            "principal": ctx.principal,
             "webhook": webhook,
+            "token": ctx.token,
         })),
     ))
 }
@@ -1524,7 +1900,9 @@ async fn join_channels(
     headers: HeaderMap,
     Json(req): Json<JoinChannelsReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/channels/join")?
+            .principal;
     let mut list = req.channels.unwrap_or_default();
     if let Some(ch) = req.channel {
         list.push(ch);
@@ -1557,7 +1935,8 @@ async fn list_messages(
     headers: HeaderMap,
     Query(q): Query<MessagesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal =
+        authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/messages")?.principal;
     let after_seq = q.after_seq.unwrap_or(0);
     let limit = q.limit.unwrap_or(100);
 
@@ -1607,7 +1986,8 @@ async fn post_message(
     headers: HeaderMap,
     Json(req): Json<PostMessageReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/messages")?.principal;
     let target = req
         .target
         .or(req.to)
@@ -1630,7 +2010,7 @@ async fn list_roles(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/roles")?;
     let snapshot = state
         .server
         .directory_snapshot()
@@ -1654,7 +2034,8 @@ async fn set_role(
     headers: HeaderMap,
     Json(req): Json<SetRoleReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Admin, "/v1/roles")?.principal;
     let updated = state
         .server
         .set_role_api(&actor, &req.nick, &req.role, req.channel.as_deref())
@@ -1670,7 +2051,8 @@ async fn get_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/webhooks")?
+        .principal;
     let cfg = state
         .server
         .webhooks()
@@ -1696,7 +2078,8 @@ async fn set_webhook(
     headers: HeaderMap,
     Json(req): Json<SetWebhookReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal = authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/webhooks")?
+        .principal;
     let cfg = state
         .server
         .webhooks()
@@ -1738,7 +2121,8 @@ async fn delete_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal = authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/webhooks")?
+        .principal;
     let deleted = state
         .server
         .webhooks()
@@ -1766,7 +2150,9 @@ async fn test_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/webhooks/test")?
+            .principal;
     let delivery = state
         .server
         .webhooks()
@@ -1790,7 +2176,13 @@ async fn list_webhook_deliveries(
     headers: HeaderMap,
     Query(q): Query<LimitQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/webhooks/deliveries",
+    )?
+    .principal;
     let deliveries = state
         .server
         .webhooks()
@@ -1821,7 +2213,8 @@ async fn create_report(
     headers: HeaderMap,
     Json(req): Json<CreateReportReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let principal = authenticate_request(&state, &headers)?;
+    let principal = authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/reports")?
+        .principal;
     let chan = normalize_http_channel(req.channel.as_deref().unwrap_or("#general"));
     let report = state
         .server
@@ -1858,7 +2251,7 @@ async fn list_reports(
     headers: HeaderMap,
     Query(q): Query<ReportsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/reports")?;
     let channel = q.channel.as_deref().map(normalize_http_channel);
     let author_id = q
         .author
@@ -1884,7 +2277,7 @@ async fn get_report(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/reports/{id}")?;
     let report = state
         .server
         .reports()
@@ -1908,7 +2301,7 @@ async fn list_tasks(
     headers: HeaderMap,
     Query(q): Query<ChannelQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/tasks")?;
     let channel = normalize_http_channel(q.channel.as_deref().unwrap_or("#general"));
     let tasks = state
         .server
@@ -1941,7 +2334,7 @@ async fn create_task(
     headers: HeaderMap,
     Json(req): Json<CreateTaskReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks")?.principal;
     let raw_channel = req.channel.as_deref().ok_or_else(|| {
         ApiError::bad_request("channel is required: name the project channel this task belongs to")
     })?;
@@ -1984,7 +2377,9 @@ async fn assign_task(
     Path(id): Path<String>,
     Json(req): Json<AssignTaskReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/assign")?
+            .principal;
     let task = state
         .server
         .assign_task_api(&actor, &id, req.assignee.as_deref())
@@ -2012,7 +2407,18 @@ async fn set_task_status(
     Path(id): Path<String>,
     Json(req): Json<TaskStatusReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let normalized_status = req.status.trim().to_ascii_lowercase().replace('-', "_");
+    let required_scope = match normalized_status.as_str() {
+        "in_progress" | "testing" | "review" => Scope::Write,
+        _ => Scope::Pm,
+    };
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        required_scope,
+        "/v1/tasks/{id}/status",
+    )?
+    .principal;
     let task = state
         .server
         .set_task_status_revision_api(
@@ -2047,7 +2453,13 @@ async fn peer_review_task(
     Path(id): Path<String>,
     Json(req): Json<PeerReviewTaskReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Write,
+        "/v1/tasks/{id}/peer-review",
+    )?
+    .principal;
     let task = state
         .server
         .peer_review_task_api(&actor, &id, &req.revision, &req.decision, &req.note)
@@ -2064,7 +2476,7 @@ async fn get_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/tasks/{id}")?;
     let task = state
         .server
         .get_task_api(&id)
@@ -2120,7 +2532,13 @@ async fn upload_task_attachment(
     Query(q): Query<AttachQuery>,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Write,
+        "/v1/tasks/{id}/attachments",
+    )?
+    .principal;
     let task = state
         .server
         .get_task_api(&id)
@@ -2163,7 +2581,12 @@ async fn list_task_attachments(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/tasks/{id}/attachments",
+    )?;
     let task = state
         .server
         .get_task_api(&id)
@@ -2186,7 +2609,12 @@ async fn download_task_attachment(
     headers: HeaderMap,
     Path((id, attachment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/tasks/{id}/attachments/{attachment_id}",
+    )?;
     let (meta, data) = state
         .server
         .attachments()
@@ -2229,7 +2657,8 @@ async fn get_inbox(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/inbox")?.principal;
     let inbox = state
         .server
         .inbox_api(&actor)
@@ -2253,7 +2682,8 @@ async fn create_project(
     headers: HeaderMap,
     Json(req): Json<CreateProjectReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Admin, "/v1/projects")?.principal;
     let channel = normalize_http_channel(&req.channel);
     let name = req
         .name
@@ -2281,7 +2711,7 @@ async fn open_room(
     headers: HeaderMap,
     Json(req): Json<OpenRoomReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/rooms")?.principal;
     let project = normalize_http_channel(&req.project);
     let room = state
         .server
@@ -2300,7 +2730,7 @@ async fn list_rooms(
     headers: HeaderMap,
     Query(q): Query<ChannelQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/rooms")?;
     let project = q.channel.as_deref().map(normalize_http_channel);
     let rooms = state
         .server
@@ -2318,7 +2748,7 @@ async fn list_projects(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/projects")?;
     let projects = state
         .server
         .projects()
@@ -2343,7 +2773,13 @@ async fn set_project_member(
     headers: HeaderMap,
     Json(req): Json<ProjectMemberReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Pm,
+        "/v1/projects/members",
+    )?
+    .principal;
     let channel = normalize_http_channel(&req.channel);
     let member = state
         .server
@@ -2361,7 +2797,7 @@ async fn list_project_members(
     headers: HeaderMap,
     Query(q): Query<ChannelQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = authenticate_request(&state, &headers)?;
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/projects/members")?;
     let raw = q
         .channel
         .ok_or_else(|| ApiError::bad_request("channel is required"))?;
@@ -2391,7 +2827,8 @@ async fn ask_task(
     Path(id): Path<String>,
     Json(req): Json<TaskTextReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/ask")?
+        .principal;
     let task = state
         .server
         .ask_task_api(&actor, &id, req.question.as_deref().unwrap_or_default())
@@ -2409,7 +2846,8 @@ async fn answer_task(
     Path(id): Path<String>,
     Json(req): Json<TaskTextReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/answer")?
+        .principal;
     let task = state
         .server
         .answer_task_api(&actor, &id, req.answer.as_deref().unwrap_or_default())
@@ -2427,7 +2865,9 @@ async fn escalate_task(
     Path(id): Path<String>,
     Json(req): Json<TaskTextReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/escalate")?
+            .principal;
     let task = state
         .server
         .escalate_task_api(&actor, &id, req.note.as_deref())
@@ -2450,7 +2890,8 @@ async fn get_notes(
     headers: HeaderMap,
     Query(q): Query<NotesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/notes")?.principal;
     let target_id = match q.nick.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         Some(nick) if !nick.trim_start_matches('@').eq_ignore_ascii_case(&actor.id) => {
             if !Server::is_owner(&actor) {
@@ -2504,7 +2945,8 @@ async fn write_notes(
     headers: HeaderMap,
     Json(req): Json<WriteNotesReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/notes")?.principal;
     let notes = state
         .server
         .notes()
@@ -2528,7 +2970,8 @@ async fn set_project_pm(
     headers: HeaderMap,
     Json(req): Json<ProjectPmReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Admin, "/v1/projects/pm")?.principal;
     let channel = normalize_http_channel(&req.channel);
     let project = state
         .server
@@ -2546,7 +2989,9 @@ async fn claim_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/claim")?
+            .principal;
     let task = state
         .server
         .claim_task_api(&actor, &id)
@@ -2563,7 +3008,9 @@ async fn done_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/done")?
+            .principal;
     let task = state
         .server
         .done_task_api(&actor, &id)
@@ -2580,7 +3027,9 @@ async fn release_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/release")?
+            .principal;
     let task = state
         .server
         .release_task_api(&actor, &id)
@@ -2605,7 +3054,8 @@ async fn acquire_lock(
     headers: HeaderMap,
     Json(req): Json<AcquireLockReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/locks")?.principal;
     let chan = normalize_http_channel(req.channel.as_deref().unwrap_or("#general"));
     let lock = state
         .server
@@ -2641,7 +3091,14 @@ async fn release_lock_post(
     headers: HeaderMap,
     Json(req): Json<ReleaseLockReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let required_scope = if req.force.unwrap_or(false) {
+        Scope::Admin
+    } else {
+        Scope::Write
+    };
+    let actor =
+        authenticate_scoped_request(&state, &headers, required_scope, "/v1/locks/release")?
+            .principal;
     let is_privileged = matches!(
         actor.role.as_str(),
         "leader" | "coordinator" | "op" | "admin"
@@ -2675,17 +3132,38 @@ async fn release_lock_delete(
     headers: HeaderMap,
     Path(resource): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let ctx =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/locks/{resource}")?;
+    let actor = ctx.principal;
     let is_privileged = matches!(
         actor.role.as_str(),
         "leader" | "coordinator" | "op" | "admin"
     );
+    let can_force = is_privileged && ctx.token.has_scope(Scope::Admin);
     let released = state
         .server
-        .release_lock_api(&actor, &resource, is_privileged)
+        .release_lock_api(&actor, &resource, can_force)
         .map_err(|err| {
             if err.downcast_ref::<LockConflictError>().is_some() {
-                ApiError::conflict(err.to_string())
+                if is_privileged && !ctx.token.has_scope(Scope::Admin) {
+                    state.server.logger().log_security(
+                        Severity::Warning,
+                        "auth.scope_denied",
+                        "denied",
+                        Some(&actor.id),
+                        Some(&resource),
+                        Some("/v1/locks/{resource}"),
+                        format!(
+                            "Scope denied for @{} on /v1/locks/{{resource}}: required=admin, token_scopes={:?}",
+                            actor.nick, ctx.token.scopes
+                        ),
+                    );
+                    ApiError::forbidden(
+                        "Token lacks required scope 'admin' to force-unlock another agent's resource",
+                    )
+                } else {
+                    ApiError::conflict(err.to_string())
+                }
             } else {
                 ApiError::bad_request(err.to_string())
             }
@@ -2712,7 +3190,7 @@ async fn register_git_repo(
     headers: HeaderMap,
     Json(req): Json<RegisterGitRepoReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/gits")?.principal;
     let clean_name =
         sanitize_repo_name(&req.name).map_err(|err| ApiError::bad_request(err.to_string()))?;
     let channel = normalize_http_channel(req.channel.as_deref().unwrap_or_else(|| &clean_name));
@@ -2761,7 +3239,8 @@ async fn post_git_event(
     headers: HeaderMap,
     Json(req): Json<PostGitEventReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = authenticate_request(&state, &headers)?;
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/git-events")?.principal;
     let (message, channel) = state
         .server
         .post_git_event(
@@ -3004,8 +3483,8 @@ fn extract_github_summary(
     }
 }
 
-fn authenticate_request(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
-    let raw = headers
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|auth| {
@@ -3019,37 +3498,80 @@ fn authenticate_request(state: &AppState, headers: &HeaderMap) -> Result<Princip
         })
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            state.server.logger().log_security(
-                Severity::Warning,
-                "auth.http_failed",
-                "failure",
-                None,
-                None,
-                None,
-                "HTTP authentication failed: missing bearer token",
-            );
-            ApiError::unauthorized(
-                "Missing Authorization: Bearer <token> header; register via POST /v1/register first",
-            )
-        })?;
+}
 
+fn authenticate_token_context(state: &AppState, raw: &str) -> Result<AuthContext, ApiError> {
     state
         .server
         .auth()
-        .authenticate(raw)
-        .map_err(|_| {
-            state.server.logger().log_security(
-                Severity::Warning,
-                "auth.http_failed",
-                "failure",
-                None,
-                None,
-                None,
-                "HTTP authentication failed: invalid bearer token",
-            );
-            ApiError::unauthorized("Invalid bearer token")
+        .authenticate_context(raw)
+        .map_err(|err| {
+            if err.downcast_ref::<TokenExpiredError>().is_some() {
+                ApiError::unauthorized("Bearer token has expired")
+            } else {
+                state.server.logger().log_security(
+                    Severity::Warning,
+                    "auth.http_failed",
+                    "failure",
+                    None,
+                    None,
+                    None,
+                    "HTTP authentication failed: invalid bearer token",
+                );
+                ApiError::unauthorized("Invalid bearer token")
+            }
         })
+}
+
+fn authenticate_context_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, ApiError> {
+    let raw = extract_bearer_token(headers).ok_or_else(|| {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "auth.http_failed",
+            "failure",
+            None,
+            None,
+            None,
+            "HTTP authentication failed: missing bearer token",
+        );
+        ApiError::unauthorized(
+            "Missing Authorization: Bearer <token> header; register via POST /v1/register first",
+        )
+    })?;
+    authenticate_token_context(state, raw)
+}
+
+fn authenticate_scoped_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    required: Scope,
+    endpoint: &str,
+) -> Result<AuthContext, ApiError> {
+    let ctx = authenticate_context_request(state, headers)?;
+    if !ctx.token.has_scope(required) {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "auth.scope_denied",
+            "failure",
+            Some(&ctx.principal.id),
+            None,
+            Some(endpoint),
+            format!(
+                "HTTP {} denied for @{}: token lacks required scope '{}'",
+                endpoint,
+                ctx.principal.nick,
+                required.as_str()
+            ),
+        );
+        return Err(ApiError::forbidden(format!(
+            "token lacks required scope '{}' for {endpoint}",
+            required.as_str()
+        )));
+    }
+    Ok(ctx)
 }
 
 fn build_welcome_payload(state: &AppState, base_host: &str) -> Result<Value, ApiError> {
@@ -6913,6 +7435,418 @@ mod tests {
         assert_eq!(cp_json["ok"], true);
         assert_eq!(cp_json["checkpoint"]["mode"], "truncate");
         assert_eq!(cp_json["checkpoint"]["busy"], 0);
+
+        handle.abort();
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_endpoints_enforce_token_scopes_ttl_and_refresh() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("aircd-http-scopes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let db = store::open(dir.join("hub.sqlite3"))?;
+        let server = Server::with_logger_backup_and_ttl(
+            db.clone(),
+            crate::logging::EventForwarder::default(),
+            crate::backup::BackupConfig::default(),
+            Some(3600),
+        );
+        let owner_secret = "owner-scopes-secret";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some(owner_secret.to_string());
+        let app = router(server.clone(), info);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // Register a leader principal; initial token defaults to ["admin"] and inherits default TTL.
+        let reg_resp = client
+            .post(format!("{base}/v1/register"))
+            .header("X-AirCD-Invite", owner_secret)
+            .json(&json!({ "nick": "scope-lead", "role": "leader" }))
+            .send()
+            .await?;
+        assert_eq!(reg_resp.status(), StatusCode::CREATED);
+        let reg_json: serde_json::Value = reg_resp.json().await?;
+        let admin_token = reg_json["token"].as_str().unwrap().to_string();
+        assert_eq!(reg_json["scopes"], json!(["admin"]));
+        assert_eq!(reg_json["ttl_seconds"], json!(3600));
+        assert!(reg_json["expires_at"].as_i64().is_some());
+
+        // Owner-only endpoints remain owner-key guarded even against admin bearer tokens.
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/owner/db"))
+                .bearer_auth(&admin_token)
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Register a worker principal and issue read-only, builder, and pm scoped tokens.
+        let worker_reg: serde_json::Value = client
+            .post(format!("{base}/v1/register"))
+            .header("X-AirCD-Invite", owner_secret)
+            .json(&json!({ "nick": "scope-worker", "role": "builder" }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let worker_admin_token = worker_reg["token"].as_str().unwrap().to_string();
+
+        let issue = |nick: &str, scopes: serde_json::Value, ttl: Option<u64>, label: &str| {
+            let client = client.clone();
+            let base = base.clone();
+            let admin_token = admin_token.clone();
+            let nick = nick.to_string();
+            let label = label.to_string();
+            async move {
+                let mut body = json!({
+                    "nick": nick,
+                    "label": label,
+                    "scopes": scopes,
+                });
+                if let Some(ttl) = ttl {
+                    body["ttl_seconds"] = json!(ttl);
+                }
+                client
+                    .post(format!("{base}/v1/tokens"))
+                    .bearer_auth(&admin_token)
+                    .json(&body)
+                    .send()
+                    .await
+            }
+        };
+
+        let ro_json: serde_json::Value = issue("scope-worker", json!(["read-only"]), Some(600), "ro")
+            .await?
+            .json()
+            .await?;
+        assert_eq!(ro_json["scopes"], json!(["read"]));
+        let ro_token = ro_json["token"].as_str().unwrap().to_string();
+        let ro_token_id = ro_json["token_id"].as_str().unwrap().to_string();
+
+        let rw_json: serde_json::Value = issue("scope-worker", json!(["builder"]), Some(600), "rw")
+            .await?
+            .json()
+            .await?;
+        assert_eq!(rw_json["scopes"], json!(["write"]));
+        let rw_token = rw_json["token"].as_str().unwrap().to_string();
+
+        let pm_json: serde_json::Value = issue("scope-lead", json!(["pm"]), Some(600), "pm")
+            .await?
+            .json()
+            .await?;
+        let pm_token = pm_json["token"].as_str().unwrap().to_string();
+
+        // Create a project using admin token (required by POST /v1/projects).
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/projects"))
+                .bearer_auth(&pm_token)
+                .json(&json!({ "channel": "#scopeproj", "name": "Scope Proj" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/projects"))
+                .bearer_auth(&admin_token)
+                .json(&json!({ "channel": "#scopeproj", "name": "Scope Proj" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/projects/members"))
+                .bearer_auth(&pm_token)
+                .json(&json!({ "channel": "#scopeproj", "nick": "scope-worker", "role": "builder" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+
+        // read-only allows GETs (including /v1/me with token metadata) and denies writes.
+        let me_json: serde_json::Value = client
+            .get(format!("{base}/v1/me"))
+            .bearer_auth(&ro_token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(me_json["token"]["scopes"], json!(["read"]));
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/messages"))
+                .bearer_auth(&ro_token)
+                .json(&json!({ "channel": "#scopeproj", "body": "no" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // builder (write) allows messages and claim/testing/review transitions, denies task create/assign/merge & roles.
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/messages"))
+                .bearer_auth(&rw_token)
+                .json(&json!({ "channel": "#scopeproj", "body": "hello" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks"))
+                .bearer_auth(&rw_token)
+                .json(&json!({ "channel": "#scopeproj", "title": "Denied" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // pm creates tasks and assigns one, builder claims an open task and moves assigned -> testing -> review, pm merges; builder cannot merge or set roles.
+        let claimable_task: serde_json::Value = client
+            .post(format!("{base}/v1/tasks"))
+            .bearer_auth(&pm_token)
+            .json(&json!({ "channel": "#scopeproj", "title": "Claimable task" }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let claim_id = claimable_task["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks/{claim_id}/claim"))
+                .bearer_auth(&rw_token)
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+
+        let created_task: serde_json::Value = client
+            .post(format!("{base}/v1/tasks"))
+            .bearer_auth(&pm_token)
+            .json(&json!({ "channel": "#scopeproj", "title": "Scoped task" }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let task_id = created_task["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks/{task_id}/assign"))
+                .bearer_auth(&rw_token)
+                .json(&json!({ "assignee": "scope-worker" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks/{task_id}/assign"))
+                .bearer_auth(&pm_token)
+                .json(&json!({ "assignee": "scope-worker" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks/{task_id}/status"))
+                .bearer_auth(&rw_token)
+                .json(&json!({ "status": "testing" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks/{task_id}/status"))
+                .bearer_auth(&rw_token)
+                .json(&json!({ "status": "review", "note": "all unit tests pass" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks/{task_id}/status"))
+                .bearer_auth(&rw_token)
+                .json(&json!({ "status": "merged" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/tasks/{task_id}/status"))
+                .bearer_auth(&pm_token)
+                .json(&json!({ "status": "merged" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/roles"))
+                .bearer_auth(&pm_token)
+                .json(&json!({ "nick": "scope-worker", "role": "reviewer" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // admin can set roles, list another user's tokens, and force-unlock.
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/roles"))
+                .bearer_auth(&admin_token)
+                .json(&json!({ "nick": "scope-worker", "role": "reviewer" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/tokens?nick=scope-worker"))
+                .bearer_auth(&pm_token)
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let worker_tokens: serde_json::Value = client
+            .get(format!("{base}/v1/tokens?nick=scope-worker"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert!(worker_tokens["tokens"].as_array().unwrap().len() >= 2);
+
+        // POST /v1/tokens/refresh extends TTL and keeps existing scopes without escalation.
+        let refresh_json: serde_json::Value = client
+            .post(format!("{base}/v1/tokens/refresh"))
+            .bearer_auth(&ro_token)
+            .json(&json!({ "ttl_seconds": 7200 }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(refresh_json["scopes"], json!(["read"]));
+        assert_eq!(refresh_json["ttl_seconds"], json!(7200));
+        assert_eq!(refresh_json["token"], json!(ro_token));
+
+        // POST /v1/login with rotate_token preserves scopes too.
+        let login_json: serde_json::Value = client
+            .post(format!("{base}/v1/login"))
+            .bearer_auth(&ro_token)
+            .json(&json!({ "rotate_token": true }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let login_rotated = login_json["rotated_token"].as_str().unwrap().to_string();
+        assert_ne!(login_rotated, ro_token);
+        assert_eq!(login_json["scopes"], json!(["read"]));
+
+        // POST /v1/tokens/refresh with rotate=true replaces the caller's token and retires the old secret.
+        let rotated_resp: serde_json::Value = client
+            .post(format!("{base}/v1/tokens/refresh"))
+            .bearer_auth(&ro_token)
+            .json(&json!({ "rotate": true }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let rotated_ro = rotated_resp["token"].as_str().unwrap().to_string();
+        assert_ne!(rotated_ro, ro_token);
+        assert_eq!(rotated_resp["scopes"], json!(["read"]));
+        // Old rotated token is now rejected with 401.
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/me"))
+                .bearer_auth(&ro_token)
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Also verify worker_admin_token can acquire & another admin force-unlock.
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/locks"))
+                .bearer_auth(&worker_admin_token)
+                .json(&json!({ "resource": "res-lock", "channel": "#scopeproj" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/locks/release"))
+                .bearer_auth(&pm_token)
+                .json(&json!({ "resource": "res-lock", "force": true }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/locks/release"))
+                .bearer_auth(&admin_token)
+                .json(&json!({ "resource": "res-lock", "force": true }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+
+        // Expired token returns 401 Unauthorized.
+        let _ = ro_token_id;
+        let rotated_ro_id = rotated_resp["token_id"].as_str().unwrap();
+        db.write()?.execute(
+            "UPDATE principal_tokens SET expires_at = 1 WHERE token_id = ?1",
+            rusqlite::params![rotated_ro_id],
+        )?;
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/me"))
+                .bearer_auth(&rotated_ro)
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
 
         handle.abort();
         drop(server);

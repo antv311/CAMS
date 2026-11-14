@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
                        --register-key <key>     Invite key required to register (env AIRCD_REGISTER_KEY;\n  \
                                                 default: generated once in aircd-owner.key beside the DB)\n  \
                        --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)\n  \
+                       --token-ttl-seconds <n>  Default bearer token lifetime in seconds (env AIRCD_TOKEN_TTL_SECONDS; default: non-expiring)\n  \
                        --windows-event-log      Forward server errors and security audits to Windows Application Event Log (env AIRCD_WINDOWS_EVENT_LOG=1)\n  \
                        --windows-event-log-source <name>  Windows Event Log source name (default aircd)\n  \
                        --syslog-target <target> Forward server errors and security audits to syslog (udp://host:port, tcp://host:port, unix:///path)\n  \
@@ -163,13 +164,19 @@ async fn main() -> Result<()> {
         tls_bind,
         register_key,
         open_registration,
+        auth: auth_config,
         ..
     } = server_config;
 
     let (register_key, register_note) =
         resolve_register_key(register_key, open_registration, &db_path)?;
     let db = store::open_with_config(&db_path, sqlite_config.clone())?;
-    let server = Server::with_logger_and_backup(db, logger.clone(), backup_config.clone());
+    let server = Server::with_logger_backup_and_ttl(
+        db,
+        logger.clone(),
+        backup_config.clone(),
+        auth_config.token_ttl_seconds,
+    );
     let _webhook_worker = server.webhooks().spawn_worker();
     let _backup_worker = server.backups().spawn_worker();
 
