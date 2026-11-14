@@ -66,3 +66,14 @@ open_registration = false
 # db_vacuum_batch_pages = 64              # max pages reclaimed per non-blocking vacuum step
 # db_vacuum_step_delay_ms = 25            # pause between batches so active writers never starve
 # db_vacuum_max_batches_per_run = 32      # max batches per scheduled pass (0 unlimited)
+
+# Execution timeouts are opt-in for assigned work; claimed tasks retain the
+# AIRCD_TASK_LEASE_SECONDS default (300 seconds). Positive per-task overrides
+# take precedence over priority, then default. Chat does not renew execution.
+# [task_timeout]
+# default_seconds = 3600
+# [task_timeout.priority_seconds]
+# urgent = 900
+# high = 1800
+# normal = 3600
+# low = 7200

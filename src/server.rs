@@ -345,6 +345,79 @@ impl Server {
         &self.tasks
     }
 
+    pub fn with_task_timeout_config(
+        mut self,
+        config: crate::tasks::TaskTimeoutConfig,
+    ) -> Result<Self> {
+        self.tasks = self.tasks.with_timeout_config(config)?;
+        Ok(self)
+    }
+
+    pub fn set_task_timeout_api(
+        &self,
+        actor: &Principal,
+        id: &str,
+        seconds: Option<u32>,
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let task = self.get_task_api(id)?;
+        self.require_dependency_manager(actor, &task)?;
+        self.tasks.set_timeout(id, seconds, &actor.id)
+    }
+
+    pub fn task_heartbeat_api(&self, actor: &Principal, id: &str) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        self.tasks.heartbeat(id, &actor.id)
+    }
+
+    pub fn recover_task_timeouts(&self, now: i64) -> Result<usize> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let events = self.tasks.recover_timeouts(now)?;
+        for event in &events {
+            // Recovery informs the PM and prior worker without killing its process.
+            let mut recipients: HashSet<_> = self
+                .project_managers(&event.task.channel)?
+                .into_iter()
+                .collect();
+            recipients.extend(event.previous_holder.iter().cloned());
+            self.broadcast_task_event_to(
+                &event.task,
+                "timeout",
+                "success",
+                SERVER_NAME,
+                format!(
+                    "TASK {} timed out and returned to {}: {} ({})",
+                    event.task.id, event.task.status, event.task.title, event.note
+                ),
+                recipients,
+            )?;
+        }
+        Ok(events.len())
+    }
+
+    pub fn spawn_task_timeout_worker(&self) -> tokio::task::JoinHandle<()> {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let worker = server.clone();
+                match tokio::task::spawn_blocking(move || {
+                    worker.recover_task_timeouts(unix_timestamp())
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    result => server.logger.log_error(
+                        "task.timeout_error",
+                        format!("task timeout sweep failed: {result:?}"),
+                    ),
+                }
+            }
+        })
+    }
+
     pub fn webhooks(&self) -> &WebhookStore {
         &self.webhooks
     }

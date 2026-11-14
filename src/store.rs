@@ -1268,6 +1268,8 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         ("reviewer", "TEXT"),
         ("parent_task_id", "TEXT"),
         ("review_round_json", "TEXT"),
+        ("timeout_seconds", "INTEGER CHECK(timeout_seconds > 0)"),
+        ("execution_heartbeat_at", "INTEGER"),
     ];
 
     for (column, definition) in columns {
@@ -1285,6 +1287,18 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         }
     }
 
+    connection.execute_batch(
+        "UPDATE tasks SET execution_heartbeat_at = updated_at
+         WHERE status IN ('in_progress', 'testing') AND execution_heartbeat_at IS NULL;
+         CREATE TRIGGER IF NOT EXISTS task_execution_phase AFTER UPDATE OF status ON tasks
+         WHEN OLD.status != NEW.status
+         BEGIN
+           UPDATE tasks SET execution_heartbeat_at =
+             CASE WHEN NEW.status IN ('in_progress', 'testing') THEN NEW.updated_at ELSE NULL END,
+             lease_expires_at = CASE WHEN NEW.status = 'claimed' THEN NEW.lease_expires_at ELSE NULL END
+             WHERE id = NEW.id;
+         END;",
+    )?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks (assignee, status)",
         [],

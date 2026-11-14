@@ -135,6 +135,25 @@ class TaskPayloadTest(unittest.TestCase):
 
 
 class GroupHttpClientTest(_HubCase):
+    def test_task_timeout_sdk_payloads_and_paths(self) -> None:
+        task = {"id": "task/1", "status": "in_progress"}
+        self.reply(*[(200, {"task": task}) for _ in range(4)])
+        hub = AircdHttpClient(self.url, token="member-token", invite="owner")
+        hub.create_task("#one", "Timed", timeout_seconds=60)
+        hub.set_task_timeout("task/1", 90)
+        hub.set_task_timeout("task/1", None)
+        hub.task_heartbeat("task/1")
+        create, configure, inherit, heartbeat = self.hub.requests
+        self.assertEqual(create["body"]["timeout_seconds"], 60)
+        self.assertEqual(configure["path"], "/v1/tasks/task%2F1/timeout")
+        self.assertEqual(configure["body"], {"timeout_seconds": 90})
+        self.assertEqual(inherit["body"], {"timeout_seconds": None})
+        self.assertEqual(heartbeat["path"], "/v1/tasks/task%2F1/heartbeat")
+        for request in self.hub.requests:
+            self.assertEqual(request["headers"]["authorization"], "Bearer member-token")
+            self.assertNotIn("x-aircd-invite", request["headers"])
+
+
     def test_group_activity_uses_member_token_and_encoded_paths(self) -> None:
         heartbeat = {"ok": True, "principal_id": "worker", "last_activity_at": 100}
         events = [{"task_id": "task_1", "old_assignee": "a", "new_assignee": "b", "created_at": 100}]
@@ -272,6 +291,20 @@ class GroupHttpClientTest(_HubCase):
 
 
 class GroupCliTest(_HubCase):
+    def test_task_timeout_cli_commands_and_inheritance(self) -> None:
+        task = {"id": "task_1", "status": "in_progress", "kind": "task", "channel": "#one", "title": "Timed"}
+        self.reply(*[(200, {"task": task}) for _ in range(4)])
+        for args in [("create", "#one", "Timed", "--timeout-seconds", "60"),
+                     ("timeout", "task_1", "90"), ("timeout", "task_1"), ("heartbeat", "task_1")]:
+            code, _, err = self.run_cli("task", *args)
+            self.assertEqual(code, 0, err)
+        create, configure, inherit, heartbeat = self.hub.requests
+        self.assertEqual(create["body"]["timeout_seconds"], 60)
+        self.assertEqual(configure["body"], {"timeout_seconds": 90})
+        self.assertEqual(inherit["body"], {"timeout_seconds": None})
+        self.assertEqual(heartbeat["path"], "/v1/tasks/task_1/heartbeat")
+
+
     def test_activity_cli_and_membership_denial(self) -> None:
         self.reply((200, {"ok": True, "principal_id": "worker", "last_activity_at": 100}),
                    (200, {"events": [{"task_id": "task_1", "old_assignee": "a", "new_assignee": "b", "created_at": 100}]}),
@@ -638,6 +671,27 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         if check and proc.returncode != 0:
             raise AssertionError(f"airc {' '.join(args)} failed:\n{proc.stdout}\n{proc.stderr}")
         return proc
+
+    def test_task_timeout_cli_recovery_against_real_hub(self) -> None:
+        self.cli("project", "create", "#timeout")
+        task = json.loads(self.cli("--json", "task", "create", "#timeout", "Timed execution",
+                                  "--assign", "grplead", "--timeout-seconds", "3").stdout)["task"]
+        tid = task["id"]
+        self.cli("task", "status", tid, "in_progress")
+        beat = json.loads(self.cli("--json", "task", "heartbeat", tid).stdout)["task"]
+        self.assertIsInstance(beat["execution_heartbeat_at"], int)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = json.loads(self.cli("--json", "task", "show", tid).stdout)
+            if state["task"]["status"] == "assigned":
+                break
+            time.sleep(0.2)
+        self.assertEqual(state["task"]["status"], "assigned")
+        self.assertEqual(sum(e["action"] == "timeout" for e in state["events"]), 1)
+        self.assertEqual(self.cli("task", "heartbeat", tid, check=False).returncode, 1)
+        self.cli("task", "timeout", tid)
+        self.cli("task", "status", tid, "testing")
+        self.cli("task", "status", tid, "review", "--note", "timeout CLI smoke passed")
 
     def test_group_activity_cli_against_real_hub(self) -> None:
         for nick in ("activity-lead", "activity-worker", "activity-outsider"):

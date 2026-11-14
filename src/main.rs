@@ -156,6 +156,8 @@ async fn main() -> Result<()> {
     let vacuum_config = server_config.to_vacuum_config()?;
     let tls_spec = server_config.to_tls_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
+    let task_timeout_config = server_config.task_timeout.clone();
+    task_timeout_config.validate()?;
     let config::ServerConfig {
         bind: bind_addr,
         http_bind,
@@ -178,7 +180,8 @@ async fn main() -> Result<()> {
         logger.clone(),
         backup_config.clone(),
         auth_config.token_ttl_seconds,
-    );
+    )
+    .with_task_timeout_config(task_timeout_config)?;
     server.vacuum().update_config(vacuum_config.clone());
     let _webhook_worker = server.webhooks().spawn_worker();
     let _backup_worker = server.backups().spawn_worker();
@@ -229,6 +232,7 @@ async fn main() -> Result<()> {
     };
     server.wakes().set_server_url(&wake_url);
     let _group_inactivity_worker = server.spawn_group_inactivity_worker();
+    let _task_timeout_worker = server.spawn_task_timeout_worker();
     println!("  registration: {register_note}");
     println!(
         "  database:     {} (pool={}, busy={}ms, sync={}, autocheckpoint={}p)",
