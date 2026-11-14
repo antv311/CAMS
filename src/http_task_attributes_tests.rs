@@ -1,5 +1,3 @@
-\\?\C:\Users\tony\Projects\CAMS\.aircd\worktrees\task-tags-metadata\src\http_task_attributes_tests.rs:
-
 async fn attributes_request(
     api: &TemplateApi,
     token: &str,

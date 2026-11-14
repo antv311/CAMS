@@ -1,5 +1,3 @@
-\\?\C:\Users\tony\Projects\CAMS\.aircd\worktrees\task-tags-metadata\src\task_attributes.rs:
-
 //! Descriptive task attributes, independent of workflow and completion output.
 use super::*;
 
