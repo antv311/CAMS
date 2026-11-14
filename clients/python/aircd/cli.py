@@ -9,9 +9,11 @@ import http.server
 import json
 import os
 import shlex
+import shutil
 import socketserver
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -1513,6 +1515,7 @@ def _install_git_hooks(
     channel: str,
     server: str,
     profile_name: str,
+    auto_rebase: bool = True,
 ) -> list[str]:
     hooks_rel = _run_git(repo_root, ["rev-parse", "--git-path", "hooks"])
     hooks_dir = Path(hooks_rel)
@@ -1536,11 +1539,332 @@ def _install_git_hooks(
             f"--event {shlex.quote(event_kind)} --path {shlex.quote(repo_root.as_posix())} "
             "|| true\n"
         )
+        if event_kind == "merge" and auto_rebase:
+            # After a merge lands on the default branch, rebase the open sibling
+            # task branches onto it. `--hook` makes this a no-op on other branches.
+            script += (
+                f"AIRCD_CONFIG_DIR={shlex.quote(cfg_dir)} "
+                f"PYTHONPATH={shlex.quote(cli_root)} "
+                f"{shlex.quote(py_exe)} -m aircd.cli "
+                f"--server {shlex.quote(server)} --profile {shlex.quote(profile_name)} "
+                f"git rebase-siblings --hook --repo {shlex.quote(repo_name)} --path \"$PWD\" "
+                "|| true\n"
+            )
         installed.append(str(_install_single_hook(hooks_dir, hook_name, script)))
     return installed
 
 
+# ── Sibling branch rebase ─────────────────────────────────────
+
+# Tasks in these states have a review bound to their exact commit; rebasing
+# them would silently invalidate that review, so they are left alone unless
+# the caller passes --include-review.
+REBASE_REVIEW_STATUSES = frozenset({"review", "super_review"})
+
+
+def _git_try(repo_path: Path, git_args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo_path), *git_args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+
+
+def _is_ancestor(repo_path: Path, older: str, newer: str) -> bool:
+    return _git_try(repo_path, ["merge-base", "--is-ancestor", older, newer]).returncode == 0
+
+
+def _sibling_candidates(
+    tasks: list[dict[str, Any]],
+    repo_name: str,
+    root: Path,
+    base: str,
+    include_review: bool,
+    extra_branches: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Map open tasks of this repo to local branches. Returns (candidates, skipped)."""
+    candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[str] = {base}
+    for task in tasks:
+        task_repo = (task.get("repo") or "").strip().lower()
+        if task_repo and task_repo != repo_name.lower():
+            continue
+        branch = (task.get("branch") or "").strip() or f"task/{task['id']}"
+        if branch in seen or not _ref_exists(root, f"refs/heads/{branch}"):
+            continue
+        seen.add(branch)
+        entry = {
+            "branch": branch,
+            "task_id": task["id"],
+            "assignee": task.get("assignee"),
+            "status": task.get("status"),
+        }
+        if task.get("status") in REBASE_REVIEW_STATUSES and not include_review:
+            skipped.append({**entry, "result": "skipped", "detail": f"task is in {task['status']}; its review is bound to the current commit"})
+            continue
+        candidates.append(entry)
+    for branch in extra_branches:
+        branch = branch.strip()
+        if not branch or branch in seen:
+            continue
+        seen.add(branch)
+        if not _ref_exists(root, f"refs/heads/{branch}"):
+            skipped.append({"branch": branch, "task_id": None, "assignee": None, "status": None, "result": "skipped", "detail": "no such local branch"})
+            continue
+        candidates.append({"branch": branch, "task_id": None, "assignee": None, "status": None})
+    return candidates, skipped
+
+
+def _worktree_busy(wt_path: Path) -> str | None:
+    """Why a checked-out worktree must not be rebased, or None if it is safe."""
+    for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+        rel = _git_try(wt_path, ["rev-parse", "--git-path", marker]).stdout.strip()
+        if rel:
+            marker_path = Path(rel) if Path(rel).is_absolute() else wt_path / rel
+            if marker_path.exists():
+                return f"a {marker.split('_')[0].lower().replace('-', ' ')} is already in progress in {wt_path}"
+    dirty = _git_try(wt_path, ["status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+    if dirty:
+        return f"uncommitted changes in {wt_path}"
+    return None
+
+
+def _rebase_branch(
+    root: Path,
+    entry: dict[str, Any],
+    base: str,
+    base_sha: str,
+    worktrees: list[dict[str, Any]],
+    env: dict[str, str],
+    dry_run: bool,
+) -> dict[str, Any]:
+    branch = entry["branch"]
+    result = dict(entry)
+    old = _git_try(root, ["rev-parse", f"refs/heads/{branch}"]).stdout.strip()
+    result["old"] = old[:12]
+    if _is_ancestor(root, base_sha, old):
+        return {**result, "result": "up_to_date", "detail": f"already based on {base}"}
+    # No commits of its own (fresh, or already merged): rebasing fast-forwards it.
+    no_own_commits = _is_ancestor(root, old, base_sha)
+
+    checked_out = next((w for w in worktrees if w.get("branch") == branch and not w.get("bare")), None)
+    if checked_out is not None:
+        busy = _worktree_busy(Path(checked_out["path"]))
+        if busy:
+            return {**result, "result": "skipped", "detail": busy}
+
+    if dry_run:
+        probe = _git_try(root, ["merge-tree", "--write-tree", "--name-only", base_sha, old])
+        if probe.returncode == 1:
+            # Output: tree id, conflicted paths, a blank line, then messages.
+            files = []
+            for ln in probe.stdout.splitlines()[1:]:
+                if not ln.strip():
+                    break
+                files.append(ln.strip())
+            return {**result, "result": "would_conflict", "files": files, "detail": "dry run"}
+        return {**result, "result": "would_fast_forward" if no_own_commits else "would_rebase", "detail": "dry run"}
+
+    temp_dir: Path | None = None
+    if checked_out is not None:
+        work = Path(checked_out["path"])
+    else:
+        temp_dir = Path(tempfile.mkdtemp(prefix="aircd-rebase-"))
+        work = temp_dir / "wt"
+        added = _git_try(root, ["worktree", "add", "--quiet", str(work), branch], env=env)
+        if added.returncode != 0:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {**result, "result": "error", "detail": added.stderr.strip() or "git worktree add failed"}
+    try:
+        reb = _git_try(work, ["rebase", "--no-autostash", base_sha], env=env)
+        if reb.returncode != 0:
+            files = [
+                f
+                for f in _git_try(work, ["diff", "--name-only", "--diff-filter=U"]).stdout.splitlines()
+                if f.strip()
+            ]
+            _git_try(work, ["rebase", "--abort"], env=env)
+            return {
+                **result,
+                "result": "conflict",
+                "files": files,
+                "detail": "rebase hit conflicts; aborted and left the branch unchanged",
+            }
+        new = _git_try(root, ["rev-parse", f"refs/heads/{branch}"]).stdout.strip()
+        if no_own_commits:
+            return {**result, "result": "fast_forwarded", "new": new[:12], "detail": f"had no commits of its own; moved to {base}@{base_sha[:12]}"}
+        return {**result, "result": "rebased", "new": new[:12], "detail": f"rebased onto {base}@{base_sha[:12]}"}
+    finally:
+        if temp_dir is not None:
+            _git_try(root, ["worktree", "remove", "--force", str(work)], env=env)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            _git_try(root, ["worktree", "prune"], env=env)
+
+
+def _rebase_env(root: Path, nick: str) -> tuple[dict[str, str], Path]:
+    """Environment for the rebase: hooks off (no commit events per replayed
+    commit, no recursion) and a committer identity if the repo has none."""
+    env = dict(os.environ)
+    hooks_off = Path(tempfile.mkdtemp(prefix="aircd-nohooks-"))
+    count = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    env[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
+    env[f"GIT_CONFIG_VALUE_{count}"] = hooks_off.as_posix()
+    if not _git_try(root, ["config", "user.email"]).stdout.strip():
+        who = nick or "aircd"
+        env.setdefault("GIT_COMMITTER_NAME", who)
+        env.setdefault("GIT_COMMITTER_EMAIL", f"{who}@users.noreply.aircd.local")
+    return env, hooks_off
+
+
+def _cmd_rebase_siblings(args: argparse.Namespace) -> int:
+    hook = bool(args.hook)
+    if hook and os.environ.get("AIRCD_NO_AUTO_REBASE", "").strip() not in ("", "0"):
+        return 0
+    server, token, prof = resolve_connection(args)
+    if not token:
+        if hook:
+            return 0
+        raise CliError("rebase-siblings needs a token to read the project's tasks (airc register/login or --token)")
+    try:
+        target = Path(args.path).resolve()
+        root = _primary_repo_root(target)
+        repo_name = args.repo or root.name
+        repos = http_json(server, "GET", "/v1/gits", token=token).get("git_repos", [])
+        repo = next((r for r in repos if r.get("name", "").lower() == repo_name.lower()), None)
+        if repo is None:
+            repo = next(
+                (r for r in repos if r.get("local_path") and os.path.normcase(str(Path(r["local_path"]).resolve())) == os.path.normcase(str(root))),
+                None,
+            )
+        if repo is not None:
+            repo_name = repo["name"]
+        base = args.base or (repo or {}).get("default_branch") or "main"
+        if hook:
+            current = _git_try(target, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+            if current != base:
+                return 0
+        if not _ref_exists(root, f"refs/heads/{base}"):
+            raise CliError(f"base branch {base!r} does not exist in {root}")
+        base_sha = _run_git(root, ["rev-parse", f"refs/heads/{base}"])
+        channel = args.channel or (repo or {}).get("channel") or _git_channel(repo_name, None)
+        channel = channel if channel.startswith("#") else f"#{channel}"
+        tasks = http_json(
+            server, "GET", f"/v1/tasks?channel={urllib.parse.quote(channel)}", token=token
+        ).get("tasks", [])
+        candidates, skipped = _sibling_candidates(
+            tasks, repo_name, root, base, bool(args.include_review), list(args.branch or [])
+        )
+        worktrees = _parse_worktree_list(root)
+        env, hooks_off = _rebase_env(root, prof.get("nick") or "")
+        try:
+            results = [
+                _rebase_branch(root, entry, base, base_sha, worktrees, env, bool(args.dry_run))
+                for entry in candidates
+            ]
+        finally:
+            shutil.rmtree(hooks_off, ignore_errors=True)
+        results.extend(skipped)
+    except CliError as err:
+        if hook:
+            print(f"aircd: sibling rebase skipped: {err}", file=sys.stderr)
+            return 0
+        raise
+
+    rebased = [r for r in results if r["result"] in ("rebased", "fast_forwarded")]
+    conflicts = [r for r in results if r["result"] in ("conflict", "error")]
+    notified = False
+    if not args.dry_run and not args.no_notify and (rebased or conflicts):
+        notified = _notify_rebase(server, token, repo_name, channel, base, base_sha, rebased, conflicts)
+
+    out = {
+        "ok": not conflicts,
+        "repo": repo_name,
+        "repo_root": str(root),
+        "base": base,
+        "base_commit": base_sha[:12],
+        "channel": channel,
+        "dry_run": bool(args.dry_run),
+        "notified": notified,
+        "branches": results,
+    }
+    lines = [f"Sibling rebase onto {base}@{base_sha[:12]} ({repo_name}):"]
+    for r in results:
+        label = f"{r['branch']}" + (f" ({r['task_id']})" if r.get("task_id") else "")
+        extra = f" files: {', '.join(r['files'])}" if r.get("files") else ""
+        lines.append(f"  {r['result']:<14} {label}: {r.get('detail', '')}{extra}")
+    if not results:
+        lines.append("  no open sibling task branches found")
+    if hook and not rebased and not conflicts:
+        return 0
+    print_out(args, out, lines)
+    # A conflict is reported, not fatal: the branch is left exactly as it was.
+    return 0
+
+
+def _notify_rebase(
+    server: str,
+    token: str,
+    repo_name: str,
+    channel: str,
+    base: str,
+    base_sha: str,
+    rebased: list[dict[str, Any]],
+    conflicts: list[dict[str, Any]],
+) -> bool:
+    parts = []
+    if rebased:
+        parts.append("rebased " + ", ".join(f"{r['branch']} {r['old']}->{r['new']}" for r in rebased))
+    if conflicts:
+        parts.append("needs a manual rebase: " + ", ".join(r["branch"] for r in conflicts))
+    ok = True
+    try:
+        http_json(
+            server,
+            "POST",
+            "/v1/git/event",
+            token=token,
+            payload={
+                "repo": repo_name,
+                "channel": channel,
+                "event": "rebase",
+                "branch": base,
+                "commit": base_sha[:12],
+                "title": f"sibling rebase onto {base}",
+                "summary": f"onto {base}@{base_sha[:12]}: " + "; ".join(parts),
+            },
+            timeout=5.0,
+        )
+    except CliError:
+        ok = False
+    # Clean rebases are only announced in the channel notice above. Owners of
+    # conflicting branches have to act, so they are mentioned by name.
+    for r in conflicts:
+        who = r.get("assignee")
+        if not who:
+            continue
+        task = f" ({r['task_id']})" if r.get("task_id") else ""
+        files = f" Conflicts in: {', '.join(r.get('files') or [])}." if r.get("files") else ""
+        body = (
+            f"@{who} {base} moved to {base_sha[:12]} and your branch {r['branch']}{task} no longer "
+            f"rebases cleanly, so it was left unchanged.{files} Run `git rebase {base}` in your worktree "
+            "and resolve the conflicts."
+        )
+        try:
+            http_json(server, "POST", "/v1/messages", token=token, payload={"target": channel, "body": body}, timeout=5.0)
+        except CliError:
+            ok = False
+    return ok
+
+
 def cmd_git(args: argparse.Namespace) -> int:
+    if args.git_cmd == "rebase-siblings":
+        return _cmd_rebase_siblings(args)
+
     if args.git_cmd == "list":
         server, _token, _prof = resolve_connection(args)
         data = http_json(server, "GET", "/v1/gits")
@@ -1596,7 +1920,9 @@ def cmd_git(args: argparse.Namespace) -> int:
         root, detected_name, _remote, _branch = _detect_git_meta(target)
         repo_name = args.repo or detected_name
         channel = _git_channel(repo_name, args.channel)
-        installed = _install_git_hooks(Path(root), repo_name, channel, server, prof["_profile_name"])
+        installed = _install_git_hooks(
+            Path(root), repo_name, channel, server, prof["_profile_name"], auto_rebase=not args.no_auto_rebase
+        )
         print_out(
             args,
             {"ok": True, "hooks": installed, "repo": repo_name, "channel": channel},
@@ -1623,7 +1949,14 @@ def cmd_git(args: argparse.Namespace) -> int:
                 "default_branch": args.branch or branch,
             },
         )
-        hooks = _install_git_hooks(Path(root), reg["git_repo"]["name"], reg["git_repo"]["channel"], server, prof["_profile_name"])
+        hooks = _install_git_hooks(
+            Path(root),
+            reg["git_repo"]["name"],
+            reg["git_repo"]["channel"],
+            server,
+            prof["_profile_name"],
+            auto_rebase=not args.no_auto_rebase,
+        )
         out = {"ok": True, "git_repo": reg["git_repo"], "webhook_secret": reg.get("webhook_secret"), "hooks": hooks}
         print_out(
             args,
@@ -2333,6 +2666,12 @@ def build_parser() -> argparse.ArgumentParser:
             p_gr.add_argument("--branch")
         if subname == "register":
             p_gr.add_argument("--secret")
+        else:
+            p_gr.add_argument(
+                "--no-auto-rebase",
+                action="store_true",
+                help="Do not rebase open sibling task branches from the post-merge hook",
+            )
         p_gr.set_defaults(func=cmd_git)
 
     p_ge = git_sub.add_parser("emit-hook")
@@ -2341,6 +2680,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_ge.add_argument("--event", default="commit")
     p_ge.add_argument("--path", default=".")
     p_ge.set_defaults(func=cmd_git)
+
+    p_grs = git_sub.add_parser(
+        "rebase-siblings",
+        help="Rebase the open task branches of this repo onto the default branch after a merge",
+    )
+    p_grs.add_argument("--path", default=".")
+    p_grs.add_argument("--repo", help="Registered repo name (default: detected from --path)")
+    p_grs.add_argument("--base", help="Branch to rebase onto (default: the repo's default branch, else main)")
+    p_grs.add_argument("--channel", help="Project channel whose tasks are siblings (default: the repo's channel)")
+    p_grs.add_argument("--branch", action="append", help="Also rebase this local branch (repeatable)")
+    p_grs.add_argument("--include-review", action="store_true", help="Also rebase branches of tasks in review")
+    p_grs.add_argument("--dry-run", action="store_true", help="Report what would happen; change nothing")
+    p_grs.add_argument("--no-notify", action="store_true", help="Do not post the result to the hub")
+    p_grs.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)
+    p_grs.set_defaults(func=cmd_git)
 
     p_gw = git_sub.add_parser("worktree-setup")
     p_gw.add_argument("path")
