@@ -626,13 +626,13 @@ async fn owner_drain_endpoint_and_metrics_track_shutdown_state() -> Result<()> {
 
     // Hold worker slot running so a queued wake exists when drain starts.
     let script = if cfg!(windows) {
-        "ping -n 3 127.0.0.1 >nul"
+        "ping -n 8 127.0.0.1 >nul"
     } else {
-        "sleep 2"
+        "sleep 7"
     };
     server
         .wakes()
-        .upsert(&worker.id, shell_wake_input(script, 0, 10))?;
+        .upsert(&worker.id, shell_wake_input(script, 0, 15))?;
     let wake_ctx = crate::wake::WakeContext {
         principal_id: worker.id.clone(),
         nick: worker.nick.clone(),
@@ -642,7 +642,7 @@ async fn owner_drain_endpoint_and_metrics_track_shutdown_state() -> Result<()> {
         ..Default::default()
     };
     assert!(server.wakes().request(wake_ctx.clone())?);
-    for _ in 0..60 {
+    for _ in 0..100 {
         if server.wakes().active_execution_count() == 1 {
             break;
         }

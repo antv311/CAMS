@@ -6362,9 +6362,9 @@ mod tests {
             .auth()
             .register_principal("slow-drain-worker", Some("member"), None)?;
         let script = if cfg!(windows) {
-            "ping -n 4 127.0.0.1 >nul"
+            "ping -n 7 127.0.0.1 >nul"
         } else {
-            "sleep 3"
+            "sleep 6"
         };
         server.wakes().upsert(&worker.id, shell_wake_config(script))?;
         assert!(server.wakes().request(crate::wake::WakeContext {

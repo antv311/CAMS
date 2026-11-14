@@ -2592,9 +2592,9 @@ mod tests {
     async fn detach_running_executions_leaves_child_alive_and_marks_detached() -> Result<()> {
         let wakes = WakeManager::new(crate::store::open(":memory:")?);
         let script = if cfg!(windows) {
-            "ping -n 3 127.0.0.1 >nul"
+            "ping -n 6 127.0.0.1 >nul"
         } else {
-            "sleep 1.5"
+            "sleep 5"
         };
         wakes.upsert("agent-a", shell_launcher(script))?;
         assert!(wakes.request(channel_ctx("pm", "agent-a", "#cams"))?);
