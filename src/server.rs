@@ -1314,9 +1314,51 @@ impl Server {
         action: &str,
         status: &str,
         actor: &str,
-        mut body: String,
+        body: String,
     ) -> Result<()> {
         let recipients = self.task_wake_recipients(task, action)?;
+        self.broadcast_task_event_to(task, action, status, actor, body, recipients)
+    }
+
+    fn broadcast_task_cascades(
+        &self,
+        root: &Task,
+        changes: Vec<crate::tasks::TaskCascade>,
+        actor: &str,
+    ) -> Result<()> {
+        for change in changes {
+            let recipients = change
+                .task
+                .assignee
+                .iter()
+                .chain(change.previous_holder.iter())
+                .map(|id| id.to_ascii_lowercase())
+                .collect();
+            let text = format!(
+                "TASK {} {} because ancestor {} is {}: {}",
+                change.task.id, change.task.status, root.id, root.status, change.task.title
+            );
+            self.broadcast_task_event_to(
+                &change.task,
+                change.action,
+                "success",
+                actor,
+                text,
+                recipients,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn broadcast_task_event_to(
+        &self,
+        task: &Task,
+        action: &str,
+        status: &str,
+        actor: &str,
+        mut body: String,
+        recipients: HashSet<String>,
+    ) -> Result<()> {
         let mut cc: Vec<_> = recipients
             .iter()
             .filter(|id| !id.eq_ignore_ascii_case(actor))
@@ -2252,6 +2294,7 @@ impl Server {
     /// The assignee cannot continue without a decision: park the task and
     /// ask the project manager.
     pub fn ask_task_api(&self, actor: &Principal, task_id: &str, question: &str) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let question = question.trim();
         if question.is_empty() {
             return Err(anyhow!("a question is required"));
@@ -2260,18 +2303,21 @@ impl Server {
         if current.assignee.as_deref() != Some(actor.id.as_str()) {
             return Err(anyhow!("only the task's assignee can ask a question on it"));
         }
-        let (task, _) = self.tasks.ask(&current.id, &actor.id, question)?;
+        let (update, _) = self.tasks.ask(&current.id, &actor.id, question)?;
+        let task = update.task;
         let text = format!(
             "TASK {} blocked - @{} asks: {}",
             task.id, actor.nick, question
         );
         self.broadcast_task_event(&task, "ask", "success", &actor.nick, text)?;
+        self.broadcast_task_cascades(&task, update.cascaded, &actor.nick)?;
         Ok(task)
     }
 
     /// A project manager, or the owner, answers the pending question; the
     /// task returns to where it was and the asker is notified.
     pub fn answer_task_api(&self, actor: &Principal, task_id: &str, answer: &str) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let answer = answer.trim();
         if answer.is_empty() {
             return Err(anyhow!("an answer is required"));
@@ -2289,12 +2335,14 @@ impl Server {
                 current.channel
             ));
         }
-        let (task, question) = self.tasks.answer(&current.id, &actor.id, answer)?;
+        let (update, question) = self.tasks.answer(&current.id, &actor.id, answer)?;
+        let task = update.task;
         let text = format!(
             "TASK {} answered by @{} for @{}: {}",
             task.id, actor.nick, question.asked_by, answer
         );
         self.broadcast_task_event(&task, "answer", "success", &actor.nick, text)?;
+        self.broadcast_task_cascades(&task, update.cascaded, &actor.nick)?;
         Ok(task)
     }
 
@@ -2305,6 +2353,7 @@ impl Server {
         task_id: &str,
         note: Option<&str>,
     ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let current = self.get_task_api(task_id)?;
         let is_manager = self.is_project_manager(actor, &current.channel)?;
         if !is_manager && !self.is_task_reviewer(actor, &current)? {
@@ -2705,6 +2754,7 @@ impl Server {
     }
 
     pub fn create_task_full_api(&self, actor: &Principal, mut new: NewTask) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let title = new.title.trim().to_string();
         if title.is_empty() {
             return Err(anyhow!("task title is required"));
@@ -3211,7 +3261,7 @@ impl Server {
             }
         }
         let note = (!evidence.is_empty()).then_some(evidence.as_str());
-        let task = self.tasks.set_status_with_round(
+        let update = self.tasks.set_status_with_round(
             &current.id,
             &from,
             &to,
@@ -3220,6 +3270,7 @@ impl Server {
             branch,
             round.as_ref(),
         )?;
+        let task = update.task;
 
         let mut text = format!(
             "TASK {} {} -> {} by @{}: {}",
@@ -3228,7 +3279,12 @@ impl Server {
         if let Some(note) = note {
             text.push_str(&format!(" - {note}"));
         }
-        self.broadcast_task_event(&task, "status", "success", &actor.nick, text)?;
+        let mut recipients = self.task_wake_recipients(&task, "status")?;
+        if to == "cancelled" {
+            recipients.extend(current.claimed_by.iter().map(|id| id.to_ascii_lowercase()));
+        }
+        self.broadcast_task_event_to(&task, "status", "success", &actor.nick, text, recipients)?;
+        self.broadcast_task_cascades(&task, update.cascaded, &actor.nick)?;
         self.notify_unblocked_dependents(&task, &actor.nick);
         Ok(task)
     }

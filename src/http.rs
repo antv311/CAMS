@@ -4874,6 +4874,7 @@ mod tests {
     include!("http_group_memory_tests.rs");
     include!("http_attachment_tests.rs");
     include!("http_group_activity_tests.rs");
+    include!("http_task_cascade_tests.rs");
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
     include!("http_dashboard_tests.rs");

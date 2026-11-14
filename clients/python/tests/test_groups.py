@@ -690,6 +690,44 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         notes = [ev.get("note") or "" for ev in shown["events"]]
         self.assertTrue(any(f"report {rep['id']}" in n and "12 passed" in n for n in notes), notes)
 
+    def test_parent_pause_and_cancellation_cascade_against_real_hub(self) -> None:
+        self.cli("project", "create", "#cascade")
+
+        def create(title: str, parent: str | None = None) -> str:
+            args = ["--json", "task", "create", "#cascade", title, "--assign", "grplead"]
+            if parent:
+                args.extend(["--parent", parent])
+            return json.loads(self.cli(*args).stdout)["task"]["id"]
+
+        def show(tid: str) -> dict:
+            return json.loads(self.cli("--json", "task", "show", tid).stdout)
+
+        parent = create("Parent")
+        child = create("Independent blocker", parent)
+        nested = create("Nested work", child)
+        sibling = create("Testing work", parent)
+        self.cli("task", "status", sibling, "testing")
+        self.cli("task", "ask", child, "Child decision?")
+        self.cli("task", "ask", parent, "Parent decision?")
+        for tid in (parent, child, nested, sibling):
+            self.assertEqual(show(tid)["task"]["status"], "blocked")
+        denied = self.cli("task", "assign", sibling, "grplead", check=False)
+        self.assertEqual(denied.returncode, 1)
+        self.cli("task", "answer", parent, "Continue parent")
+        self.assertEqual(show(sibling)["task"]["status"], "testing")
+        self.assertEqual(show(child)["task"]["status"], "blocked")
+        self.assertEqual(show(nested)["task"]["status"], "blocked")
+        self.cli("task", "answer", child, "Continue child")
+        self.assertEqual(show(nested)["task"]["status"], "assigned")
+        self.cli("task", "ask", child, "Obsolete question?")
+        self.cli("task", "status", parent, "cancelled", "--note", "Cancel the tree")
+        for tid in (child, nested, sibling):
+            snapshot = show(tid)
+            self.assertEqual(snapshot["task"]["status"], "cancelled")
+            self.assertIsNone(snapshot["question"])
+            self.assertEqual(snapshot["events"][-1]["action"], "parent_cancel")
+        self.assertEqual(self.cli("task", "answer", child, "Too late", check=False).returncode, 1)
+
     def test_consensus_cli_against_real_hub(self) -> None:
         self.cli("project", "create", "#consensus")
         for nick in ("consensus-lead", "consensus-worker", "consensus-peer"):
