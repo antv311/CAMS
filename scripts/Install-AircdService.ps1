@@ -37,6 +37,10 @@ param(
     [string]$TlsCert = '',
     [string]$TlsKey = '',
     [string]$TlsBind = '127.0.0.1:6697',
+    [string]$TlsClientCa = '',
+    [string]$TlsClientAuth = '',
+    [string]$HttpTlsBind = '',
+    [switch]$TlsOnly,
     [switch]$WindowsEventLog,
     [string]$WindowsEventLogSource = '',
     [string]$SyslogTarget = '',
@@ -79,7 +83,7 @@ if ($StartNow -and ($Uninstall -or $Stop -or $Status)) {
 Import-Module (Join-Path $PSScriptRoot 'AircdService.psm1') -Force
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $CfgParams = @{ RepoRoot = $RepoRoot }
-foreach ($Key in @('ConfigPath', 'Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'WindowsEventLog', 'WindowsEventLogSource', 'SyslogTarget', 'SyslogFormat', 'SyslogFacility', 'ExecutablePath')) {
+foreach ($Key in @('ConfigPath', 'Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'TlsClientCa', 'TlsClientAuth', 'HttpTlsBind', 'TlsOnly', 'WindowsEventLog', 'WindowsEventLogSource', 'SyslogTarget', 'SyslogFormat', 'SyslogFacility', 'ExecutablePath')) {
     if ($PSBoundParameters.ContainsKey($Key)) {
         $CfgParams[$Key] = $PSBoundParameters[$Key]
     }

@@ -407,6 +407,10 @@ function Resolve-AircdWindowsConfig {
     }
 
     $TlsBindRes = & $ResolveSetting 'TlsBind' @('AIRCD_TLS_BIND') @('server', '') @('tls_bind') '127.0.0.1:6697'
+    $TlsClientCaRes = & $ResolveSetting 'TlsClientCa' @('AIRCD_TLS_CLIENT_CA') @('server', '') @('tls_client_ca') '' -IsPath
+    $TlsClientAuthRes = & $ResolveSetting 'TlsClientAuth' @('AIRCD_TLS_CLIENT_AUTH') @('server', '') @('tls_client_auth') ''
+    $HttpTlsBindRes = & $ResolveSetting 'HttpTlsBind' @('AIRCD_HTTP_TLS_BIND') @('server', '') @('http_tls_bind') ''
+    $TlsOnlyRes = & $ResolveSetting 'TlsOnly' @('AIRCD_TLS_ONLY') @('server', '') @('tls_only') $false -IsBool
     $WinEventLogRes = & $ResolveSetting 'WindowsEventLog' @('AIRCD_WINDOWS_EVENT_LOG') @('server', '') @('windows_event_log') $false -IsBool
     $WinEventSourceRes = & $ResolveSetting 'WindowsEventLogSource' @('AIRCD_WINDOWS_EVENT_LOG_SOURCE') @('server', '') @('windows_event_log_source') ''
     $SyslogTargetRes = & $ResolveSetting 'SyslogTarget' @('AIRCD_SYSLOG_TARGET') @('server', '') @('syslog_target') ''
@@ -439,6 +443,10 @@ function Resolve-AircdWindowsConfig {
         TlsCert               = $TlsCertRes.Value
         TlsKey                = $TlsKeyRes.Value
         TlsBind               = $TlsBindRes.Value
+        TlsClientCa           = $TlsClientCaRes.Value
+        TlsClientAuth         = $TlsClientAuthRes.Value
+        HttpTlsBind           = $HttpTlsBindRes.Value
+        TlsOnly               = $TlsOnlyRes.Value
         WindowsEventLog       = $WinEventLogRes.Value
         WindowsEventLogSource = $WinEventSourceRes.Value
         SyslogTarget          = $SyslogTargetRes.Value

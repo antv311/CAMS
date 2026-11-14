@@ -9,6 +9,11 @@ tls_bind = "127.0.0.1:6697"
 db = "aircd.sqlite3"
 # tls_cert = "cert.pem"
 # tls_key = "key.pem"
+# Mutual TLS (mTLS) client certificate verification and optional HTTPS listener:
+# tls_client_ca = "client-ca.pem"
+# tls_client_auth = "required"          # none, optional, or required (default required if tls_client_ca is set)
+# http_tls_bind = "0.0.0.0:6443"        # HTTPS API listener using the TLS/mTLS config
+# tls_only = false                      # true disables plaintext IRC and HTTP listeners
 
 # By default a random owner key is generated once beside the database.
 # Prefer AIRCD_REGISTER_KEY to storing a credential in this file.

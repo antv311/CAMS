@@ -384,7 +384,11 @@ class Daemon:
         tls: bool = False,
         tls_verify: bool = True,
         tls_ca_path: Optional[str] = None,
+        tls_cert_path: Optional[str] = None,
+        tls_key_path: Optional[str] = None,
     ):
+        if tls_key_path and not tls_cert_path:
+            raise ValueError("tls_cert_path is required when tls_key_path is set")
         self.host = host
         self.port = port
         self.token = token
@@ -397,6 +401,8 @@ class Daemon:
         self.tls = tls
         self.tls_verify = tls_verify
         self.tls_ca_path = tls_ca_path
+        self.tls_cert_path = tls_cert_path
+        self.tls_key_path = tls_key_path
 
         self.irc: Optional[AircdClient] = None
         self.agent = AgentState()
@@ -435,6 +441,8 @@ class Daemon:
             tls=self.tls,
             tls_verify=self.tls_verify,
             tls_ca_path=self.tls_ca_path,
+            tls_cert_path=self.tls_cert_path,
+            tls_key_path=self.tls_key_path,
             auto_reconnect=True,
         )
         await self.irc.connect()
@@ -1090,8 +1098,18 @@ def main():
     )
     parser.add_argument(
         "--tls-ca",
-        default=None,
-        help="Path to CA certificate file for TLS verification",
+        default=os.environ.get("AIRCD_TLS_CA") or None,
+        help="Path to CA certificate file for TLS verification (env AIRCD_TLS_CA)",
+    )
+    parser.add_argument(
+        "--tls-cert",
+        default=os.environ.get("AIRCD_TLS_CLIENT_CERT") or None,
+        help="Path to client TLS certificate PEM for mutual TLS (env AIRCD_TLS_CLIENT_CERT)",
+    )
+    parser.add_argument(
+        "--tls-key",
+        default=os.environ.get("AIRCD_TLS_CLIENT_KEY") or None,
+        help="Path to client TLS private key PEM for mutual TLS (env AIRCD_TLS_CLIENT_KEY)",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -1122,6 +1140,8 @@ def main():
             tls=args.tls,
             tls_verify=not args.tls_insecure,
             tls_ca_path=args.tls_ca,
+            tls_cert_path=args.tls_cert,
+            tls_key_path=args.tls_key,
         )
     except ValueError as e:
         parser.error(str(e))

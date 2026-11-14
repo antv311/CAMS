@@ -331,7 +331,10 @@ impl LogEvent {
         match self.action.as_str() {
             "server.startup_error" => 1001,
             "irc.accept_error" | "irc.connection_error" => 1002,
-            "irc.tls_handshake_failed" | "irc.tls_connection_error" => 1003,
+            "irc.tls_handshake_failed"
+            | "irc.tls_connection_error"
+            | "http.tls_handshake_failed"
+            | "http.tls_connection_error" => 1003,
             "http.internal_error" => 1004,
             "webhook.enqueue_error" | "webhook.worker_error" => 1005,
             "wake.request_error" | "wake.run_error" | "wake.failure_notice_error" => 1006,
@@ -354,6 +357,7 @@ impl LogEvent {
             | "template.deleted" => 2009,
             "auth.irc_session_replaced" => 2010,
             "http.rate_limited" => 2011,
+            "irc.tls_client_verified" | "http.tls_client_verified" => 2012,
             _ => 2099,
         }
     }

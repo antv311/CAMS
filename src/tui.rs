@@ -18,6 +18,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -208,12 +209,24 @@ pub struct Snapshot {
     pub hub_down: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct TuiConfig {
     server: String,
     token: String,
     nick: String,
     owner_key: Option<String>,
+    tls_ca: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_insecure: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TuiTlsOverrides {
+    ca: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+    insecure: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -463,8 +476,29 @@ fn selected_task<'a>(app: &App, snap: &'a Snapshot) -> Option<&'a TaskView> {
 
 // ---------------------------------------------------------------- config
 
-fn load_config(server: Option<String>, profile: Option<String>) -> Result<TuiConfig> {
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn load_config(
+    server: Option<String>,
+    profile: Option<String>,
+    tls: TuiTlsOverrides,
+) -> Result<TuiConfig> {
     let dir = config_dir();
+    load_config_from_dir(&dir, server, profile, tls, env_nonempty)
+}
+
+fn load_config_from_dir(
+    dir: &Path,
+    server: Option<String>,
+    profile: Option<String>,
+    tls: TuiTlsOverrides,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<TuiConfig> {
     let path = dir.join("profiles.json");
     let raw = std::fs::read_to_string(&path).with_context(|| {
         format!(
@@ -485,6 +519,28 @@ fn load_config(server: Option<String>, profile: Option<String>) -> Result<TuiCon
         .ok()
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty());
+    let tls_ca = tls
+        .ca
+        .or_else(|| env("AIRCD_TLS_CA"))
+        .or_else(|| entry["tls_ca"].as_str().map(str::to_owned))
+        .filter(|s| !s.trim().is_empty());
+    let tls_cert = tls
+        .cert
+        .or_else(|| env("AIRCD_TLS_CLIENT_CERT"))
+        .or_else(|| entry["tls_cert"].as_str().map(str::to_owned))
+        .filter(|s| !s.trim().is_empty());
+    let tls_key = tls
+        .key
+        .or_else(|| env("AIRCD_TLS_CLIENT_KEY"))
+        .or_else(|| entry["tls_key"].as_str().map(str::to_owned))
+        .filter(|s| !s.trim().is_empty());
+    if tls_key.is_some() && tls_cert.is_none() {
+        return Err(anyhow!("--tls-cert is required when --tls-key is specified"));
+    }
+    let tls_insecure = tls.insecure
+        || env("AIRCD_TLS_INSECURE")
+            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        || entry["tls_insecure"].as_bool().unwrap_or(false);
     Ok(TuiConfig {
         server: server
             .or_else(|| entry["server"].as_str().map(str::to_owned))
@@ -494,7 +550,45 @@ fn load_config(server: Option<String>, profile: Option<String>) -> Result<TuiCon
         token,
         nick: entry["nick"].as_str().unwrap_or(&name).to_string(),
         owner_key,
+        tls_ca,
+        tls_cert,
+        tls_key,
+        tls_insecure,
     })
+}
+
+fn build_http_client(cfg: &TuiConfig) -> Result<reqwest::Client> {
+    crate::tls::ensure_crypto_provider();
+    if cfg.tls_key.is_some() && cfg.tls_cert.is_none() {
+        return Err(anyhow!("tls_cert is required when tls_key is set"));
+    }
+    let mut builder = reqwest::Client::builder();
+    if let Some(ca_path) = &cfg.tls_ca {
+        let ca_pem = std::fs::read(ca_path)
+            .with_context(|| format!("read TLS CA certificate: {ca_path}"))?;
+        let cert = reqwest::Certificate::from_pem(&ca_pem)
+            .with_context(|| format!("parse TLS CA certificate: {ca_path}"))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    if let Some(cert_path) = &cfg.tls_cert {
+        let mut combined = std::fs::read(cert_path)
+            .with_context(|| format!("read client TLS certificate: {cert_path}"))?;
+        if let Some(key_path) = &cfg.tls_key {
+            let key_pem = std::fs::read(key_path)
+                .with_context(|| format!("read client TLS private key: {key_path}"))?;
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&key_pem);
+        }
+        let identity = reqwest::Identity::from_pem(&combined)
+            .with_context(|| format!("load client TLS identity from {cert_path}"))?;
+        builder = builder.identity(identity);
+    }
+    if cfg.tls_insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().context("build HTTP/HTTPS client")
 }
 
 // ---------------------------------------------------------------- fetching
@@ -1188,12 +1282,12 @@ async fn start_hub(server: &str) -> (bool, String) {
 }
 
 async fn fetch_loop(
+    client: reqwest::Client,
     cfg: TuiConfig,
     shared: Arc<Mutex<Snapshot>>,
     mut commands: UnboundedReceiver<Action>,
     stop: Arc<AtomicBool>,
 ) {
-    let client = reqwest::Client::new();
     let set_notice = |ok: bool, message: String| {
         shared.lock().expect("snapshot mutex poisoned").notice =
             Some((ok, message, Instant::now()));
@@ -3237,11 +3331,16 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     let mut server = None;
     let mut profile = None;
     let mut dump = false;
+    let mut tls = TuiTlsOverrides::default();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--server" => server = Some(iter.next().context("--server requires a URL")?),
             "--profile" => profile = Some(iter.next().context("--profile requires a name")?),
+            "--tls-ca" => tls.ca = Some(iter.next().context("--tls-ca requires a path")?),
+            "--tls-cert" => tls.cert = Some(iter.next().context("--tls-cert requires a path")?),
+            "--tls-key" => tls.key = Some(iter.next().context("--tls-key requires a path")?),
+            "--tls-insecure" => tls.insecure = true,
             "--dump" => dump = true,
             "-h" | "--help" => {
                 println!(
@@ -3249,6 +3348,10 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                      Flags:\n  \
                        --server <url>     Hub address (default: the profile's, or http://127.0.0.1:6680)\n  \
                        --profile <name>   Saved airc profile to sign in as (default: your default profile)\n  \
+                       --tls-ca <path>    CA certificate PEM for verifying HTTPS hub\n  \
+                       --tls-cert <path>  Client TLS certificate PEM for mutual TLS (mTLS)\n  \
+                       --tls-key <path>   Client TLS private key PEM for mutual TLS (mTLS)\n  \
+                       --tls-insecure     Skip HTTPS server certificate verification\n  \
                        --dump             Print the dashboard and chat screens once as plain text and exit\n\
                      Press ? on the dashboard for the list of keys."
                 );
@@ -3257,7 +3360,8 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             other => return Err(anyhow!("unknown argument for tui: {other} (use --help)")),
         }
     }
-    let cfg = load_config(server, profile)?;
+    let cfg = load_config(server, profile, tls)?;
+    let client = build_http_client(&cfg)?;
 
     let shared = Arc::new(Mutex::new(Snapshot {
         server: cfg.server.clone(),
@@ -3266,7 +3370,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }));
     // Fail with a clear message before taking over the terminal, except
     // when the hub is simply not running: the interface offers to start it.
-    if let Err(err) = refresh(&reqwest::Client::new(), &cfg, &shared).await {
+    if let Err(err) = refresh(&client, &cfg, &shared).await {
         if dump || !hub_unreachable(&err) {
             return Err(err);
         }
@@ -3297,7 +3401,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 
     let (tx, rx) = unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let fetcher = tokio::spawn(fetch_loop(cfg, shared.clone(), rx, stop.clone()));
+    let fetcher = tokio::spawn(fetch_loop(client, cfg, shared.clone(), rx, stop.clone()));
     let outcome = tokio::task::spawn_blocking(move || ui_loop(shared, tx)).await;
     stop.store(true, Ordering::Relaxed);
     fetcher.abort();
@@ -4837,6 +4941,7 @@ mod tests {
             token: "t".into(),
             nick: "me".into(),
             owner_key: None,
+            ..TuiConfig::default()
         };
         let err = get(&reqwest::Client::new(), &cfg, "/v1/me")
             .await
@@ -4896,5 +5001,136 @@ mod tests {
             Some(Action::StartHub)
         );
         assert!(!render(&mut app, &up).contains("No hub is running"));
+    }
+
+    #[test]
+    fn tui_tls_config_precedence_and_validation() {
+        let dir = crate::tls::tests::TempDir::new("aircd-tui-cfg");
+        std::fs::write(
+            dir.0.join("profiles.json"),
+            serde_json::json!({
+                "default": "alice",
+                "profiles": {
+                    "alice": {
+                        "server": "https://127.0.0.1:6681/",
+                        "token": "tok-1",
+                        "nick": "alice",
+                        "tls_ca": "/prof/ca.pem",
+                        "tls_cert": "/prof/cert.pem",
+                        "tls_key": "/prof/key.pem",
+                        "tls_insecure": false
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write profiles");
+
+        // Profile values used when CLI/env are absent.
+        let cfg = load_config_from_dir(&dir.0, None, None, TuiTlsOverrides::default(), |_| None)
+            .expect("load from profile");
+        assert_eq!(cfg.server, "https://127.0.0.1:6681");
+        assert_eq!(cfg.tls_ca.as_deref(), Some("/prof/ca.pem"));
+        assert_eq!(cfg.tls_cert.as_deref(), Some("/prof/cert.pem"));
+        assert_eq!(cfg.tls_key.as_deref(), Some("/prof/key.pem"));
+        assert!(!cfg.tls_insecure);
+
+        // Env overrides profile.
+        let cfg = load_config_from_dir(&dir.0, None, None, TuiTlsOverrides::default(), |name| {
+            match name {
+                "AIRCD_TLS_CA" => Some("/env/ca.pem".into()),
+                "AIRCD_TLS_INSECURE" => Some("yes".into()),
+                _ => None,
+            }
+        })
+        .expect("load with env override");
+        assert_eq!(cfg.tls_ca.as_deref(), Some("/env/ca.pem"));
+        assert_eq!(cfg.tls_cert.as_deref(), Some("/prof/cert.pem"));
+        assert!(cfg.tls_insecure);
+
+        // CLI overrides env and profile.
+        let cfg = load_config_from_dir(
+            &dir.0,
+            None,
+            None,
+            TuiTlsOverrides {
+                ca: Some("/cli/ca.pem".into()),
+                cert: Some("/cli/cert.pem".into()),
+                key: Some("/cli/key.pem".into()),
+                insecure: false,
+            },
+            |name| match name {
+                "AIRCD_TLS_CA" => Some("/env/ca.pem".into()),
+                "AIRCD_TLS_CLIENT_CERT" => Some("/env/cert.pem".into()),
+                "AIRCD_TLS_CLIENT_KEY" => Some("/env/key.pem".into()),
+                _ => None,
+            },
+        )
+        .expect("load with CLI override");
+        assert_eq!(cfg.tls_ca.as_deref(), Some("/cli/ca.pem"));
+        assert_eq!(cfg.tls_cert.as_deref(), Some("/cli/cert.pem"));
+        assert_eq!(cfg.tls_key.as_deref(), Some("/cli/key.pem"));
+
+        // tls_key without tls_cert is rejected.
+        std::fs::write(
+            dir.0.join("profiles.json"),
+            serde_json::json!({
+                "default": "bob",
+                "profiles": {
+                    "bob": {
+                        "server": "https://127.0.0.1:6681",
+                        "token": "tok-2"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write bob profile");
+        let err = load_config_from_dir(
+            &dir.0,
+            None,
+            None,
+            TuiTlsOverrides {
+                key: Some("/only/key.pem".into()),
+                ..TuiTlsOverrides::default()
+            },
+            |_| None,
+        )
+        .expect_err("key without cert should fail");
+        assert!(err.to_string().contains("--tls-cert is required"));
+    }
+
+    #[test]
+    fn tui_build_http_client_validates_and_loads_mtls() {
+        let mut cfg = TuiConfig {
+            server: "https://127.0.0.1:6681".into(),
+            token: "tok".into(),
+            nick: "alice".into(),
+            owner_key: None,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: Some("missing-key.pem".into()),
+            tls_insecure: false,
+        };
+        let err = build_http_client(&cfg).expect_err("key without cert must fail");
+        assert!(err.to_string().contains("tls_cert is required"));
+
+        cfg.tls_key = None;
+        cfg.tls_ca = Some("/nonexistent/ca.pem".into());
+        assert!(build_http_client(&cfg).is_err());
+
+        // Generate real ephemeral CA + client cert via OpenSSL and build reqwest client.
+        let pki = crate::tls::tests::TestPki::generate();
+        let valid_cfg = TuiConfig {
+            server: "https://127.0.0.1:6681".into(),
+            token: "tok".into(),
+            nick: "alice".into(),
+            owner_key: None,
+            tls_ca: Some(pki.ca_cert.display().to_string()),
+            tls_cert: Some(pki.client_cert.display().to_string()),
+            tls_key: Some(pki.client_key.display().to_string()),
+            tls_insecure: false,
+        };
+        assert!(build_http_client(&valid_cfg).is_ok());
     }
 }
