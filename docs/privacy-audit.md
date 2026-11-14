@@ -82,8 +82,9 @@ Scope: tracked files under `clients/` (client, CLI, tests, examples), `docs/`
 - Removed personal identifiers from documentation. The README used the
   owner's personal nick and a live agent account as example nicks; these are
   now `owner`, `gemini-flash` and `pm-agent`. `docs/sprint-1.md` named the
-  owner and now says "the owner's message 472". The public repository link
-  and upstream attribution are kept on purpose.
+  owner and now says "the owner's message 472". The README's issue-tracker
+  link named the owner's GitHub account and is now plain text. Upstream
+  aircd attribution is kept on purpose.
 - Config: `airc` already reads hub URLs and tokens from an editable
   `profiles.json` found in `AIRCD_CONFIG_DIR`, `%LOCALAPPDATA%\aircd`,
   `$XDG_CONFIG_HOME/aircd` or `~/.config/aircd`. Flags and `AIRCD_*`
@@ -94,4 +95,5 @@ Scope: tracked files under `clients/` (client, CLI, tests, examples), `docs/`
   config-directory resolution and override precedence. It also scans the
   tracked files above for user-home paths and non-reserved email domains. The
   current machine's user and host names are read at run time, so no personal
-  value is stored in the test.
+  value is stored in the test. It also fails if any of these files contains a
+  `github.com/<account>` link to an account other than the upstream author or a linked tool.
