@@ -752,14 +752,19 @@ impl TaskStore {
         let mut updates = Vec::with_capacity(changes.len());
         if changes.len() > 1 {
             let explicit: HashSet<&str> = changes.iter().map(|c| c.current.id.as_str()).collect();
-            for (index, change) in changes.iter().enumerate().filter(|(_, c)| c.to == "cancelled") {
+            for (index, change) in changes
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.to == "cancelled")
+            {
                 let mut statement = tx.prepare(
                     "WITH RECURSIVE descendants(id) AS (
                         SELECT id FROM tasks WHERE parent_task_id = ?1
                         UNION SELECT t.id FROM tasks t JOIN descendants d ON t.parent_task_id = d.id
                      ) SELECT id FROM descendants",
                 )?;
-                let descendants = statement.query_map([&change.current.id], |row| row.get::<_, String>(0))?;
+                let descendants =
+                    statement.query_map([&change.current.id], |row| row.get::<_, String>(0))?;
                 for id in descendants {
                     if explicit.contains(id?.as_str()) {
                         return Err(anyhow!("updates[{index}]: cancellation overlaps an explicit descendant in this batch; submit the ancestor alone"));
