@@ -12,9 +12,11 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
@@ -219,20 +221,24 @@ struct DmWakeState {
 
 struct ActiveWakeGuard {
     counter: Arc<AtomicUsize>,
+    idle_notify: Arc<Notify>,
 }
 
 impl ActiveWakeGuard {
-    fn enter(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
+    fn enter(counter: &Arc<AtomicUsize>, idle_notify: &Arc<Notify>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
         Self {
             counter: Arc::clone(counter),
+            idle_notify: Arc::clone(idle_notify),
         }
     }
 }
 
 impl Drop for ActiveWakeGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.idle_notify.notify_waiters();
+        }
     }
 }
 
@@ -246,6 +252,12 @@ pub struct WakeManager {
     notifier: Arc<Mutex<Option<WakeNotifier>>>,
     /// Lowercased account id -> unix time its quota cooldown ends.
     quota_cooldowns: Arc<Mutex<HashMap<String, i64>>>,
+    dispatch_paused: Arc<AtomicBool>,
+    drain_notify: Arc<Notify>,
+    execution_idle_notify: Arc<Notify>,
+    detach_requested: Arc<AtomicBool>,
+    detach_notify: Arc<Notify>,
+    detached_count: Arc<AtomicUsize>,
     logger: EventForwarder,
     metrics: Arc<MetricsRegistry>,
 }
@@ -517,9 +529,134 @@ impl WakeManager {
             server_url: Arc::new(Mutex::new("http://127.0.0.1:6680".to_string())),
             notifier: Arc::new(Mutex::new(None)),
             quota_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_paused: Arc::new(AtomicBool::new(false)),
+            drain_notify: Arc::new(Notify::new()),
+            execution_idle_notify: Arc::new(Notify::new()),
+            detach_requested: Arc::new(AtomicBool::new(false)),
+            detach_notify: Arc::new(Notify::new()),
+            detached_count: Arc::new(AtomicUsize::new(0)),
             logger,
             metrics,
         }
+    }
+
+    pub fn is_dispatch_paused(&self) -> bool {
+        self.dispatch_paused.load(Ordering::SeqCst)
+    }
+
+    pub fn active_execution_count(&self) -> usize {
+        self.active_executions.load(Ordering::SeqCst)
+    }
+
+    /// Pause wake dispatch for graceful hub shutdown, clearing any pending
+    /// queued follow-up wakeups and waking cooldown loops immediately.
+    pub fn pause_dispatch(&self) -> usize {
+        self.dispatch_paused.store(true, Ordering::SeqCst);
+        let cancelled = {
+            let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
+            let mut drained = Vec::new();
+            for slot in slots.values_mut() {
+                if let Some(pending) = slot.pending.take() {
+                    drained.push(pending.ctx);
+                }
+            }
+            drained
+        };
+        let count = cancelled.len();
+        let now = unix_timestamp();
+        for ctx in cancelled {
+            let run_id = format!("wake_{}", Uuid::new_v4().simple());
+            let _ = self.insert_run(
+                &run_id,
+                &ctx,
+                "skipped",
+                now,
+                Some(now),
+                None,
+                Some("skipped: queued wake cancelled during hub shutdown"),
+            );
+            self.metrics.record_wake_request("skipped");
+            self.metrics.record_wake_run_skipped();
+        }
+        self.drain_notify.notify_waiters();
+        count
+    }
+
+    /// Wait up to `timeout` for all currently running wake executions to finish.
+    /// Returns `true` if all active executions completed before the deadline.
+    pub async fn wait_until_idle(&self, timeout: Duration) -> bool {
+        if self.active_execution_count() == 0 {
+            return true;
+        }
+        if timeout.is_zero() {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.execution_idle_notify.notified();
+            if self.active_execution_count() == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.active_execution_count() == 0;
+                }
+            }
+        }
+    }
+
+    /// Cleanly detach any wake executions still running after the drain window:
+    /// child processes are left alive (`kill_on_drop(false)`) and any `running`
+    /// rows in `wake_runs` are transitioned to `detached`.
+    pub async fn detach_running_executions(&self, settle_timeout: Duration) -> usize {
+        let before = self.detached_count.load(Ordering::SeqCst);
+        self.dispatch_paused.store(true, Ordering::SeqCst);
+        self.detach_requested.store(true, Ordering::SeqCst);
+        self.drain_notify.notify_waiters();
+        self.detach_notify.notify_waiters();
+        let _ = self.wait_until_idle(settle_timeout).await;
+
+        {
+            let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
+            for slot in slots.values_mut() {
+                slot.pending = None;
+                slot.running = false;
+            }
+        }
+
+        let now = unix_timestamp();
+        let note = "detached during hub shutdown; worker process preserved";
+        let swept = match self.db.write() {
+            Ok(db) => {
+                let count = db
+                    .query_row(
+                        "SELECT COUNT(*) FROM wake_runs WHERE status = 'running'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let _ = db.execute(
+                    "UPDATE wake_runs
+                     SET status = 'detached',
+                         finished_at = COALESCE(finished_at, ?1),
+                         log_tail = COALESCE(log_tail, ?2)
+                     WHERE status = 'running'",
+                    params![now, note],
+                );
+                count
+            }
+            Err(_) => 0,
+        };
+        for _ in 0..swept {
+            self.metrics.record_wake_run_detached();
+        }
+        let after = self.detached_count.load(Ordering::SeqCst);
+        after.saturating_sub(before).saturating_add(swept)
     }
 
     /// Snapshot of `(running_executions, pending_queued, active_quota_cooldowns)`.
@@ -1055,6 +1192,22 @@ impl WakeManager {
     /// launch was started or queued. While one run is active, later requests
     /// collapse into a single follow-up run.
     pub fn request(&self, ctx: WakeContext) -> Result<bool> {
+        if self.is_dispatch_paused() {
+            let run_id = format!("wake_{}", Uuid::new_v4().simple());
+            let now = unix_timestamp();
+            let _ = self.insert_run(
+                &run_id,
+                &ctx,
+                "skipped",
+                now,
+                Some(now),
+                None,
+                Some("skipped: wake dispatch paused during hub shutdown"),
+            );
+            self.metrics.record_wake_request("skipped");
+            self.metrics.record_wake_run_skipped();
+            return Ok(false);
+        }
         let Some(cfg) = self.get(&ctx.principal_id)?.filter(|cfg| cfg.enabled) else {
             self.metrics.record_wake_request("disabled");
             return Ok(false);
@@ -1081,6 +1234,22 @@ impl WakeManager {
         let queued_at = Instant::now();
         {
             let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
+            if self.is_dispatch_paused() {
+                let run_id = format!("wake_{}", Uuid::new_v4().simple());
+                let now = unix_timestamp();
+                let _ = self.insert_run(
+                    &run_id,
+                    &ctx,
+                    "skipped",
+                    now,
+                    Some(now),
+                    None,
+                    Some("skipped: wake dispatch paused during hub shutdown"),
+                );
+                self.metrics.record_wake_request("skipped");
+                self.metrics.record_wake_run_skipped();
+                return Ok(false);
+            }
             let slot = slots.entry(ctx.principal_id.clone()).or_default();
             if slot.running {
                 let result = match slot.pending.as_ref() {
@@ -1114,7 +1283,27 @@ impl WakeManager {
                     format!("wake @{}: {err:#}", ctx.principal_id),
                 );
             }
-            tokio::time::sleep(Duration::from_secs(cfg.cooldown_seconds.max(0) as u64)).await;
+            if self.is_dispatch_paused() {
+                let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
+                let slot = slots.entry(ctx.principal_id.clone()).or_default();
+                slot.pending = None;
+                slot.running = false;
+                break;
+            }
+            let cooldown = Duration::from_secs(cfg.cooldown_seconds.max(0) as u64);
+            if !cooldown.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(cooldown) => {}
+                    _ = self.drain_notify.notified() => {}
+                }
+            }
+            if self.is_dispatch_paused() {
+                let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
+                let slot = slots.entry(ctx.principal_id.clone()).or_default();
+                slot.pending = None;
+                slot.running = false;
+                break;
+            }
 
             let next = {
                 let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
@@ -1383,15 +1572,23 @@ impl WakeManager {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(false);
+
+        if self.is_dispatch_paused() {
+            let note = "skipped: wake dispatch paused during hub shutdown";
+            self.insert_run(&run_id, ctx, "skipped", started, Some(started), None, Some(note))?;
+            self.metrics.record_wake_run_skipped();
+            return Ok(());
+        }
 
         self.insert_run(&run_id, ctx, "running", started, None, None, None)?;
-        let _active_guard = ActiveWakeGuard::enter(&self.active_executions);
+        let _active_guard =
+            ActiveWakeGuard::enter(&self.active_executions, &self.execution_idle_notify);
         let exec_started = Instant::now();
         self.metrics
             .record_wake_dispatch(exec_started.saturating_duration_since(queued_at).as_secs_f64());
 
-        let child = match command.spawn() {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let note = format!("could not start '{}': {err}", cfg.command);
@@ -1406,21 +1603,59 @@ impl WakeManager {
             }
         };
 
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe.take() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe.take() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
         let limit = Duration::from_secs(cfg.timeout_seconds.max(1) as u64);
-        match tokio::time::timeout(limit, child.wait_with_output()).await {
-            Ok(Ok(output)) => {
+        enum WaitOutcome {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            TimedOut,
+            Detached,
+        }
+
+        let outcome = tokio::select! {
+            biased;
+            _ = wait_for_flag(&self.detach_requested, &self.detach_notify) => {
+                WaitOutcome::Detached
+            }
+            status = child.wait() => {
+                WaitOutcome::Exited(status)
+            }
+            _ = tokio::time::sleep(limit) => {
+                WaitOutcome::TimedOut
+            }
+        };
+
+        match outcome {
+            WaitOutcome::Exited(Ok(exit_status)) => {
+                let stdout_bytes = stdout_task.await.unwrap_or_default();
+                let stderr_bytes = stderr_task.await.unwrap_or_default();
                 let exec_secs = exec_started.elapsed().as_secs_f64();
                 let e2e_secs = queued_at.elapsed().as_secs_f64();
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&stdout_bytes);
+                let stderr = String::from_utf8_lossy(&stderr_bytes);
                 let mut text = stdout.clone().into_owned();
                 if !stderr.is_empty() {
                     text.push_str("\n[stderr]\n");
                     text.push_str(&stderr);
                 }
-                let status = if output.status.success() { "ok" } else { "failed" };
+                let status = if exit_status.success() { "ok" } else { "failed" };
                 if resuming {
-                    if output.status.success() {
+                    if exit_status.success() {
                         // Remember the conversation so the next launch continues it.
                         if let Some(found) = cfg
                             .session_marker
@@ -1437,15 +1672,15 @@ impl WakeManager {
                 self.finish_run(
                     &run_id,
                     status,
-                    output.status.code().map(i64::from),
+                    exit_status.code().map(i64::from),
                     Some(tail(&text)),
                 )?;
                 self.metrics
                     .record_wake_completion(status, exec_secs, e2e_secs);
-                if output.status.success() {
+                if exit_status.success() {
                     self.clear_quota_cooldown(&ctx.principal_id);
                 } else {
-                    let head = match output.status.code() {
+                    let head = match exit_status.code() {
                         Some(code) => format!("exited with code {code}"),
                         None => "was stopped by a signal".to_string(),
                     };
@@ -1464,7 +1699,9 @@ impl WakeManager {
                     self.report_failure(ctx, failure_summary(&head, detail), cooldown_until);
                 }
             }
-            Ok(Err(err)) => {
+            WaitOutcome::Exited(Err(err)) => {
+                stdout_task.abort();
+                stderr_task.abort();
                 let note = format!("wait failed: {err}");
                 self.finish_run(&run_id, "failed", None, Some(&note))?;
                 self.metrics.record_wake_completion(
@@ -1474,8 +1711,11 @@ impl WakeManager {
                 );
                 self.report_failure(ctx, failure_summary(&note, ""), None);
             }
-            Err(_) => {
-                // Dropping the wait future drops the child, which kills it.
+            WaitOutcome::TimedOut => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
                 let note = format!("killed after timeout_seconds={}", cfg.timeout_seconds);
                 self.finish_run(&run_id, "timeout", None, Some(&note))?;
                 self.metrics.record_wake_completion(
@@ -1484,6 +1724,17 @@ impl WakeManager {
                     queued_at.elapsed().as_secs_f64(),
                 );
                 self.report_failure(ctx, failure_summary(&note, ""), None);
+            }
+            WaitOutcome::Detached => {
+                // Leave the OS child process running independently (kill_on_drop(false))
+                // and mark the wake_runs entry detached instead of leaving it running.
+                stdout_task.abort();
+                stderr_task.abort();
+                drop(child);
+                let note = "detached during hub shutdown; worker process preserved";
+                self.finish_run(&run_id, "detached", None, Some(note))?;
+                self.detached_count.fetch_add(1, Ordering::SeqCst);
+                self.metrics.record_wake_run_detached();
             }
         }
         Ok(())
@@ -1572,6 +1823,16 @@ impl WakeManager {
             session_marker: row.get(13)?,
             session_scope: row.get(14)?,
         })
+    }
+}
+
+async fn wait_for_flag(flag: &AtomicBool, notify: &Notify) {
+    loop {
+        let notified = notify.notified();
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -2258,6 +2519,114 @@ mod tests {
             let pending = slots["agent-a"].pending.as_ref().unwrap();
             assert_eq!(pending.ctx.task_id.as_deref(), Some("task_urgent_2"));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pause_dispatch_cancels_pending_and_rejects_new_requests() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes.upsert("agent-a", fast_launcher(true))?;
+        wakes.upsert("agent-b", fast_launcher(true))?;
+
+        // Hold agent-a running so a request queues in its pending slot.
+        {
+            let mut slots = wakes.slots.lock().unwrap();
+            slots.entry("agent-a".into()).or_default().running = true;
+        }
+        assert!(wakes.request(channel_ctx("pm", "agent-a", "#cams"))?);
+        assert!(wakes.slots.lock().unwrap()["agent-a"].pending.is_some());
+
+        let cancelled = wakes.pause_dispatch();
+        assert_eq!(cancelled, 1);
+        assert!(wakes.is_dispatch_paused());
+        assert!(wakes.slots.lock().unwrap()["agent-a"].pending.is_none());
+
+        // New requests are rejected while dispatch is paused.
+        assert!(!wakes.request(channel_ctx("pm", "agent-b", "#cams"))?);
+        assert!(wakes
+            .runs(Some("agent-a"), 10)?
+            .iter()
+            .any(|run| {
+                run.status == "skipped"
+                    && run.log_tail.as_deref() == Some("skipped: queued wake cancelled during hub shutdown")
+            }));
+        assert!(wakes
+            .runs(Some("agent-b"), 10)?
+            .iter()
+            .any(|run| {
+                run.status == "skipped"
+                    && run.log_tail.as_deref() == Some("skipped: wake dispatch paused during hub shutdown")
+            }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_until_idle_waits_for_running_wake_then_succeeds() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        let script = if cfg!(windows) {
+            "ping -n 2 127.0.0.1 >nul & echo done"
+        } else {
+            "sleep 0.2; echo done"
+        };
+        wakes.upsert("agent-a", shell_launcher(script))?;
+        assert!(wakes.request(channel_ctx("pm", "agent-a", "#cams"))?);
+
+        for _ in 0..60 {
+            if wakes.active_execution_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(wakes.active_execution_count(), 1);
+
+        let settled = wakes.wait_until_idle(Duration::from_secs(5)).await;
+        assert!(settled);
+        assert_eq!(wakes.active_execution_count(), 0);
+        let runs = wakes.runs(Some("agent-a"), 10)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detach_running_executions_leaves_child_alive_and_marks_detached() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        let script = if cfg!(windows) {
+            "ping -n 6 127.0.0.1 >nul"
+        } else {
+            "sleep 5"
+        };
+        wakes.upsert("agent-a", shell_launcher(script))?;
+        assert!(wakes.request(channel_ctx("pm", "agent-a", "#cams"))?);
+
+        // Wait briefly for run_once_at to enter running state and insert the wake_runs row.
+        for _ in 0..60 {
+            if wakes.active_execution_count() == 1
+                && wakes
+                    .runs(Some("agent-a"), 5)?
+                    .iter()
+                    .any(|run| run.status == "running")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(wakes.active_execution_count(), 1);
+
+        wakes.pause_dispatch();
+        let detached = wakes.detach_running_executions(Duration::from_secs(3)).await;
+        assert_eq!(detached, 1);
+        assert_eq!(wakes.active_execution_count(), 0);
+
+        let runs = wakes.runs(Some("agent-a"), 5)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "detached");
+        assert!(runs[0].finished_at.is_some());
+        assert!(runs[0]
+            .log_tail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("detached during hub shutdown"));
         Ok(())
     }
 }

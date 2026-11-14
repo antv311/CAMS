@@ -192,4 +192,60 @@ impl TaskStore {
         }
         Ok(recovered)
     }
+
+    /// Checkpoint active `claimed`, `in_progress`, and `testing` tasks during
+    /// graceful hub shutdown so live worker leases and execution heartbeats
+    /// survive a hub restart without premature expiry.
+    pub fn checkpoint_active_leases(&self, now: i64, extension_secs: i64) -> Result<Vec<Task>> {
+        let extension_secs = extension_secs.max(0);
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tasks = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {TASK_COLUMNS} FROM tasks
+                WHERE status IN ('claimed', 'in_progress', 'testing') ORDER BY id"
+            ))?;
+            let rows = stmt.query_map([], Self::from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut checkpointed = Vec::new();
+        for current in tasks {
+            if self.execution_expired(&current, now) {
+                continue;
+            }
+            let note = if current.status == "claimed" {
+                let new_deadline = current
+                    .lease_expires_at
+                    .unwrap_or(now)
+                    .max(now.saturating_add(extension_secs));
+                tx.execute(
+                    "UPDATE tasks SET lease_expires_at = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![current.id, new_deadline, now],
+                )?;
+                let holder = current.claimed_by.as_deref().unwrap_or("-");
+                format!("hub shutdown lease checkpoint; holder={holder} lease_expires_at={new_deadline}")
+            } else {
+                let new_hb = current.execution_heartbeat_at.unwrap_or(now).max(now);
+                tx.execute(
+                    "UPDATE tasks SET execution_heartbeat_at = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![current.id, new_hb, now],
+                )?;
+                let holder = current.assignee.as_deref().unwrap_or("-");
+                format!("hub shutdown execution checkpoint; holder={holder} heartbeat_at={new_hb}")
+            };
+            Self::log_event_locked(
+                &tx,
+                &current.id,
+                "aircd",
+                "lease_checkpoint",
+                Some(&current.status),
+                Some(&current.status),
+                Some(&note),
+                now,
+            )?;
+            checkpointed.push(Self::get_locked(&tx, &current.id)?);
+        }
+        tx.commit()?;
+        Ok(checkpointed)
+    }
 }

@@ -438,7 +438,17 @@ pub fn detect_local_ips() -> Vec<String> {
     hosts.into_iter().collect()
 }
 
+#[allow(dead_code)]
 pub async fn serve(server: Server, bind_addr: &str, info: HttpRuntimeInfo) -> Result<()> {
+    serve_with_shutdown(server, bind_addr, info, crate::shutdown::never_stop_rx()).await
+}
+
+pub async fn serve_with_shutdown(
+    server: Server,
+    bind_addr: &str,
+    info: HttpRuntimeInfo,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("bind HTTP welcome/API listener on {bind_addr}"))?;
@@ -446,19 +456,53 @@ pub async fn serve(server: Server, bind_addr: &str, info: HttpRuntimeInfo) -> Re
     let mut runtime = info;
     runtime.http_port = actual_port;
     println!("aircd HTTP welcome & API listening on http://{bind_addr} (port {actual_port})");
+    serve_on_with_shutdown(listener, server, runtime, stop_rx).await
+}
+
+pub async fn serve_on_with_shutdown(
+    listener: TcpListener,
+    server: Server,
+    info: HttpRuntimeInfo,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     axum::serve(
         listener,
-        router(server, runtime).into_make_service_with_connect_info::<SocketAddr>(),
+        router(server, info).into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        while !*stop_rx.borrow() {
+            if stop_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
     .await
     .context("serve HTTP router")
 }
 
+#[allow(dead_code)]
 pub async fn serve_tls(
     server: Server,
     bind_addr: &str,
     info: HttpRuntimeInfo,
     acceptor: tokio_rustls::TlsAcceptor,
+) -> Result<()> {
+    serve_tls_with_shutdown(
+        server,
+        bind_addr,
+        info,
+        acceptor,
+        crate::shutdown::never_stop_rx(),
+    )
+    .await
+}
+
+pub async fn serve_tls_with_shutdown(
+    server: Server,
+    bind_addr: &str,
+    info: HttpRuntimeInfo,
+    acceptor: tokio_rustls::TlsAcceptor,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let tcp = TcpListener::bind(bind_addr)
         .await
@@ -479,6 +523,13 @@ pub async fn serve_tls(
         tls_listener,
         router(server, runtime).into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        while !*stop_rx.borrow() {
+            if stop_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
     .await
     .context("serve HTTPS router")
 }
@@ -527,6 +578,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/owner/alerts", get(owner_alerts_status))
         .route("/v1/owner/alerts/evaluate", post(owner_alerts_evaluate))
         .route("/v1/owner/alerts/test", post(owner_alerts_test))
+        .route(
+            "/v1/owner/drain",
+            get(owner_drain_status).post(owner_trigger_drain),
+        )
         .route("/v1/login", post(login_agent))
         .route("/v1/tokens", get(list_tokens_api).post(issue_token_api))
         .route("/v1/tokens/refresh", post(refresh_token_api))
@@ -700,6 +755,9 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "ok": true,
             "service": "aircd",
+            "draining": state.server.is_draining(),
+            "phase": state.server.shutdown_phase().as_str(),
+            "active_wake_executions": state.server.wakes().active_execution_count(),
             "irc_port": state.info.irc_port,
             "http_port": state.info.http_port,
             "http_tls_port": state.info.http_tls_port,
@@ -2189,6 +2247,58 @@ async fn owner_alerts_test(
         Json(json!({
             "ok": true,
             "deliveries": deliveries,
+        })),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+struct OwnerDrainReq {
+    invite: Option<String>,
+    reason: Option<String>,
+}
+
+async fn owner_drain_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, None)?;
+    let (active_wakes, pending_wakes, _) = state.server.wakes().runtime_session_counts();
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "draining": state.server.is_draining(),
+            "phase": state.server.shutdown_phase().as_str(),
+            "wake_dispatch_paused": state.server.wakes().is_dispatch_paused(),
+            "active_wake_executions": active_wakes,
+            "pending_wake_sessions": pending_wakes,
+            "config": state.server.shutdown().config(),
+            "last_report": state.server.shutdown().last_report(),
+        })),
+    ))
+}
+
+async fn owner_trigger_drain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OwnerDrainReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let source = match req.reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(reason) => format!("owner_api ({reason})"),
+        None => "owner_api".to_string(),
+    };
+    let initiated = state.server.shutdown().request_drain(source);
+    Ok((
+        StatusCode::ACCEPTED,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "initiated": initiated,
+            "draining": state.server.is_draining(),
+            "phase": state.server.shutdown_phase().as_str(),
         })),
     ))
 }

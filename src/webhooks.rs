@@ -437,16 +437,36 @@ impl WebhookStore {
         }
     }
 
+    #[allow(dead_code)]
     pub fn spawn_worker(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_worker_with_shutdown(crate::shutdown::never_stop_rx())
+    }
+
+    pub fn spawn_worker_with_shutdown(
+        &self,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
         tokio::spawn(async move {
             loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
                 if let Err(err) = store.process_due_deliveries().await {
                     store
                         .logger
                         .log_error("webhook.worker_error", format!("webhooks worker error: {err:#}"));
                 }
+                if *stop_rx.borrow() {
+                    break;
+                }
                 tokio::select! {
+                    biased;
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
                     _ = store.notify.notified() => {}
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
