@@ -253,6 +253,16 @@ class BionicConfig:
     #: when the call fails or is rejected (``--rollback``; see
     #: :mod:`aircd.bionic_rollback`).
     rollback: bool = False
+    #: Prompt-cache hints sent with each request (``--prompt-cache``; one of
+    #: :data:`aircd.bionic_cache.PROMPT_CACHE_MODES`). ``auto`` asks local
+    #: servers to keep and reuse the KV cache of the shared prompt prefix.
+    prompt_cache: str = "auto"
+    #: LM Studio ``ttl`` (seconds) that keeps the model, and its KV cache,
+    #: loaded between requests (``--cache-ttl``).
+    cache_ttl: Optional[int] = None
+    #: llama.cpp ``id_slot`` to pin this agent's requests to one KV slot
+    #: (``--cache-slot``; ``llamacpp`` mode only).
+    cache_slot: Optional[int] = None
 
 
 @dataclass
@@ -469,6 +479,26 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
     if rollback is None:
         rollback = _parse_bool_env("BIONIC_ROLLBACK")
 
+    from aircd.bionic_cache import PROMPT_CACHE_MODES
+
+    prompt_cache = (
+        str(getattr(args, "prompt_cache", None) or os.environ.get("BIONIC_PROMPT_CACHE", "")).strip().lower() or "auto"
+    )
+    if prompt_cache not in PROMPT_CACHE_MODES:
+        raise BionicError(f"prompt cache mode must be one of: {', '.join(PROMPT_CACHE_MODES)}")
+    cache_ttl = getattr(args, "cache_ttl", None)
+    if cache_ttl is None:
+        env_ttl = os.environ.get("BIONIC_CACHE_TTL", "").strip()
+        cache_ttl = _parse_int(env_ttl, "BIONIC_CACHE_TTL", minimum=1) if env_ttl else None
+    elif int(cache_ttl) < 1:
+        raise BionicError("--cache-ttl must be at least 1")
+    cache_slot = getattr(args, "cache_slot", None)
+    if cache_slot is None:
+        env_slot = os.environ.get("BIONIC_CACHE_SLOT", "").strip()
+        cache_slot = _parse_int(env_slot, "BIONIC_CACHE_SLOT", minimum=0) if env_slot else None
+    elif int(cache_slot) < 0:
+        raise BionicError("--cache-slot must be 0 or more")
+
     return BionicConfig(
         base_url=base_url,
         api_key=api_key,
@@ -498,6 +528,9 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
         task_id=task_id,
         report_usage=bool(report_usage),
         rollback=bool(rollback),
+        prompt_cache=prompt_cache,
+        cache_ttl=int(cache_ttl) if cache_ttl is not None else None,
+        cache_slot=int(cache_slot) if cache_slot is not None else None,
     )
 
 
@@ -1417,6 +1450,7 @@ def accumulate_stream(events: Iterable[str], emit: Optional[StreamEmit] = None) 
     reasoning: list[str] = []
     calls: dict[int, dict[str, Any]] = {}
     usage: Optional[dict[str, int]] = None
+    timings: Optional[dict[str, Any]] = None
     saw_chunk = False
     for data in events:
         if data.strip() == "[DONE]":
@@ -1432,6 +1466,8 @@ def accumulate_stream(events: Iterable[str], emit: Optional[StreamEmit] = None) 
         saw_chunk = True
         if isinstance(obj.get("usage"), dict):
             usage = obj["usage"]
+        if isinstance(obj.get("timings"), dict):
+            timings = obj["timings"]  # llama.cpp: cache_n = prompt tokens reused from the KV cache
         choices = obj.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             continue  # e.g. a trailing usage-only chunk
@@ -1491,6 +1527,8 @@ def accumulate_stream(events: Iterable[str], emit: Optional[StreamEmit] = None) 
         msg["tool_calls"] = tool_calls
     if usage is not None:
         msg["usage"] = usage
+    if timings is not None:
+        msg["timings"] = timings
     return msg
 
 
@@ -1524,6 +1562,8 @@ def _http_chat_stream(
                     raise BionicError(f"Bionic API returned no choices: {json.dumps(body)[:400]}")
                 if isinstance(body.get("usage"), dict):
                     msg = {**msg, "usage": body["usage"]}
+                if isinstance(body.get("timings"), dict):
+                    msg = {**msg, "timings": body["timings"]}
                 if emit is not None and isinstance(msg.get("content"), str) and msg["content"]:
                     emit("token", msg["content"])
                 return msg
@@ -1921,13 +1961,23 @@ def _normalize_assistant_message(msg: dict[str, Any]) -> dict[str, Any]:
 _USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
 
 
-def _usage_counts(raw: Any) -> Optional[dict[str, int]]:
-    """Pick the integer token counts out of an OpenAI ``usage`` object."""
+def _usage_counts(raw: Any, timings: Any = None) -> Optional[dict[str, int]]:
+    """Pick the integer token counts out of an OpenAI ``usage`` object.
+
+    Adds ``cached_tokens`` (prompt tokens served from the server's KV/prompt
+    cache) when the server reports it, including llama.cpp's ``timings``.
+    """
     if not isinstance(raw, dict):
         return None
     counts = {k: int(raw[k]) for k in _USAGE_KEYS if isinstance(raw.get(k), (int, float)) and not isinstance(raw.get(k), bool)}
     if counts and "total_tokens" not in counts:
         counts["total_tokens"] = counts.get("prompt_tokens", 0) + counts.get("completion_tokens", 0)
+    if counts:
+        from aircd.bionic_cache import cached_tokens
+
+        cached = cached_tokens(raw, timings)
+        if cached is not None:
+            counts["cached_tokens"] = cached
     return counts or None
 
 
@@ -2364,6 +2414,9 @@ def run_agent(
         log(f"[plugins] loaded {len(registry)} tool(s) from {', '.join(registry.dirs)}: {', '.join(registry.tools)}")
     system_prompt = system_prompt_for(config, tool_schemas)
     chat_url = normalize_base_url(config.base_url) + "/chat/completions"
+    from aircd import bionic_cache
+
+    cache_key = bionic_cache.cache_key_for(model, system_prompt, tool_schemas)
     guard = rollback_guard_for(config, log=log, review=review_tool, notify=notify)
 
     active_session_id = config.session_id
@@ -2381,6 +2434,8 @@ def run_agent(
     if messages is None:
         messages = [{"role": "system", "content": system_prompt}]
     elif messages and messages[0].get("role") == "system":
+        if log and len(messages) > 1 and messages[0].get("content") != system_prompt:
+            log("[cache] system prompt changed since this conversation started; the server's prefix cache will miss once")
         messages[0] = {"role": "system", "content": system_prompt}
     elif caller_owns_messages and not messages:
         messages.append({"role": "system", "content": system_prompt})
@@ -2427,6 +2482,15 @@ def run_agent(
             payload["max_tokens"] = max_tokens
         # Size of what this turn sends, for servers that report no usage.
         prompt_estimate = estimate_tokens(messages) + estimate_tokens(tool_schemas) if ledger.active else 0
+        # Cache hints go on a copy; ``messages`` (and the saved session) stay plain.
+        payload = bionic_cache.apply_cache_hints(
+            payload,
+            config.prompt_cache,
+            base_url=config.base_url,
+            cache_key=cache_key,
+            ttl=config.cache_ttl,
+            slot=config.cache_slot,
+        )
 
         notify({"type": "turn", "turn": turn, "model": model})
         if config.stream:
@@ -2453,9 +2517,22 @@ def run_agent(
                 raise BionicError(f"Bionic API choice missing 'message': {json.dumps(choices[0])[:400]}")
             if isinstance(resp.get("usage"), dict):
                 msg = {**msg, "usage": resp["usage"]}
+            if isinstance(resp.get("timings"), dict):
+                msg = {**msg, "timings": resp["timings"]}
 
-        usage = _usage_counts(msg.get("usage"))
+        usage = _usage_counts(msg.get("usage"), msg.get("timings"))
         turn_usage.append(usage)
+        if usage and "cached_tokens" in usage:
+            notify(
+                {
+                    "type": "cache",
+                    "turn": turn,
+                    "cached_tokens": usage["cached_tokens"],
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                }
+            )
+            if log:
+                log(f"[cache] turn {turn}: {usage['cached_tokens']}/{usage.get('prompt_tokens', '?')} prompt tokens reused")
         for key, value in (usage or {}).items():
             usage_totals[key] = usage_totals.get(key, 0) + value
 
@@ -2718,6 +2795,15 @@ class BionicAgent:
             self._resolved_model = str(report["model"])
         return report
 
+    def warm(self) -> dict[str, Any]:
+        """Pre-fill the server's prompt cache with this agent's system prompt and tools.
+
+        See :func:`aircd.bionic_cache.prewarm`; failures are reported (``ok`` False), not raised.
+        """
+        from aircd.bionic_cache import prewarm
+
+        return prewarm(self._config, model=self.model, log=self._log)
+
     def tools(self) -> list[dict[str, Any]]:
         """Describe the built-in and plugin tools a run would offer (same as ``--list-tools``).
 
@@ -2924,6 +3010,33 @@ def build_parser() -> argparse.ArgumentParser:
             "fails or is denied; discarded changes are kept under refs/bionic/rollbacks/ (env: BIONIC_ROLLBACK=1)"
         ),
     )
+    parser.add_argument(
+        "--prompt-cache",
+        choices=["auto", "off", "llamacpp", "openai", "anthropic"],
+        help=(
+            "Prompt/KV cache hints to send: auto (cache_prompt + prompt_cache_key for local servers, "
+            "prompt_cache_key for api.openai.com, nothing elsewhere), off, llamacpp (cache_prompt), "
+            "openai (prompt_cache_key) or anthropic (cache_control breakpoints) (env: BIONIC_PROMPT_CACHE)"
+        ),
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        help="Ask LM Studio to keep the model and its KV cache loaded this many idle seconds (env: BIONIC_CACHE_TTL)",
+    )
+    parser.add_argument(
+        "--cache-slot",
+        type=int,
+        help="Pin requests to this llama.cpp KV slot (id_slot; --prompt-cache llamacpp) (env: BIONIC_CACHE_SLOT)",
+    )
+    parser.add_argument(
+        "--warm-cache",
+        action="store_true",
+        help=(
+            "Pre-fill the server's prompt cache with the system prompt and tools, print a JSON report and exit; "
+            "with --repl, warm it in the background while you type the first prompt"
+        ),
+    )
     parser.add_argument("--system-prompt", help="Override default system prompt (env: BIONIC_SYSTEM_PROMPT)")
     parser.add_argument("--system-prompt-file", help="Read system prompt override from a UTF-8 file")
     parser.add_argument("--session-id", help="Resume or create a saved local session by ID")
@@ -3064,11 +3177,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             prompt = args.prompt
             if prompt == "-":
                 prompt = sys.stdin.read()
-            return run_repl(config, step=args.debug, initial_prompt=prompt)
+            return run_repl(config, step=args.debug, initial_prompt=prompt, warm_cache=args.warm_cache)
+
+        if args.warm_cache:
+            if args.prompt:
+                parser.error("--warm-cache runs on its own (or with --repl); drop -p/--prompt")
+            from aircd.bionic_cache import prewarm
+
+            log = (lambda msg: print(msg, file=sys.stderr)) if config.verbose else None
+            report = prewarm(config, log=log)
+            print(json.dumps(report))
+            if not report["ok"]:
+                print(f"error: {report['error']}", file=sys.stderr)
+                return 2
+            return 0
 
         if not args.prompt:
             parser.error(
-                "-p/--prompt is required unless --repl, --list-models, --list-tools or --health is specified"
+                "-p/--prompt is required unless --repl, --list-models, --list-tools, --health or --warm-cache is specified"
             )
 
         prompt = sys.stdin.read() if args.prompt == "-" else args.prompt

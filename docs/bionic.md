@@ -86,6 +86,10 @@ No paths, model IDs, or hostnames outside `localhost` are hardcoded.
 | `--task` | `BIONIC_TASK_ID`, then `AIRCD_WAKE_TASK` | *(the woken task)* | Hub task billed for every turn; its budget (and its parents') is enforced |
 | `--no-report-usage` | `BIONIC_NO_USAGE_REPORT` | `false` | Do not send token usage to the hub task |
 | `--rollback` | `BIONIC_ROLLBACK` | `false` | Snapshot the git workspace before each mutating tool call and restore it when the call fails (see [Rollback](#workspace-snapshots-and-auto-rollback---rollback)) |
+| `--prompt-cache` | `BIONIC_PROMPT_CACHE` | `auto` | Prompt/KV cache hints: `auto`, `off`, `llamacpp`, `openai` or `anthropic` (see [Prompt caching](#prompt-prefix-caching-and-kv-reuse---prompt-cache---warm-cache)) |
+| `--cache-ttl` | `BIONIC_CACHE_TTL` | *(unset)* | LM Studio `ttl`: keep the model and its KV cache loaded this many idle seconds |
+| `--cache-slot` | `BIONIC_CACHE_SLOT` | *(unset)* | llama.cpp `id_slot` to pin requests to (`--prompt-cache llamacpp`) |
+| `--warm-cache` | — | — | Pre-fill the prompt cache with the system prompt and tools, print a JSON report and exit (with `--repl`: warm in the background) |
 | `--system-prompt` | `BIONIC_SYSTEM_PROMPT` | *(generated)* | Override default system prompt (or `--system-prompt-file`) |
 | `--session-id` | — | *(none)* | Persist/resume message history for a session ID |
 | `--session-dir` | `BIONIC_SESSION_DIR` | `<tempdir>/aircd-bionic-sessions` | Directory where session JSON files are stored |
@@ -268,6 +272,57 @@ How the snapshot works:
 Prune old rollback refs with
 `git for-each-ref --format='%(refname)' refs/bionic/rollbacks | xargs -n1 git update-ref -d`.
 
+### Prompt prefix caching and KV reuse (`--prompt-cache`, `--warm-cache`)
+
+Every turn of a run resends the same system prompt and tool schemas, and then
+the whole conversation so far. Local servers (LM Studio, llama.cpp, vLLM,
+Ollama) keep the KV cache of the last request and only compute the tokens
+after the longest prefix it shares with the next one. Bionic keeps that prefix
+byte-identical: the system prompt, the tool order and the stored messages stay
+the same from turn to turn. It also tells the server to keep the prefix, using
+whichever hint that server understands:
+
+| `--prompt-cache` | Sends |
+|---|---|
+| `auto` (default) | Local server (loopback, private network, `localhost`, `*.local`, `*.lan`): `cache_prompt: true` and `prompt_cache_key`. `api.openai.com`: `prompt_cache_key`. Any other host: nothing, because strict servers reject unknown fields |
+| `llamacpp` | `cache_prompt: true`, plus `id_slot` when `--cache-slot N` is set, so one agent always uses the same KV slot |
+| `openai` | `prompt_cache_key` |
+| `anthropic` | `cache_control: {"type": "ephemeral"}` on the system message and on the newest user/tool message (for Anthropic-style gateways such as OpenRouter) |
+| `off` | nothing |
+
+`prompt_cache_key` is `bionic-<hash>` of the model, system prompt and tools.
+Every run in the same workspace with the same tools therefore shares one cache
+entry. `--cache-ttl SECONDS` (`BIONIC_CACHE_TTL`) adds LM Studio's `ttl` field
+in every mode except `off`, so a just-in-time loaded model, and its cache, stays
+loaded while the agent is idle between wakes. The hints are added to the
+request only. Saved sessions and `/save` files keep plain messages.
+
+When the server reports reused tokens, through `usage.prompt_tokens_details.cached_tokens`
+(OpenAI, vLLM), `usage.cache_read_input_tokens` or llama.cpp `timings.cache_n`,
+they appear as `cached_tokens` in `usage` (`--json`, `RunResult.usage`, REPL
+`/usage`). A `cache` event is emitted for each such turn, and `-v` logs
+`[cache] turn N: cached/prompt prompt tokens reused`. Resuming a session whose
+saved system prompt no longer matches, for example after a cwd or plugin
+change, logs a one-time cache-miss warning under `-v`. LM Studio accepts the
+hints but does not report cached tokens.
+
+**Pre-warming.** `airc-bionic --warm-cache` sends that same prefix with a
+throwaway user turn and a 1-token completion, prints a JSON report
+(`ok`, `model`, `mode`, `cache_key`, `fingerprint`, `seconds`,
+`prompt_tokens`, `cached_tokens`) and exits. It exits with code 2 if the
+request fails. Run it with the same `--cwd`, `--approval` and plugin flags as
+the real run, for example right after `--health` in a wake script, so the first
+real turn only pays for the prompt itself. With `--repl --warm-cache`, the warm
+request runs in the background while you type the first prompt. That prompt
+waits for it to finish instead of racing it. `/warm` re-warms on demand.
+
+```bash
+airc-bionic --warm-cache --model auto --cache-ttl 900
+# {"ok": true, "model": "google/gemma-4-26b-a4b-qat", "mode": "local", "cache_key": "bionic-2739fe...",
+#  "seconds": 2.49, "prompt_tokens": 833, "cached_tokens": null, ...}
+airc-bionic --model auto --cache-ttl 900 -p "Fix the failing test"
+```
+
 ### Interactive REPL and debug mode (`--repl`, `--debug`)
 
 `airc-bionic --repl` opens an interactive session that keeps one conversation
@@ -380,6 +435,9 @@ for event in agent.stream("Explain src/main.rs"):  # SSE streaming, events as th
   that keeps handlers, the session and the cached model.
 - **Plugins**: `tools_dirs=[...]` and `plugins=False` mirror `--tools-dir` and
   `--no-plugins`; `agent.tools()` returns the `--list-tools` descriptions.
+- **Prompt cache**: `prompt_cache=`, `cache_ttl=` and `cache_slot=` mirror the
+  CLI flags; `agent.warm()` pre-fills the server's prompt cache and returns the
+  `--warm-cache` report (see [Prompt caching](#prompt-prefix-caching-and-kv-reuse---prompt-cache---warm-cache)).
 
 See `clients/python/examples/bionic_workflow.py` for a runnable example.
 
