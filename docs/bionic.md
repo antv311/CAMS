@@ -215,6 +215,93 @@ for event in agent.stream("Explain src/main.rs"):  # SSE streaming, events as th
 
 See `clients/python/examples/bionic_workflow.py` for a runnable example.
 
+`RunResult.usage` holds the token totals (`prompt_tokens`, `completion_tokens`,
+`total_tokens`) summed over the turns whose response carried a `usage` object, and
+`RunResult.turn_usage` holds the per-turn values. It is `{}` when the server sends no
+usage. Streamed requests ask for usage with `"stream_options": {"include_usage": true}`.
+`--json` output includes `usage`. When a run runs out of turns it raises
+`MaxTurnsError` (a `BionicError`), which carries `turns`, `tool_calls`, `usage`
+and `turn_usage` for the work done so far.
+
+## Benchmark and multi-turn evaluation (`airc-bionic-bench`)
+
+`airc-bionic-bench` (`clients/python/aircd/bionic_bench.py`, or `.\airc-bionic-bench.cmd`)
+runs the tool-calling loop through scripted scenarios against a local model. It
+measures latency, memory and token efficiency and checks each result:
+
+```powershell
+airc-bionic-bench --model auto --output bench.json            # all built-in scenarios
+airc-bionic-bench --model auto --stream --repeat 3 --tag multi-turn
+airc-bionic-bench --list-scenarios
+```
+
+Each scenario run gets a fresh temporary workspace, seeded with files, that the
+tools are jailed to. The prompts run in order in one saved session, so a later
+prompt can depend on an earlier one. Then deterministic checks decide pass or fail.
+
+| Scenario | Tags | What it exercises |
+| --- | --- | --- |
+| `read-answer` | single-turn, read | read a file, report a value |
+| `write-file` | single-turn, write | create a file with exact contents |
+| `edit-config` | single-turn, edit | change one value, leave the rest of the file intact |
+| `command-output` | single-turn, command | run a script and report its output |
+| `aggregate-files` | multi-step | discover and read several files, combine, write the result |
+| `fix-and-test` | multi-step | fix a bug and confirm it with the unit tests (checked by re-running them) |
+| `session-recall` | multi-turn, memory | use a fact from prompt 1 in prompt 2 |
+| `session-followup` | multi-turn | three prompts that refer back to "the file you just created" |
+
+Before the first scenario, the model is checked with the same logic as `--health`
+(exit **2** if it is not ready). It is also warmed up with a one-token probe, so the
+first run doesn't include load time (`--no-warmup` keeps load time in).
+`--auto-pull` pulls and loads the model first.
+
+Metrics per run and aggregated (`summary`), with mean / p50 / p95 / min / max:
+
+- **Latency**: scenario wall time, each LLM call (from the request to the first
+  tool call or final answer), time to first token (with `--stream`), and tool
+  execution time, overall and per tool.
+- **Tokens**: prompt and completion totals from the server's `usage`, prompt
+  tokens per turn (context growth across a multi-turn run), completion tokens
+  per second, `tokens_per_run_mean`, and `tokens_per_pass` (all tokens spent,
+  failed runs included, divided by passed runs; lower is better). Runs that end
+  at `--max-turns` still count their tokens.
+- **Memory**: resident memory of the benchmark process, and with
+  `--server-pid <pid>` (repeatable) of the inference server processes. Memory is
+  sampled in the background every `--sample-interval` seconds (start / peak /
+  mean / end / delta). It doesn't cover GPU VRAM or a server on another machine.
+- Pass rate overall and per scenario, turns and tool calls per run, tool errors.
+
+The full JSON report goes to stdout or `--output`. A readable summary and
+per-run progress go to stderr (`-q` silences them). Exit codes: **0** done, **1**
+configuration error, **2** model not ready, **3** pass rate below
+`--min-pass-rate` (use this as a CI gate). Connection flags are the same as for
+`airc-bionic`: `--base-url`, `--api-key`, `--model`, `--max-turns`, `--timeout`,
+`--command-timeout`, `--temperature`, `--max-tokens`, and the matching `BIONIC_*`
+variables. Tools always run in `auto` approval inside the throwaway workspace.
+
+Custom scenarios go in a JSON file passed with `--scenarios-file`. They replace
+the built-ins unless you add `--with-builtin`. `{python}` in prompts and commands
+expands to the current interpreter:
+
+```json
+{"scenarios": [{
+  "name": "rename-fn", "tags": ["edit"],
+  "files": {"app.py": "def old():\n    return 1\n"},
+  "prompts": ["Rename the function old to new in app.py."],
+  "checks": [
+    {"type": "file_contains", "path": "app.py", "text": "def new("},
+    {"type": "command", "command": "{python} -c \"import app; app.new()\""}
+  ]
+}]}
+```
+
+Check types: `answer_contains` (`text`, optional `case_sensitive`),
+`answer_matches_any` (`texts`: the answer is one of them, or contains one as a
+word), `file_equals` (compares after trimming trailing whitespace; line endings
+don't matter), `file_contains`, `file_absent`, and `command` (`expect_exit`,
+default 0, and `timeout`). Answer checks use the last prompt's answer unless
+`prompt` sets an index. `--keep-workspaces` keeps each workspace for inspection.
+
 ## Client template (`docs/templates/bionic.json`)
 
 Register the preset on your hub (owner key required):
