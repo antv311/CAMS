@@ -121,6 +121,55 @@ Because `aircd` captures a worker's stderr into the wake transcript, enabling
 `BIONIC_STREAM` on a hub template makes those transcripts include the model's
 token stream; leave it off for templates unless you want that.
 
+## Python SDK (`BionicAgent`)
+
+For programmatic workflows, `aircd.BionicAgent` (also importable from
+`aircd.client` and `aircd.bionic`) wraps the same tool-calling loop the CLI
+uses, without spawning a subprocess:
+
+```python
+from aircd import BionicAgent, BionicError
+
+agent = BionicAgent(model="auto", cwd="path/to/repo", approval="read-only", keep_session=True)
+
+result = agent.run("Summarize README.md")          # RunResult(content, model, turns, tool_calls, session_id)
+follow = agent.run("Now list its section headings")  # continues the same conversation
+print(follow.content, agent.session_id)
+
+for event in agent.stream("Explain src/main.rs"):  # SSE streaming, events as they happen
+    if event["type"] == "token":
+        print(event["text"], end="", flush=True)
+    elif event["type"] == "result":
+        final = event["result"]
+```
+
+- **Options** are the `BionicConfig` field names (`model`, `base_url`,
+  `api_key`, `cwd`, `workspace_root`, `approval`, `max_turns`, `timeout`,
+  `command_timeout`, `max_output_chars`, `temperature`, `max_tokens`,
+  `system_prompt`, `session_dir`, `stream`, `stream_format`, …) plus
+  `system_prompt_file`. They are validated and resolved exactly like CLI flags
+  (argument → `BIONIC_*` environment variable → default); unknown names raise
+  `TypeError`, invalid values raise `BionicError`. Pass `config=BionicConfig(...)`
+  instead to skip resolution.
+- **Model**: `agent.model` resolves `auto` through `/models` once and caches it
+  for every later run. `agent.list_models(include_all=False)` queries the server.
+- **Sessions**: `keep_session=True` carries the conversation across `run()`
+  calls (saved under `session_dir` like `--session-id`) and keeps
+  `agent.session_id` current; `agent.new_session()` starts over. `run(...,
+  session_id="id")` resumes a specific saved session for one call.
+- **Events**: `on_event=` (agent-wide, or per `run()` call) receives the event
+  dicts described under [Streaming](#streaming---stream); `run(..., stream=True)`
+  adds `token`/`reasoning` events. `agent.stream(prompt)` runs on a background
+  thread, yields the events, finishes with `{"type": "result", "result":
+  RunResult}`, and raises any error from the iterator. Closing the iterator early
+  cancels the run at its next event.
+- **Approval**: with `approval="prompt"`, pass `approver=lambda name, args: ...`
+  to approve mutating tool calls in code; without one, the terminal is asked.
+- `agent.with_options(max_turns=5, approval="auto")` returns a re-validated copy
+  that keeps handlers, the session and the cached model.
+
+See `clients/python/examples/bionic_workflow.py` for a runnable example.
+
 ## Client template (`docs/templates/bionic.json`)
 
 Register the preset on your hub (owner key required):
