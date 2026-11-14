@@ -16,7 +16,7 @@ set both `command` and the first entry of `models_command` to the installed
 The `bionic` preset uses [`airc-bionic`](../bionic.md), CAMS's function-calling
 agent runner for LM Studio Bionic (`http://localhost:1235/v1`) and compatible
 OpenAI servers. Unlike `lmstudio`, `bionic` gives local models file and shell
-tools (`run_command`, `read_file`, `write_file`, `edit_file`) so they can act as
+tools (`run_command`, `read_file`, `write_file`, `edit_file`, `apply_patch`) so they can act as
 coding workers and group members. Install the Python package (`pip install -e
 clients/python`) so `airc-bionic` is on `PATH`, or point `command` and
 `models_command[0]` to the installed executable path.
