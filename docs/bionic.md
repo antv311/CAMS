@@ -53,10 +53,11 @@ Without installing on `PATH`, you can invoke the runner directly with
 `PYTHONPATH=clients/python python -m aircd.bionic` (or `.\airc-bionic.cmd` from
 the repository root on Windows). Zero third-party Python packages are required.
 
-Verify model discovery against your running Bionic server:
+Verify model discovery and readiness against your running Bionic server:
 
 ```powershell
 airc-bionic --list-models
+airc-bionic --health --model auto
 ```
 
 ## Configuration
@@ -84,6 +85,50 @@ No paths, model IDs, or hostnames outside `localhost` are hardcoded.
 | `--emit-session-id` | — | `false` | Print `session_id: <id>` on stderr for `aircd` tracking |
 | `--stream` | `BIONIC_STREAM` | `false` | Request SSE token streaming and show live progress on stderr |
 | `--stream-format` | `BIONIC_STREAM_FORMAT` | `text` | `text` or `jsonl` live feedback (the CLI flag implies `--stream`) |
+| `--auto-pull` | `BIONIC_AUTO_PULL` | `false` | Download/load the model with `lms` and confirm it answers before the first turn |
+| `--lms` | `BIONIC_LMS` | `lms` on `PATH` | Path to the LM Studio `lms` CLI used by `--auto-pull` |
+| `--pull-timeout` | `BIONIC_PULL_TIMEOUT` | `1800` | Timeout in seconds for each `lms get` / `lms load` |
+
+### Readiness check (`--health`) and auto-pull (`--auto-pull`)
+
+`airc-bionic --health --model <id|auto>` checks, in order, that:
+
+1. the server answers `GET /models` (`server.reachable`);
+2. the model is listed (`available`); `auto` picks the first chat model that is
+   already loaded, else the first chat model;
+3. its load `state` is `loaded`, read from LM Studio's `GET /api/v0/models`
+   (servers without that endpoint report `unknown`);
+4. it answers a one-token chat completion (`probe`, skipped with `--no-probe`).
+   LM Studio loads a model on demand for this request, so a passing probe also
+   means the model is now resident.
+
+It prints one JSON report on stdout and exits **0** when the model is ready and
+**2** when it is not (the reason is in `error` and on stderr). Exit 1 still
+means a configuration error. Without `--model` it reports only the server and
+its `available_models`.
+
+```powershell
+airc-bionic --health --model auto
+# {"ok": true, "model": "google/gemma-4-26b-a4b-qat", "available": true, "state": "loaded",
+#  "probe": {"ok": true, "latency_ms": 412, "error": null}, "actions": [], ...}
+```
+
+With `--auto-pull` (or `BIONIC_AUTO_PULL=1`), a missing model is downloaded with
+`lms get <model> --yes` and a not-loaded one is loaded with `lms load <model>
+--yes`; each step is recorded in `actions`. The `lms` CLI is found through
+`--lms`, `BIONIC_LMS`, or `PATH`, and each step is bounded by `--pull-timeout`.
+
+On a normal run, `--auto-pull` does the same check as a pre-task gate before the
+first turn: the model is pulled and loaded if needed, and probed unless LM Studio
+already reports it `loaded`. If the model cannot be made ready, the run fails
+with `error: Bionic model not ready: ...` before any tool call. To enable it for
+hub wakes, set `"env": {"BIONIC_AUTO_PULL": "1"}` on the `bionic` template (or add
+`--auto-pull` to `args`). Make sure the hub's `PATH` contains `lms`
+(`~/.lmstudio/bin`) or set `BIONIC_LMS`. A download can take a long time, so keep
+`--pull-timeout` in mind. From Python, `BionicAgent(..., auto_pull=True)` gates
+each `run()`, and `agent.health(probe=True, auto_pull=None)` returns the same
+report. With `auto_pull`, the run also emits a `{"type": "health", "report": ...}`
+event first.
 
 ### Streaming (`--stream`)
 
