@@ -353,6 +353,7 @@ impl LogEvent {
             | "template.upserted"
             | "template.deleted" => 2009,
             "auth.irc_session_replaced" => 2010,
+            "http.rate_limited" => 2011,
             _ => 2099,
         }
     }

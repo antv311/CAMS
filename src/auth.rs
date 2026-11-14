@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::history::unix_timestamp;
 use crate::logging::{EventForwarder, Severity};
@@ -200,12 +201,42 @@ pub struct TokenRecord {
     pub active: bool,
 }
 
+const VERIFIED_TOKEN_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Default)]
+struct VerifiedTokenCache {
+    order: VecDeque<(String, String, [u8; 32])>,
+    entries: HashSet<(String, String, [u8; 32])>,
+}
+
+impl VerifiedTokenCache {
+    fn contains(&self, key: &(String, String, [u8; 32])) -> bool {
+        self.entries.contains(key)
+    }
+
+    fn insert(&mut self, key: (String, String, [u8; 32])) {
+        if self.entries.contains(&key) {
+            return;
+        }
+        while self.entries.len() >= VERIFIED_TOKEN_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key);
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthStore {
     db: SharedConnection,
     legacy_hits: Arc<AtomicU64>,
     logger: EventForwarder,
     default_ttl_seconds: Option<u64>,
+    verified_cache: Arc<Mutex<VerifiedTokenCache>>,
 }
 
 impl AuthStore {
@@ -228,7 +259,33 @@ impl AuthStore {
             legacy_hits: Arc::new(AtomicU64::new(0)),
             logger,
             default_ttl_seconds: default_ttl_seconds.filter(|ttl| *ttl > 0),
+            verified_cache: Arc::new(Mutex::new(VerifiedTokenCache::default())),
         }
+    }
+
+    fn verify_token_secret(&self, token_id: &str, secret: &str, token_hash: &str) -> Result<bool> {
+        let secret_digest: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
+        let key = (
+            token_id.to_string(),
+            token_hash.to_string(),
+            secret_digest,
+        );
+        if self
+            .verified_cache
+            .lock()
+            .expect("verified token cache lock poisoned")
+            .contains(&key)
+        {
+            return Ok(true);
+        }
+        let ok = tokens::verify(secret, token_hash)?;
+        if ok {
+            self.verified_cache
+                .lock()
+                .expect("verified token cache lock poisoned")
+                .insert(key);
+        }
+        Ok(ok)
     }
 
     pub fn default_ttl_seconds(&self) -> Option<u64> {
@@ -339,7 +396,7 @@ impl AuthStore {
         };
 
         if let Some(row) = row {
-            if tokens::verify(secret, &row.token_hash)? {
+            if self.verify_token_secret(token_id, secret, &row.token_hash)? {
                 let scopes = parse_scopes_column(&row.scopes_raw)?;
                 let ttl_seconds = row
                     .ttl_raw
@@ -778,6 +835,7 @@ impl AuthStore {
 
     /// Refresh an active bearer token's expiry (and optionally rotate the secret).
     /// Preserves the token's existing scopes so refresh never escalates privileges.
+    #[cfg(test)]
     pub fn refresh_token(
         &self,
         raw_token: &str,
@@ -788,6 +846,19 @@ impl AuthStore {
             return Err(anyhow!("ttl_seconds must be at least 1"));
         }
         let ctx = self.authenticate_context(raw_token)?;
+        self.refresh_token_with_context(ctx, raw_token, ttl_seconds, rotate)
+    }
+
+    pub fn refresh_token_with_context(
+        &self,
+        ctx: AuthContext,
+        raw_token: &str,
+        ttl_seconds: Option<u64>,
+        rotate: bool,
+    ) -> Result<(Principal, IssuedToken)> {
+        if ttl_seconds == Some(0) {
+            return Err(anyhow!("ttl_seconds must be at least 1"));
+        }
         let now = unix_timestamp();
 
         let Some(token_id) = ctx.token.token_id.clone() else {
