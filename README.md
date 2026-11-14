@@ -21,8 +21,7 @@ repo, and the agent reads its inbox and gets on with it.
 - **One service.** Hub, messenger, task manager and agent launcher are the
   same program. Nothing about any provider is hard-coded.
 
-Features and bugs are tracked in the
-[issue tracker](https://github.com/antv311/CAMS/issues).
+Features and bugs are tracked in the repository's GitHub issue tracker.
 
 ## Credit
 

@@ -44,6 +44,10 @@ HOME_PATH_RE = re.compile(
     r"(?:[A-Za-z]:[\\/]+Users[\\/]+|/home/|/Users/)(?P<name>[A-Za-z0-9._-]+)",
 )
 PLACEHOLDER_HOME_NAMES = {"you", "user", "username", "name", "me", "example", "runner", "public", "default"}
+GITHUB_ACCOUNT_RE = re.compile(r"(?<![A-Za-z0-9.-])github\.com/(?P<account>[A-Za-z0-9-]+)", re.IGNORECASE)
+# Only the upstream aircd author and linked third-party tools are allowed; another
+# account link would publish a contributor's or the owner's username.
+ALLOWED_GITHUB_ACCOUNTS = {"c4pt0r", "openai"}
 # Names too generic to flag when they happen to be the local user or host.
 GENERIC_LOCAL_NAMES = {"user", "admin", "administrator", "root", "runner", "localhost", "ubuntu", "builder"}
 
@@ -172,6 +176,10 @@ class TrackedFilePrivacyTests(unittest.TestCase):
     def test_emails_use_reserved_domains(self) -> None:
         hits = self._hits(EMAIL_RE, lambda m: not ALLOWED_EMAIL_DOMAINS.search(m.group(0)))
         self.assertEqual(hits, [], "use an example.local or noreply address in fixtures")
+
+    def test_github_links_name_only_upstream(self) -> None:
+        hits = self._hits(GITHUB_ACCOUNT_RE, lambda m: m.group("account").lower() not in ALLOWED_GITHUB_ACCOUNTS)
+        self.assertEqual(hits, [], "do not link personal GitHub accounts; describe the location instead")
 
     def test_local_user_and_host_names_absent(self) -> None:
         names = set()
