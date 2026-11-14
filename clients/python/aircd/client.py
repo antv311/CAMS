@@ -918,6 +918,112 @@ class AircdHttpClient:
             raise AircdHttpError(f"attachment {attachment_id} failed its sha256 check")
         return raw
 
+    # Audit log streaming
+
+    def stream_audit_logs(
+        self,
+        *,
+        stream_format: str = "sse",
+        category: Optional[str] = None,
+        severity: Optional[str] = None,
+        action: Optional[str] = None,
+        actor: Optional[str] = None,
+        channel: Optional[str] = None,
+        task_id: Optional[str] = None,
+        since_seq: Optional[int] = None,
+        last_event_id: Optional[int] = None,
+        replay: Optional[int] = None,
+        limit: Optional[int] = None,
+        keepalive_secs: Optional[int] = None,
+        owner: bool = False,
+        timeout: Optional[float] = None,
+    ):
+        """Stream structured JSON audit events from ``GET /v1/audit/stream``.
+
+        Yields parsed ``dict`` objects as they arrive over SSE or chunked NDJSON.
+        Uses ``X-AirCD-Invite`` when ``owner=True`` or ``self.invite`` is set
+        without a token, otherwise sends ``Authorization: Bearer <token>``.
+        """
+        fmt = (stream_format or "sse").strip().lower()
+        params: list[tuple[str, str]] = [("format", fmt)]
+        if category:
+            params.append(("category", category))
+        if severity:
+            params.append(("severity", severity))
+        if action:
+            params.append(("action", action))
+        if actor:
+            params.append(("actor", actor))
+        if channel:
+            params.append(("channel", channel))
+        if task_id:
+            params.append(("task_id", task_id))
+        if since_seq is not None:
+            params.append(("since_seq", str(int(since_seq))))
+        if replay is not None:
+            params.append(("replay", str(int(replay))))
+        if limit is not None:
+            params.append(("limit", str(int(limit))))
+        if keepalive_secs is not None:
+            params.append(("keepalive_secs", str(int(keepalive_secs))))
+        path = "/v1/audit/stream?" + urllib.parse.urlencode(params)
+
+        headers = {
+            "Accept": "application/x-ndjson" if fmt in ("ndjson", "jsonl", "chunked") else "text/event-stream",
+        }
+        use_owner = owner or (bool(self.invite) and not self.token)
+        if use_owner:
+            if not self.invite:
+                raise AircdHttpError("this action needs the owner key (invite)")
+            headers["X-AirCD-Invite"] = self.invite
+        elif self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = str(int(last_event_id))
+
+        req = urllib.request.Request(f"{self.base_url}{path}", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" in ctype:
+                    data_lines: list[str] = []
+                    while True:
+                        raw = resp.readline()
+                        if not raw:
+                            break
+                        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if not line:
+                            if data_lines:
+                                yield json.loads("\n".join(data_lines))
+                                data_lines = []
+                            continue
+                        if line.startswith(":"):
+                            continue
+                        field, _, value = line.partition(":")
+                        if field == "data":
+                            data_lines.append(value[1:] if value.startswith(" ") else value)
+                    if data_lines:
+                        yield json.loads("\n".join(data_lines))
+                else:
+                    while True:
+                        raw = resp.readline()
+                        if not raw:
+                            break
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if line:
+                            yield json.loads(line)
+        except urllib.error.HTTPError as err:
+            raw = err.read().decode("utf-8", errors="replace")
+            try:
+                message = json.loads(raw).get("error") or raw
+            except Exception:
+                message = raw or str(err)
+            raise AircdHttpError(f"HTTP {err.code} GET {path}: {message}", err.code) from None
+        except (urllib.error.URLError, OSError) as err:
+            raise AircdHttpError(
+                f"Cannot reach aircd at {self.base_url}: {getattr(err, 'reason', err)}"
+            ) from None
+
     # Internal
 
     def _raw(

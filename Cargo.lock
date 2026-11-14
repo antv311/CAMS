@@ -21,6 +21,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "futures-core",
  "hmac",
  "rand 0.8.6",
  "ratatui",
