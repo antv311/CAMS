@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -15,6 +15,7 @@ use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
 use crate::locks::{LockConflictError, LockStore, ResourceLock};
 use crate::logging::{EventForwarder, LogEvent, Severity};
+use crate::metrics::{MetricsRegistry, MetricsSnapshot};
 use crate::notes::NoteStore;
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
@@ -76,6 +77,7 @@ pub struct Server {
     groups: GroupStore,
     backups: BackupManager,
     logger: EventForwarder,
+    metrics: Arc<MetricsRegistry>,
     // Lock before db/inner: registration, command effects, reissue and cleanup
     // must agree on which session owns a principal across credential changes.
     session_gate: Arc<Mutex<()>>,
@@ -177,16 +179,21 @@ impl Server {
             .filter(|value| *value > 0)
             .unwrap_or(300);
 
+        let metrics = Arc::new(MetricsRegistry::new());
         let server = Self {
             auth: AuthStore::with_config(db.clone(), logger.clone(), token_ttl_seconds),
             history: HistoryStore::new(db.clone()),
-            tasks: TaskStore::new(db.clone(), lease_seconds),
+            tasks: TaskStore::with_metrics(db.clone(), lease_seconds, metrics.clone()),
             webhooks: WebhookStore::with_logger(db.clone(), logger.clone()),
             reports: ReportStore::new(db.clone()),
             gits: GitRepoStore::new(db.clone()),
             locks: LockStore::new(db.clone()),
             projects: ProjectStore::new(db.clone()),
-            wakes: WakeManager::with_logger(db.clone(), logger.clone()),
+            wakes: WakeManager::with_logger_and_metrics(
+                db.clone(),
+                logger.clone(),
+                metrics.clone(),
+            ),
             notes: NoteStore::new(db.clone()),
             attachments: AttachmentStore::new(db.clone()),
             rooms: RoomStore::new(db.clone()),
@@ -194,6 +201,7 @@ impl Server {
             groups: GroupStore::new(db.clone()),
             backups: BackupManager::new(db.clone(), backup_config, logger.clone()),
             logger: logger.clone(),
+            metrics,
             db,
             session_gate: Arc::new(Mutex::new(())),
             task_gate: Arc::new(Mutex::new(())),
@@ -308,6 +316,7 @@ impl Server {
             let _ = client
                 .shutdown_tx
                 .send("Credentials reissued by owner".into());
+            self.metrics.record_irc_session("revoked");
         }
         self.logger.log_security(
             Severity::Info,
@@ -355,6 +364,96 @@ impl Server {
 
     pub fn attachments(&self) -> &AttachmentStore {
         &self.attachments
+    }
+
+    pub fn metrics(&self) -> &Arc<MetricsRegistry> {
+        &self.metrics
+    }
+
+    pub fn metrics_snapshot(&self) -> Result<MetricsSnapshot> {
+        let irc_sessions = self
+            .inner
+            .lock()
+            .expect("server mutex poisoned")
+            .clients
+            .len();
+        let (wake_running_sessions, wake_pending_sessions, wake_quota_cooldowns_active) =
+            self.wakes.runtime_session_counts();
+        let db = self.db.read()?;
+        let wake_stored_sessions: i64 = db
+            .query_row("SELECT COUNT(*) FROM wake_sessions", [], |row| row.get(0))
+            .context("count wake sessions")?;
+        let principals_total: i64 = db
+            .query_row("SELECT COUNT(*) FROM principals", [], |row| row.get(0))
+            .context("count principals")?;
+        let messages_total: i64 = db
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .context("count messages")?;
+
+        let mut tasks_by_status = BTreeMap::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")
+                .context("prepare task status counts")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (status, count) = row?;
+                tasks_by_status.insert(status, count.max(0) as u64);
+            }
+        }
+
+        let mut task_events_by_action = BTreeMap::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT action, COUNT(*) FROM task_events GROUP BY action")
+                .context("prepare task event counts")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (action, count) = row?;
+                task_events_by_action.insert(action, count.max(0) as u64);
+            }
+        }
+
+        let mut webhook_deliveries_by_status = BTreeMap::new();
+        for status in ["pending", "delivered", "failed"] {
+            webhook_deliveries_by_status.insert(status.to_string(), 0u64);
+        }
+        {
+            let mut stmt = db
+                .prepare("SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status")
+                .context("prepare webhook delivery counts")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (status, count) = row?;
+                webhook_deliveries_by_status.insert(status, count.max(0) as u64);
+            }
+        }
+        drop(db);
+
+        Ok(MetricsSnapshot {
+            irc_sessions,
+            wake_running_sessions,
+            wake_pending_sessions,
+            wake_stored_sessions: wake_stored_sessions.max(0) as usize,
+            wake_quota_cooldowns_active,
+            principals_total: principals_total.max(0) as u64,
+            messages_total: messages_total.max(0) as u64,
+            tasks_by_status,
+            task_events_by_action,
+            webhook_deliveries_by_status,
+            db_pool: Some(self.db.pool_stats()),
+        })
+    }
+
+    pub fn render_prometheus_metrics(&self) -> Result<String> {
+        let snap = self.metrics_snapshot()?;
+        Ok(self.metrics.render_prometheus(&snap))
     }
 
     /// Run once for deterministic tests, or from the background worker.
@@ -416,7 +515,10 @@ impl Server {
             .await
             .with_context(|| format!("bind {bind_addr}"))?;
         println!("aircd listening on {bind_addr}");
+        self.listen_on(listener).await
+    }
 
+    pub(crate) async fn listen_on(self, listener: TcpListener) -> Result<()> {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let server = self.clone();
@@ -850,6 +952,7 @@ impl Server {
                     Some("irc"),
                     "IRC authentication failed: invalid or expired token",
                 );
+                self.metrics.record_irc_session("auth_failed");
                 session.send(format!(":{SERVER_NAME} 464 * :Password incorrect"));
                 return Ok(());
             }
@@ -880,6 +983,7 @@ impl Server {
                 let _ = old_client
                     .shutdown_tx
                     .send(format!("Replaced by a newer session for {}", principal.id));
+                self.metrics.record_irc_session("replaced");
                 self.logger.log_security(
                     Severity::Info,
                     "auth.irc_session_replaced",
@@ -899,6 +1003,7 @@ impl Server {
                     .insert(principal.id.clone());
             }
         }
+        self.metrics.record_irc_session("connected");
 
         session.send(format!(
             ":{SERVER_NAME} 001 {} :Welcome to aircd, {}{}",
@@ -3884,6 +3989,7 @@ impl Server {
         let Some(principal) = session.principal.as_ref() else {
             return Ok(());
         };
+        self.metrics.record_irc_session("disconnected");
 
         let should_mark_disconnected = {
             let mut inner = self.inner.lock().expect("server mutex poisoned");

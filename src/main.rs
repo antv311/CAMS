@@ -8,6 +8,7 @@ mod history;
 mod http;
 mod locks;
 mod logging;
+mod metrics;
 mod notes;
 mod projects;
 mod protocol;
