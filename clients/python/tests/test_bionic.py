@@ -50,6 +50,23 @@ def _binary_path() -> Path | None:
     return max(candidates, key=lambda p: (p.stat().st_mtime, p.parent.name == "release"))
 
 
+class _SSEReply:
+    """Scripted ``text/event-stream`` chat reply: raw SSE event strings sent in order."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    def chunks(cls, deltas: list[dict[str, Any]], *, done: bool = True) -> "_SSEReply":
+        events = [
+            "data: " + json.dumps({"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": d}]}) + "\n\n"
+            for d in deltas
+        ]
+        if done:
+            events.append("data: [DONE]\n\n")
+        return cls(events)
+
+
 class _FakeBionicServer(http.server.ThreadingHTTPServer):
     """Programmable OpenAI-compatible server for testing ``aircd.bionic``."""
 
@@ -111,7 +128,20 @@ class _FakeBionicHandler(http.server.BaseHTTPRequestHandler):
             status, payload = self.server.chat_replies.pop(0)
         else:
             status, payload = (500, {"error": {"message": "no scripted reply"}})
-        self._send_json(status, payload)
+        if isinstance(payload, _SSEReply):
+            self._send_sse(status, payload)
+        else:
+            self._send_json(status, payload)
+
+    def _send_sse(self, status: int, reply: "_SSEReply") -> None:
+        # HTTP/1.0 handler: no Content-Length, the body ends when the socket closes.
+        self.send_response(status)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        for event in reply.events:
+            self.wfile.write(event.encode("utf-8"))
+            self.wfile.flush()
 
     def _send_json(self, status: int, payload: Any) -> None:
         raw = json.dumps(payload).encode("utf-8")
@@ -948,6 +978,224 @@ class BionicServerLoopTests(unittest.TestCase):
         # Path traversal session ID rejected
         with self.assertRaises(bionic.BionicError):
             bionic._resolve_session_file("../escape", str(sess_dir))
+
+
+class BionicStreamingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = _FakeBionicServer()
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _config(self, **overrides: Any) -> bionic.BionicConfig:
+        values: dict[str, Any] = {
+            "base_url": self.base_url,
+            "model": "m1",
+            "cwd": self.tmp.name,
+            "workspace_root": self.tmp.name,
+            "stream": True,
+        }
+        values.update(overrides)
+        return bionic.BionicConfig(**values)
+
+    def _tool_then_answer_replies(self) -> list[tuple[int, Any]]:
+        args = json.dumps({"path": "out.txt", "content": "streamed\n"})
+        return [
+            (
+                200,
+                _SSEReply.chunks(
+                    [
+                        {"role": "assistant", "reasoning_content": "Need a "},
+                        {"reasoning_content": "file."},
+                        # Fragmented tool call: no id (some local servers omit it), args split.
+                        {"tool_calls": [{"index": 0, "type": "function", "function": {"name": "write_file", "arguments": ""}}]},
+                        {"tool_calls": [{"index": 0, "function": {"arguments": args[:9]}}]},
+                        {"tool_calls": [{"index": 0, "function": {"arguments": args[9:]}}]},
+                    ]
+                ),
+            ),
+            (
+                200,
+                _SSEReply.chunks([{"role": "assistant", "content": "Wrote "}, {"content": "out.txt"}, {"content": " ✓"}]),
+            ),
+        ]
+
+    def test_iter_sse_data_parses_events(self) -> None:
+        raw = (
+            b": keep-alive comment\r\n"
+            b"event: message\r\n"
+            b"data: {\"a\": 1}\r\n"
+            b"\r\n"
+            b"id: 7\n"
+            b"data: line one\n"
+            b"data:line two\n"
+            b"\n"
+            b"data: [DONE]"
+        )
+        lines = io.BytesIO(raw).readlines()
+        self.assertEqual(list(bionic.iter_sse_data(lines)), ['{"a": 1}', "line one\nline two", "[DONE]"])
+
+    def test_accumulate_stream_merges_content_reasoning_and_tool_calls(self) -> None:
+        def chunk(delta: dict[str, Any]) -> str:
+            return json.dumps({"choices": [{"index": 0, "delta": delta}]})
+
+        emitted: list[tuple[str, str]] = []
+        msg = bionic.accumulate_stream(
+            [
+                chunk({"role": "assistant", "content": ""}),
+                chunk({"reasoning": "hmm"}),
+                chunk({"content": "Hel"}),
+                chunk({"content": "lo"}),
+                chunk({"tool_calls": [{"index": 1, "id": "b", "function": {"name": "read_file", "arguments": '{"pa'}}]}),
+                chunk({"tool_calls": [{"index": 0, "id": "a", "function": {"name": "run_command", "arguments": "{}"}}]}),
+                chunk({"tool_calls": [{"index": 1, "function": {"name": "read_file", "arguments": 'th": "x"}'}}]}),
+                json.dumps({"choices": [], "usage": {"total_tokens": 9}}),
+                "[DONE]",
+                chunk({"content": "ignored after DONE"}),
+            ],
+            lambda kind, text: emitted.append((kind, text)),
+        )
+        self.assertEqual(msg["content"], "Hello")
+        self.assertEqual(msg["reasoning_content"], "hmm")
+        self.assertEqual(emitted, [("reasoning", "hmm"), ("token", "Hel"), ("token", "lo")])
+        self.assertEqual(
+            msg["tool_calls"],
+            [
+                {"id": "a", "type": "function", "function": {"name": "run_command", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "x"}'}},
+            ],
+        )
+
+        no_text = bionic.accumulate_stream([chunk({"role": "assistant"})])
+        self.assertIsNone(no_text["content"])
+        self.assertNotIn("tool_calls", no_text)
+
+        with self.assertRaisesRegex(bionic.BionicError, "stream error: boom"):
+            bionic.accumulate_stream([json.dumps({"error": {"message": "boom"}})])
+        with self.assertRaisesRegex(bionic.BionicError, "Invalid JSON"):
+            bionic.accumulate_stream(["{not json"])
+        with self.assertRaisesRegex(bionic.BionicError, "without any completion chunks"):
+            bionic.accumulate_stream(["[DONE]"])
+
+    def test_streamed_tool_loop_emits_events_and_keeps_history_paired(self) -> None:
+        self.server.chat_replies = self._tool_then_answer_replies()
+        events: list[dict[str, Any]] = []
+        result = bionic.run_agent("make out.txt", self._config(), on_event=events.append)
+
+        self.assertEqual(result.content, "Wrote out.txt ✓")
+        self.assertEqual((result.turns, result.tool_calls), (2, 1))
+        self.assertEqual((Path(self.tmp.name) / "out.txt").read_text(encoding="utf-8"), "streamed\n")
+
+        bodies = [r["body"] for r in self.server.requests]
+        self.assertTrue(all(b["stream"] is True for b in bodies))
+        self.assertIn("text/event-stream", self.server.requests[0]["headers"]["accept"])
+
+        # The generated tool_call id is written back into history so the reply pairs with it.
+        second = bodies[1]["messages"]
+        assistant = [m for m in second if m["role"] == "assistant"][0]
+        tool_msg = [m for m in second if m["role"] == "tool"][0]
+        self.assertEqual(assistant["tool_calls"][0]["id"], "call_1_0")
+        self.assertEqual(tool_msg["tool_call_id"], "call_1_0")
+        self.assertEqual(json.loads(assistant["tool_calls"][0]["function"]["arguments"])["path"], "out.txt")
+        self.assertNotIn("reasoning_content", assistant)
+
+        kinds = [e["type"] for e in events]
+        self.assertEqual(
+            kinds,
+            ["turn", "reasoning", "reasoning", "tool_call", "tool_result", "turn", "token", "token", "token", "done"],
+        )
+        self.assertEqual(events[3]["name"], "write_file")
+        self.assertIsNone(events[4]["error"])
+        self.assertEqual("".join(e["text"] for e in events if e["type"] == "token"), "Wrote out.txt ✓")
+        self.assertEqual(events[-1], {"type": "done", "turns": 2, "tool_calls": 1})
+
+    def test_stream_falls_back_to_json_and_non_stream_omits_flag(self) -> None:
+        self.server.chat_replies = [
+            (200, {"choices": [{"message": {"role": "assistant", "content": "plain body"}}]}),
+            (200, {"choices": [{"message": {"role": "assistant", "content": "no stream"}}]}),
+        ]
+        events: list[dict[str, Any]] = []
+        result = bionic.run_agent("hi", self._config(), on_event=events.append)
+        self.assertEqual(result.content, "plain body")
+        self.assertIn({"type": "token", "turn": 1, "text": "plain body"}, events)
+
+        events.clear()
+        result = bionic.run_agent("hi", self._config(stream=False), on_event=events.append)
+        self.assertEqual(result.content, "no stream")
+        self.assertNotIn("stream", self.server.requests[-1]["body"])
+        self.assertEqual([e["type"] for e in events], ["turn", "done"])
+
+    def test_stream_errors_surface_as_bionic_errors(self) -> None:
+        self.server.chat_replies = [
+            (400, {"error": {"message": "context overflow"}}),
+            (200, _SSEReply(['data: {"error": {"message": "model crashed"}}\n\n'])),
+            (200, _SSEReply([])),
+        ]
+        with self.assertRaisesRegex(bionic.BionicError, "HTTP 400.*context overflow"):
+            bionic.run_agent("hi", self._config())
+        with self.assertRaisesRegex(bionic.BionicError, "model crashed"):
+            bionic.run_agent("hi", self._config())
+        with self.assertRaisesRegex(bionic.BionicError, "without any completion chunks"):
+            bionic.run_agent("hi", self._config())
+
+    def test_cli_jsonl_stream_keeps_stdout_json_clean(self) -> None:
+        self.server.chat_replies = self._tool_then_answer_replies()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = bionic.main(
+                ["--base-url", self.base_url, "--model", "m1", "--cwd", self.tmp.name,
+                 "--stream-format", "jsonl", "--json", "-p", "go"]
+            )
+        self.assertEqual(rc, 0, err.getvalue())
+        parsed = json.loads(out.getvalue())
+        self.assertEqual(parsed["content"], "Wrote out.txt ✓")
+        events = [json.loads(line) for line in err.getvalue().splitlines()]
+        self.assertEqual(events[0], {"type": "turn", "turn": 1, "model": "m1"})
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertIn("tool_call", [e["type"] for e in events])
+
+    def test_cli_text_stream_renders_tokens_and_tools(self) -> None:
+        self.server.chat_replies = self._tool_then_answer_replies()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = bionic.main(["--base-url", self.base_url, "--model", "m1", "--cwd", self.tmp.name, "--stream", "-p", "go"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(out.getvalue(), "Wrote out.txt ✓\n")
+        self.assertEqual(
+            err.getvalue(),
+            "[thinking] Need a file.\n[tool] write_file: out.txt (9 chars)\nWrote out.txt ✓\n",
+        )
+
+    def test_renderer_survives_unencodable_console(self) -> None:
+        raw = io.BytesIO()
+        console = io.TextIOWrapper(raw, encoding="cp1252", errors="strict", newline="\n")
+        renderer = bionic.StreamRenderer("text", out=console)
+        renderer({"type": "token", "turn": 1, "text": "ok ✓ — done"})
+        renderer({"type": "done", "turns": 1, "tool_calls": 0})
+        console.flush()
+        self.assertEqual(raw.getvalue().decode("cp1252"), "ok ? — done\n")
+        with self.assertRaises(bionic.BionicError):
+            bionic.StreamRenderer("xml")
+
+    def test_stream_config_resolution(self) -> None:
+        parser = bionic.build_parser()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            cfg = bionic.resolve_config(parser.parse_args(["--cwd", self.tmp.name]))
+            self.assertEqual((cfg.stream, cfg.stream_format), (False, "text"))
+            cfg = bionic.resolve_config(parser.parse_args(["--cwd", self.tmp.name, "--stream-format", "jsonl"]))
+            self.assertEqual((cfg.stream, cfg.stream_format), (True, "jsonl"))
+        with mock.patch.dict(os.environ, {"BIONIC_STREAM_FORMAT": "jsonl"}, clear=True):
+            cfg = bionic.resolve_config(parser.parse_args(["--cwd", self.tmp.name]))
+            self.assertEqual((cfg.stream, cfg.stream_format), (False, "jsonl"))
+        with mock.patch.dict(os.environ, {"BIONIC_STREAM": "1"}, clear=True):
+            cfg = bionic.resolve_config(parser.parse_args(["--cwd", self.tmp.name]))
+            self.assertEqual((cfg.stream, cfg.stream_format), (True, "text"))
+        with mock.patch.dict(os.environ, {"BIONIC_STREAM_FORMAT": "xml"}, clear=True):
+            with self.assertRaisesRegex(bionic.BionicError, "stream format"):
+                bionic.resolve_config(parser.parse_args(["--cwd", self.tmp.name]))
 
 
 @unittest.skipIf(_binary_path() is None, "aircd binary not built (cargo build)")
