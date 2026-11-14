@@ -171,7 +171,7 @@ you, and the recent launches.
 | `t` | Send a real test wake to an agent (this spends its quota) |
 | `l` | Switch an account's launcher on or off |
 | `w` | Answer a question that is waiting on you |
-| `g` / `c` | Groups topology view / Chat |
+| `g` / `T` / `c` | Groups topology view / Dependency Tree / Chat |
 | `/`, `Ctrl+F` | Search chat history across sprint channels and DMs |
 | `?` / `q` | List of keys / quit |
 
@@ -184,7 +184,7 @@ you, and the recent launches.
 | `a` | Assign or reassign, or return the task to the pool |
 | `s` | Move the task to another status, with an optional note |
 | `o`, `m`, `p`, `w`, `l` | As on Home |
-| `g` | Open the Groups topology view |
+| `g` / `t` | Open the Groups topology view / Dependency Tree DAG viewer |
 | `Esc` | Back to Home |
 
 **Groups** shows configured groups on the left, the selected group's topology
@@ -192,8 +192,18 @@ you, and the recent launches.
 top right, and current non-terminal subtasks on the bottom right. `n` opens an
 interactive group editor modal to create a group, `e` edits the selected group,
 `a` opens the project attachment dialog, `Tab` (or left/right arrows) switches
-focus between Groups and Current Subtasks, `Enter` opens subtask details, `r`
-refreshes, `q` quits, and `d` or `Esc` returns to the dashboard.
+focus between Groups and Current Subtasks, `Enter` opens subtask details, `t`
+opens the Dependency Tree, `r` refreshes, `q` quits, and `d` or `Esc` returns
+to the dashboard.
+
+**Tree** (`[T]ree`, `t` from Dashboard/Groups, `T` from Home) renders an
+interactive Unicode DAG tree of cross-task and cross-repo dependencies, upstream
+blockers, and ready states (`READY`, `BLK`, `ACTIVE`, `DONE`, `CLOSED`) alongside
+a selected-task dependency inspector. `Space`/`Left`/`Right` collapse, expand,
+or jump shared nodes, `u` toggles Downstream vs. Upstream direction, `f` cycles
+filters (`Active`, `Connected`, `Blocked`, `Ready`, `All`), `p` cycles project
+scope, `Enter` opens task details, `a`/`s` assign or update status, and `d` or
+`Esc` returns to the dashboard.
 
 **Chat** has the rooms on the left as a tree (a header per project, its rooms
 underneath, unread counts), the messages in the middle and the people on the

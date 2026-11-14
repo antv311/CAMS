@@ -27,7 +27,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const NOTICE_FOR: Duration = Duration::from_secs(6);
-const TABS: &str = " [H]ome  [D]ashboard  [G]roups  [C]hat  [Q]uit ";
+const TABS: &str = " [H]ome  [D]ashboard  [G]roups  [T]ree  [C]hat  [Q]uit ";
 const CHANNEL_PANE_WIDTH: u16 = 26;
 const PEOPLE_PANE_WIDTH: u16 = 26;
 const GROUPS_PANE_WIDTH: u16 = 34;
@@ -65,7 +65,7 @@ const HELP: &[&str] = &[
     "              for a client and model (owner)",
     "  w           answer a question that is waiting on you",
     "  l           switch an account's launcher on or off (owner)",
-    "  g           groups    c  chat      r  refresh      q  quit",
+    "  g           groups    t  tree    c  chat    r  refresh    q  quit",
     "  / / Ctrl+F  search chat history across sprint channels and DMs",
     "  S           start the hub on this machine when it is not running",
     "              (Ctrl+S in chat)",
@@ -76,7 +76,14 @@ const HELP: &[&str] = &[
     "  Tab / <- -> switch between Groups and Current Subtasks",
     "  up/down     move within the focused pane",
     "  Enter       open the selected subtask details",
-    "  d / Esc     dashboard   c  chat   r  refresh   q  quit",
+    "  t           dependency tree    d / Esc  dashboard    c  chat",
+    "",
+    "Tree / Dependency Graph  (t from Dashboard/Groups, T from Home)",
+    "  up/down     move between tasks in the DAG",
+    "  Space / <- -> collapse/expand subtree (or jump to parent/shared)",
+    "  u / f / p   toggle direction / cycle filter / cycle project scope",
+    "  Enter / a / s  task details / assign / status",
+    "  d / Esc     dashboard    g  groups    c  chat    r  refresh",
     "",
     "Chat",
     "  Enter send · Tab complete @name · up/down channel · Esc dashboard",
@@ -130,6 +137,10 @@ pub struct TaskView {
     pub reviewer: Option<String>,
     /// The task this one is a subtask of.
     pub parent: Option<String>,
+    /// Repository attached to this task, if any.
+    pub repo: Option<String>,
+    /// Upstream task IDs that must be `done` or `merged` before this task can proceed.
+    pub blocked_by: Vec<String>,
 }
 
 /// A sprint room under a project.
@@ -301,6 +312,9 @@ pub struct Snapshot {
     pub my_role: String,
     pub accounts: Vec<Account>,
     pub projects: Vec<ProjectView>,
+    /// Terminal tasks (`done`, `merged`, `cancelled`, `skipped`) loaded from `/v1/dashboard`
+    /// so resolved or closed upstream blockers show their title, status, and repo in the DAG viewer.
+    pub terminal_tasks: Vec<(String, TaskView)>,
     pub groups: Vec<GroupView>,
     pub waiting: Vec<Waiting>,
     pub launchers: Vec<Launcher>,
@@ -379,7 +393,70 @@ pub enum View {
     Home,
     Dashboard,
     Groups,
+    Graph,
     Chat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GraphDirection {
+    /// Upstream blockers at the roots with downstream dependents indented beneath (`├─▶`).
+    #[default]
+    Downstream,
+    /// Downstream tasks at the roots with upstream blockers indented beneath (`├─◀`).
+    Upstream,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GraphFilter {
+    /// Non-terminal tasks plus any terminal tasks referenced as upstream blockers.
+    #[default]
+    Active,
+    /// Only tasks with at least one dependency edge (`blocked_by` or downstream dependent).
+    Connected,
+    /// Only blocked tasks and their upstream blocker chains.
+    Blocked,
+    /// Only unblocked ready tasks (`open` / `assigned` / `claimed` with resolved dependencies).
+    Ready,
+    /// All tasks including standalone terminal tasks.
+    AllWithDone,
+}
+
+impl GraphFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Connected => "Connected",
+            Self::Blocked => "Blocked",
+            Self::Ready => "Ready",
+            Self::AllWithDone => "All",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Active => Self::Connected,
+            Self::Connected => Self::Blocked,
+            Self::Blocked => Self::Ready,
+            Self::Ready => Self::AllWithDone,
+            Self::AllWithDone => Self::Active,
+        }
+    }
+}
+
+impl GraphDirection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Downstream => "Downstream (Blockers → Unblocks)",
+            Self::Upstream => "Upstream (Tasks ← Blocked By)",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Downstream => Self::Upstream,
+            Self::Upstream => Self::Downstream,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -551,6 +628,17 @@ pub struct App {
     pub group_subtask_cursor: usize,
     pub group_subtask_scroll: usize,
     pub groups_focus: GroupsFocus,
+    /// Selected row index and scroll offset in `View::Graph`.
+    pub graph_cursor: usize,
+    pub graph_scroll: usize,
+    /// Selected task id in `View::Graph`, preserved across refreshes and filter toggles.
+    pub graph_selected_id: Option<String>,
+    pub graph_direction: GraphDirection,
+    pub graph_filter: GraphFilter,
+    /// Optional project channel scope in `View::Graph`.
+    pub graph_project: Option<String>,
+    /// Collapsed node task ids in `View::Graph`.
+    pub graph_collapsed: HashSet<String>,
     /// Last message seen in each room, for the unread counts.
     pub seen: HashMap<String, i64>,
     /// Rooms first shown later count messages after this seq as unread.
@@ -572,6 +660,8 @@ pub struct App {
     home_rows: Vec<(u16, usize)>,
     group_rows: Vec<(u16, usize)>,
     group_subtask_rows: Vec<(u16, usize)>,
+    graph_rows: Vec<(u16, usize, String)>,
+    graph_tree_area: Rect,
     /// People pane rows that open a direct message: (y, nick).
     people_rows: Vec<(u16, String)>,
     people_area: Rect,
@@ -593,6 +683,13 @@ impl Default for App {
             group_subtask_cursor: 0,
             group_subtask_scroll: 0,
             groups_focus: GroupsFocus::Groups,
+            graph_cursor: 0,
+            graph_scroll: 0,
+            graph_selected_id: None,
+            graph_direction: GraphDirection::Downstream,
+            graph_filter: GraphFilter::Active,
+            graph_project: None,
+            graph_collapsed: HashSet::new(),
             seen: HashMap::new(),
             seen_floor: None,
             dm_open: Vec::new(),
@@ -608,6 +705,8 @@ impl Default for App {
             home_rows: Vec::new(),
             group_rows: Vec::new(),
             group_subtask_rows: Vec::new(),
+            graph_rows: Vec::new(),
+            graph_tree_area: Rect::default(),
             people_rows: Vec::new(),
             people_area: Rect::default(),
             scroll: 0,
@@ -1336,6 +1435,18 @@ async fn refresh(
         Err(_) => Vec::new(),
     };
 
+    // Older hubs may not expose /v1/dashboard; fall back to active tasks only.
+    snap.terminal_tasks = match get(client, cfg, "/v1/dashboard?include_terminal=true").await {
+        Ok(body) => body["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| is_terminal_status(&text(&t["status"])))
+            .map(|t| (text(&t["channel"]), task_view_from_json(t)))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
     let projects = get(client, cfg, "/v1/projects").await?;
     let gits = get(client, cfg, "/v1/gits").await?;
     let rooms = get(client, cfg, "/v1/rooms").await?;
@@ -1352,21 +1463,7 @@ async fn refresh(
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|t| TaskView {
-                    id: text(&t["id"]),
-                    kind: text(&t["kind"]),
-                    priority: t["priority"].as_str().unwrap_or("normal").to_string(),
-                    status: text(&t["status"]),
-                    assignee: t["assignee"]
-                        .as_str()
-                        .or(t["claimed_by"].as_str())
-                        .unwrap_or("-")
-                        .to_string(),
-                    title: text(&t["title"]),
-                    sprint: t["sprint"].as_str().map(str::to_owned),
-                    reviewer: t["reviewer"].as_str().map(str::to_owned),
-                    parent: t["parent_task_id"].as_str().map(str::to_owned),
-                })
+                .map(task_view_from_json)
                 .collect(),
             members: members["members"]
                 .as_array()
@@ -1569,6 +1666,58 @@ fn reviewer_text(reviewer: Option<&str>, parent: Option<&Value>, pm: Option<&str
     format!("@{reviewer}{why}")
 }
 
+fn task_view_from_json(t: &Value) -> TaskView {
+    TaskView {
+        id: text(&t["id"]),
+        kind: text(&t["kind"]),
+        priority: t["priority"].as_str().unwrap_or("normal").to_string(),
+        status: text(&t["status"]),
+        assignee: t["assignee"]
+            .as_str()
+            .or(t["claimed_by"].as_str())
+            .unwrap_or("-")
+            .to_string(),
+        title: text(&t["title"]),
+        sprint: t["sprint"].as_str().map(str::to_owned),
+        reviewer: t["reviewer"].as_str().map(str::to_owned),
+        parent: t["parent_task_id"].as_str().map(str::to_owned),
+        repo: t["repo"].as_str().map(str::to_owned),
+        blocked_by: t["blocked_by"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+    }
+}
+
+fn push_detail_dep_section(
+    lines: &mut Vec<String>,
+    heading: &str,
+    items: &[Value],
+    (unresolved_label, resolved_label): (&str, &str),
+) {
+    lines.push(heading.to_string());
+    for dep in items {
+        let state = if dep["resolved"].as_bool() == Some(true) {
+            resolved_label
+        } else {
+            unresolved_label
+        };
+        let repo = dep["repo"].as_str().unwrap_or("-");
+        lines.push(format!(
+            "  {} [{}/{}] repo={} {}: {}",
+            text(&dep["task_id"]),
+            text(&dep["status"]),
+            state,
+            repo,
+            text(&dep["channel"]),
+            text(&dep["title"])
+        ));
+    }
+    lines.push(String::new());
+}
+
 /// The lines of the task details window. `parent` is the parent task when it
 /// could be loaded, and `pm` is the project manager.
 pub fn task_detail_lines(body: &Value, parent: Option<&Value>, pm: Option<&str>) -> Vec<String> {
@@ -1607,30 +1756,16 @@ pub fn task_detail_lines(body: &Value, parent: Option<&Value>, pm: Option<&str>)
         String::new(),
     ];
     if let Some(deps) = body["dependencies"].as_array().filter(|d| !d.is_empty()) {
-        lines.push("Blocked by:".to_string());
-        for dep in deps {
-            let state = if dep["resolved"].as_bool() == Some(true) {
-                "resolved"
-            } else {
-                "blocking"
-            };
-            lines.push(format!(
-                "  {} [{}/{}] repo={} {}: {}",
-                text(&dep["task_id"]),
-                text(&dep["status"]),
-                state,
-                or_dash(&dep["repo"]),
-                text(&dep["channel"]),
-                text(&dep["title"])
-            ));
-        }
-        lines.push(String::new());
+        push_detail_dep_section(&mut lines, "Blocked by:", deps, ("blocking", "resolved"));
     } else if let Some(ids) = task["blocked_by"].as_array().filter(|d| !d.is_empty()) {
         lines.push(format!(
             "blocked_by: {}",
             ids.iter().map(text).collect::<Vec<_>>().join(", ")
         ));
         lines.push(String::new());
+    }
+    if let Some(dependents) = body["dependents"].as_array().filter(|d| !d.is_empty()) {
+        push_detail_dep_section(&mut lines, "Blocks:", dependents, ("waiting", "done"));
     }
     if let Some(round) = task["review_round"].as_object() {
         lines.push(format!(
@@ -3875,6 +4010,7 @@ pub fn handle_key(
         View::Home => handle_home_key(app, code, snap),
         View::Dashboard => handle_dashboard_key(app, code, snap),
         View::Groups => handle_groups_key(app, code, snap),
+        View::Graph => handle_graph_key(app, code, snap),
         View::Chat => handle_chat_key(app, code, snap),
     }
 }
@@ -3907,6 +4043,7 @@ fn handle_home_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
                 Flow::TestAgent,
             );
         }
+        KeyCode::Char('T') => open_graph_view(app, snap, None),
         // Task actions belong to the dashboard.
         KeyCode::Char('a') | KeyCode::Char('s') | KeyCode::Esc => {}
         other => return handle_dashboard_key(app, other, snap),
@@ -3924,6 +4061,10 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
         KeyCode::Char('g') | KeyCode::Char('G') => {
             select_project_group(app, snap);
             app.view = View::Groups;
+        }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            let focus_task = selected_task(app, snap).map(|t| t.id.clone());
+            open_graph_view(app, snap, focus_task);
         }
         KeyCode::Char('c') | KeyCode::Char('C') => {
             // Chat opens in the room of the project you are looking at.
@@ -4108,6 +4249,16 @@ fn handle_groups_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Ac
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => return Some(Action::Quit),
         KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => app.view = View::Dashboard,
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            let focus_task = if app.groups_focus == GroupsFocus::Subtasks {
+                subtasks
+                    .get(app.group_subtask_cursor)
+                    .map(|s| s.task_id.clone())
+            } else {
+                None
+            };
+            open_graph_view(app, snap, focus_task);
+        }
         KeyCode::Char('c') | KeyCode::Char('C') => {
             let room = snap
                 .groups
@@ -4228,6 +4379,974 @@ fn handle_groups_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Ac
     None
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphTask {
+    pub id: String,
+    pub channel: String,
+    pub project_name: String,
+    pub title: String,
+    pub kind: String,
+    pub priority: String,
+    pub status: String,
+    pub assignee: String,
+    pub repo: Option<String>,
+    pub sprint: Option<String>,
+    pub reviewer: Option<String>,
+    pub parent: Option<String>,
+    pub blocked_by: Vec<String>,
+    pub dependents: Vec<String>,
+    pub is_placeholder: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskReadyState {
+    Resolved,
+    ClosedUnresolved,
+    Blocked {
+        unresolved_count: usize,
+        total_blockers: usize,
+    },
+    Active,
+    Ready {
+        resolved_blockers: usize,
+    },
+}
+
+impl TaskReadyState {
+    fn badge(self) -> (String, Color, &'static str) {
+        match self {
+            Self::Resolved => ("DONE".to_string(), Color::Green, "✓"),
+            Self::ClosedUnresolved => ("CLOSED".to_string(), Color::DarkGray, "✗"),
+            Self::Blocked {
+                unresolved_count,
+                total_blockers,
+            } => {
+                let label = if total_blockers > 0 {
+                    format!("BLK {unresolved_count}/{total_blockers}")
+                } else {
+                    "BLOCKED".to_string()
+                };
+                (label, Color::Red, "⊘")
+            }
+            Self::Active => ("ACTIVE".to_string(), Color::Cyan, "▶"),
+            Self::Ready { resolved_blockers } => {
+                let label = if resolved_blockers > 0 {
+                    format!("READY {resolved_blockers}/{resolved_blockers}")
+                } else {
+                    "READY".to_string()
+                };
+                (label, Color::LightGreen, "●")
+            }
+        }
+    }
+
+    fn sort_rank(self) -> u8 {
+        match self {
+            Self::Blocked { .. } => 0,
+            Self::Ready { .. } => 1,
+            Self::Active => 2,
+            Self::Resolved => 3,
+            Self::ClosedUnresolved => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphSummary {
+    pub ready: usize,
+    pub blocked: usize,
+    pub active: usize,
+    pub resolved: usize,
+    pub closed: usize,
+    pub edges: usize,
+    pub cross_repo_edges: usize,
+    pub cross_project_edges: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DagRow {
+    pub task_id: Option<String>,
+    pub section_label: Option<String>,
+    pub tree_prefix: String,
+    pub cross_repo: bool,
+    pub cross_project: bool,
+    pub has_children: bool,
+    pub collapsed: bool,
+    pub child_count: usize,
+    pub is_shared_ref: bool,
+    pub is_cycle_ref: bool,
+    pub depth: usize,
+    pub parent_in_tree: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DagModel {
+    pub tasks: HashMap<String, GraphTask>,
+    pub ready_states: HashMap<String, TaskReadyState>,
+    pub rows: Vec<DagRow>,
+    pub summary: GraphSummary,
+}
+
+fn graph_priority_rank(priority: &str) -> u8 {
+    match priority.trim().to_ascii_lowercase().as_str() {
+        "urgent" => 0,
+        "high" => 1,
+        "normal" | "" => 2,
+        "low" => 3,
+        _ => 2,
+    }
+}
+
+fn is_dep_resolved_status(status: &str) -> bool {
+    matches!(status, "done" | "merged")
+}
+
+fn compute_task_ready_state(
+    tasks: &HashMap<String, GraphTask>,
+    task: &GraphTask,
+) -> TaskReadyState {
+    if is_dep_resolved_status(&task.status) {
+        return TaskReadyState::Resolved;
+    }
+    if matches!(task.status.as_str(), "cancelled" | "skipped") {
+        return TaskReadyState::ClosedUnresolved;
+    }
+    let total_blockers = task.blocked_by.len();
+    let unresolved_count = task
+        .blocked_by
+        .iter()
+        .filter(|dep_id| {
+            !tasks
+                .get(*dep_id)
+                .is_some_and(|dep| is_dep_resolved_status(&dep.status))
+        })
+        .count();
+    if unresolved_count > 0 || task.status == "blocked" {
+        return TaskReadyState::Blocked {
+            unresolved_count,
+            total_blockers,
+        };
+    }
+    if matches!(
+        task.status.as_str(),
+        "in_progress" | "testing" | "review" | "super_review" | "changes_requested"
+    ) {
+        return TaskReadyState::Active;
+    }
+    TaskReadyState::Ready {
+        resolved_blockers: total_blockers,
+    }
+}
+
+fn sort_task_ids(tasks: &HashMap<String, GraphTask>, ids: &mut [String]) {
+    ids.sort_by(|a, b| {
+        let ta = tasks.get(a);
+        let tb = tasks.get(b);
+        let key = |t: Option<&GraphTask>| {
+            t.map(|task| {
+                (
+                    is_terminal_status(&task.status),
+                    graph_priority_rank(&task.priority),
+                    task.channel.clone(),
+                    task.id.clone(),
+                )
+            })
+        };
+        key(ta).cmp(&key(tb))
+    });
+}
+
+fn graph_task_from_view(channel: &str, project_name: &str, task: &TaskView) -> GraphTask {
+    GraphTask {
+        id: task.id.clone(),
+        channel: channel.to_string(),
+        project_name: project_name.to_string(),
+        title: task.title.clone(),
+        kind: task.kind.clone(),
+        priority: task.priority.clone(),
+        status: task.status.clone(),
+        assignee: task.assignee.clone(),
+        repo: task.repo.clone(),
+        sprint: task.sprint.clone(),
+        reviewer: task.reviewer.clone(),
+        parent: task.parent.clone(),
+        blocked_by: task.blocked_by.clone(),
+        dependents: Vec::new(),
+        is_placeholder: false,
+    }
+}
+
+fn collect_upstream_ancestors(
+    tasks: &HashMap<String, GraphTask>,
+    seeds: &[String],
+    out: &mut HashSet<String>,
+) {
+    let mut stack: Vec<String> = seeds.to_vec();
+    while let Some(id) = stack.pop() {
+        if let Some(task) = tasks.get(&id) {
+            for dep_id in &task.blocked_by {
+                if out.insert(dep_id.clone()) {
+                    stack.push(dep_id.clone());
+                }
+            }
+        }
+    }
+}
+
+fn subtree_has_active(
+    tasks: &HashMap<String, GraphTask>,
+    root_id: &str,
+    direction: GraphDirection,
+    allowed: &HashSet<String>,
+) -> bool {
+    let mut stack = vec![root_id.to_string()];
+    let mut seen = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let Some(task) = tasks.get(&id) else {
+            continue;
+        };
+        if !is_terminal_status(&task.status) {
+            return true;
+        }
+        let next = match direction {
+            GraphDirection::Downstream => &task.dependents,
+            GraphDirection::Upstream => &task.blocked_by,
+        };
+        for child_id in next {
+            if allowed.contains(child_id) {
+                stack.push(child_id.clone());
+            }
+        }
+    }
+    false
+}
+
+/// Build the visual DAG tree model from `snap` for the current direction, filter,
+/// optional project channel scope, and collapsed node set.
+pub fn build_dag_model(
+    snap: &Snapshot,
+    direction: GraphDirection,
+    filter: GraphFilter,
+    project_filter: Option<&str>,
+    collapsed_ids: &HashSet<String>,
+) -> DagModel {
+    let project_names: HashMap<String, String> = snap
+        .projects
+        .iter()
+        .map(|p| (p.channel.clone(), p.name.clone()))
+        .collect();
+
+    let mut tasks: HashMap<String, GraphTask> = HashMap::new();
+    for (channel, tv) in &snap.terminal_tasks {
+        let project_name = project_names
+            .get(channel)
+            .cloned()
+            .unwrap_or_else(|| channel.clone());
+        tasks.insert(tv.id.clone(), graph_task_from_view(channel, &project_name, tv));
+    }
+    for project in &snap.projects {
+        for tv in &project.tasks {
+            tasks.insert(
+                tv.id.clone(),
+                graph_task_from_view(&project.channel, &project.name, tv),
+            );
+        }
+    }
+
+    // Ensure every referenced blocker exists as a node (placeholder if external/missing).
+    let missing_deps: Vec<String> = tasks
+        .values()
+        .flat_map(|t| t.blocked_by.iter())
+        .filter(|dep_id| !tasks.contains_key(*dep_id))
+        .cloned()
+        .collect();
+    for dep_id in missing_deps {
+        tasks.entry(dep_id.clone()).or_insert_with(|| GraphTask {
+            id: dep_id.clone(),
+            channel: "-".to_string(),
+            project_name: "-".to_string(),
+            title: format!("(unresolved task {dep_id})"),
+            kind: "task".to_string(),
+            priority: "normal".to_string(),
+            status: "unknown".to_string(),
+            assignee: "-".to_string(),
+            repo: None,
+            sprint: None,
+            reviewer: None,
+            parent: None,
+            blocked_by: Vec::new(),
+            dependents: Vec::new(),
+            is_placeholder: true,
+        });
+    }
+
+    // Populate reverse dependency edges (`dependents`).
+    let edges: Vec<(String, String)> = tasks
+        .values()
+        .flat_map(|t| {
+            t.blocked_by
+                .iter()
+                .map(move |dep_id| (dep_id.clone(), t.id.clone()))
+        })
+        .collect();
+    for (dep_id, dependent_id) in edges {
+        if let Some(dep_task) = tasks.get_mut(&dep_id) {
+            if !dep_task.dependents.contains(&dependent_id) {
+                dep_task.dependents.push(dependent_id);
+            }
+        }
+    }
+    let all_ids: Vec<String> = tasks.keys().cloned().collect();
+    for id in all_ids {
+        let mut deps = tasks.get(&id).map(|t| t.blocked_by.clone()).unwrap_or_default();
+        let mut children = tasks.get(&id).map(|t| t.dependents.clone()).unwrap_or_default();
+        sort_task_ids(&tasks, &mut deps);
+        sort_task_ids(&tasks, &mut children);
+        if let Some(t) = tasks.get_mut(&id) {
+            t.blocked_by = deps;
+            t.dependents = children;
+        }
+    }
+
+    let ready_states: HashMap<String, TaskReadyState> = tasks
+        .iter()
+        .map(|(id, t)| (id.clone(), compute_task_ready_state(&tasks, t)))
+        .collect();
+
+    // Determine scope_ids: either all tasks or project tasks + cross-project blockers/dependents.
+    let mut scope_ids: HashSet<String> = HashSet::new();
+    if let Some(ch) = project_filter {
+        let seeds: Vec<String> = tasks
+            .values()
+            .filter(|t| t.channel.eq_ignore_ascii_case(ch))
+            .map(|t| t.id.clone())
+            .collect();
+        for id in &seeds {
+            scope_ids.insert(id.clone());
+            if let Some(task) = tasks.get(id) {
+                for dep in &task.dependents {
+                    scope_ids.insert(dep.clone());
+                }
+            }
+        }
+        collect_upstream_ancestors(&tasks, &seeds, &mut scope_ids);
+    } else {
+        scope_ids.extend(tasks.keys().cloned());
+    }
+
+    // Active non-terminal tasks in scope + their upstream blockers.
+    let active_seeds: Vec<String> = scope_ids
+        .iter()
+        .filter(|id| {
+            tasks
+                .get(*id)
+                .is_some_and(|t| !t.is_placeholder && !is_terminal_status(&t.status))
+        })
+        .cloned()
+        .collect();
+    let mut active_plus_blockers: HashSet<String> = active_seeds.iter().cloned().collect();
+    collect_upstream_ancestors(&tasks, &active_seeds, &mut active_plus_blockers);
+
+    let visible_ids: HashSet<String> = match filter {
+        GraphFilter::Active => active_plus_blockers,
+        GraphFilter::Connected => active_plus_blockers
+            .into_iter()
+            .filter(|id| {
+                tasks
+                    .get(id)
+                    .is_some_and(|t| !t.blocked_by.is_empty() || !t.dependents.is_empty())
+            })
+            .collect(),
+        GraphFilter::Blocked => {
+            let blocked_seeds: Vec<String> = active_seeds
+                .iter()
+                .filter(|id| {
+                    matches!(
+                        ready_states.get(*id),
+                        Some(TaskReadyState::Blocked { .. })
+                    )
+                })
+                .cloned()
+                .collect();
+            let mut out: HashSet<String> = blocked_seeds.iter().cloned().collect();
+            collect_upstream_ancestors(&tasks, &blocked_seeds, &mut out);
+            out
+        }
+        GraphFilter::Ready => active_seeds
+            .iter()
+            .filter(|id| matches!(ready_states.get(*id), Some(TaskReadyState::Ready { .. })))
+            .cloned()
+            .collect(),
+        GraphFilter::AllWithDone => scope_ids.clone(),
+    };
+
+    let mut summary = GraphSummary::default();
+    for id in &scope_ids {
+        let Some(task) = tasks.get(id) else {
+            continue;
+        };
+        if task.is_placeholder {
+            continue;
+        }
+        match ready_states.get(id) {
+            Some(TaskReadyState::Ready { .. }) => summary.ready += 1,
+            Some(TaskReadyState::Blocked { .. }) => summary.blocked += 1,
+            Some(TaskReadyState::Active) => summary.active += 1,
+            Some(TaskReadyState::Resolved) => summary.resolved += 1,
+            Some(TaskReadyState::ClosedUnresolved) => summary.closed += 1,
+            None => {}
+        }
+    }
+    for id in &visible_ids {
+        if let Some(task) = tasks.get(id) {
+            for dep_id in &task.blocked_by {
+                if visible_ids.contains(dep_id) {
+                    summary.edges += 1;
+                    if let Some(dep) = tasks.get(dep_id) {
+                        if dep.repo != task.repo {
+                            summary.cross_repo_edges += 1;
+                        }
+                        if dep.channel != task.channel {
+                            summary.cross_project_edges += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let children_in_vis = |id: &str| -> Vec<String> {
+        let Some(task) = tasks.get(id) else {
+            return Vec::new();
+        };
+        let raw = match direction {
+            GraphDirection::Downstream => &task.dependents,
+            GraphDirection::Upstream => &task.blocked_by,
+        };
+        raw.iter()
+            .filter(|cid| visible_ids.contains(*cid))
+            .cloned()
+            .collect()
+    };
+    let parents_in_vis_count = |id: &str| -> usize {
+        let Some(task) = tasks.get(id) else {
+            return 0;
+        };
+        let raw = match direction {
+            GraphDirection::Downstream => &task.blocked_by,
+            GraphDirection::Upstream => &task.dependents,
+        };
+        raw.iter().filter(|pid| visible_ids.contains(*pid)).count()
+    };
+
+    let mut dag_ids: Vec<String> = Vec::new();
+    let mut standalone_ids: Vec<String> = Vec::new();
+    for id in &visible_ids {
+        if !children_in_vis(id).is_empty() || parents_in_vis_count(id) > 0 {
+            dag_ids.push(id.clone());
+        } else {
+            standalone_ids.push(id.clone());
+        }
+    }
+    let dag_set: HashSet<String> = dag_ids.iter().cloned().collect();
+
+    let mut roots: Vec<String> = dag_ids
+        .iter()
+        .filter(|id| parents_in_vis_count(id) == 0)
+        .cloned()
+        .collect();
+    let sort_roots = |list: &mut Vec<String>| {
+        list.sort_by(|a, b| {
+            let key = |id: &String| {
+                let t = tasks.get(id);
+                let has_active = subtree_has_active(&tasks, id, direction, &dag_set);
+                (
+                    !has_active,
+                    t.map(|task| graph_priority_rank(&task.priority)).unwrap_or(2),
+                    t.map(|task| task.channel.clone()).unwrap_or_default(),
+                    id.clone(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
+    };
+    sort_roots(&mut roots);
+    sort_task_ids(&tasks, &mut dag_ids);
+
+    let mut rows: Vec<DagRow> = Vec::new();
+    let mut expanded_once: HashSet<String> = HashSet::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_dfs(
+        id: &str,
+        parent_id: Option<&str>,
+        guide_prefix: &str,
+        branch_glyph: &str,
+        depth: usize,
+        direction: GraphDirection,
+        tasks: &HashMap<String, GraphTask>,
+        visible_ids: &HashSet<String>,
+        collapsed_ids: &HashSet<String>,
+        visiting: &mut HashSet<String>,
+        expanded_once: &mut HashSet<String>,
+        rows: &mut Vec<DagRow>,
+    ) {
+        let Some(task) = tasks.get(id) else {
+            return;
+        };
+        let (cross_repo, cross_project) = parent_id
+            .and_then(|pid| tasks.get(pid))
+            .map(|parent| (parent.repo != task.repo, parent.channel != task.channel))
+            .unwrap_or((false, false));
+        let tree_prefix = format!("{guide_prefix}{branch_glyph}");
+
+        if visiting.contains(id) {
+            rows.push(DagRow {
+                task_id: Some(id.to_string()),
+                section_label: None,
+                tree_prefix,
+                cross_repo,
+                cross_project,
+                has_children: false,
+                collapsed: false,
+                child_count: 0,
+                is_shared_ref: false,
+                is_cycle_ref: true,
+                depth,
+                parent_in_tree: parent_id.map(str::to_owned),
+            });
+            return;
+        }
+        if expanded_once.contains(id) {
+            rows.push(DagRow {
+                task_id: Some(id.to_string()),
+                section_label: None,
+                tree_prefix,
+                cross_repo,
+                cross_project,
+                has_children: false,
+                collapsed: false,
+                child_count: 0,
+                is_shared_ref: true,
+                is_cycle_ref: false,
+                depth,
+                parent_in_tree: parent_id.map(str::to_owned),
+            });
+            return;
+        }
+
+        expanded_once.insert(id.to_string());
+        let raw_children = match direction {
+            GraphDirection::Downstream => &task.dependents,
+            GraphDirection::Upstream => &task.blocked_by,
+        };
+        let children: Vec<String> = raw_children
+            .iter()
+            .filter(|cid| visible_ids.contains(*cid))
+            .cloned()
+            .collect();
+        let has_children = !children.is_empty();
+        let collapsed = has_children && collapsed_ids.contains(id);
+
+        rows.push(DagRow {
+            task_id: Some(id.to_string()),
+            section_label: None,
+            tree_prefix,
+            cross_repo,
+            cross_project,
+            has_children,
+            collapsed,
+            child_count: children.len(),
+            is_shared_ref: false,
+            is_cycle_ref: false,
+            depth,
+            parent_in_tree: parent_id.map(str::to_owned),
+        });
+
+        if collapsed || children.is_empty() {
+            return;
+        }
+
+        visiting.insert(id.to_string());
+        let child_guide = if depth == 0 {
+            String::new()
+        } else if branch_glyph.starts_with('├') {
+            format!("{guide_prefix}│  ")
+        } else {
+            format!("{guide_prefix}   ")
+        };
+        let arrow = match direction {
+            GraphDirection::Downstream => "▶ ",
+            GraphDirection::Upstream => "◀ ",
+        };
+        for (idx, child_id) in children.iter().enumerate() {
+            let is_last = idx + 1 == children.len();
+            let glyph = if is_last {
+                format!("└─{arrow}")
+            } else {
+                format!("├─{arrow}")
+            };
+            emit_dfs(
+                child_id,
+                Some(id),
+                &child_guide,
+                &glyph,
+                depth + 1,
+                direction,
+                tasks,
+                visible_ids,
+                collapsed_ids,
+                visiting,
+                expanded_once,
+                rows,
+            );
+        }
+        visiting.remove(id);
+    }
+
+    for root_id in roots.iter().chain(dag_ids.iter()) {
+        if expanded_once.contains(root_id) {
+            continue;
+        }
+        emit_dfs(
+            root_id,
+            None,
+            "",
+            "",
+            0,
+            direction,
+            &tasks,
+            &visible_ids,
+            collapsed_ids,
+            &mut visiting,
+            &mut expanded_once,
+            &mut rows,
+        );
+    }
+
+    if !standalone_ids.is_empty() {
+        standalone_ids.sort_by(|a, b| {
+            let key = |id: &String| {
+                let rank = ready_states
+                    .get(id)
+                    .map(|r| r.sort_rank())
+                    .unwrap_or(9);
+                let t = tasks.get(id);
+                (
+                    rank,
+                    t.map(|task| graph_priority_rank(&task.priority)).unwrap_or(2),
+                    t.map(|task| task.channel.clone()).unwrap_or_default(),
+                    id.clone(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
+        let section_title = if dag_ids.is_empty() {
+            format!(
+                "── Standalone tasks (no dependency edges) ({}) ──",
+                standalone_ids.len()
+            )
+        } else {
+            format!("── Standalone tasks ({}) ──", standalone_ids.len())
+        };
+        rows.push(DagRow {
+            task_id: None,
+            section_label: Some(section_title),
+            tree_prefix: String::new(),
+            cross_repo: false,
+            cross_project: false,
+            has_children: false,
+            collapsed: false,
+            child_count: 0,
+            is_shared_ref: false,
+            is_cycle_ref: false,
+            depth: 0,
+            parent_in_tree: None,
+        });
+        for id in standalone_ids {
+            rows.push(DagRow {
+                task_id: Some(id),
+                section_label: None,
+                tree_prefix: String::new(),
+                cross_repo: false,
+                cross_project: false,
+                has_children: false,
+                collapsed: false,
+                child_count: 0,
+                is_shared_ref: false,
+                is_cycle_ref: false,
+                depth: 0,
+                parent_in_tree: None,
+            });
+        }
+    }
+
+    DagModel {
+        tasks,
+        ready_states,
+        rows,
+        summary,
+    }
+}
+
+fn open_graph_view(app: &mut App, snap: &Snapshot, focus_task: Option<String>) {
+    app.graph_project = app
+        .project
+        .as_deref()
+        .filter(|ch| snap.projects.iter().any(|p| p.channel == *ch))
+        .map(str::to_owned);
+    if let Some(id) = focus_task {
+        app.graph_selected_id = Some(id);
+    }
+    app.graph_scroll = 0;
+    app.view = View::Graph;
+}
+
+fn sync_graph_cursor(app: &mut App, rows: &[DagRow]) -> Option<usize> {
+    let selectable: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.task_id.as_ref().map(|_| i))
+        .collect();
+    if selectable.is_empty() {
+        app.graph_cursor = 0;
+        return None;
+    }
+    if let Some(sel_id) = app.graph_selected_id.as_deref() {
+        let current_matches = rows
+            .get(app.graph_cursor)
+            .and_then(|r| r.task_id.as_deref())
+            == Some(sel_id);
+        if !current_matches {
+            if let Some(canonical_idx) = rows
+                .iter()
+                .position(|r| r.task_id.as_deref() == Some(sel_id) && !r.is_shared_ref)
+                .or_else(|| rows.iter().position(|r| r.task_id.as_deref() == Some(sel_id)))
+            {
+                app.graph_cursor = canonical_idx;
+            }
+        }
+    }
+    if rows
+        .get(app.graph_cursor)
+        .and_then(|r| r.task_id.as_ref())
+        .is_none()
+    {
+        let next = selectable
+            .iter()
+            .copied()
+            .find(|&i| i >= app.graph_cursor)
+            .unwrap_or(selectable[0]);
+        app.graph_cursor = next;
+    }
+    app.graph_selected_id = rows
+        .get(app.graph_cursor)
+        .and_then(|r| r.task_id.clone());
+    Some(app.graph_cursor)
+}
+
+fn move_graph_cursor(app: &mut App, rows: &[DagRow], delta: isize) {
+    let selectable: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.task_id.as_ref().map(|_| i))
+        .collect();
+    if selectable.is_empty() {
+        return;
+    }
+    let pos = selectable
+        .iter()
+        .position(|&i| i == app.graph_cursor)
+        .unwrap_or(0);
+    let next_pos = if delta < 0 {
+        pos.saturating_sub(delta.unsigned_abs())
+    } else {
+        (pos + delta as usize).min(selectable.len() - 1)
+    };
+    app.graph_cursor = selectable[next_pos];
+    app.graph_selected_id = rows[app.graph_cursor].task_id.clone();
+}
+
+fn handle_graph_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
+    let model = build_dag_model(
+        snap,
+        app.graph_direction,
+        app.graph_filter,
+        app.graph_project.as_deref(),
+        &app.graph_collapsed,
+    );
+    let cursor = sync_graph_cursor(app, &model.rows);
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => return Some(Action::Quit),
+        KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => app.view = View::Dashboard,
+        KeyCode::Char('g') | KeyCode::Char('G') => {
+            select_project_group(app, snap);
+            app.view = View::Groups;
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            let room = cursor
+                .and_then(|i| model.rows.get(i))
+                .and_then(|r| r.task_id.as_deref())
+                .and_then(|id| model.tasks.get(id))
+                .map(|t| t.channel.clone())
+                .or_else(|| app.graph_project.clone())
+                .or_else(|| app.project.clone());
+            if let Some(index) = room.and_then(|r| snap.channels.iter().position(|c| *c == r)) {
+                app.channel_idx = index;
+                app.chat_channel = None;
+            }
+            app.chat_scroll = 0;
+            app.view = View::Chat;
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => return Some(Action::Refresh),
+        KeyCode::Char('/') => open_search_modal(app, snap),
+        KeyCode::Char('?') | KeyCode::Char('h') => app.modal = Some(Modal::Help),
+        KeyCode::Char('u') | KeyCode::Char('U') => {
+            app.graph_direction = app.graph_direction.toggle();
+            app.graph_scroll = 0;
+        }
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            app.graph_filter = app.graph_filter.next();
+            app.graph_scroll = 0;
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.graph_project = match app.graph_project.as_deref() {
+                None => snap.projects.first().map(|p| p.channel.clone()),
+                Some(current) => snap
+                    .projects
+                    .iter()
+                    .position(|p| p.channel == current)
+                    .and_then(|pos| snap.projects.get(pos + 1))
+                    .map(|p| p.channel.clone()),
+            };
+            app.graph_scroll = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') => move_graph_cursor(app, &model.rows, 1),
+        KeyCode::Up | KeyCode::Char('k') => move_graph_cursor(app, &model.rows, -1),
+        KeyCode::PageDown => move_graph_cursor(app, &model.rows, 10),
+        KeyCode::PageUp => move_graph_cursor(app, &model.rows, -10),
+        KeyCode::Home => {
+            if let Some(first) = model.rows.iter().position(|r| r.task_id.is_some()) {
+                app.graph_cursor = first;
+                app.graph_selected_id = model.rows[first].task_id.clone();
+            }
+        }
+        KeyCode::End => {
+            if let Some(last) = model.rows.iter().rposition(|r| r.task_id.is_some()) {
+                app.graph_cursor = last;
+                app.graph_selected_id = model.rows[last].task_id.clone();
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(row) = cursor.and_then(|i| model.rows.get(i)) {
+                if let Some(id) = row.task_id.as_deref() {
+                    if row.is_shared_ref {
+                        if let Some(canonical) = model
+                            .rows
+                            .iter()
+                            .position(|r| r.task_id.as_deref() == Some(id) && !r.is_shared_ref)
+                        {
+                            app.graph_cursor = canonical;
+                            app.graph_selected_id = Some(id.to_string());
+                        }
+                    } else if row.has_children && !app.graph_collapsed.remove(id) {
+                        app.graph_collapsed.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        KeyCode::Left => {
+            if let Some(row) = cursor.and_then(|i| model.rows.get(i)) {
+                if let Some(id) = row.task_id.as_deref() {
+                    if row.has_children && !row.collapsed && !row.is_shared_ref {
+                        app.graph_collapsed.insert(id.to_string());
+                    } else if let Some(parent_id) = row.parent_in_tree.as_deref() {
+                        if let Some(parent_idx) = model.rows[..app.graph_cursor]
+                            .iter()
+                            .rposition(|r| r.task_id.as_deref() == Some(parent_id))
+                        {
+                            app.graph_cursor = parent_idx;
+                            app.graph_selected_id = Some(parent_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Right => {
+            if let Some(row) = cursor.and_then(|i| model.rows.get(i)) {
+                if let Some(id) = row.task_id.as_deref() {
+                    if row.is_shared_ref {
+                        if let Some(canonical) = model
+                            .rows
+                            .iter()
+                            .position(|r| r.task_id.as_deref() == Some(id) && !r.is_shared_ref)
+                        {
+                            app.graph_cursor = canonical;
+                            app.graph_selected_id = Some(id.to_string());
+                        }
+                    } else if row.has_children && row.collapsed {
+                        app.graph_collapsed.remove(id);
+                    } else if row.has_children {
+                        move_graph_cursor(app, &model.rows, 1);
+                    }
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(id) = cursor
+                .and_then(|i| model.rows.get(i))
+                .and_then(|r| r.task_id.clone())
+            {
+                app.modal = Some(Modal::Detail {
+                    task_id: id.clone(),
+                });
+                return Some(Action::LoadTask(id));
+            }
+        }
+        KeyCode::Char('a') => {
+            if let Some(task) = cursor
+                .and_then(|i| model.rows.get(i))
+                .and_then(|r| r.task_id.as_deref())
+                .and_then(|id| model.tasks.get(id))
+            {
+                if !task.is_placeholder && !is_terminal_status(&task.status) {
+                    app.modal = picker(
+                        format!("Assign: {}", task.title),
+                        member_choices(snap, &task.channel, "(return to the pool)"),
+                        Flow::Assign {
+                            task_id: task.id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        KeyCode::Char('s') => {
+            if let Some(task) = cursor
+                .and_then(|i| model.rows.get(i))
+                .and_then(|r| r.task_id.as_deref())
+                .and_then(|id| model.tasks.get(id))
+            {
+                if !task.is_placeholder && !is_terminal_status(&task.status) {
+                    app.modal = picker(
+                        format!("Move from {}: {}", task.status, task.title),
+                        choices(STATUS_CHOICES),
+                        Flow::Status {
+                            task_id: task.id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
     match code {
         KeyCode::Esc => app.view = View::Dashboard,
@@ -4312,6 +5431,8 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
             app.view = View::Dashboard;
         } else if within("[G]roups") {
             app.view = View::Groups;
+        } else if within("[T]ree") {
+            app.view = View::Graph;
         } else if within("[C]hat") {
             app.view = View::Chat;
         } else if within("[Q]uit") {
@@ -4350,6 +5471,12 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
                 app.groups_focus = GroupsFocus::Subtasks;
             }
         }
+        View::Graph => {
+            if let Some((_, index, id)) = app.graph_rows.iter().find(|(y, _, _)| *y == row) {
+                app.graph_cursor = *index;
+                app.graph_selected_id = Some(id.clone());
+            }
+        }
         View::Dashboard => {
             if let Some((_, index)) = app.task_rows.iter().find(|(y, _)| *y == row) {
                 app.cursor = *index;
@@ -4381,6 +5508,20 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Option<Action> {
                 }
                 _ => app.chat_scroll.saturating_sub(3),
             };
+            None
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if app.view == View::Graph
+                && app.graph_tree_area.contains((mouse.column, mouse.row).into()) =>
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    app.graph_scroll = app.graph_scroll.saturating_sub(3);
+                }
+                _ => {
+                    app.graph_scroll = app.graph_scroll.saturating_add(3);
+                }
+            }
             None
         }
         _ => None,
@@ -4436,6 +5577,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
         View::Home => draw_home(frame, app, snap, body),
         View::Dashboard => draw_dashboard(frame, app, snap, body),
         View::Groups => draw_groups(frame, app, snap, body),
+        View::Graph => draw_graph(frame, app, snap, body),
         View::Chat => draw_chat(frame, app, snap, body),
     }
 
@@ -4479,12 +5621,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("q", "quit"),
         ],
         View::Dashboard => &[
-            ("Enter", "details"),
             ("n", "new"),
             ("a", "assign"),
             ("s", "status"),
-            ("w", "answer"),
             ("o", "sprint"),
+            ("t", "tree"),
+            ("g", "groups"),
             ("c", "chat"),
             ("Esc", "home"),
             ("?", "help"),
@@ -4496,8 +5638,21 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("a", "attach"),
             ("Tab", "pane"),
             ("Enter", "task"),
+            ("t", "tree"),
             ("d", "dashboard"),
             ("c", "chat"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        View::Graph => &[
+            ("Enter", "details"),
+            ("Space", "fold"),
+            ("u", "dir"),
+            ("f", "filter"),
+            ("p", "project"),
+            ("a", "assign"),
+            ("s", "status"),
+            ("d", "dashboard"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -4701,7 +5856,7 @@ pub fn hint_color(key: &str, label: &str) -> Color {
     match (key, label) {
         ("q", _) | ("Q", _) => Color::Red,
         ("?", _) => Color::Gray,
-        ("t", _) => Color::Magenta,
+        ("t", "test") => Color::Magenta,
         (_, "answer" | "chat" | "send" | "complete @name" | "direct message" | "search") => {
             Color::Yellow
         }
@@ -4730,6 +5885,7 @@ fn tab_spans(view: View) -> Vec<Span<'static>> {
         ("[H]", "ome", Some(View::Home)),
         ("[D]", "ashboard", Some(View::Dashboard)),
         ("[G]", "roups", Some(View::Groups)),
+        ("[T]", "ree", Some(View::Graph)),
         ("[C]", "hat", Some(View::Chat)),
         ("[Q]", "uit", None),
     ];
@@ -5087,6 +6243,18 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
                         dim(),
                     ),
                     Span::styled(orphan, dim()),
+                    Span::styled(
+                        if task.blocked_by.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  deps:{}", task.blocked_by.len())
+                        },
+                        if task.status == "blocked" {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            dim()
+                        },
+                    ),
                     Span::styled(
                         task.reviewer
                             .as_deref()
@@ -5543,6 +6711,425 @@ fn draw_groups(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
         ),
         subtasks_area,
     );
+}
+
+fn graph_summary_line(model: &DagModel, scope_label: &str, filter: GraphFilter) -> Line<'static> {
+    let s = &model.summary;
+    let mut spans = vec![
+        Span::styled(format!(" Ready {} ", s.ready), bold().fg(Color::LightGreen)),
+        Span::styled("·", dim()),
+        Span::styled(format!(" Blocked {} ", s.blocked), bold().fg(Color::Red)),
+        Span::styled("·", dim()),
+        Span::styled(format!(" Active {} ", s.active), bold().fg(Color::Cyan)),
+        Span::styled("·", dim()),
+        Span::styled(format!(" Done {} ", s.resolved), Style::default().fg(Color::Green)),
+        Span::styled(format!(" |  Edges {} ", s.edges), dim()),
+    ];
+    if s.cross_repo_edges > 0 || s.cross_project_edges > 0 {
+        spans.push(Span::styled(
+            format!("({} x-repo, {} x-proj) ", s.cross_repo_edges, s.cross_project_edges),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" |  Filter: {}  Scope: {}", filter.label(), scope_label),
+        dim(),
+    ));
+    Line::from(spans)
+}
+
+fn graph_row_line(
+    row: &DagRow,
+    model: &DagModel,
+    selected: bool,
+    show_project_tag: bool,
+) -> Line<'static> {
+    if let Some(label) = &row.section_label {
+        return Line::from(Span::styled(label.clone(), dim()));
+    }
+    let Some(task_id) = row.task_id.as_deref() else {
+        return Line::default();
+    };
+    let Some(task) = model.tasks.get(task_id) else {
+        return Line::default();
+    };
+    let ready = model
+        .ready_states
+        .get(task_id)
+        .copied()
+        .unwrap_or(TaskReadyState::Active);
+    let (badge, badge_color, glyph) = ready.badge();
+
+    let mut spans = Vec::new();
+    if !row.tree_prefix.is_empty() {
+        spans.push(Span::styled(row.tree_prefix.clone(), dim()));
+    }
+    let fold = if row.has_children {
+        if row.collapsed {
+            Span::styled("▸ ", bold().fg(Color::Yellow))
+        } else {
+            Span::styled("▾ ", dim())
+        }
+    } else {
+        Span::raw("  ")
+    };
+    spans.push(fold);
+    spans.push(Span::styled(format!("{glyph} "), bold().fg(badge_color)));
+    spans.push(Span::styled(
+        format!("[{badge}] "),
+        bold().fg(badge_color),
+    ));
+    if row.collapsed {
+        spans.push(Span::styled(
+            format!("[+{}] ", row.child_count),
+            bold().fg(Color::Yellow),
+        ));
+    }
+    if row.is_shared_ref {
+        spans.push(Span::styled("(↗ shared) ", Style::default().fg(Color::Magenta)));
+    }
+    if row.is_cycle_ref {
+        spans.push(Span::styled("(↻ cycle) ", Style::default().fg(Color::Red)));
+    }
+    spans.push(Span::styled(
+        format!("{} ", task.status),
+        Style::default().fg(status_color(&task.status)),
+    ));
+    if task.assignee != "-" && !task.assignee.is_empty() {
+        spans.push(Span::styled(format!("@{} ", task.assignee), bold()));
+    }
+    if show_project_tag || row.cross_project {
+        let proj_style = if row.cross_project {
+            Style::default().fg(Color::Magenta)
+        } else {
+            dim()
+        };
+        let tag = if row.cross_project {
+            format!("[x-proj {}] ", task.channel)
+        } else {
+            format!("[{}] ", task.channel)
+        };
+        spans.push(Span::styled(tag, proj_style));
+    }
+    if let Some(repo) = task.repo.as_deref() {
+        let repo_style = if row.cross_repo {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let tag = if row.cross_repo {
+            format!("[x-repo:{repo}] ")
+        } else {
+            format!("[{repo}] ")
+        };
+        spans.push(Span::styled(tag, repo_style));
+    } else if row.cross_repo {
+        spans.push(Span::styled("[x-repo] ", Style::default().fg(Color::Yellow)));
+    }
+    spans.push(priority_span(&task.priority));
+    spans.push(Span::raw(task.title.clone()));
+    spans.push(Span::styled(format!("  {}", short_id(&task.id)), dim()));
+
+    let mut line = Line::from(spans);
+    if selected {
+        line = line.style(Style::default().bg(Color::DarkGray));
+    }
+    line
+}
+
+fn graph_transitive_upstream_count(tasks: &HashMap<String, GraphTask>, root_id: &str) -> usize {
+    let mut visited = HashSet::new();
+    let mut stack = vec![root_id.to_string()];
+    while let Some(id) = stack.pop() {
+        if let Some(task) = tasks.get(&id) {
+            for dep_id in &task.blocked_by {
+                if visited.insert(dep_id.clone()) {
+                    stack.push(dep_id.clone());
+                }
+            }
+        }
+    }
+    visited.len()
+}
+
+fn push_inspector_dep_list(
+    lines: &mut Vec<Line<'static>>,
+    heading: &str,
+    ids: &[String],
+    source: &GraphTask,
+    model: &DagModel,
+    is_upstream: bool,
+) {
+    lines.push(Line::from(Span::styled(
+        format!("{heading} ({})", ids.len()),
+        bold().fg(Color::Cyan),
+    )));
+    if ids.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)", dim())));
+        return;
+    }
+    for id in ids {
+        let Some(other) = model.tasks.get(id) else {
+            continue;
+        };
+        let (glyph, color) = if is_upstream {
+            if is_dep_resolved_status(&other.status) {
+                ("✓", Color::Green)
+            } else {
+                ("⊘", Color::Red)
+            }
+        } else {
+            let (_, c, g) = model
+                .ready_states
+                .get(id)
+                .copied()
+                .unwrap_or(TaskReadyState::Active)
+                .badge();
+            (g, c)
+        };
+        let mut tags = Vec::new();
+        if other.channel != source.channel {
+            tags.push(format!("x-proj {}", other.channel));
+        }
+        if other.repo != source.repo {
+            tags.push(format!(
+                "x-repo:{}",
+                other.repo.as_deref().unwrap_or("-")
+            ));
+        } else if let Some(repo) = other.repo.as_deref() {
+            tags.push(format!("repo:{repo}"));
+        }
+        let suffix = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", tags.join(" · "))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {glyph} "), bold().fg(color)),
+            Span::styled(
+                format!("{:<11} ", other.status),
+                Style::default().fg(status_color(&other.status)),
+            ),
+            Span::raw(other.title.clone()),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("      {}{suffix}", short_id(&other.id)),
+            dim(),
+        )));
+    }
+}
+
+fn draw_graph_inspector(
+    frame: &mut Frame,
+    model: &DagModel,
+    selected_row: Option<&DagRow>,
+    area: Rect,
+) {
+    let block = Block::bordered().title(" Dependency Inspector ");
+    let Some(task) = selected_row
+        .and_then(|r| r.task_id.as_deref())
+        .and_then(|id| model.tasks.get(id))
+    else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Select a task node to inspect blockers and dependents.",
+                dim(),
+            )))
+            .block(block),
+            area,
+        );
+        return;
+    };
+
+    let ready = model
+        .ready_states
+        .get(&task.id)
+        .copied()
+        .unwrap_or(TaskReadyState::Active);
+    let (badge, badge_color, glyph) = ready.badge();
+    let ready_detail = match ready {
+        TaskReadyState::Ready { resolved_blockers: 0 } => {
+            "Ready to start (no upstream dependencies)".to_string()
+        }
+        TaskReadyState::Ready { resolved_blockers } => {
+            format!("Ready to start (all {resolved_blockers} upstream deps resolved)")
+        }
+        TaskReadyState::Blocked {
+            unresolved_count,
+            total_blockers,
+        } if total_blockers > 0 => {
+            format!("Blocked by {unresolved_count}/{total_blockers} unresolved upstream task(s)")
+        }
+        TaskReadyState::Blocked { .. } => "Task status is blocked (check pending question)".to_string(),
+        TaskReadyState::Active => "In flight (upstream dependencies satisfied)".to_string(),
+        TaskReadyState::Resolved => "Resolved (unblocks downstream tasks)".to_string(),
+        TaskReadyState::ClosedUnresolved => {
+            "Closed without resolution (downstream deps remain blocked)".to_string()
+        }
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(task.title.clone(), bold()),
+            Span::styled(format!("  [{}]", task.kind), dim()),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "{} · {} · status {} · @{}",
+                task.id, task.channel, task.status, task.assignee
+            ),
+            dim(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "repo: {}   sprint: {}   reviewer: {}",
+                task.repo.as_deref().unwrap_or("-"),
+                task.sprint.as_deref().unwrap_or("-"),
+                task.reviewer.as_deref().unwrap_or("-"),
+            ),
+            dim(),
+        )),
+    ];
+    if let Some(parent_id) = task.parent.as_deref() {
+        let parent_title = model
+            .tasks
+            .get(parent_id)
+            .map(|p| format!(" \"{}\"", p.title))
+            .unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!("parent subtask of: {}{parent_title}", short_id(parent_id)),
+            dim(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{glyph} {badge}: "), bold().fg(badge_color)),
+        Span::styled(ready_detail, Style::default().fg(badge_color)),
+    ]));
+
+    let total_upstream = graph_transitive_upstream_count(&model.tasks, &task.id);
+    if total_upstream > task.blocked_by.len() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ({total_upstream} total transitive upstream dependencies)"
+            ),
+            dim(),
+        )));
+    }
+    lines.push(Line::from(""));
+    push_inspector_dep_list(
+        &mut lines,
+        "Upstream Blockers (Blocked By)",
+        &task.blocked_by,
+        task,
+        model,
+        true,
+    );
+    lines.push(Line::from(""));
+    push_inspector_dep_list(
+        &mut lines,
+        "Downstream Dependents (Unblocks)",
+        &task.dependents,
+        task,
+        model,
+        false,
+    );
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        area,
+    );
+}
+
+fn draw_graph(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
+    app.graph_rows.clear();
+    let model = build_dag_model(
+        snap,
+        app.graph_direction,
+        app.graph_filter,
+        app.graph_project.as_deref(),
+        &app.graph_collapsed,
+    );
+    let cursor = sync_graph_cursor(app, &model.rows);
+
+    let [summary_area, main_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
+
+    let scope_label = app.graph_project.as_deref().unwrap_or("All Projects");
+    frame.render_widget(
+        Paragraph::new(graph_summary_line(&model, scope_label, app.graph_filter)),
+        summary_area,
+    );
+
+    let (tree_area, inspector_area) = if main_area.width >= 90 {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .areas(main_area);
+        (left, Some(right))
+    } else {
+        (main_area, None)
+    };
+    app.graph_tree_area = tree_area;
+
+    let visible_rows = tree_area.height.saturating_sub(2) as usize;
+    if let Some(cur) = cursor {
+        if cur < app.graph_scroll {
+            app.graph_scroll = cur;
+        } else if visible_rows > 0 && cur >= app.graph_scroll + visible_rows {
+            app.graph_scroll = cur + 1 - visible_rows;
+        }
+    } else {
+        app.graph_scroll = 0;
+    }
+
+    let show_project_tag = app.graph_project.is_none() || model.summary.cross_project_edges > 0;
+    let mut tree_lines: Vec<Line> = Vec::new();
+    for (index, row) in model
+        .rows
+        .iter()
+        .enumerate()
+        .skip(app.graph_scroll)
+        .take(visible_rows.max(1))
+    {
+        if let Some(task_id) = row.task_id.as_ref() {
+            let y = tree_area.y + 1 + tree_lines.len() as u16;
+            app.graph_rows.push((y, index, task_id.clone()));
+        }
+        tree_lines.push(graph_row_line(
+            row,
+            &model,
+            cursor == Some(index),
+            show_project_tag,
+        ));
+    }
+
+    if model.rows.is_empty() {
+        let msg = match app.graph_filter {
+            GraphFilter::Connected => {
+                "No task dependency edges match this filter. Press f for All or Active."
+            }
+            GraphFilter::Blocked => "No blocked tasks in this scope. Press f to change filter.",
+            GraphFilter::Ready => "No ready tasks in this scope. Press f to change filter.",
+            GraphFilter::Active | GraphFilter::AllWithDone => {
+                "No tasks found in this scope."
+            }
+        };
+        tree_lines.push(Line::from(Span::styled(msg, dim())));
+    }
+
+    let title = format!(
+        " Task Dependency Graph · {}  (u dir · f filter · p scope · Space fold) ",
+        app.graph_direction.label()
+    );
+    frame.render_widget(
+        Paragraph::new(tree_lines).block(Block::bordered().title(title)),
+        tree_area,
+    );
+
+    if let Some(right_area) = inspector_area {
+        let selected_row = cursor.and_then(|i| model.rows.get(i));
+        draw_graph_inspector(frame, &model, selected_row, right_area);
+    }
 }
 
 fn chat_message<'a>(message: &'a ChatLine, me: &str, highlighted: bool) -> Text<'a> {
@@ -6812,6 +8399,7 @@ mod tests {
                     title: Some("Local playback".into()),
                 }],
             }],
+            terminal_tasks: Vec::new(),
             groups: Vec::new(),
             waiting: vec![Waiting {
                 task_id: "task_abc123".into(),
@@ -7676,7 +9264,7 @@ mod tests {
 
         // The tab bar keeps the exact TABS text, so clicks still line up,
         // and highlights the open view.
-        for view in [View::Home, View::Dashboard, View::Groups, View::Chat] {
+        for view in [View::Home, View::Dashboard, View::Groups, View::Graph, View::Chat] {
             let text: String = tab_spans(view).iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(text, TABS);
         }
@@ -9323,5 +10911,438 @@ mod tests {
         for (width, height) in [(110, 32), (60, 10), (20, 6), (1, 1)] {
             render_to_text(&mut app, &snap, width, height).unwrap();
         }
+    }
+
+    fn dag_fixture() -> Snapshot {
+        let mut snap = fixture();
+        snap.projects = vec![
+            ProjectView {
+                channel: "#backend".into(),
+                name: "Backend".into(),
+                pm: Some("agent3.8".into()),
+                tasks: vec![
+                    TaskView {
+                        id: "task_api".into(),
+                        kind: "feature".into(),
+                        priority: "high".into(),
+                        status: "in_progress".into(),
+                        assignee: "agent3.8".into(),
+                        title: "Build REST API".into(),
+                        repo: Some("api".into()),
+                        blocked_by: vec!["task_schema".into()],
+                        ..TaskView::default()
+                    },
+                    TaskView {
+                        id: "task_ready_unblocked".into(),
+                        kind: "task".into(),
+                        priority: "normal".into(),
+                        status: "open".into(),
+                        assignee: "codex".into(),
+                        title: "Enable auth middleware".into(),
+                        repo: Some("api".into()),
+                        blocked_by: vec!["task_schema".into()],
+                        ..TaskView::default()
+                    },
+                ],
+                members: vec![
+                    Member {
+                        nick: "agent3.8".into(),
+                        role: "builder".into(),
+                    },
+                    Member {
+                        nick: "codex".into(),
+                        role: "builder".into(),
+                    },
+                ],
+                ..ProjectView::default()
+            },
+            ProjectView {
+                channel: "#frontend".into(),
+                name: "Frontend".into(),
+                pm: Some("agent3.8".into()),
+                tasks: vec![
+                    TaskView {
+                        id: "task_ui".into(),
+                        kind: "feature".into(),
+                        priority: "normal".into(),
+                        status: "open".into(),
+                        assignee: "codex".into(),
+                        title: "Build dashboard UI".into(),
+                        repo: Some("web".into()),
+                        blocked_by: vec!["task_api".into()],
+                        ..TaskView::default()
+                    },
+                    TaskView {
+                        id: "task_e2e".into(),
+                        kind: "task".into(),
+                        priority: "urgent".into(),
+                        status: "open".into(),
+                        assignee: "user".into(),
+                        title: "Run cross-repo E2E suite".into(),
+                        repo: Some("e2e".into()),
+                        blocked_by: vec!["task_api".into(), "task_ui".into()],
+                        ..TaskView::default()
+                    },
+                    TaskView {
+                        id: "task_standalone".into(),
+                        kind: "bug".into(),
+                        priority: "low".into(),
+                        status: "assigned".into(),
+                        assignee: "codex".into(),
+                        title: "Fix footer alignment".into(),
+                        repo: Some("web".into()),
+                        ..TaskView::default()
+                    },
+                ],
+                members: vec![Member {
+                    nick: "codex".into(),
+                    role: "builder".into(),
+                }],
+                ..ProjectView::default()
+            },
+        ];
+        snap.terminal_tasks = vec![(
+            "#backend".into(),
+            TaskView {
+                id: "task_schema".into(),
+                kind: "task".into(),
+                priority: "high".into(),
+                status: "merged".into(),
+                assignee: "agent3.8".into(),
+                title: "Init SQL schema".into(),
+                repo: Some("db".into()),
+                ..TaskView::default()
+            },
+        )];
+        snap.channels = vec![
+            "#general".into(),
+            "#backend".into(),
+            "#frontend".into(),
+        ];
+        snap
+    }
+
+    #[test]
+    fn dag_model_computes_ready_states_cross_repo_and_diamond_refs() {
+        let snap = dag_fixture();
+        let model = build_dag_model(
+            &snap,
+            GraphDirection::Downstream,
+            GraphFilter::Active,
+            None,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            model.ready_states.get("task_schema"),
+            Some(&TaskReadyState::Resolved)
+        );
+        assert_eq!(
+            model.ready_states.get("task_api"),
+            Some(&TaskReadyState::Active)
+        );
+        assert_eq!(
+            model.ready_states.get("task_ready_unblocked"),
+            Some(&TaskReadyState::Ready {
+                resolved_blockers: 1
+            })
+        );
+        assert_eq!(
+            model.ready_states.get("task_ui"),
+            Some(&TaskReadyState::Blocked {
+                unresolved_count: 1,
+                total_blockers: 1
+            })
+        );
+        assert_eq!(
+            model.ready_states.get("task_e2e"),
+            Some(&TaskReadyState::Blocked {
+                unresolved_count: 2,
+                total_blockers: 2
+            })
+        );
+        assert_eq!(
+            model.ready_states.get("task_standalone"),
+            Some(&TaskReadyState::Ready {
+                resolved_blockers: 0
+            })
+        );
+
+        assert_eq!(model.summary.ready, 2);
+        assert_eq!(model.summary.blocked, 2);
+        assert_eq!(model.summary.active, 1);
+        assert_eq!(model.summary.resolved, 1);
+        assert_eq!(model.summary.edges, 5);
+        assert_eq!(model.summary.cross_repo_edges, 5);
+        assert_eq!(model.summary.cross_project_edges, 2);
+
+        // Diamond (`task_api -> task_e2e` and `task_api -> task_ui -> task_e2e`) emits one canonical
+        // row and one shared reference row for `task_e2e`.
+        let e2e_rows: Vec<&DagRow> = model
+            .rows
+            .iter()
+            .filter(|r| r.task_id.as_deref() == Some("task_e2e"))
+            .collect();
+        assert_eq!(e2e_rows.len(), 2);
+        assert_eq!(e2e_rows.iter().filter(|r| r.is_shared_ref).count(), 1);
+    }
+
+    #[test]
+    fn dag_viewer_navigation_fold_direction_filter_and_actions() {
+        let snap = dag_fixture();
+        // Open Tree view from Dashboard with `task_ui` selected.
+        let mut app = App {
+            view: View::Dashboard,
+            project: Some("#frontend".into()),
+            ..App::default()
+        };
+        render(&mut app, &snap);
+        let ui_cursor = rows(&snap, app.project.as_deref())
+            .iter()
+            .position(|r| {
+                matches!(r, Row::Task(p, t) if snap.projects[*p].tasks[*t].id == "task_ui")
+            })
+            .unwrap();
+        app.cursor = ui_cursor;
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Char('t')]), None);
+        assert_eq!(app.view, View::Graph);
+        assert_eq!(app.graph_project.as_deref(), Some("#frontend"));
+        assert_eq!(app.graph_selected_id.as_deref(), Some("task_ui"));
+
+        let screen = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(screen.contains("Downstream (Blockers"), "{screen}");
+        assert!(screen.contains("Init SQL schema"), "{screen}");
+        assert!(screen.contains("Build REST API"), "{screen}");
+        assert!(screen.contains("Build dashboard UI"), "{screen}");
+        assert!(screen.contains("Dependency Inspector"), "{screen}");
+        assert!(screen.contains("Upstream Blockers (Blocked By)"), "{screen}");
+
+        // Toggle project scope to All Projects (`p`), then filter (`f`) -> Connected / Blocked / Ready.
+        press(&mut app, &snap, &[KeyCode::Char('p')]);
+        assert_eq!(app.graph_project, None);
+        let all_screen = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(all_screen.contains("Scope: All Projects"), "{all_screen}");
+        assert!(all_screen.contains("READY 1/1"), "{all_screen}");
+        assert!(all_screen.contains("Standalone tasks (1)"), "{all_screen}");
+
+        // Switch direction to Upstream (`u`).
+        press(&mut app, &snap, &[KeyCode::Char('u')]);
+        assert_eq!(app.graph_direction, GraphDirection::Upstream);
+        let upstream = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(upstream.contains("Upstream (Tasks"), "{upstream}");
+        assert!(upstream.contains("◀"), "{upstream}");
+
+        // Collapse root node (`Space` or `Left`), verify `[+N]` appears, then expand (`Right`).
+        press(&mut app, &snap, &[KeyCode::Home, KeyCode::Char(' ')]);
+        let collapsed_id = app.graph_selected_id.clone().unwrap();
+        assert!(app.graph_collapsed.contains(&collapsed_id));
+        let collapsed_screen = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(collapsed_screen.contains("[+"), "{collapsed_screen}");
+        press(&mut app, &snap, &[KeyCode::Right]);
+        assert!(!app.graph_collapsed.contains(&collapsed_id));
+
+        // Filter cycle: Active -> Connected -> Blocked -> Ready.
+        press(&mut app, &snap, &[KeyCode::Char('f')]);
+        assert_eq!(app.graph_filter, GraphFilter::Connected);
+        let connected = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(!connected.contains("Fix footer alignment"), "{connected}");
+        press(&mut app, &snap, &[KeyCode::Char('f')]);
+        assert_eq!(app.graph_filter, GraphFilter::Blocked);
+        let blocked = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(blocked.contains("Run cross-repo E2E suite"), "{blocked}");
+        press(&mut app, &snap, &[KeyCode::Char('f')]);
+        assert_eq!(app.graph_filter, GraphFilter::Ready);
+        let ready = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(ready.contains("Enable auth middleware"), "{ready}");
+        assert!(!ready.contains("Build dashboard UI"), "{ready}");
+
+        // Reset filter to Active, select an active task, test Enter / 'a' / 's' / click / 'd'.
+        press(&mut app, &snap, &[KeyCode::Char('f'), KeyCode::Char('f')]);
+        assert_eq!(app.graph_filter, GraphFilter::Active);
+        render_to_text(&mut app, &snap, 130, 32).unwrap();
+        let (_, _, clicked_id) = app.graph_rows.last().unwrap().clone();
+        let click_y = app.graph_rows.last().unwrap().0;
+        handle_click(&mut app, 6, click_y);
+        assert_eq!(app.graph_selected_id.as_deref(), Some(clicked_id.as_str()));
+
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::LoadTask(clicked_id.clone()))
+        );
+        press(&mut app, &snap, &[KeyCode::Esc]);
+        assert!(app.modal.is_none());
+
+        press(&mut app, &snap, &[KeyCode::Char('a')]);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Picker {
+                flow: Flow::Assign { .. },
+                ..
+            })
+        ));
+        press(&mut app, &snap, &[KeyCode::Esc]);
+
+        press(&mut app, &snap, &[KeyCode::Char('s')]);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Picker {
+                flow: Flow::Status { .. },
+                ..
+            })
+        ));
+        press(&mut app, &snap, &[KeyCode::Esc]);
+
+        // Return to Dashboard via 'd', then click [T]ree tab to come back.
+        press(&mut app, &snap, &[KeyCode::Char('d')]);
+        assert_eq!(app.view, View::Dashboard);
+        let tree_x = TABS.find("[T]ree").unwrap() as u16 + 1;
+        handle_click(&mut app, tree_x, 0);
+        assert_eq!(app.view, View::Graph);
+
+        // From Home, Shift-T opens the Tree view without colliding with lowercase 't' test wake.
+        app.view = View::Home;
+        press(&mut app, &snap, &[KeyCode::Char('T')]);
+        assert_eq!(app.view, View::Graph);
+
+        // In Downstream mode, Space on a shared diamond node jumps to its canonical row, and Left jumps to parent.
+        app.graph_direction = GraphDirection::Downstream;
+        app.graph_filter = GraphFilter::Active;
+        let down_model = build_dag_model(
+            &snap,
+            app.graph_direction,
+            app.graph_filter,
+            None,
+            &app.graph_collapsed,
+        );
+        let shared_idx = down_model
+            .rows
+            .iter()
+            .position(|r| r.is_shared_ref && r.task_id.as_deref() == Some("task_e2e"))
+            .unwrap();
+        let canonical_idx = down_model
+            .rows
+            .iter()
+            .position(|r| !r.is_shared_ref && r.task_id.as_deref() == Some("task_e2e"))
+            .unwrap();
+        app.graph_cursor = shared_idx;
+        app.graph_selected_id = Some("task_e2e".into());
+        press(&mut app, &snap, &[KeyCode::Char(' ')]);
+        assert_eq!(app.graph_cursor, canonical_idx);
+        press(&mut app, &snap, &[KeyCode::Left]);
+        assert_ne!(app.graph_selected_id.as_deref(), Some("task_e2e"));
+
+        // AllWithDone filter shows standalone terminal tasks too.
+        let mut snap_with_done = snap.clone();
+        snap_with_done.terminal_tasks.push((
+            "#frontend".into(),
+            TaskView {
+                id: "task_old_done".into(),
+                kind: "task".into(),
+                status: "merged".into(),
+                assignee: "codex".into(),
+                title: "Historical merged task".into(),
+                ..TaskView::default()
+            },
+        ));
+        let active_only = render_to_text(&mut app, &snap_with_done, 130, 32).unwrap();
+        assert!(!active_only.contains("Historical merged task"));
+        app.graph_filter = GraphFilter::AllWithDone;
+        let with_done = render_to_text(&mut app, &snap_with_done, 130, 32).unwrap();
+        assert!(with_done.contains("Historical merged task"), "{with_done}");
+    }
+
+    #[test]
+    fn task_view_from_json_parses_repo_blocked_by_and_claimed_by_fallback() {
+        let parsed = task_view_from_json(&json!({
+            "id": "task_xyz",
+            "kind": "feature",
+            "priority": "urgent",
+            "status": "claimed",
+            "claimed_by": "worker1",
+            "title": "Cross-repo task",
+            "sprint": "#cams-s4",
+            "reviewer": "lead",
+            "parent_task_id": "task_parent",
+            "repo": "frontend",
+            "blocked_by": ["task_up1", "task_up2"]
+        }));
+        assert_eq!(parsed.id, "task_xyz");
+        assert_eq!(parsed.assignee, "worker1");
+        assert_eq!(parsed.repo.as_deref(), Some("frontend"));
+        assert_eq!(parsed.blocked_by, vec!["task_up1", "task_up2"]);
+        assert_eq!(parsed.parent.as_deref(), Some("task_parent"));
+    }
+
+    #[test]
+    fn dag_viewer_handles_cycles_missing_deps_and_small_terminals() {
+        let mut snap = fixture();
+        snap.projects[0].tasks = vec![
+            TaskView {
+                id: "task_a".into(),
+                kind: "task".into(),
+                status: "open".into(),
+                assignee: "codex".into(),
+                title: "Cycle A".into(),
+                blocked_by: vec!["task_b".into()],
+                ..TaskView::default()
+            },
+            TaskView {
+                id: "task_b".into(),
+                kind: "task".into(),
+                status: "open".into(),
+                assignee: "codex".into(),
+                title: "Cycle B".into(),
+                blocked_by: vec!["task_a".into(), "task_missing_ext".into()],
+                ..TaskView::default()
+            },
+        ];
+        let mut app = App {
+            view: View::Graph,
+            ..App::default()
+        };
+        let screen = render_to_text(&mut app, &snap, 130, 32).unwrap();
+        assert!(screen.contains("(↻ cycle)"), "{screen}");
+        assert!(screen.contains("unresolved task task_missing_ext"), "{screen}");
+
+        for (width, height) in [(120, 32), (80, 24), (60, 10), (20, 6), (1, 1)] {
+            render_to_text(&mut app, &snap, width, height).unwrap();
+        }
+    }
+
+    #[test]
+    fn task_detail_lines_shows_both_blocked_by_and_blocks() {
+        let body = json!({
+            "task": {
+                "id": "task_mid",
+                "channel": "#backend",
+                "title": "Middle task",
+                "kind": "feature",
+                "status": "in_progress",
+                "assignee": "agent3.8",
+                "priority": "high"
+            },
+            "dependencies": [{
+                "task_id": "task_up",
+                "title": "Upstream merged",
+                "status": "merged",
+                "channel": "#db",
+                "repo": "db",
+                "resolved": true
+            }],
+            "dependents": [{
+                "task_id": "task_down",
+                "title": "Downstream UI",
+                "status": "open",
+                "channel": "#frontend",
+                "repo": "web",
+                "resolved": false
+            }],
+            "events": []
+        });
+        let lines = task_detail_lines(&body, None, Some("agent3.8")).join("\n");
+        assert!(lines.contains("Blocked by:"), "{lines}");
+        assert!(lines.contains("task_up [merged/resolved] repo=db #db: Upstream merged"), "{lines}");
+        assert!(lines.contains("Blocks:"), "{lines}");
+        assert!(lines.contains("task_down [open/waiting] repo=web #frontend: Downstream UI"), "{lines}");
     }
 }
