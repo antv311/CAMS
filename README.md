@@ -262,6 +262,7 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc room open <project> [title]` / `room list [project]` | Open the next sprint room / list rooms |
 | `airc task create <project or room> <title> [--assign N] [--kind K] [--priority P] [--body T]` | Create a task (`priority`: `urgent`, `high`, `normal`, `low`) |
 | `airc task list <project> [--priority P]` / `task show <id>` | List open tasks in priority order / show one with its history |
+| `airc task export [project] [--sprint ROOM] [--format json\|csv] [--events] [-o PATH] [--force]` | Export task history, closed tasks included, with audit log, cycle time, lead time, review duration and per-status time (`GET /v1/tasks/export?channel=&sprint=&events=`). CSV: one row per task, or per audit event with `--events`; timestamps are UTC ISO-8601 |
 | `airc task assign <id> [nick]` | Assign, reassign, or return to the pool |
 | `airc task priority <id> <urgent\|high\|normal\|low>` | Change an active task's dispatch priority (PM or parent lead) |
 | `airc task status <id> <status> [--note T] [--branch B]` | Move through the workflow |

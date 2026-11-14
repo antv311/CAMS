@@ -1254,6 +1254,28 @@ impl TaskStore {
         Ok((task, true))
     }
 
+    /// Every task in `channel` and/or `sprint`, closed ones included, oldest
+    /// first. At least one filter must be given.
+    pub fn history(&self, channel: Option<&str>, sprint: Option<&str>) -> Result<Vec<Task>> {
+        if channel.is_none() && sprint.is_none() {
+            return Err(anyhow!("task history needs a channel or a sprint"));
+        }
+        let db = self.db.read()?;
+        let mut statement = db
+            .prepare(&format!(
+                "SELECT {TASK_COLUMNS}
+                 FROM tasks
+                 WHERE (?1 IS NULL OR channel = ?1) AND (?2 IS NULL OR sprint = ?2)
+                 ORDER BY created_at ASC, rowid ASC"
+            ))
+            .context("prepare task history")?;
+        let mut tasks = statement
+            .query_map(params![channel, sprint], Self::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::attach_dependencies(&db, &mut tasks)?;
+        Ok(tasks)
+    }
+
     pub fn events(&self, task_id: &str) -> Result<Vec<TaskEvent>> {
         let db = self.db.read()?;
         let mut statement = db

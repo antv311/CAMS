@@ -555,6 +555,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/reports", get(list_reports).post(create_report))
         .route("/v1/reports/{id}", get(get_report))
         .route("/v1/tasks", get(list_tasks).post(create_task))
+        .route("/v1/tasks/export", get(export_tasks))
         .route("/v1/tasks/{id}/claim", post(claim_task))
         .route("/v1/tasks/{id}/done", post(done_task))
         .route("/v1/tasks/{id}/release", post(release_task))
@@ -2845,6 +2846,72 @@ async fn list_tasks(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "channel": channel, "tasks": tasks })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    channel: Option<String>,
+    sprint: Option<String>,
+    /// `false` leaves out each task's audit log.
+    events: Option<bool>,
+}
+
+/// Task history for a project channel and/or sprint, closed tasks included,
+/// with per-task cycle/review metrics and a summary.
+async fn export_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ExportQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/tasks/export")?;
+    let pick = |raw: Option<&str>| {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalize_http_channel)
+    };
+    let channel = pick(q.channel.as_deref());
+    let sprint = pick(q.sprint.as_deref());
+    if channel.is_none() && sprint.is_none() {
+        return Err(ApiError::bad_request(
+            "pass channel and/or sprint to choose which tasks to export",
+        ));
+    }
+    let store = state.server.tasks();
+    let tasks = store
+        .history(channel.as_deref(), sprint.as_deref())
+        .map_err(ApiError::internal)?;
+    let now = crate::history::unix_timestamp();
+    let mut rows = Vec::with_capacity(tasks.len());
+    for task in &tasks {
+        let events = store.events(&task.id).map_err(ApiError::internal)?;
+        let metrics = crate::task_metrics::compute(task, &events, now);
+        rows.push((task, metrics, events));
+    }
+    let summary =
+        crate::task_metrics::summarize(&rows.iter().map(|(t, m, _)| (*t, m)).collect::<Vec<_>>());
+    let with_events = q.events.unwrap_or(true);
+    let exported: Vec<Value> = rows
+        .into_iter()
+        .map(|(task, metrics, events)| {
+            let mut entry = json!({ "task": task, "metrics": metrics });
+            if with_events {
+                entry["events"] = json!(events);
+            }
+            entry
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "channel": channel,
+            "sprint": sprint,
+            "generated_at": now,
+            "summary": summary,
+            "tasks": exported,
+        })),
     ))
 }
 
@@ -7426,6 +7493,169 @@ mod tests {
             format!("{base}/v1/messages?channel=%23quest-s1"), worker, Value::Null).await?;
         assert_eq!(status, 200);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_export_returns_sprint_history_with_metrics_and_audit_log() -> Result<()> {
+        let db = store::open(":memory:")?;
+        let server = Server::new(db);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let mut tokens = std::collections::HashMap::new();
+        for (nick, role) in [("owner", "leader"), ("worker", "member")] {
+            let res: Value = client
+                .post(format!("{base}/v1/register"))
+                .json(&json!({"nick": nick, "role": role}))
+                .send()
+                .await?
+                .json()
+                .await?;
+            tokens.insert(nick, res["token"].as_str().unwrap().to_string());
+        }
+        let (owner, worker) = (tokens["owner"].as_str(), tokens["worker"].as_str());
+        call(
+            &client,
+            "POST",
+            format!("{base}/v1/projects"),
+            owner,
+            json!({"channel": "#quest"}),
+        )
+        .await?;
+        call(
+            &client,
+            "POST",
+            format!("{base}/v1/projects/members"),
+            owner,
+            json!({"channel": "#quest", "nick": "worker"}),
+        )
+        .await?;
+        let tasks_url = format!("{base}/v1/tasks");
+        let (_, body) = call(
+            &client,
+            "POST",
+            tasks_url.clone(),
+            owner,
+            json!({"channel": "#quest", "title": "Before sprints"}),
+        )
+        .await?;
+        let early = body["task"]["id"].as_str().unwrap().to_string();
+        call(
+            &client,
+            "POST",
+            format!("{base}/v1/rooms"),
+            owner,
+            json!({"project": "#quest"}),
+        )
+        .await?;
+        let (_, body) = call(
+            &client,
+            "POST",
+            tasks_url.clone(),
+            owner,
+            json!({"channel": "#quest", "title": "Seek bar", "assignee": "worker"}),
+        )
+        .await?;
+        let seek = body["task"]["id"].as_str().unwrap().to_string();
+        let (_, body) = call(
+            &client,
+            "POST",
+            tasks_url.clone(),
+            owner,
+            json!({"channel": "#quest", "title": "Dropped", "kind": "bug", "assignee": "worker"}),
+        )
+        .await?;
+        let dropped = body["task"]["id"].as_str().unwrap().to_string();
+        let status_url = |id: &str| format!("{tasks_url}/{id}/status");
+        let (status, body) = call(
+            &client,
+            "POST",
+            status_url(&seek),
+            worker,
+            json!({"status": "in_progress"}),
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = call(
+            &client,
+            "POST",
+            status_url(&dropped),
+            owner,
+            json!({"status": "cancelled", "note": "out of scope"}),
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+
+        let (status, body) = call(
+            &client,
+            "GET",
+            format!("{tasks_url}/export"),
+            worker,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 400, "{body}");
+
+        // A sprint export holds closed tasks too, with their audit log.
+        let (status, body) = call(
+            &client,
+            "GET",
+            format!("{tasks_url}/export?sprint=quest-s1"),
+            worker,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["sprint"], "#quest-s1");
+        assert_eq!(body["channel"], Value::Null);
+        let rows = body["tasks"].as_array().unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|r| r["task"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [seek.as_str(), dropped.as_str()]);
+        assert_eq!(rows[0]["task"]["status"], "in_progress");
+        assert!(rows[0]["metrics"]["started_at"].is_i64());
+        assert_eq!(rows[0]["metrics"]["completed_at"], Value::Null);
+        let log = rows[1]["events"].as_array().unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last["to_status"], "cancelled");
+        assert_eq!(last["note"], "out of scope");
+        assert_eq!(body["summary"]["tasks"], 2);
+        assert_eq!(body["summary"]["by_status"]["cancelled"], 1);
+        assert_eq!(body["summary"]["by_kind"]["bug"], 1);
+        assert_eq!(body["summary"]["completed"], 0);
+
+        // The whole project, without event logs.
+        let (status, body) = call(
+            &client,
+            "GET",
+            format!("{tasks_url}/export?channel=%23quest&events=false"),
+            owner,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let rows = body["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["task"]["id"], early.as_str());
+        assert!(rows[0].get("events").is_none());
+        let (_, body) = call(
+            &client,
+            "GET",
+            format!("{tasks_url}/export?channel=%23other"),
+            owner,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(body["summary"]["cycle_time_seconds"]["count"], 0);
         Ok(())
     }
 
