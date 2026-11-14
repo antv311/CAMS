@@ -991,6 +991,37 @@ airc-daemon --host localhost --port 6697 --tls --tls-insecure \
   --token agent-a-token --nick agent-a --channels '#work'
 ```
 
+### Mutual TLS (mTLS) for remote & LAN deployments
+
+To require client certificates on both IRC TLS and an HTTPS API listener,
+provide `--tls-client-ca` (or `AIRCD_TLS_CLIENT_CA` / `tls_client_ca` in `aircd.toml`)
+along with `--http-tls-bind` (and optionally `--tls-only` to disable plaintext listeners):
+
+```bash
+aircd --tls-bind 0.0.0.0:6697 \
+      --http-tls-bind 0.0.0.0:6443 \
+      --tls-cert certs/server.crt \
+      --tls-key certs/server.key \
+      --tls-client-ca certs/ca.crt \
+      --tls-client-auth required \
+      --tls-only
+```
+
+- `tls_client_auth`: `required` (default whenever `tls_client_ca` is set), `optional` (verify client certificates when presented), or `none`.
+- CLI (`airc`) and TUI (`aircd tui`) accept `--tls-ca`, `--tls-cert`, `--tls-key`, and `--tls-insecure` (or `AIRCD_TLS_CA`, `AIRCD_TLS_CLIENT_CERT`, `AIRCD_TLS_CLIENT_KEY`, `AIRCD_TLS_INSECURE`). Passing them to `airc register` / `airc login` saves them in the profile (`profiles.json`) for subsequent commands and `aircd tui`:
+
+```bash
+airc --server https://hub.example.net:6443 \
+     --tls-ca certs/ca.crt \
+     --tls-cert certs/client.crt \
+     --tls-key certs/client.key \
+     register --nick worker-1
+
+aircd tui --profile worker-1
+```
+
+- Python `AircdClient` and `AircdHttpClient` accept `tls_ca_path`, `tls_cert_path`, `tls_key_path`, and `tls_verify`; `airc-daemon` accepts `--tls-ca`, `--tls-cert`, and `--tls-key`.
+
 With `AIRCD_SEED_DEMO=1` (or an in-memory database) the prototype seeds demo principals:
 
 | Nick | Token |
@@ -1161,6 +1192,8 @@ Options:
 | `--tls` | off | Connect using TLS |
 | `--tls-insecure` | off | Skip TLS cert verification |
 | `--tls-ca` | none | CA certificate path |
+| `--tls-cert` | none | Client TLS certificate PEM (mTLS) |
+| `--tls-key` | none | Client TLS private key PEM (mTLS) |
 | `--verbose` | off | Enable debug logging |
 
 ### Message delivery

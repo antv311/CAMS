@@ -458,6 +458,22 @@ impl Server {
                         return;
                     }
                 };
+                if let Some(cert_info) = crate::tls::extract_client_cert_info(tls_stream.get_ref().1)
+                {
+                    server.logger.log(
+                        LogEvent::security_audit(
+                            crate::logging::Severity::Info,
+                            "irc.tls_client_verified",
+                            "success",
+                            format!(
+                                "IRC client certificate verified from {peer_addr} (sha256={}, chain={})",
+                                cert_info.sha256, cert_info.chain_len
+                            ),
+                        )
+                        .with_actor("tls")
+                        .with_target(peer_addr.to_string()),
+                    );
+                }
                 if let Err(error) = server.handle_stream(tls_stream).await {
                     server.logger.log(
                         LogEvent::server_error(

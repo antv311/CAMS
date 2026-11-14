@@ -24,7 +24,7 @@ $Unrelated = $null
 $OtherProc = $null
 
 $SavedEnv = @{}
-foreach ($EnvName in @('AIRCD_CONFIG_DIR', 'AIRCD_DATA_DIR', 'AIRCD_CONFIG', 'AIRCD_WINDOWS_CONFIG', 'AIRCD_EXECUTABLE', 'AIRCD_BIND', 'AIRCD_HTTP_BIND', 'AIRCD_DB', 'AIRCD_OPEN_REGISTRATION', 'AIRCD_REGISTER_KEY', 'AIRCD_TLS_CERT', 'AIRCD_TLS_KEY', 'AIRCD_TLS_BIND', 'AIRCD_SERVICE_NAME', 'AIRCD_TASK_PATH', 'AIRCD_SERVICE_MODE', 'AIRCD_SERVICE_TRIGGER')) {
+foreach ($EnvName in @('AIRCD_CONFIG_DIR', 'AIRCD_DATA_DIR', 'AIRCD_CONFIG', 'AIRCD_WINDOWS_CONFIG', 'AIRCD_EXECUTABLE', 'AIRCD_BIND', 'AIRCD_HTTP_BIND', 'AIRCD_DB', 'AIRCD_OPEN_REGISTRATION', 'AIRCD_REGISTER_KEY', 'AIRCD_TLS_CERT', 'AIRCD_TLS_KEY', 'AIRCD_TLS_BIND', 'AIRCD_TLS_CLIENT_CA', 'AIRCD_TLS_CLIENT_AUTH', 'AIRCD_HTTP_TLS_BIND', 'AIRCD_TLS_ONLY', 'AIRCD_SERVICE_NAME', 'AIRCD_TASK_PATH', 'AIRCD_SERVICE_MODE', 'AIRCD_SERVICE_TRIGGER')) {
     $Item = Get-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
     $SavedEnv[$EnvName] = if ($null -ne $Item) { $Item.Value } else { $null }
     Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
@@ -120,11 +120,14 @@ try {
     $Config = New-AircdServiceConfig -RepoRoot $TestRoot -Name $TaskName -Bind "127.0.0.1:$IrcPort" -HttpBind "127.0.0.1:$HttpPort" -DbPath $Db
     $TlsCertFixture = Join-Path $TestRoot 'cert.pem'
     $TlsKeyFixture = Join-Path $TestRoot 'key.pem'
+    $TlsCaFixture = Join-Path $TestRoot 'client-ca.pem'
     Set-Content -LiteralPath $TlsCertFixture -Value 'cert'
     Set-Content -LiteralPath $TlsKeyFixture -Value 'key'
-    $CustomCfg = New-AircdServiceConfig -RepoRoot $TestRoot -Name $TaskName -Bind "127.0.0.1:$IrcPort" -HttpBind "127.0.0.1:$HttpPort" -DbPath $Db -OpenRegistration -RegisterKey 'secret-123' -TlsCert $TlsCertFixture -TlsKey $TlsKeyFixture
-    Assert ($CustomCfg.ServerArguments -contains '--open-registration' -and $CustomCfg.ServerArguments -contains '--register-key' -and $CustomCfg.ServerArguments -contains '--tls-cert') 'Optional server flags were not propagated.'
-    Remove-Item -LiteralPath $TlsCertFixture, $TlsKeyFixture -Force
+    Set-Content -LiteralPath $TlsCaFixture -Value 'ca'
+    do { $HttpTlsPort = Get-FreePort } while ($HttpTlsPort -eq $IrcPort -or $HttpTlsPort -eq $HttpPort)
+    $CustomCfg = New-AircdServiceConfig -RepoRoot $TestRoot -Name $TaskName -Bind "127.0.0.1:$IrcPort" -HttpBind "127.0.0.1:$HttpPort" -DbPath $Db -OpenRegistration -RegisterKey 'secret-123' -TlsCert $TlsCertFixture -TlsKey $TlsKeyFixture -TlsClientCa $TlsCaFixture -TlsClientAuth 'required' -HttpTlsBind "127.0.0.1:$HttpTlsPort" -TlsOnly
+    Assert ($CustomCfg.ServerArguments -contains '--open-registration' -and $CustomCfg.ServerArguments -contains '--register-key' -and $CustomCfg.ServerArguments -contains '--tls-cert' -and $CustomCfg.ServerArguments -contains '--tls-client-ca' -and $CustomCfg.ServerArguments -contains '--tls-client-auth' -and $CustomCfg.ServerArguments -contains '--http-tls-bind' -and $CustomCfg.ServerArguments -contains '--tls-only') 'Optional server flags were not propagated.'
+    Remove-Item -LiteralPath $TlsCertFixture, $TlsKeyFixture, $TlsCaFixture -Force
     Assert-Throws { New-AircdServiceConfig -RepoRoot $TestRoot -Bind 'remote:6667' } 'local numeric'
     Assert-Throws { New-AircdServiceConfig -RepoRoot $TestRoot -Bind "127.0.0.1:$HttpPort" -HttpBind "127.0.0.1:$HttpPort" } 'different ports'
     Assert-Throws { New-AircdServiceConfig -RepoRoot $TestRoot -DbPath ':memory:' } 'persistent database'

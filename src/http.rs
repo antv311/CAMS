@@ -33,7 +33,10 @@ pub struct HttpRuntimeInfo {
     pub irc_port: u16,
     pub http_bind: String,
     pub http_port: u16,
+    pub http_tls_port: Option<u16>,
     pub tls_port: Option<u16>,
+    pub tls_client_auth: String,
+    pub tls_only: bool,
     pub detected_hosts: Vec<String>,
     /// Owner invite key. When set, `POST /v1/register` must present it.
     #[serde(skip)]
@@ -359,7 +362,10 @@ pub fn build_runtime_info(
         irc_port: parse_port(irc_bind, 6667),
         http_bind: http_bind.to_string(),
         http_port: parse_port(http_bind, 6680),
+        http_tls_port: None,
         tls_port,
+        tls_client_auth: "none".to_string(),
+        tls_only: false,
         detected_hosts: reachable_hosts(http_bind),
         register_key: None,
         rate_limit: RateLimitConfig::default(),
@@ -432,6 +438,35 @@ pub async fn serve(server: Server, bind_addr: &str, info: HttpRuntimeInfo) -> Re
     )
     .await
     .context("serve HTTP router")
+}
+
+pub async fn serve_tls(
+    server: Server,
+    bind_addr: &str,
+    info: HttpRuntimeInfo,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> Result<()> {
+    let tcp = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind HTTPS welcome/API listener on {bind_addr}"))?;
+    let actual_port = tcp.local_addr()?.port();
+    let mut runtime = info;
+    runtime.http_tls_port = Some(actual_port);
+    let logger = server.logger().clone();
+    use axum::serve::ListenerExt;
+    let tls_listener = crate::tls::TlsListener::from_tcp(tcp, acceptor, logger)
+        .with_context(|| format!("initialize HTTPS TLS listener on {bind_addr}"))?
+        .tap_io(|_| {});
+    println!(
+        "aircd HTTPS welcome & API listening on https://{bind_addr} (port {actual_port}, client_auth={})",
+        runtime.tls_client_auth
+    );
+    axum::serve(
+        tls_listener,
+        router(server, runtime).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve HTTPS router")
 }
 
 pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
@@ -612,7 +647,10 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "service": "aircd",
             "irc_port": state.info.irc_port,
             "http_port": state.info.http_port,
+            "http_tls_port": state.info.http_tls_port,
             "tls_port": state.info.tls_port,
+            "tls_client_auth": state.info.tls_client_auth,
+            "tls_only": state.info.tls_only,
         })),
     )
 }
@@ -3883,7 +3921,10 @@ fn build_welcome_payload(state: &AppState, base_host: &str) -> Result<Value, Api
             "http_url": base_http,
             "irc_host": base_host,
             "irc_port": state.info.irc_port,
+            "http_tls_port": state.info.http_tls_port,
             "tls_port": state.info.tls_port,
+            "tls_client_auth": state.info.tls_client_auth,
+            "tls_only": state.info.tls_only,
             "detected_hosts": state.info.detected_hosts,
             "reachable_welcome_urls": state.info.detected_hosts.iter().map(|h| format!("http://{}:{}", h, state.info.http_port)).collect::<Vec<_>>(),
         },
@@ -5709,7 +5750,10 @@ mod tests {
             irc_port: 6667,
             http_bind: api_addr.to_string(),
             http_port: api_addr.port(),
+            http_tls_port: None,
             tls_port: None,
+            tls_client_auth: "none".to_string(),
+            tls_only: false,
             detected_hosts: vec!["127.0.0.1".to_string()],
             register_key: None,
             rate_limit: RateLimitConfig::default(),
@@ -7515,6 +7559,7 @@ mod tests {
             owner_key_path: Some(owner_key_path.clone()),
             tls_cert_path: None,
             tls_key_path: None,
+            tls_client_ca_path: None,
         };
         let server = Server::with_logger_and_backup(
             db,

@@ -9,6 +9,10 @@ param(
     [string]$TlsCert = '',
     [string]$TlsKey = '',
     [string]$TlsBind = '127.0.0.1:6697',
+    [string]$TlsClientCa = '',
+    [string]$TlsClientAuth = '',
+    [string]$HttpTlsBind = '',
+    [switch]$TlsOnly,
     [string]$ExecutablePath = '',
     [switch]$NoStart
 )
@@ -18,7 +22,7 @@ Import-Module (Join-Path $PSScriptRoot 'AircdTray.psm1') -Force
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 $CfgParams = @{ RepoRoot = (Split-Path -Parent $PSScriptRoot) }
-foreach ($Key in @('ConfigPath', 'Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath')) {
+foreach ($Key in @('ConfigPath', 'Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'TlsClientCa', 'TlsClientAuth', 'HttpTlsBind', 'TlsOnly', 'ExecutablePath')) {
     if ($PSBoundParameters.ContainsKey($Key)) {
         $CfgParams[$Key] = $PSBoundParameters[$Key]
     }

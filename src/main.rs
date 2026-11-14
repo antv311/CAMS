@@ -17,6 +17,7 @@ mod rooms;
 mod server;
 mod store;
 mod tasks;
+mod tls;
 mod tokens;
 mod tui;
 mod wake;
@@ -24,31 +25,6 @@ mod webhooks;
 
 use anyhow::{Context, Result};
 use server::Server;
-use std::sync::Arc;
-
-fn load_tls_config(cert_path: &str, key_path: &str) -> Result<tokio_rustls::TlsAcceptor> {
-    let cert_data =
-        std::fs::read(cert_path).with_context(|| format!("read TLS cert: {cert_path}"))?;
-    let key_data = std::fs::read(key_path).with_context(|| format!("read TLS key: {key_path}"))?;
-
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_data.as_slice())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("parse TLS certificates")?;
-    if certs.is_empty() {
-        anyhow::bail!("no certificates found in {cert_path}");
-    }
-
-    let key = rustls_pemfile::private_key(&mut key_data.as_slice())
-        .context("parse TLS private key")?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
-
-    let config = tokio_rustls::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("build TLS server config")?;
-
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
-}
 
 /// Decide which invite key guards `POST /v1/register`. The key itself is
 /// never printed; only where it came from.
@@ -125,9 +101,13 @@ async fn main() -> Result<()> {
                        --bind <host:port>       IRC TCP listen address (env AIRCD_BIND, default 127.0.0.1:6667)\n  \
                        --http-bind <host:port>  HTTP welcome & REST API (env AIRCD_HTTP_BIND, default 127.0.0.1:6680)\n  \
                        --db <path>              SQLite database path (env AIRCD_DB, default aircd.sqlite3)\n  \
-                       --tls-cert <path>        Optional PEM certificate for IRC TLS\n  \
-                       --tls-key <path>         Optional PEM key for IRC TLS\n  \
+                       --tls-cert <path>        Optional PEM certificate for IRC/HTTP TLS\n  \
+                       --tls-key <path>         Optional PEM key for IRC/HTTP TLS\n  \
                        --tls-bind <host:port>   IRC TLS listen address (default 127.0.0.1:6697)\n  \
+                       --tls-client-ca <path>   Optional PEM CA bundle for client certificate verification (mTLS)\n  \
+                       --tls-client-auth <mode> mTLS mode: none, optional, or required (default: required if --tls-client-ca is set)\n  \
+                       --http-tls-bind <addr>   Optional HTTPS welcome & API listen address (uses TLS/mTLS config)\n  \
+                       --tls-only               Disable plaintext IRC and HTTP listeners (env AIRCD_TLS_ONLY=1)\n  \
                        --register-key <key>     Invite key required to register (env AIRCD_REGISTER_KEY;\n  \
                                                 default: generated once in aircd-owner.key beside the DB)\n  \
                        --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)\n  \
@@ -162,14 +142,15 @@ async fn main() -> Result<()> {
     let log_config = server_config.to_log_config()?;
     let backup_config = server_config.to_backup_config()?;
     let sqlite_config = server_config.to_sqlite_config()?;
+    let tls_spec = server_config.to_tls_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
     let config::ServerConfig {
         bind: bind_addr,
         http_bind,
         db: db_path,
-        tls_cert,
-        tls_key,
         tls_bind,
+        http_tls_bind,
+        tls_only,
         register_key,
         open_registration,
         auth: auth_config,
@@ -189,24 +170,50 @@ async fn main() -> Result<()> {
     let _webhook_worker = server.webhooks().spawn_worker();
     let _backup_worker = server.backups().spawn_worker();
 
-    let tls_port = if tls_cert.is_some() && tls_key.is_some() {
+    let tls_acceptor = tls_spec
+        .as_ref()
+        .map(tls::build_tls_acceptor)
+        .transpose()?;
+    let tls_client_auth_mode = tls_spec
+        .as_ref()
+        .map(|spec| spec.client_auth.as_str().to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    let tls_port = if tls_acceptor.is_some() {
         tls_bind
             .rsplit_once(':')
             .and_then(|(_, p)| p.parse::<u16>().ok())
     } else {
         None
     };
+    let http_tls_port = http_tls_bind
+        .as_deref()
+        .and_then(|addr| addr.rsplit_once(':'))
+        .and_then(|(_, p)| p.parse::<u16>().ok());
     let mut runtime_info = http::build_runtime_info(&bind_addr, &http_bind, tls_port);
+    runtime_info.http_tls_port = http_tls_port;
+    runtime_info.tls_client_auth = tls_client_auth_mode.clone();
+    runtime_info.tls_only = tls_only;
     runtime_info.register_key = register_key;
     runtime_info.rate_limit = rate_limit_config.clone();
-    let wake_host = http_bind
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .filter(|host| !matches!(*host, "0.0.0.0" | "[::]" | "::"))
-        .unwrap_or("127.0.0.1");
-    server
-        .wakes()
-        .set_server_url(&format!("http://{wake_host}:{}", runtime_info.http_port));
+    let wake_host = if tls_only {
+        http_tls_bind.as_deref().unwrap_or(&http_bind)
+    } else {
+        &http_bind
+    }
+    .rsplit_once(':')
+    .map(|(host, _)| host)
+    .filter(|host| !matches!(*host, "0.0.0.0" | "[::]" | "::"))
+    .unwrap_or("127.0.0.1");
+    let wake_url = if tls_only {
+        format!(
+            "https://{wake_host}:{}",
+            http_tls_port.unwrap_or(runtime_info.http_port)
+        )
+    } else {
+        format!("http://{wake_host}:{}", runtime_info.http_port)
+    };
+    server.wakes().set_server_url(&wake_url);
     let _group_inactivity_worker = server.spawn_group_inactivity_worker();
     println!("  registration: {register_note}");
     println!(
@@ -242,11 +249,19 @@ async fn main() -> Result<()> {
     } else {
         println!("  rate limit:   disabled");
     }
-    for host in &runtime_info.detected_hosts {
+    if tls_acceptor.is_some() {
         println!(
-            "  welcome/API: http://{}:{}   IRC: {}:{}",
-            host, runtime_info.http_port, host, runtime_info.irc_port
+            "  TLS:          irc={tls_bind}, https={}, client_auth={tls_client_auth_mode}, tls_only={tls_only}",
+            http_tls_bind.as_deref().unwrap_or("disabled")
         );
+    }
+    if !tls_only {
+        for host in &runtime_info.detected_hosts {
+            println!(
+                "  welcome/API: http://{}:{}   IRC: {}:{}",
+                host, runtime_info.http_port, host, runtime_info.irc_port
+            );
+        }
     }
 
     logger.log_security(
@@ -257,38 +272,61 @@ async fn main() -> Result<()> {
         None,
         None,
         format!(
-            "aircd started (irc={bind_addr}, http={http_bind}, tls={})",
-            tls_cert.is_some() && tls_key.is_some()
+            "aircd started (irc={bind_addr}, http={http_bind}, tls={}, https={}, client_auth={tls_client_auth_mode}, tls_only={tls_only})",
+            tls_acceptor.is_some(),
+            http_tls_bind.as_deref().unwrap_or("none"),
         ),
     );
 
-    let run_result = match (tls_cert, tls_key) {
-        (Some(cert), Some(key)) => {
-            let acceptor = load_tls_config(&cert, &key)?;
-            let plain_server = server.clone();
-            let http_server = server.clone();
-            let tls_server = server;
-            tokio::try_join!(
-                plain_server.listen(&bind_addr),
-                tls_server.listen_tls(&tls_bind, acceptor),
-                http::serve(http_server, &http_bind, runtime_info),
-            )
-            .map(|_| ())
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            Err(anyhow::anyhow!(
-                "both AIRCD_TLS_CERT and AIRCD_TLS_KEY must be set to enable TLS"
-            ))
-        }
-        (None, None) => {
-            let http_server = server.clone();
-            tokio::try_join!(
-                server.listen(&bind_addr),
-                http::serve(http_server, &http_bind, runtime_info),
-            )
-            .map(|_| ())
+    let plain_irc_fut = {
+        let server = server.clone();
+        let bind_addr = bind_addr.clone();
+        async move {
+            if tls_only {
+                std::future::pending::<Result<()>>().await
+            } else {
+                server.listen(&bind_addr).await
+            }
         }
     };
+    let plain_http_fut = {
+        let server = server.clone();
+        let http_bind = http_bind.clone();
+        let runtime_info = runtime_info.clone();
+        async move {
+            if tls_only {
+                std::future::pending::<Result<()>>().await
+            } else {
+                http::serve(server, &http_bind, runtime_info).await
+            }
+        }
+    };
+    let irc_tls_fut = {
+        let server = server.clone();
+        let tls_bind = tls_bind.clone();
+        let acceptor = tls_acceptor.clone();
+        async move {
+            match acceptor {
+                Some(acceptor) => server.listen_tls(&tls_bind, acceptor).await,
+                None => std::future::pending::<Result<()>>().await,
+            }
+        }
+    };
+    let https_fut = {
+        let server = server;
+        let runtime_info = runtime_info;
+        async move {
+            match (http_tls_bind, tls_acceptor) {
+                (Some(addr), Some(acceptor)) => {
+                    http::serve_tls(server, &addr, runtime_info, acceptor).await
+                }
+                _ => std::future::pending::<Result<()>>().await,
+            }
+        }
+    };
+
+    let run_result =
+        tokio::try_join!(plain_irc_fut, plain_http_fut, irc_tls_fut, https_fut).map(|_| ());
 
     if let Err(err) = run_result {
         logger.log_error("server.startup_error", format!("aircd server error: {err:#}"));
