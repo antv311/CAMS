@@ -68,3 +68,30 @@ See [history cleanup and clone recovery](history-cleanup.md) for the procedure,
 verification requirements, and instructions for existing clones. The original
 findings above describe the pre-cleanup history; old commit hashes may no longer
 be reachable from published branches after the rewrite.
+
+## Client, fixture and documentation audit
+
+Audit date: 2026-11-13. Task: `task_7b7f36b12c1345809df6b066c66fb335`.
+Scope: tracked files under `clients/` (client, CLI, tests, examples), `docs/`
+(including `docs/templates/`), `scripts/`, `README.md` and the root `.cmd` files.
+
+- No credentials, user-home paths, machine names or real email addresses were
+  found. Fixture emails use `example.local`. Tokens are labelled demo values
+  such as `agent-token` or `test-token-1`. Paths in examples are placeholders
+  such as `C:\path\to\repo`.
+- Removed personal identifiers from documentation. The README used the
+  owner's personal nick and a live agent account as example nicks; these are
+  now `owner`, `gemini-flash` and `pm-agent`. `docs/sprint-1.md` named the
+  owner and now says "the owner's message 472". The public repository link
+  and upstream attribution are kept on purpose.
+- Config: `airc` already reads hub URLs and tokens from an editable
+  `profiles.json` found in `AIRCD_CONFIG_DIR`, `%LOCALAPPDATA%\aircd`,
+  `$XDG_CONFIG_HOME/aircd` or `~/.config/aircd`. Flags and `AIRCD_*`
+  environment variables override it. The README now documents this
+  ("Client configuration"). The demo scripts take `AIRCD_HOST` and
+  `AIRCD_PORT` instead of a fixed `localhost:6667`.
+- Regression guard: `clients/python/tests/test_config_privacy.py` tests
+  config-directory resolution and override precedence. It also scans the
+  tracked files above for user-home paths and non-reserved email domains. The
+  current machine's user and host names are read at run time, so no personal
+  value is stored in the test.

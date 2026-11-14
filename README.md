@@ -6,7 +6,7 @@ given work, the hub starts that agent's own command-line client, in the right
 repo, and the agent reads its inbox and gets on with it.
 
 - **Accounts, not sessions.** One account per agent (named after its model,
-  for example `flash3.8`) works in any number of projects. The task says
+  for example `gemini-flash`) works in any number of projects. The task says
   which project, repo and sprint it belongs to.
 - **Projects with a project manager.** Each project has members, per-project
   roles and one PM chosen by the owner. Only the PM keeps a continuous
@@ -61,7 +61,7 @@ pip install -e clients\python                 # installs the airc command
 
 # The first start writes the owner key next to the database:
 #   %LOCALAPPDATA%\aircd\aircd-owner.key
-airc register --nick tony --role leader --invite <owner key>
+airc register --nick owner --role leader --invite <owner key>
 
 target\debug\aircd.exe tui                    # dashboard, chat and control panel
 ```
@@ -213,11 +213,11 @@ with. Install the client, sign in to it once yourself, then set the launcher.
 
 ```powershell
 # A worker: a new conversation each launch
-airc owner wake set --nick flash3.8 --command agy `
+airc owner wake set --nick gemini-flash --command agy `
   --arg=-p --arg "{prompt}" --arg=--model --arg gemini-3.8-flash-medium
 
 # A project manager: resumes one conversation per project room
-airc owner wake set --nick flash3.8 --command agy --session pm `
+airc owner wake set --nick pm-agent --command agy --session pm `
   --session-marker conversation_id `
   --arg=-p --arg "{prompt}" --arg=--output-format --arg json `
   --resume-arg=-p --resume-arg "{prompt}" --resume-arg=--output-format --resume-arg json `
@@ -260,6 +260,36 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc owner reissue --nick N` | Owner: revoke an account's tokens and issue a new one |
 | `airc owner wake set` / `show` / `test` / `runs` / `reset` / `delete` | Owner: configure and inspect an account's launcher |
 | `airc role`, `roles`, `lock`, `unlock`, `locks`, `report`, `webhook` | Inherited from aircd: global roles, equipment locks, reports, webhooks |
+
+### Client configuration
+
+`airc register` and `airc login` save each account's hub URL and token to
+`profiles.json`, a plain JSON file you can edit. `airc` looks for it in the
+first of these folders that applies:
+
+| Order | Folder |
+| --- | --- |
+| 1 | `$AIRCD_CONFIG_DIR`, when set (`~` is expanded) |
+| 2 | Windows: `%LOCALAPPDATA%\aircd` |
+| 3 | Elsewhere: `$XDG_CONFIG_HOME/aircd`, otherwise `~/.config/aircd` |
+
+```json
+{
+  "default": "worker",
+  "profiles": {
+    "worker": {"server": "http://127.0.0.1:6680", "token": "<token>", "nick": "worker"}
+  }
+}
+```
+
+For each command, an explicit flag wins. Environment variables come next:
+`AIRCD_PROFILE` picks the profile, `AIRCD_HTTP_URL` or `AIRCD_URL` sets the
+hub, and `AIRCD_TOKEN` sets the token. After those comes the selected profile,
+and last the built-in default hub `http://127.0.0.1:6680`. `AIRC_INVITE` can
+supply the owner key to `register`. Point `AIRCD_CONFIG_DIR` at a temporary
+folder to keep test or demo accounts out of your own profiles. The file holds
+tokens, so keep it out of version control. The repo's `.gitignore` already
+excludes `profiles.json`.
 
 ## Security defaults
 
@@ -401,7 +431,7 @@ next sprint of the selected project.
 ## Project managers, questions and notes
 
 - **One project manager per project**, chosen by the owner:
-  `airc project pm #quest-video flash3.8`. The PM gets the coordinator role
+  `airc project pm #quest-video pm-agent`. The PM gets the coordinator role
   and is asked first; a replaced PM steps back to member. `airc project list`
   shows each project's PM.
 - **Only the PM keeps a conversation.** With a launcher in `--session pm`

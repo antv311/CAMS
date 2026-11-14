@@ -1,6 +1,6 @@
 # CAMS Sprint 1 checkpoint
 
-Coordination room: `#cams-s1`. Owner authorization: Tony's message 472.
+Coordination room: `#cams-s1`. Owner authorization: the owner's message 472.
 Final task: `task_9508106a796f45dca8006bc6c7bcf1ab`.
 
 ## Integrated work
