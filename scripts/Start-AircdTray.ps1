@@ -1,8 +1,15 @@
 param(
+    [string]$ConfigPath = '',
     [string]$Bind = '127.0.0.1:6667',
     [string]$HttpBind = '127.0.0.1:6680',
-    [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3",
+    [string]$DbPath = '',
     [string]$Profile = '',
+    [switch]$OpenRegistration,
+    [string]$RegisterKey = '',
+    [string]$TlsCert = '',
+    [string]$TlsKey = '',
+    [string]$TlsBind = '127.0.0.1:6697',
+    [string]$ExecutablePath = '',
     [switch]$NoStart
 )
 
@@ -10,7 +17,13 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AircdTray.psm1') -Force
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
-$Config = New-AircdTrayConfig -RepoRoot (Split-Path -Parent $PSScriptRoot) -Bind $Bind -HttpBind $HttpBind -DbPath $DbPath -Profile $Profile
+$CfgParams = @{ RepoRoot = (Split-Path -Parent $PSScriptRoot) }
+foreach ($Key in @('ConfigPath', 'Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath')) {
+    if ($PSBoundParameters.ContainsKey($Key)) {
+        $CfgParams[$Key] = $PSBoundParameters[$Key]
+    }
+}
+$Config = New-AircdTrayConfig @CfgParams
 $Mutex = New-Object Threading.Mutex($false, (Get-AircdTrayMutexName $Config))
 $OwnsMutex = $false
 try {

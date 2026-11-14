@@ -1,6 +1,11 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$ScriptConfigModule = Join-Path $PSScriptRoot 'AircdConfig.psm1'
+if (Test-Path -LiteralPath $ScriptConfigModule -PathType Leaf) {
+    Import-Module $ScriptConfigModule -Force
+}
+
 # Start-Process joins its ArgumentList on Windows PowerShell 5.1. Quote using
 # the Windows argv rules, including quotes and trailing backslashes.
 function Join-AircdArguments([string[]]$Values) {
@@ -36,9 +41,41 @@ namespace AircdTray {
 }
 
 function New-AircdTrayConfig {
-    param([string]$RepoRoot, [string]$Bind = '127.0.0.1:6667',
+    param(
+        [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
+        [string]$ConfigPath = '',
+        [string]$Bind = '127.0.0.1:6667',
         [string]$HttpBind = '127.0.0.1:6680',
-        [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3", [string]$Profile = '')
+        [string]$DbPath = '',
+        [string]$Profile = '',
+        [switch]$OpenRegistration,
+        [string]$RegisterKey = '',
+        [string]$TlsCert = '',
+        [string]$TlsKey = '',
+        [string]$TlsBind = '127.0.0.1:6697',
+        [string]$ExecutablePath = '',
+        [string]$StartupDirectory = ''
+    )
+
+    $Overrides = @{}
+    foreach ($Key in @('Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath', 'StartupDirectory')) {
+        if ($PSBoundParameters.ContainsKey($Key)) {
+            $Overrides[$Key] = $PSBoundParameters[$Key]
+        }
+    }
+
+    $ResolvedCfg = Resolve-AircdWindowsConfig -RepoRoot $RepoRoot -ConfigPath $ConfigPath -Overrides $Overrides
+    $Bind = $ResolvedCfg.Bind
+    $HttpBind = $ResolvedCfg.HttpBind
+    $DbPath = $ResolvedCfg.DbPath
+    $Profile = $ResolvedCfg.Profile
+    $OpenRegistration = [bool]$ResolvedCfg.OpenRegistration
+    $RegisterKey = $ResolvedCfg.RegisterKey
+    $TlsCert = $ResolvedCfg.TlsCert
+    $TlsKey = $ResolvedCfg.TlsKey
+    $TlsBind = $ResolvedCfg.TlsBind
+    $ExecutablePath = $ResolvedCfg.ExecutablePath
+
     foreach ($Address in @($Bind, $HttpBind)) {
         if ($Address -notmatch '^(127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):([0-9]+)$' -or
             [int]$Matches[2] -lt 1 -or [int]$Matches[2] -gt 65535) {
@@ -50,13 +87,52 @@ function New-AircdTrayConfig {
     if ($HttpPort -eq $IrcPort) { throw 'HTTP and IRC must use different ports.' }
     if ($DbPath -eq ':memory:') { throw 'Tray control requires a persistent database.' }
     $DbPath = [IO.Path]::GetFullPath($DbPath)
+
+    $ServerArgs = @('--bind', $Bind, '--http-bind', $HttpBind, '--db', $DbPath)
+    if ($OpenRegistration) { $ServerArgs += '--open-registration' }
+    if (-not [string]::IsNullOrWhiteSpace($RegisterKey)) { $ServerArgs += @('--register-key', $RegisterKey) }
+
+    $HasTlsCert = -not [string]::IsNullOrWhiteSpace($TlsCert)
+    $HasTlsKey = -not [string]::IsNullOrWhiteSpace($TlsKey)
+    if ($HasTlsCert -ne $HasTlsKey) {
+        throw 'Both -TlsCert and -TlsKey must be specified together to enable TLS.'
+    }
+    if ($HasTlsCert) {
+        $FullTlsCert = [IO.Path]::GetFullPath($TlsCert)
+        $FullTlsKey = [IO.Path]::GetFullPath($TlsKey)
+        if (-not (Test-Path -LiteralPath $FullTlsCert -PathType Leaf)) { throw "TLS certificate not found: $FullTlsCert" }
+        if (-not (Test-Path -LiteralPath $FullTlsKey -PathType Leaf)) { throw "TLS private key not found: $FullTlsKey" }
+        if ($TlsBind -notmatch '^(127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):([0-9]+)$' -or
+            [int]$Matches[2] -lt 1 -or [int]$Matches[2] -gt 65535) {
+            throw "Use a local numeric TLS bind address and port: $TlsBind"
+        }
+        $ServerArgs += @('--tls-cert', $FullTlsCert, '--tls-key', $FullTlsKey, '--tls-bind', $TlsBind)
+    }
+
+    $ResolvedExe = ''
+    if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+        $ResolvedExe = [IO.Path]::GetFullPath($ExecutablePath)
+    }
+
     $UrlHost = if ($HttpBind.StartsWith('[')) { '[::1]' } else { '127.0.0.1' }
     [pscustomobject]@{
-        RepoRoot = [IO.Path]::GetFullPath($RepoRoot); Bind = $Bind; HttpBind = $HttpBind
+        RepoRoot = $ResolvedCfg.RepoRoot; ConfigPath = $ResolvedCfg.ConfigPath
+        Bind = $Bind; HttpBind = $HttpBind
         DbPath = $DbPath; Profile = $Profile; HttpPort = $HttpPort; IrcPort = $IrcPort
         Url = "http://${UrlHost}:$HttpPort"; LogDir = (Split-Path -Parent $DbPath)
-        ServerArguments = @('--bind', $Bind, '--http-bind', $HttpBind, '--db', $DbPath)
+        ExecutablePath = $ResolvedExe; StartupDirectory = $ResolvedCfg.StartupDirectory
+        ServerArguments = $ServerArgs
     }
+}
+
+function Resolve-AircdTrayExecutable($Config) {
+    if ($Config.PSObject.Properties['ExecutablePath'] -and -not [string]::IsNullOrWhiteSpace($Config.ExecutablePath)) {
+        if (-not (Test-Path -LiteralPath $Config.ExecutablePath -PathType Leaf)) {
+            throw "Configured aircd executable not found: $($Config.ExecutablePath)"
+        }
+        return $Config.ExecutablePath
+    }
+    & (Join-Path $Config.RepoRoot 'scripts\Get-AircdExecutable.ps1') -RepoRoot $Config.RepoRoot
 }
 
 function Get-AircdTrayMutexName($Config) {
@@ -161,7 +237,7 @@ function Start-AircdTrayServer($Config) {
         $Config.ServerArguments = $Existing.Arguments
         return Get-AircdTrayStatus $Config
     }
-    $Exe = & (Join-Path $Config.RepoRoot 'scripts\Get-AircdExecutable.ps1') -RepoRoot $Config.RepoRoot
+    $Exe = Resolve-AircdTrayExecutable $Config
     if (!$Exe) { throw 'No aircd build found. Run cargo build, then Restart Server.' }
     New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null
     $Process = Start-Process -FilePath $Exe -ArgumentList (Join-AircdArguments $Config.ServerArguments) `
@@ -193,7 +269,7 @@ function Start-AircdTrayServer($Config) {
 function Open-AircdTrayTui($Config) {
     $Status = Get-AircdTrayStatus $Config
     if ($Status.State -ne 'Running') { throw 'Start or restart the server before launching the TUI.' }
-    $Exe = & (Join-Path $Config.RepoRoot 'scripts\Get-AircdExecutable.ps1') -RepoRoot $Config.RepoRoot
+    $Exe = Resolve-AircdTrayExecutable $Config
     if (!$Exe) { throw 'No aircd build found. Run cargo build.' }
     $Arguments = @('tui', '--server', $Config.Url)
     if ($Config.Profile) { $Arguments += @('--profile', $Config.Profile) }
@@ -208,7 +284,7 @@ function Invoke-AircdTrayAction($Config, [string]$Action) {
         'Start' { Start-AircdTrayServer $Config }
         'Restart' {
             # Resolve before stopping so a missing build leaves a running hub up.
-            $Exe = & (Join-Path $Config.RepoRoot 'scripts\Get-AircdExecutable.ps1') -RepoRoot $Config.RepoRoot
+            $Exe = Resolve-AircdTrayExecutable $Config
             if (!$Exe) { throw 'No aircd build found. Run cargo build before restarting.' }
             Stop-AircdTrayServer $Config
             Start-AircdTrayServer $Config

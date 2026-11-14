@@ -1,11 +1,52 @@
 param(
+    [string]$ConfigPath = "",
     [string]$Bind = "127.0.0.1:6667",
     [string]$HttpBind = "127.0.0.1:6680",
-    [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3",
+    [string]$DbPath = "",
+    [switch]$OpenRegistration,
+    [string]$RegisterKey = "",
+    [string]$TlsCert = "",
+    [string]$TlsKey = "",
+    [string]$TlsBind = "127.0.0.1:6697",
+    [string]$ExecutablePath = "",
     [switch]$Background,
     # Do nothing when a hub is already listening (used by the sign-in shortcut).
     [switch]$IfNotRunning
 )
+
+$ErrorActionPreference = "Stop"
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$ConfigModule = Join-Path $PSScriptRoot "AircdConfig.psm1"
+if (Test-Path -LiteralPath $ConfigModule -PathType Leaf) {
+    Import-Module $ConfigModule -Force
+    $Overrides = @{}
+    foreach ($Key in @("Bind", "HttpBind", "DbPath", "OpenRegistration", "RegisterKey", "TlsCert", "TlsKey", "TlsBind", "ExecutablePath")) {
+        if ($PSBoundParameters.ContainsKey($Key)) {
+            $Overrides[$Key] = $PSBoundParameters[$Key]
+        }
+    }
+    $ResolvedCfg = Resolve-AircdWindowsConfig -RepoRoot $RepoRoot -ConfigPath $ConfigPath -Overrides $Overrides
+    $Bind = $ResolvedCfg.Bind
+    $HttpBind = $ResolvedCfg.HttpBind
+    $DbPath = $ResolvedCfg.DbPath
+    $OpenRegistration = [bool]$ResolvedCfg.OpenRegistration
+    $RegisterKey = $ResolvedCfg.RegisterKey
+    $TlsCert = $ResolvedCfg.TlsCert
+    $TlsKey = $ResolvedCfg.TlsKey
+    $TlsBind = $ResolvedCfg.TlsBind
+    $ExecutablePath = $ResolvedCfg.ExecutablePath
+} else {
+    if (-not $PSBoundParameters.ContainsKey("Bind") -and $env:AIRCD_BIND) { $Bind = $env:AIRCD_BIND }
+    if (-not $PSBoundParameters.ContainsKey("HttpBind") -and $env:AIRCD_HTTP_BIND) { $HttpBind = $env:AIRCD_HTTP_BIND }
+    if (-not $PSBoundParameters.ContainsKey("DbPath")) {
+        if ($env:AIRCD_DB) {
+            $DbPath = $env:AIRCD_DB
+        } else {
+            $LocalBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath("LocalApplicationData") }
+            $DbPath = Join-Path $LocalBase "aircd\aircd.sqlite3"
+        }
+    }
+}
 
 if ($IfNotRunning) {
     $HttpPort = [int]($HttpBind -split ':')[-1]
@@ -15,30 +56,51 @@ if ($IfNotRunning) {
     }
 }
 
-$ErrorActionPreference = "Stop"
-$RepoRoot = Split-Path -Parent $PSScriptRoot
-$DbDir = Split-Path -Parent $DbPath
+$DbDir = if ($DbPath -eq ":memory:") { "" } else { Split-Path -Parent $DbPath }
 if ($DbDir -and !(Test-Path $DbDir)) {
     New-Item -ItemType Directory -Path $DbDir -Force | Out-Null
 }
 
-$DebugExe = Join-Path $RepoRoot "target\debug\aircd.exe"
-$Exe = & (Join-Path $PSScriptRoot "Get-AircdExecutable.ps1") -RepoRoot $RepoRoot
-if (!$Exe) {
-    Write-Host "Building aircd..."
-    & cargo build --manifest-path (Join-Path $RepoRoot "Cargo.toml")
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $Exe = $DebugExe
+$HasTlsCert = -not [string]::IsNullOrWhiteSpace($TlsCert)
+$HasTlsKey = -not [string]::IsNullOrWhiteSpace($TlsKey)
+if ($HasTlsCert -ne $HasTlsKey) {
+    throw "Both -TlsCert and -TlsKey must be specified together to enable TLS."
+}
+
+$Exe = ""
+if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+    $FullExe = [IO.Path]::GetFullPath($ExecutablePath)
+    if (!(Test-Path -LiteralPath $FullExe -PathType Leaf)) {
+        throw "Configured aircd executable not found: $FullExe"
+    }
+    $Exe = $FullExe
+} else {
+    $DebugExe = Join-Path $RepoRoot "target\debug\aircd.exe"
+    $Exe = & (Join-Path $PSScriptRoot "Get-AircdExecutable.ps1") -RepoRoot $RepoRoot
+    if (!$Exe) {
+        Write-Host "Building aircd..."
+        & cargo build --manifest-path (Join-Path $RepoRoot "Cargo.toml")
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $Exe = $DebugExe
+    }
 }
 
 $ArgList = @("--bind", $Bind, "--http-bind", $HttpBind, "--db", $DbPath)
+if ($OpenRegistration) { $ArgList += "--open-registration" }
+if (-not [string]::IsNullOrWhiteSpace($RegisterKey)) { $ArgList += @("--register-key", $RegisterKey) }
+if ($HasTlsCert) {
+    $ArgList += @("--tls-cert", [IO.Path]::GetFullPath($TlsCert), "--tls-key", [IO.Path]::GetFullPath($TlsKey), "--tls-bind", $TlsBind)
+}
 if ($Background) {
-    $LogOut = Join-Path $DbDir "aircd.stdout.log"
-    $LogErr = Join-Path $DbDir "aircd.stderr.log"
+    $LogDir = if ($DbDir) { $DbDir } else { $RepoRoot }
+    $LogOut = Join-Path $LogDir "aircd.stdout.log"
+    $LogErr = Join-Path $LogDir "aircd.stderr.log"
     $Proc = Start-Process -FilePath $Exe -ArgumentList $ArgList -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr -PassThru -WindowStyle Hidden
+    $DisplayHttpHost = if ($HttpBind.StartsWith("[")) { "[::1]" } elseif ($HttpBind.StartsWith("0.0.0.0:")) { "127.0.0.1" } else { ($HttpBind -split ':')[0] }
+    $DisplayIrcHost = if ($Bind.StartsWith("[")) { "[::1]" } elseif ($Bind.StartsWith("0.0.0.0:")) { "127.0.0.1" } else { ($Bind -split ':')[0] }
     Write-Host "Started aircd (PID $($Proc.Id))"
-    Write-Host "Welcome/API: http://127.0.0.1:$(($HttpBind -split ':')[-1])/"
-    Write-Host "IRC TCP:     127.0.0.1:$(($Bind -split ':')[-1])"
+    Write-Host "Welcome/API: http://${DisplayHttpHost}:$(($HttpBind -split ':')[-1])/"
+    Write-Host "IRC TCP:     ${DisplayIrcHost}:$(($Bind -split ':')[-1])"
     Write-Host "Logs:        $LogOut"
 } else {
     & $Exe @ArgList

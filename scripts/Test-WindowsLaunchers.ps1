@@ -6,7 +6,15 @@ $Release = Join-Path $TestRoot "target\release\aircd.exe"
 $Debug = Join-Path $TestRoot "target\debug\aircd.exe"
 $Resolver = Join-Path $TestRoot "scripts\Get-AircdExecutable.ps1"
 $Starter = Join-Path $TestRoot "scripts\Start-Aircd.ps1"
+$ConfigMod = Join-Path $TestRoot "scripts\AircdConfig.psm1"
 $Wrapper = Join-Path $TestRoot "aircd-server.cmd"
+
+$SavedEnv = @{}
+foreach ($EnvName in @("AIRCD_CONFIG_DIR", "AIRCD_DATA_DIR", "AIRCD_CONFIG", "AIRCD_WINDOWS_CONFIG", "AIRCD_EXECUTABLE", "AIRCD_BIND", "AIRCD_HTTP_BIND", "AIRCD_DB", "AIRCD_OPEN_REGISTRATION", "AIRCD_REGISTER_KEY")) {
+    $Item = Get-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+    $SavedEnv[$EnvName] = if ($null -ne $Item) { $Item.Value } else { $null }
+    Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+}
 
 function Assert-Equal($Actual, $Expected, $Label) {
     if ($Actual -ne $Expected) {
@@ -15,10 +23,13 @@ function Assert-Equal($Actual, $Expected, $Label) {
 }
 
 try {
-    New-Item -ItemType Directory -Path (Split-Path $Release), (Split-Path $Debug), (Split-Path $Resolver) -Force | Out-Null
+    $IsolatedCfgDir = Join-Path $TestRoot "isolated-config"
+    New-Item -ItemType Directory -Path (Split-Path $Release), (Split-Path $Debug), (Split-Path $Resolver), $IsolatedCfgDir -Force | Out-Null
+    $env:AIRCD_CONFIG_DIR = $IsolatedCfgDir
     Copy-Item -LiteralPath (Join-Path $RepoRoot "aircd-server.cmd") -Destination $Wrapper
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "Get-AircdExecutable.ps1") -Destination $Resolver
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "Start-Aircd.ps1") -Destination $Starter
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "AircdConfig.psm1") -Destination $ConfigMod
     Assert-Equal (& $Resolver) $null "no build"
 
     # A real executable exercises both wrappers, argument quoting and exit codes.
@@ -55,8 +66,55 @@ public static class LauncherFixture {
     Assert-Equal ($Output -join '|') 'release|--test' "cmd newer release"
     (Get-Item -LiteralPath $Debug).LastWriteTimeUtc = (Get-Item -LiteralPath $Release).LastWriteTimeUtc
     Assert-Equal (& $Resolver) $Release "tie prefers release"
-    Write-Host "PASS: Windows launcher selection, paths with spaces, arguments and exit status"
+
+    # AIRCD_EXECUTABLE override in aircd-server.cmd
+    $env:AIRCD_EXECUTABLE = $Debug
+    $Output = & $Wrapper --env-exe
+    Assert-Equal ($Output -join '|') 'debug|--env-exe' "cmd AIRCD_EXECUTABLE override"
+    Remove-Item Env:\AIRCD_EXECUTABLE -ErrorAction SilentlyContinue
+
+    # Editable JSON config + env + CLI precedence in Start-Aircd.ps1
+    $JsonCfgPath = Join-Path $TestRoot "custom-win.json"
+    $RelDbExpected = [IO.Path]::GetFullPath((Join-Path $TestRoot "rel-data\from-json.sqlite3"))
+    @{
+        server = @{
+            bind = "127.0.0.1:17667"
+            http_bind = "127.0.0.1:17680"
+            db_path = "rel-data\from-json.sqlite3"
+            open_registration = $true
+        }
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $JsonCfgPath -Encoding UTF8
+
+    $Output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Starter -ConfigPath $JsonCfgPath
+    Assert-Equal $LASTEXITCODE 17 "JSON config exit status"
+    Assert-Equal ($Output -join '|') "release|--bind|127.0.0.1:17667|--http-bind|127.0.0.1:17680|--db|$RelDbExpected|--open-registration" "JSON config resolution"
+
+    # Editable TOML config via AIRCD_CONFIG_DIR + env > file + CLI > env
+    $TomlCfgPath = Join-Path $IsolatedCfgDir "aircd.toml"
+    $TomlDb = Join-Path $TestRoot "toml-data\from-toml.sqlite3"
+    @"
+# Comment
+[server]
+bind = "127.0.0.1:18667"
+http_bind = "127.0.0.1:18680"
+db_path = '$TomlDb'
+open_registration = false
+"@ | Set-Content -LiteralPath $TomlCfgPath -Encoding UTF8
+
+    $env:AIRCD_HTTP_BIND = "127.0.0.1:19680"
+    $Output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Starter -Bind 127.0.0.1:20667
+    Assert-Equal $LASTEXITCODE 17 "TOML/env/CLI precedence exit status"
+    Assert-Equal ($Output -join '|') "release|--bind|127.0.0.1:20667|--http-bind|127.0.0.1:19680|--db|$TomlDb" "CLI > Env > TOML precedence"
+
+    Write-Host "PASS: Windows launcher selection, paths with spaces, editable JSON/TOML config & env/CLI precedence, arguments and exit status"
 } finally {
+    foreach ($EnvName in $SavedEnv.Keys) {
+        if ($null -eq $SavedEnv[$EnvName]) {
+            Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -LiteralPath "Env:\$EnvName" -Value $SavedEnv[$EnvName]
+        }
+    }
     $ResolvedTestRoot = [IO.Path]::GetFullPath($TestRoot)
     if (!$ResolvedTestRoot.StartsWith($TempRoot, [StringComparison]::OrdinalIgnoreCase) -or
         (Split-Path -Leaf $ResolvedTestRoot) -notlike 'aircd launcher test *') {

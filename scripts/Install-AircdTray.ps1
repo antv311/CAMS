@@ -1,16 +1,30 @@
 param(
+    [string]$ConfigPath = '',
     [switch]$Uninstall,
     [switch]$StartNow,
     [string]$Bind = '127.0.0.1:6667',
     [string]$HttpBind = '127.0.0.1:6680',
-    [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3",
+    [string]$DbPath = '',
     [string]$Profile = '',
-    [string]$StartupDirectory = [Environment]::GetFolderPath('Startup')
+    [switch]$OpenRegistration,
+    [string]$RegisterKey = '',
+    [string]$TlsCert = '',
+    [string]$TlsKey = '',
+    [string]$TlsBind = '127.0.0.1:6697',
+    [string]$ExecutablePath = '',
+    [string]$StartupDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AircdTray.psm1') -Force
-$Config = New-AircdTrayConfig -RepoRoot (Split-Path -Parent $PSScriptRoot) -Bind $Bind -HttpBind $HttpBind -DbPath $DbPath -Profile $Profile
+$CfgParams = @{ RepoRoot = (Split-Path -Parent $PSScriptRoot) }
+foreach ($Key in @('ConfigPath', 'Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath', 'StartupDirectory')) {
+    if ($PSBoundParameters.ContainsKey($Key)) {
+        $CfgParams[$Key] = $PSBoundParameters[$Key]
+    }
+}
+$Config = New-AircdTrayConfig @CfgParams
+$StartupDirectory = $Config.StartupDirectory
 $ShortcutPath = Join-Path $StartupDirectory 'CAMS tray.lnk'
 if ($Uninstall) {
     if (Test-Path -LiteralPath $ShortcutPath) { Remove-Item -LiteralPath $ShortcutPath }
@@ -20,11 +34,19 @@ if ($Uninstall) {
 New-Item -ItemType Directory -Path $StartupDirectory -Force | Out-Null
 $TrayScript = Join-Path $PSScriptRoot 'Start-AircdTray.ps1'
 $Arguments = @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File',
-    $TrayScript, '-Bind', $Bind, '-HttpBind', $HttpBind, '-DbPath', $Config.DbPath)
-if ($Profile) { $Arguments += @('-Profile', $Profile) }
+    $TrayScript, '-Bind', $Config.Bind, '-HttpBind', $Config.HttpBind, '-DbPath', $Config.DbPath)
+if ($Config.Profile) { $Arguments += @('-Profile', $Config.Profile) }
+if ($PSBoundParameters.ContainsKey('ConfigPath') -and $Config.ConfigPath) { $Arguments += @('-ConfigPath', $Config.ConfigPath) }
+if ($PSBoundParameters.ContainsKey('OpenRegistration') -and $OpenRegistration) { $Arguments += '-OpenRegistration' }
+if ($PSBoundParameters.ContainsKey('RegisterKey') -and $RegisterKey) { $Arguments += @('-RegisterKey', $RegisterKey) }
+if ($PSBoundParameters.ContainsKey('TlsCert') -and $TlsCert) { $Arguments += @('-TlsCert', $TlsCert) }
+if ($PSBoundParameters.ContainsKey('TlsKey') -and $TlsKey) { $Arguments += @('-TlsKey', $TlsKey) }
+if ($PSBoundParameters.ContainsKey('TlsBind') -and $TlsBind) { $Arguments += @('-TlsBind', $TlsBind) }
+if ($Config.ExecutablePath) { $Arguments += @('-ExecutablePath', $Config.ExecutablePath) }
+$PowerShellExe = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$Shortcut.TargetPath = $PowerShellExe
 $Shortcut.Arguments = Join-AircdArguments $Arguments
 $Shortcut.WorkingDirectory = $Config.RepoRoot
 $Shortcut.Description = 'CAMS server controls and TUI launcher'

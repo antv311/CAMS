@@ -1,0 +1,23 @@
+{
+  "server": {
+    "bind": "127.0.0.1:6667",
+    "http_bind": "127.0.0.1:6680",
+    "db_path": "%LOCALAPPDATA%\\aircd\\aircd.sqlite3",
+    "open_registration": false,
+    "register_key": "",
+    "tls_cert": "",
+    "tls_key": "",
+    "tls_bind": "127.0.0.1:6697",
+    "executable_path": ""
+  },
+  "service": {
+    "name": "CAMS-Aircd",
+    "task_path": "\\",
+    "mode": "Auto",
+    "trigger": "Auto"
+  },
+  "tray": {
+    "profile": "",
+    "startup_directory": ""
+  }
+}
