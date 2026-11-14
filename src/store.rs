@@ -8,6 +8,10 @@ pub use crate::db::{SharedConnection, SqlitePoolConfig, WalCheckpointMode};
 use crate::history::unix_timestamp;
 use crate::tokens;
 
+#[path = "group_memory.rs"]
+mod group_memory;
+pub use group_memory::GroupMemoryError;
+
 /// A reusable seat definition. Counts describe workers; the lead has one seat.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupMember {
@@ -357,6 +361,7 @@ impl GroupStore {
         let name = group_name(name)?;
         let db = self.db.write()?;
         let tx = db.unchecked_transaction()?;
+        tx.execute("DELETE FROM group_memory WHERE group_name = ?1", [name])?;
         tx.execute("DELETE FROM group_projects WHERE group_name = ?1", [name])?;
         let changed = tx.execute("DELETE FROM groups WHERE name = ?1", [name])?;
         tx.commit()?;
@@ -1141,7 +1146,16 @@ fn migrate_groups(connection: &Connection) -> Result<()> {
            channel TEXT NOT NULL REFERENCES projects(channel),
            PRIMARY KEY (group_name, channel)
          );
-         CREATE INDEX IF NOT EXISTS idx_group_projects_channel ON group_projects(channel);",
+         CREATE INDEX IF NOT EXISTS idx_group_projects_channel ON group_projects(channel);
+         CREATE TABLE IF NOT EXISTS group_memory (
+           group_name TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
+           kind TEXT NOT NULL CHECK(kind IN ('notes', 'scratchpad')),
+           body TEXT NOT NULL,
+           revision INTEGER NOT NULL CHECK(revision > 0),
+           updated_at INTEGER NOT NULL,
+           updated_by TEXT NOT NULL,
+           PRIMARY KEY (group_name, kind)
+         );",
         )
         .context("migrate groups")?;
     let exists: bool = connection.query_row(

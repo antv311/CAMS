@@ -125,6 +125,30 @@ class TaskPayloadTest(unittest.TestCase):
 
 
 class GroupHttpClientTest(_HubCase):
+    def test_group_memory_uses_member_token_and_carries_revision_conflicts(self) -> None:
+        memory = {"group": "dev équipe", "kind": "notes", "body": "context", "revision": 2}
+        self.reply((200, {"memory": memory}), (200, {"memory": memory}), (409, {"error": "revision changed"}))
+        hub = AircdHttpClient(self.url, token="member-token", invite="owner")
+        self.assertEqual(hub.group_memory("dev équipe"), memory)
+        self.assertEqual(hub.write_group_memory("dev équipe", "context", expected_revision=1), memory)
+        with self.assertRaises(AircdHttpError) as caught:
+            hub.write_group_memory("dev équipe", "stale", expected_revision=1)
+        self.assertEqual(caught.exception.status, 409)
+        for req in self.hub.requests:
+            self.assertEqual(req["path"], "/v1/groups/dev%20%C3%A9quipe/memory/notes")
+            self.assertEqual(req["headers"].get("authorization"), "Bearer member-token")
+            self.assertNotIn("x-aircd-invite", req["headers"])
+        self.assertEqual(self.hub.requests[1]["body"], {"text": "context", "append": False, "expected_revision": 1})
+
+    def test_group_memory_requires_revision_for_replace_and_valid_kind(self) -> None:
+        hub = AircdHttpClient(self.url, token="tok")
+        for kind in ("", "../notes"):
+            with self.assertRaises(AircdHttpError):
+                hub.group_memory("dev", kind)
+        with self.assertRaises(AircdHttpError):
+            hub.write_group_memory("dev", "overwrite")
+        self.assertEqual(self.hub.requests, [])
+
     def test_update_group_sends_only_changes_and_owner_key(self) -> None:
         self.reply((200, {"group": GROUP_REPLY}))
         update = {"add_workers": [{"template": "c", "model": "m", "nick": "worker1"}],
@@ -244,6 +268,47 @@ class GroupCliTest(_HubCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(argv)
         return code, out.getvalue(), err.getvalue()
+
+    def test_memory_cli_files_append_clear_and_revision_guard(self) -> None:
+        memory = {"group": "dev", "kind": "scratchpad", "body": "hello\né", "revision": 4}
+        self.reply((200, {"memory": memory}))
+        code, out, err = self.run_cli("group", "memory", "show", "dev", "--kind", "scratchpad")
+        self.assertEqual((code, out.strip(), err), (0, "hello\né", ""))
+        path = Path(self.cfg.name) / "context.txt"
+        path.write_text("hello\né", encoding="utf-8")
+        self.reply((200, {"memory": memory}), (200, {"memory": {**memory, "revision": 5}}))
+        code, out, err = self.run_cli("--json", "group", "memory", "set", "dev", "--kind", "scratchpad", "--file", str(path))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["memory"]["revision"], 5)
+        self.assertEqual(self.hub.requests[-1]["body"], {"text": "hello\né", "append": False, "expected_revision": 4})
+        self.reply((200, {"memory": memory}), (200, {"memory": memory}))
+        self.assertEqual(self.run_cli("group", "memory", "add", "dev", "line")[0], 0)
+        self.assertEqual(self.hub.requests[-1]["body"], {"text": "line", "append": True})
+        self.assertEqual(self.run_cli("group", "memory", "clear", "dev", "--revision", "4")[0], 0)
+        self.assertEqual(self.hub.requests[-1]["body"], {"text": "", "append": False, "expected_revision": 4})
+        self.reply((409, {"error": "revision changed"}))
+        code, _, err = self.run_cli("group", "memory", "set", "dev", "stale", "--revision", "3")
+        self.assertEqual(code, 1)
+        self.assertIn("revision changed", err)
+
+    def test_memory_cli_requires_text_and_member_credentials(self) -> None:
+        self.assertEqual(self.run_cli("group", "memory", "set", "dev")[0], 1)
+        self.assertEqual(self.run_cli("group", "memory", "show", "dev", token=None)[0], 1)
+        self.assertEqual(self.hub.requests, [])
+
+    def test_memory_cli_stdin_and_invalid_files(self) -> None:
+        memory = {"group": "dev", "kind": "notes", "body": "from stdin\né", "revision": 1}
+        self.reply((200, {"memory": memory}))
+        with mock.patch("sys.stdin", io.StringIO(memory["body"])):
+            code, _, err = self.run_cli("group", "memory", "set", "dev", "--file", "-", "--revision", "0")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.hub.requests[-1]["body"]["text"], memory["body"])
+        invalid = Path(self.cfg.name) / "invalid.txt"
+        invalid.write_bytes(b"\xff")
+        for args in [("--file", str(invalid)), ("--file", str(invalid) + "missing"),
+                     ("text", "--file", str(invalid))]:
+            self.assertEqual(self.run_cli("group", "memory", "set", "dev", *args)[0], 1)
+        self.assertEqual(len(self.hub.requests), 1)
 
     def test_consensus_policy_file_is_preserved_and_listed(self) -> None:
         policy = {"peer_reviewers": ["lead", "peer"], "quorum": 1}
@@ -632,6 +697,30 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         self.cli("task", "answer", child["id"], "Approved")
         parent_shown = self.cli("--profile", "delegate-lead", "task", "show", parent["id"]).stdout
         self.assertIn(f"subtask {child['id']} [assigned] @delegate-worker", parent_shown)
+
+    def test_group_memory_cli_against_real_hub(self) -> None:
+        for nick in ("memory-lead", "memory-worker", "memory-outsider"):
+            self.cli("--profile", nick, "register", "--nick", nick, "--invite", OWNER_KEY, "--no-default")
+        group = {"name": "memory équipe", "lead": {"template": "example", "model": "lead", "nick": "@MEMORY-LEAD"},
+                 "workers": [{"template": "example", "model": "worker", "nick": "memory-worker"}]}
+        path = Path(self.tmp.name) / "memory-group.json"
+        path.write_text(json.dumps(group), encoding="utf-8")
+        self.cli("group", "create", group["name"], "--file", str(path), "--invite", OWNER_KEY)
+        def memory(profile, action, *args, check=True):
+            return self.cli("--profile", profile, "--json", "group", "memory", action, group["name"], *args, check=check)
+        empty = json.loads(memory("memory-lead", "show").stdout)["memory"]
+        self.assertEqual(empty["revision"], 0)
+        memory("memory-lead", "set", "persistent context", "--revision", "0")
+        memory("memory-worker", "add", "worker line")
+        shared = json.loads(memory("memory-worker", "show").stdout)["memory"]
+        self.assertEqual((shared["body"], shared["revision"], shared["updated_by"]),
+                         ("persistent context\nworker line", 2, "memory-worker"))
+        self.assertEqual(memory("memory-lead", "set", "stale", "--revision", "1", check=False).returncode, 1)
+        self.assertEqual(memory("memory-outsider", "show", check=False).returncode, 1)
+        memory("memory-worker", "add", "scratch", "--kind", "scratchpad")
+        self.assertEqual(json.loads(memory("memory-lead", "show").stdout)["memory"], shared)
+        memory("memory-lead", "clear", "--revision", "2")
+        self.assertEqual(json.loads(memory("memory-worker", "show").stdout)["memory"]["revision"], 3)
 
     def test_real_hub_groups(self) -> None:
         listed = self.cli("--json", "group", "list", check=False)

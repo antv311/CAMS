@@ -19,7 +19,7 @@ use crate::logging::{LogEvent, Severity};
 use crate::server::{Server, SpawnError};
 use crate::store::{
     ClientTemplate, ClientTemplateInput, GroupInput, GroupMember, GroupMembershipUpdate,
-    GroupStoreError, WalCheckpointMode,
+    GroupMemoryError, GroupStoreError, WalCheckpointMode,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -234,6 +234,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
             patch(update_group_membership).options(cors_preflight_or_404),
         )
         .route("/v1/groups/{name}/attach", post(attach_group))
+        .route(
+            "/v1/groups/{name}/memory/{kind}",
+            get(get_group_memory).post(write_group_memory),
+        )
         .route("/v1/templates/{id}/spawn", post(spawn_template_worker))
         .route(
             "/v1/templates/{id}",
@@ -540,11 +544,71 @@ fn require_owner(
 }
 
 fn group_store_error(error: anyhow::Error) -> ApiError {
+    if let Some(memory_error) = error.downcast_ref::<GroupMemoryError>() {
+        return match memory_error {
+            GroupMemoryError::Forbidden => ApiError::new(StatusCode::FORBIDDEN, error.to_string()),
+            GroupMemoryError::Conflict => ApiError::conflict(error.to_string()),
+            GroupMemoryError::Invalid(_) => ApiError::bad_request(error.to_string()),
+        };
+    }
     if error.downcast_ref::<GroupStoreError>().is_some() {
         ApiError::not_found(error.to_string())
     } else {
         template_store_error(error)
     }
+}
+
+async fn get_group_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, kind)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let memory = state
+        .server
+        .groups()
+        .memory(&name, &kind, &actor.nick)
+        .map_err(group_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "memory": memory})),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteGroupMemoryReq {
+    text: String,
+    #[serde(default)]
+    append: bool,
+    expected_revision: Option<i64>,
+}
+
+async fn write_group_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, kind)): Path<(String, String)>,
+    Json(req): Json<WriteGroupMemoryReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let memory = state
+        .server
+        .groups()
+        .write_memory(
+            &name,
+            &kind,
+            &actor.nick,
+            &req.text,
+            req.append,
+            req.expected_revision,
+        )
+        .map_err(group_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "memory": memory})),
+    ))
 }
 
 async fn list_groups(
@@ -3288,6 +3352,7 @@ mod tests {
 
     include!("http_delegation_tests.rs");
     include!("http_consensus_tests.rs");
+    include!("http_group_memory_tests.rs");
 
     struct TemplateApi {
         server: Server,

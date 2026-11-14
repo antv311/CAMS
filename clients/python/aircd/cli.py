@@ -1143,6 +1143,42 @@ def cmd_group(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_group_memory(args: argparse.Namespace) -> int:
+    server, token, _prof = require_token(args)
+    hub = AircdHttpClient(server, token=token)
+    action = args.memory_cmd
+    try:
+        if action == "show":
+            memory = hub.group_memory(args.name, args.kind)
+        else:
+            if action == "clear":
+                text = ""
+            elif args.file is not None:
+                if args.text:
+                    raise CliError("use text or --file, not both")
+                try:
+                    text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as err:
+                    raise CliError(f"cannot read memory file: {err}") from None
+            elif args.text:
+                text = " ".join(args.text)
+            else:
+                raise CliError("memory text is required (or use --file; clear empties the document)")
+            revision = args.revision
+            if action != "add" and revision is None:
+                revision = hub.group_memory(args.name, args.kind)["revision"]
+            memory = hub.write_group_memory(
+                args.name, text, kind=args.kind, append=action == "add", expected_revision=revision,
+            )
+    except AircdHttpError as err:
+        raise CliError(str(err)) from None
+    lines = [memory["body"] or "(empty)"] if action == "show" else [
+        f"Saved {args.name} {args.kind} (revision {memory['revision']})."
+    ]
+    print_out(args, {"ok": True, "memory": memory}, lines)
+    return 0
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
     """Everything this account has to do, grouped by project."""
     server, token, _prof = require_token(args)
@@ -2570,6 +2606,19 @@ def build_parser() -> argparse.ArgumentParser:
     for group_parser in (p_gl, p_gc, p_ga, p_gu):
         group_parser.add_argument("--invite", help="Owner key (or set AIRC_INVITE); omit to use this profile's token")
         group_parser.set_defaults(func=cmd_group)
+
+    p_gm = group_sub.add_parser("memory", help="Shared group notes and scratchpad (named members only)")
+    memory_sub = p_gm.add_subparsers(dest="memory_cmd", required=True)
+    for action in ("show", "set", "add", "clear"):
+        p_mem = memory_sub.add_parser(action)
+        p_mem.add_argument("name", help="Group name")
+        p_mem.add_argument("--kind", choices=("notes", "scratchpad"), default="notes")
+        if action != "show":
+            p_mem.add_argument("--revision", type=int, help="Require this revision; set/clear otherwise read the current revision first")
+        if action in ("set", "add"):
+            p_mem.add_argument("text", nargs="*")
+            p_mem.add_argument("--file", help="Read UTF-8 context from a file ('-' reads stdin)")
+        p_mem.set_defaults(func=cmd_group_memory)
 
     p_room = sub.add_parser("room",help="Sprint rooms under a project (opened, never closed)")
     room_sub = p_room.add_subparsers(dest="room_cmd", required=True)
