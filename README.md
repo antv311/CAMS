@@ -186,9 +186,11 @@ you, and the recent launches.
 
 **Groups** shows configured groups on the left, the selected group's topology
 (lead, worker seats, live worker states, review policy, and active tasks) on the
-top right, and current non-terminal subtasks on the bottom right. `Tab`
-switches focus between Groups and Current Subtasks, `Enter` opens subtask
-details, and `d` or `Esc` returns to the dashboard.
+top right, and current non-terminal subtasks on the bottom right. `n` opens an
+interactive group editor modal to create a group, `e` edits the selected group,
+`a` opens the project attachment dialog, `Tab` switches focus between Groups
+and Current Subtasks, `Enter` opens subtask details, and `d` or `Esc` returns
+to the dashboard.
 
 **Chat** has the rooms on the left as a tree (a header per project, its rooms
 underneath, unread counts), the messages in the middle and the people on the

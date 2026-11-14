@@ -69,6 +69,8 @@ const HELP: &[&str] = &[
     "              (Ctrl+S in chat)",
     "",
     "Groups  (g from Home/Dashboard)",
+    "  n / e       create a new group / edit the selected group",
+    "  a           attach the selected group to a project",
     "  Tab / <- -> switch between Groups and Current Subtasks",
     "  up/down     move within the focused pane",
     "  Enter       open the selected subtask details",
@@ -209,6 +211,8 @@ pub struct GroupView {
     pub lead: GroupSeatView,
     pub workers: Vec<GroupSeatView>,
     pub projects: Vec<String>,
+    pub lead_prompt: Option<String>,
+    pub worker_prompt: Option<String>,
     pub review_policy: Option<GroupReviewPolicyView>,
     pub inactivity_timeout_secs: Option<i64>,
 }
@@ -326,6 +330,87 @@ pub enum Flow {
     OpenDm,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupEditorSeat {
+    pub template: String,
+    pub model: String,
+    pub count: u32,
+    pub nick: Option<String>,
+}
+
+impl From<&GroupSeatView> for GroupEditorSeat {
+    fn from(seat: &GroupSeatView) -> Self {
+        Self {
+            template: seat.template.clone(),
+            model: seat.model.clone(),
+            count: seat.count.max(1),
+            nick: seat.nick.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupEditorField {
+    Name,
+    Description,
+    Lead,
+    Worker(usize),
+    AddWorker,
+    TimeoutSecs,
+    ReviewPeers,
+    ReviewQuorum,
+    LeadPrompt,
+    WorkerPrompt,
+    Save,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatStep {
+    Menu { row: usize },
+    PickTemplate { idx: usize },
+    TypeTemplate,
+    PickModel { idx: usize },
+    TypeModel,
+    TypeCount,
+    PickNick { idx: usize },
+    TypeNick,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupSeatEditor {
+    /// `None` edits the lead seat; `Some(i)` edits worker `i` (`i == workers.len()` appends).
+    pub target: Option<usize>,
+    pub seat: GroupEditorSeat,
+    pub text: String,
+    pub step: SeatStep,
+    pub wizard: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupEditorSub {
+    Text { field: GroupEditorField, text: String },
+    Seat(GroupSeatEditor),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupEditorState {
+    pub is_edit: bool,
+    pub name: String,
+    pub description: String,
+    pub lead: GroupEditorSeat,
+    pub workers: Vec<GroupEditorSeat>,
+    pub timeout_secs: String,
+    pub review_peers: String,
+    pub review_quorum: String,
+    pub lead_prompt: String,
+    pub worker_prompt: String,
+    pub cursor: usize,
+    pub sub: Option<GroupEditorSub>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Modal {
     /// Choose one of `items` (label, value).
@@ -334,6 +419,15 @@ pub enum Modal {
     Prompt { title: String, text: String, flow: Flow },
     /// Choose a model of `template`; the list arrives from the hub.
     Models { channel: String, template: String, idx: usize },
+    /// Interactive form to create or edit a group definition.
+    GroupEditor(Box<GroupEditorState>),
+    /// Interactive dialog to attach a group to one or more projects.
+    GroupAttach {
+        group_name: String,
+        attached: Vec<String>,
+        selected: Vec<String>,
+        idx: usize,
+    },
     Detail { task_id: String },
     Help,
 }
@@ -889,6 +983,18 @@ fn encode_channel(channel: &str) -> String {
     channel.replace('#', "%23")
 }
 
+fn encode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for b in segment.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 async fn request(
     client: &reqwest::Client,
     cfg: &TuiConfig,
@@ -979,6 +1085,14 @@ fn group_view(value: &Value) -> GroupView {
             .flatten()
             .filter_map(|p| p.as_str().map(str::to_owned))
             .collect(),
+        lead_prompt: value["lead_prompt"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        worker_prompt: value["worker_prompt"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         review_policy,
         inactivity_timeout_secs: value["inactivity_timeout_secs"].as_i64(),
     }
@@ -2143,7 +2257,1018 @@ fn advance(app: &mut App, flow: Flow, value: String, snap: &Snapshot) -> Option<
     }
 }
 
-fn handle_modal(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action> {
+fn validate_template_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim();
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(
+            "Template id must contain only ASCII letters, digits, '-' or '_'".to_string(),
+        );
+    }
+    Ok(id.to_string())
+}
+
+fn validate_model_name(raw: &str) -> Result<String, String> {
+    let model = raw.trim();
+    if model.is_empty()
+        || model.len() > 100
+        || model
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '{' | '}'))
+    {
+        return Err(
+            "Model must be one word (<= 100 chars) without spaces or braces".to_string(),
+        );
+    }
+    Ok(model.to_string())
+}
+
+fn validate_seat_nick(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let cleaned = clean_nick(raw);
+    if cleaned.is_empty() {
+        return Ok(None);
+    }
+    if cleaned.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Seat nick must be one nonempty word without spaces".to_string());
+    }
+    Ok(Some(cleaned.to_string()))
+}
+
+fn validate_editor_seat(seat: &GroupEditorSeat, is_lead: bool) -> Result<Value, String> {
+    let template = validate_template_id(&seat.template)?;
+    let model = validate_model_name(&seat.model)?;
+    let count = if is_lead {
+        1
+    } else if seat.count == 0 {
+        return Err("Worker count must be at least 1".to_string());
+    } else {
+        seat.count
+    };
+    let nick = validate_seat_nick(seat.nick.as_deref())?;
+    let mut obj = json!({
+        "template": template,
+        "model": model,
+        "count": count,
+    });
+    if let Some(nick) = nick {
+        obj["nick"] = json!(nick);
+    }
+    Ok(obj)
+}
+
+impl GroupEditorState {
+    pub fn new_group() -> Self {
+        Self {
+            is_edit: false,
+            name: String::new(),
+            description: String::new(),
+            lead: GroupEditorSeat {
+                template: String::new(),
+                model: String::new(),
+                count: 1,
+                nick: None,
+            },
+            workers: Vec::new(),
+            timeout_secs: String::new(),
+            review_peers: String::new(),
+            review_quorum: String::new(),
+            lead_prompt: String::new(),
+            worker_prompt: String::new(),
+            cursor: 0,
+            sub: None,
+            error: None,
+        }
+    }
+
+    pub fn from_group(group: &GroupView) -> Self {
+        Self {
+            is_edit: true,
+            name: group.name.clone(),
+            description: group.description.clone().unwrap_or_default(),
+            lead: GroupEditorSeat::from(&group.lead),
+            workers: group.workers.iter().map(GroupEditorSeat::from).collect(),
+            timeout_secs: group
+                .inactivity_timeout_secs
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            review_peers: group
+                .review_policy
+                .as_ref()
+                .map(|rp| rp.peer_reviewers.join(", "))
+                .unwrap_or_default(),
+            review_quorum: group
+                .review_policy
+                .as_ref()
+                .and_then(|rp| rp.quorum)
+                .map(|q| q.to_string())
+                .unwrap_or_default(),
+            lead_prompt: group.lead_prompt.clone().unwrap_or_default(),
+            worker_prompt: group.worker_prompt.clone().unwrap_or_default(),
+            cursor: 1,
+            sub: None,
+            error: None,
+        }
+    }
+
+    pub fn fields(&self) -> Vec<GroupEditorField> {
+        let mut fields = vec![
+            GroupEditorField::Name,
+            GroupEditorField::Description,
+            GroupEditorField::Lead,
+        ];
+        for i in 0..self.workers.len() {
+            fields.push(GroupEditorField::Worker(i));
+        }
+        fields.extend([
+            GroupEditorField::AddWorker,
+            GroupEditorField::TimeoutSecs,
+            GroupEditorField::ReviewPeers,
+            GroupEditorField::ReviewQuorum,
+            GroupEditorField::LeadPrompt,
+            GroupEditorField::WorkerPrompt,
+            GroupEditorField::Save,
+            GroupEditorField::Cancel,
+        ]);
+        fields
+    }
+
+    fn text_value(&self, field: GroupEditorField) -> String {
+        match field {
+            GroupEditorField::Name => self.name.clone(),
+            GroupEditorField::Description => self.description.clone(),
+            GroupEditorField::TimeoutSecs => self.timeout_secs.clone(),
+            GroupEditorField::ReviewPeers => self.review_peers.clone(),
+            GroupEditorField::ReviewQuorum => self.review_quorum.clone(),
+            GroupEditorField::LeadPrompt => self.lead_prompt.clone(),
+            GroupEditorField::WorkerPrompt => self.worker_prompt.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn set_text_value(&mut self, field: GroupEditorField, value: String) {
+        match field {
+            GroupEditorField::Name => self.name = value,
+            GroupEditorField::Description => self.description = value,
+            GroupEditorField::TimeoutSecs => self.timeout_secs = value,
+            GroupEditorField::ReviewPeers => self.review_peers = value,
+            GroupEditorField::ReviewQuorum => self.review_quorum = value,
+            GroupEditorField::LeadPrompt => self.lead_prompt = value,
+            GroupEditorField::WorkerPrompt => self.worker_prompt = value,
+            _ => {}
+        }
+    }
+
+    pub fn build_upsert_payload(&self) -> Result<Value, String> {
+        let name = self.name.trim();
+        if name.is_empty()
+            || matches!(name, "." | "..")
+            || name.chars().count() > 100
+            || name
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+        {
+            return Err(
+                "Group name must be 1..100 characters without '/' or '\\'".to_string(),
+            );
+        }
+        let lead = validate_editor_seat(&self.lead, true)
+            .map_err(|err| format!("Lead: {err}"))?;
+        if self.workers.is_empty() {
+            return Err("A group needs at least one worker".to_string());
+        }
+        let mut workers = Vec::with_capacity(self.workers.len());
+        for (i, w) in self.workers.iter().enumerate() {
+            workers.push(
+                validate_editor_seat(w, false)
+                    .map_err(|err| format!("Worker {}: {err}", i + 1))?,
+            );
+        }
+
+        let timeout_json = if self.timeout_secs.trim().is_empty() {
+            Value::Null
+        } else {
+            let secs = self
+                .timeout_secs
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| "Timeout must be a positive integer (seconds)".to_string())?;
+            if secs <= 0 {
+                return Err("Timeout must be a positive integer (seconds)".to_string());
+            }
+            json!(secs)
+        };
+
+        let peers: Vec<String> = self
+            .review_peers
+            .split(',')
+            .map(clean_nick)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let review_policy_json = if peers.is_empty() {
+            if !self.review_quorum.trim().is_empty() {
+                return Err("Review quorum requires at least one peer reviewer".to_string());
+            }
+            Value::Null
+        } else {
+            let roster: HashSet<String> = std::iter::once(&self.lead)
+                .chain(&self.workers)
+                .filter_map(|m| m.nick.as_deref())
+                .map(clean_nick)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            let mut seen = HashSet::new();
+            for peer in &peers {
+                if !roster.contains(peer) || !seen.insert(peer.clone()) {
+                    return Err(
+                        "Peer reviewers must be distinct named members of the group".to_string(),
+                    );
+                }
+            }
+            let quorum = if self.review_quorum.trim().is_empty() {
+                Value::Null
+            } else {
+                let q = self
+                    .review_quorum
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| "Review quorum must be a positive integer".to_string())?;
+                if q == 0 || q as usize > peers.len() {
+                    return Err(format!(
+                        "Review quorum must be between 1 and {} peer(s)",
+                        peers.len()
+                    ));
+                }
+                json!(q)
+            };
+            json!({
+                "peer_reviewers": peers,
+                "quorum": quorum,
+            })
+        };
+
+        for text in [&self.description, &self.lead_prompt, &self.worker_prompt] {
+            if text.contains('\0') {
+                return Err("Description and prompts must not contain NUL".to_string());
+            }
+        }
+
+        Ok(json!({
+            "name": name,
+            "description": optional(&self.description),
+            "lead": lead,
+            "workers": workers,
+            "lead_prompt": optional(&self.lead_prompt),
+            "worker_prompt": optional(&self.worker_prompt),
+            "review_policy": review_policy_json,
+            "inactivity_timeout_secs": timeout_json,
+        }))
+    }
+}
+
+fn template_picker_items(snap: &Snapshot, current: &str) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    if !current.is_empty() && !snap.templates.iter().any(|t| t.id == current) {
+        items.push((format!("(keep {current})"), current.to_string()));
+    }
+    for t in &snap.templates {
+        let missing = if t.installed { "" } else { "  (not installed)" };
+        items.push((format!("{}{missing}", t.name), t.id.clone()));
+    }
+    items.push(("Type a template id...".to_string(), TYPE_MODEL.to_string()));
+    items
+}
+
+fn seat_model_items(
+    snap: &Snapshot,
+    template: &str,
+    current: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let mut items = Vec::new();
+    if !current.is_empty() {
+        items.push((format!("(keep {current})"), current.to_string()));
+    }
+    let problem = match &snap.models {
+        Some((listed_for, Ok(models))) if listed_for == template => {
+            for (id, label) in models {
+                if id == current {
+                    continue;
+                }
+                let shown = match label {
+                    Some(label) => format!("{id}  {label}"),
+                    None => id.clone(),
+                };
+                items.push((shown, id.clone()));
+            }
+            None
+        }
+        Some((listed_for, Err(err))) if listed_for == template => Some(err.clone()),
+        _ => Some("Asking the hub for models... (or type manually below)".to_string()),
+    };
+    items.push(("Type a model name...".to_string(), TYPE_MODEL.to_string()));
+    (items, problem)
+}
+
+fn nick_picker_items(snap: &Snapshot, current: Option<&str>) -> Vec<(String, String)> {
+    let mut items = vec![("(pool / unnamed)".to_string(), String::new())];
+    if let Some(nick) = current.map(clean_nick).filter(|s| !s.is_empty()) {
+        if !snap.accounts.iter().any(|a| nicks_match(&a.nick, nick)) {
+            items.push((format!("(keep @{nick})"), nick.to_string()));
+        }
+    }
+    for a in &snap.accounts {
+        items.push((format!("@{}  ({})", a.nick, a.role), a.nick.clone()));
+    }
+    items.push(("+ type account nick...".to_string(), TYPE_MODEL.to_string()));
+    items
+}
+
+impl GroupSeatEditor {
+    fn open(target: Option<usize>, seat: &GroupEditorSeat, snap: &Snapshot) -> Self {
+        let wizard = seat.template.is_empty() || seat.model.is_empty();
+        let step = if !wizard {
+            SeatStep::Menu { row: 0 }
+        } else if snap.templates.is_empty() {
+            SeatStep::TypeTemplate
+        } else {
+            SeatStep::PickTemplate { idx: 0 }
+        };
+        Self {
+            target,
+            seat: seat.clone(),
+            text: if step == SeatStep::TypeTemplate {
+                seat.template.clone()
+            } else {
+                String::new()
+            },
+            step,
+            wizard,
+            error: None,
+        }
+    }
+
+    fn open_new_worker(index: usize, snap: &Snapshot) -> Self {
+        let seat = GroupEditorSeat {
+            template: String::new(),
+            model: String::new(),
+            count: 1,
+            nick: None,
+        };
+        Self::open(Some(index), &seat, snap)
+    }
+
+    fn menu_len(&self) -> usize {
+        if self.target.is_some() {
+            5 // Template, Model, Count, Nick, Done
+        } else {
+            4 // Template, Model, Nick, Done
+        }
+    }
+
+    fn commit(&self, editor: &mut GroupEditorState) {
+        let mut seat = self.seat.clone();
+        if self.target.is_none() {
+            seat.count = 1;
+        }
+        match self.target {
+            None => editor.lead = seat,
+            Some(i) if i < editor.workers.len() => editor.workers[i] = seat,
+            Some(_) => {
+                editor.workers.push(seat);
+                // Keep the cursor on "+ Add worker seat" after inserting the new row above it.
+                editor.cursor += 1;
+            }
+        }
+    }
+}
+
+fn finish_seat_step(
+    editor: &mut GroupEditorState,
+    mut seat_ed: GroupSeatEditor,
+    just_finished: SeatStep,
+    snap: &Snapshot,
+) -> (bool, Option<Action>) {
+    seat_ed.error = None;
+    if !seat_ed.wizard {
+        seat_ed.step = SeatStep::Menu { row: 0 };
+        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+        return (false, None);
+    }
+    match just_finished {
+        SeatStep::PickTemplate { .. } | SeatStep::TypeTemplate => {
+            let tpl = seat_ed.seat.template.clone();
+            seat_ed.step = SeatStep::PickModel { idx: 0 };
+            editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+            (false, Some(Action::LoadModels(tpl)))
+        }
+        SeatStep::PickModel { .. } | SeatStep::TypeModel => {
+            if seat_ed.target.is_some() {
+                seat_ed.text = seat_ed.seat.count.to_string();
+                seat_ed.step = SeatStep::TypeCount;
+            } else {
+                seat_ed.step = SeatStep::PickNick { idx: 0 };
+            }
+            editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+            (false, None)
+        }
+        SeatStep::TypeCount => {
+            let _ = snap;
+            seat_ed.step = SeatStep::PickNick { idx: 0 };
+            editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+            (false, None)
+        }
+        SeatStep::PickNick { .. } | SeatStep::TypeNick => {
+            seat_ed.commit(editor);
+            editor.sub = None;
+            (true, None)
+        }
+        SeatStep::Menu { .. } => {
+            seat_ed.commit(editor);
+            editor.sub = None;
+            (true, None)
+        }
+    }
+}
+
+fn handle_seat_editor_key(
+    editor: &mut GroupEditorState,
+    mut seat_ed: GroupSeatEditor,
+    code: KeyCode,
+    snap: &Snapshot,
+) -> Option<Action> {
+    let step = seat_ed.step;
+    match step {
+        SeatStep::Menu { mut row } => {
+            let max_row = seat_ed.menu_len() - 1;
+            match code {
+                KeyCode::Esc => {
+                    editor.sub = None;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    row = row.saturating_sub(1);
+                    seat_ed.step = SeatStep::Menu { row };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    row = (row + 1).min(max_row);
+                    seat_ed.step = SeatStep::Menu { row };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') if seat_ed.target.is_some() && row == 2 => {
+                    seat_ed.seat.count = seat_ed.seat.count.saturating_add(1);
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Char('-') if seat_ed.target.is_some() && row == 2 => {
+                    seat_ed.seat.count = seat_ed.seat.count.saturating_sub(1).max(1);
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Enter => {
+                    let is_worker = seat_ed.target.is_some();
+                    let nick_row = if is_worker { 3 } else { 2 };
+                    let done_row = if is_worker { 4 } else { 3 };
+                    if row == 0 {
+                        seat_ed.step = SeatStep::PickTemplate { idx: 0 };
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        None
+                    } else if row == 1 {
+                        let tpl = seat_ed.seat.template.clone();
+                        seat_ed.step = SeatStep::PickModel { idx: 0 };
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        (!tpl.is_empty()).then_some(Action::LoadModels(tpl))
+                    } else if is_worker && row == 2 {
+                        seat_ed.text = seat_ed.seat.count.to_string();
+                        seat_ed.step = SeatStep::TypeCount;
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        None
+                    } else if row == nick_row {
+                        seat_ed.step = SeatStep::PickNick { idx: 0 };
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        None
+                    } else if row == done_row {
+                        seat_ed.commit(editor);
+                        editor.sub = None;
+                        None
+                    } else {
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        None
+                    }
+                }
+                _ => {
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+            }
+        }
+        SeatStep::PickTemplate { mut idx } => {
+            let items = template_picker_items(snap, &seat_ed.seat.template);
+            match code {
+                KeyCode::Esc => {
+                    if seat_ed.wizard {
+                        editor.sub = None;
+                    } else {
+                        seat_ed.step = SeatStep::Menu { row: 0 };
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    }
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    idx = idx.saturating_sub(1);
+                    seat_ed.step = SeatStep::PickTemplate { idx };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    idx = (idx + 1).min(items.len().saturating_sub(1));
+                    seat_ed.step = SeatStep::PickTemplate { idx };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Enter => {
+                    let value = items.get(idx).map(|(_, v)| v.clone()).unwrap_or_default();
+                    if value == TYPE_MODEL {
+                        seat_ed.text = seat_ed.seat.template.clone();
+                        seat_ed.step = SeatStep::TypeTemplate;
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        None
+                    } else {
+                        seat_ed.seat.template = value;
+                        finish_seat_step(editor, seat_ed, step, snap).1
+                    }
+                }
+                _ => {
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+            }
+        }
+        SeatStep::PickModel { mut idx } => {
+            let (items, _) = seat_model_items(snap, &seat_ed.seat.template, &seat_ed.seat.model);
+            match code {
+                KeyCode::Esc => {
+                    if seat_ed.wizard {
+                        editor.sub = None;
+                    } else {
+                        seat_ed.step = SeatStep::Menu { row: 1 };
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    }
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    idx = idx.saturating_sub(1);
+                    seat_ed.step = SeatStep::PickModel { idx };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    idx = (idx + 1).min(items.len().saturating_sub(1));
+                    seat_ed.step = SeatStep::PickModel { idx };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Enter => {
+                    let value = items.get(idx).map(|(_, v)| v.clone()).unwrap_or_default();
+                    if value == TYPE_MODEL {
+                        seat_ed.text = seat_ed.seat.model.clone();
+                        seat_ed.step = SeatStep::TypeModel;
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        None
+                    } else {
+                        seat_ed.seat.model = value;
+                        finish_seat_step(editor, seat_ed, step, snap).1
+                    }
+                }
+                _ => {
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+            }
+        }
+        SeatStep::PickNick { mut idx } => {
+            let items = nick_picker_items(snap, seat_ed.seat.nick.as_deref());
+            let nick_row = if seat_ed.target.is_some() { 3 } else { 2 };
+            match code {
+                KeyCode::Esc => {
+                    if seat_ed.wizard {
+                        editor.sub = None;
+                    } else {
+                        seat_ed.step = SeatStep::Menu { row: nick_row };
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    }
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    idx = idx.saturating_sub(1);
+                    seat_ed.step = SeatStep::PickNick { idx };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    idx = (idx + 1).min(items.len().saturating_sub(1));
+                    seat_ed.step = SeatStep::PickNick { idx };
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Enter => {
+                    let value = items.get(idx).map(|(_, v)| v.clone()).unwrap_or_default();
+                    if value == TYPE_MODEL {
+                        seat_ed.text = seat_ed.seat.nick.clone().unwrap_or_default();
+                        seat_ed.step = SeatStep::TypeNick;
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                        None
+                    } else {
+                        seat_ed.seat.nick = if value.is_empty() { None } else { Some(value) };
+                        finish_seat_step(editor, seat_ed, step, snap).1
+                    }
+                }
+                _ => {
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+            }
+        }
+        SeatStep::TypeTemplate | SeatStep::TypeModel | SeatStep::TypeCount | SeatStep::TypeNick => {
+            match code {
+                KeyCode::Esc => {
+                    if seat_ed.wizard {
+                        editor.sub = None;
+                    } else {
+                        let row = match step {
+                            SeatStep::TypeTemplate => 0,
+                            SeatStep::TypeModel => 1,
+                            SeatStep::TypeCount => 2,
+                            SeatStep::TypeNick => {
+                                if seat_ed.target.is_some() { 3 } else { 2 }
+                            }
+                            _ => 0,
+                        };
+                        seat_ed.error = None;
+                        seat_ed.step = SeatStep::Menu { row };
+                        editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    }
+                    None
+                }
+                KeyCode::Backspace => {
+                    seat_ed.text.pop();
+                    seat_ed.error = None;
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Char(c) => {
+                    seat_ed.text.push(c);
+                    seat_ed.error = None;
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+                KeyCode::Enter => match step {
+                    SeatStep::TypeTemplate => match validate_template_id(&seat_ed.text) {
+                        Ok(tpl) => {
+                            seat_ed.seat.template = tpl;
+                            finish_seat_step(editor, seat_ed, step, snap).1
+                        }
+                        Err(err) => {
+                            seat_ed.error = Some(err);
+                            editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                            None
+                        }
+                    },
+                    SeatStep::TypeModel => match validate_model_name(&seat_ed.text) {
+                        Ok(model) => {
+                            seat_ed.seat.model = model;
+                            finish_seat_step(editor, seat_ed, step, snap).1
+                        }
+                        Err(err) => {
+                            seat_ed.error = Some(err);
+                            editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                            None
+                        }
+                    },
+                    SeatStep::TypeCount => {
+                        match seat_ed.text.trim().parse::<u32>().ok().filter(|&c| c >= 1) {
+                            Some(count) => {
+                                seat_ed.seat.count = count;
+                                finish_seat_step(editor, seat_ed, step, snap).1
+                            }
+                            None => {
+                                seat_ed.error =
+                                    Some("Worker count must be an integer >= 1".to_string());
+                                editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                                None
+                            }
+                        }
+                    }
+                    SeatStep::TypeNick => {
+                        let raw = seat_ed.text.trim();
+                        let maybe = (!raw.is_empty()).then_some(raw);
+                        match validate_seat_nick(maybe) {
+                            Ok(nick) => {
+                                seat_ed.seat.nick = nick;
+                                finish_seat_step(editor, seat_ed, step, snap).1
+                            }
+                            Err(err) => {
+                                seat_ed.error = Some(err);
+                                editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                },
+                _ => {
+                    editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn submit_group_editor(app: &mut App, mut editor: Box<GroupEditorState>) -> Option<Action> {
+    match editor.build_upsert_payload() {
+        Ok(body) => {
+            let name = editor.name.trim().to_string();
+            let done = if editor.is_edit {
+                format!("Group '{name}' updated")
+            } else {
+                format!("Group '{name}' created")
+            };
+            Some(Action::Api {
+                path: "/v1/groups".to_string(),
+                body,
+                owner: true,
+                done,
+            })
+        }
+        Err(err) => {
+            editor.error = Some(err);
+            app.modal = Some(Modal::GroupEditor(editor));
+            None
+        }
+    }
+}
+
+fn handle_group_editor_key(
+    app: &mut App,
+    mut editor: Box<GroupEditorState>,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    snap: &Snapshot,
+) -> Option<Action> {
+    if let Some(sub) = editor.sub.take() {
+        let action = match sub {
+            GroupEditorSub::Text { field, mut text } => match code {
+                KeyCode::Esc => None,
+                KeyCode::Enter => {
+                    editor.set_text_value(field, text);
+                    editor.error = None;
+                    None
+                }
+                KeyCode::Backspace => {
+                    text.pop();
+                    editor.sub = Some(GroupEditorSub::Text { field, text });
+                    None
+                }
+                KeyCode::Char(c) => {
+                    text.push(c);
+                    editor.sub = Some(GroupEditorSub::Text { field, text });
+                    None
+                }
+                _ => {
+                    editor.sub = Some(GroupEditorSub::Text { field, text });
+                    None
+                }
+            },
+            GroupEditorSub::Seat(seat_ed) => handle_seat_editor_key(&mut editor, seat_ed, code, snap),
+        };
+        app.modal = Some(Modal::GroupEditor(editor));
+        return action;
+    }
+
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('s') | KeyCode::Char('S')) {
+        return submit_group_editor(app, editor);
+    }
+
+    let fields = editor.fields();
+    editor.cursor = editor.cursor.min(fields.len().saturating_sub(1));
+    let current = fields[editor.cursor];
+
+    match code {
+        KeyCode::Esc => None,
+        KeyCode::Char('s') => submit_group_editor(app, editor),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+            editor.cursor = editor.cursor.saturating_sub(1);
+            editor.error = None;
+            app.modal = Some(Modal::GroupEditor(editor));
+            None
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+            editor.cursor = (editor.cursor + 1).min(fields.len().saturating_sub(1));
+            editor.error = None;
+            app.modal = Some(Modal::GroupEditor(editor));
+            None
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            if let GroupEditorField::Worker(i) = current {
+                editor.workers[i].count = editor.workers[i].count.saturating_add(1);
+                editor.error = None;
+            }
+            app.modal = Some(Modal::GroupEditor(editor));
+            None
+        }
+        KeyCode::Char('-') => {
+            if let GroupEditorField::Worker(i) = current {
+                editor.workers[i].count = editor.workers[i].count.saturating_sub(1).max(1);
+                editor.error = None;
+            }
+            app.modal = Some(Modal::GroupEditor(editor));
+            None
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            if let GroupEditorField::Worker(i) = current {
+                if editor.workers.len() > 1 {
+                    editor.workers.remove(i);
+                    let new_len = editor.fields().len();
+                    editor.cursor = editor.cursor.min(new_len.saturating_sub(1));
+                    editor.error = None;
+                } else {
+                    editor.error = Some("A group needs at least one worker".to_string());
+                }
+            }
+            app.modal = Some(Modal::GroupEditor(editor));
+            None
+        }
+        KeyCode::Enter => match current {
+            GroupEditorField::Name if editor.is_edit => {
+                editor.error = Some("Group name cannot be renamed when editing".to_string());
+                app.modal = Some(Modal::GroupEditor(editor));
+                None
+            }
+            GroupEditorField::Name
+            | GroupEditorField::Description
+            | GroupEditorField::TimeoutSecs
+            | GroupEditorField::ReviewPeers
+            | GroupEditorField::ReviewQuorum
+            | GroupEditorField::LeadPrompt
+            | GroupEditorField::WorkerPrompt => {
+                let text = editor.text_value(current);
+                editor.sub = Some(GroupEditorSub::Text {
+                    field: current,
+                    text,
+                });
+                editor.error = None;
+                app.modal = Some(Modal::GroupEditor(editor));
+                None
+            }
+            GroupEditorField::Lead => {
+                let seat_ed = GroupSeatEditor::open(None, &editor.lead, snap);
+                editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                editor.error = None;
+                app.modal = Some(Modal::GroupEditor(editor));
+                None
+            }
+            GroupEditorField::Worker(i) => {
+                let seat_ed = GroupSeatEditor::open(Some(i), &editor.workers[i], snap);
+                editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                editor.error = None;
+                app.modal = Some(Modal::GroupEditor(editor));
+                None
+            }
+            GroupEditorField::AddWorker => {
+                let seat_ed = GroupSeatEditor::open_new_worker(editor.workers.len(), snap);
+                editor.sub = Some(GroupEditorSub::Seat(seat_ed));
+                editor.error = None;
+                app.modal = Some(Modal::GroupEditor(editor));
+                None
+            }
+            GroupEditorField::Save => submit_group_editor(app, editor),
+            GroupEditorField::Cancel => None,
+        },
+        _ => {
+            app.modal = Some(Modal::GroupEditor(editor));
+            None
+        }
+    }
+}
+
+fn handle_group_attach_key(
+    app: &mut App,
+    group_name: String,
+    attached: Vec<String>,
+    mut selected: Vec<String>,
+    mut idx: usize,
+    code: KeyCode,
+    snap: &Snapshot,
+) -> Option<Action> {
+    if snap.projects.is_empty() {
+        if code != KeyCode::Esc {
+            app.modal = Some(Modal::GroupAttach {
+                group_name,
+                attached,
+                selected,
+                idx: 0,
+            });
+        }
+        return None;
+    }
+    let last = snap.projects.len().saturating_sub(1);
+    idx = idx.min(last);
+    match code {
+        KeyCode::Esc => None,
+        KeyCode::Up | KeyCode::Char('k') => {
+            idx = idx.saturating_sub(1);
+            app.modal = Some(Modal::GroupAttach {
+                group_name,
+                attached,
+                selected,
+                idx,
+            });
+            None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            idx = (idx + 1).min(last);
+            app.modal = Some(Modal::GroupAttach {
+                group_name,
+                attached,
+                selected,
+                idx,
+            });
+            None
+        }
+        KeyCode::Char(' ') => {
+            let channel = &snap.projects[idx].channel;
+            if !attached.iter().any(|c| c == channel) {
+                if let Some(pos) = selected.iter().position(|c| c == channel) {
+                    selected.remove(pos);
+                } else {
+                    selected.push(channel.clone());
+                }
+            }
+            app.modal = Some(Modal::GroupAttach {
+                group_name,
+                attached,
+                selected,
+                idx,
+            });
+            None
+        }
+        KeyCode::Enter => {
+            let targets: Vec<String> = if selected.is_empty() {
+                vec![snap.projects[idx].channel.clone()]
+            } else {
+                selected
+            };
+            let encoded = encode_path_segment(&group_name);
+            let path = format!("/v1/groups/{encoded}/attach");
+            if targets.len() == 1 {
+                let channel = &targets[0];
+                Some(Action::Api {
+                    path,
+                    body: json!({"channel": channel}),
+                    owner: true,
+                    done: format!("Attached group '{group_name}' to {channel}"),
+                })
+            } else {
+                let steps = targets
+                    .iter()
+                    .map(|channel| Action::Api {
+                        path: path.clone(),
+                        body: json!({"channel": channel}),
+                        owner: true,
+                        done: format!("Attached group '{group_name}' to {} project(s)", targets.len()),
+                    })
+                    .collect();
+                Some(Action::Many(steps))
+            }
+        }
+        _ => {
+            app.modal = Some(Modal::GroupAttach {
+                group_name,
+                attached,
+                selected,
+                idx,
+            });
+            None
+        }
+    }
+}
+
+fn handle_modal(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    snap: &Snapshot,
+) -> Option<Action> {
     let modal = app.modal.take()?;
     match modal {
         Modal::Picker {
@@ -2215,6 +3340,13 @@ fn handle_modal(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Action>
                 }
             }
         }
+        Modal::GroupEditor(editor) => handle_group_editor_key(app, editor, code, modifiers, snap),
+        Modal::GroupAttach {
+            group_name,
+            attached,
+            selected,
+            idx,
+        } => handle_group_attach_key(app, group_name, attached, selected, idx, code, snap),
         Modal::Detail { .. } | Modal::Help => None,
     }
 }
@@ -2229,7 +3361,7 @@ pub fn handle_key(
         return Some(Action::Quit);
     }
     if app.modal.is_some() {
-        return handle_modal(app, code, snap);
+        return handle_modal(app, code, modifiers, snap);
     }
     // S starts a hub that is not running; Ctrl+S too, so chat can type an S.
     let start_key = match code {
@@ -2503,6 +3635,31 @@ fn handle_groups_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Ac
         }
         KeyCode::Char('r') | KeyCode::Char('R') => return Some(Action::Refresh),
         KeyCode::Char('?') | KeyCode::Char('h') => app.modal = Some(Modal::Help),
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.modal = Some(Modal::GroupEditor(Box::new(GroupEditorState::new_group())));
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            if let Some(group) = snap.groups.get(app.group_idx) {
+                app.modal = Some(Modal::GroupEditor(Box::new(GroupEditorState::from_group(
+                    group,
+                ))));
+            }
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if let Some(group) = snap.groups.get(app.group_idx) {
+                let idx = app
+                    .project
+                    .as_deref()
+                    .and_then(|ch| snap.projects.iter().position(|p| p.channel == ch))
+                    .unwrap_or(0);
+                app.modal = Some(Modal::GroupAttach {
+                    group_name: group.name.clone(),
+                    attached: group.projects.clone(),
+                    selected: Vec::new(),
+                    idx,
+                });
+            }
+        }
         KeyCode::Tab | KeyCode::BackTab => {
             app.groups_focus = match app.groups_focus {
                 GroupsFocus::Groups => GroupsFocus::Subtasks,
@@ -2833,13 +3990,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("q", "quit"),
         ],
         View::Groups => &[
+            ("n", "new"),
+            ("e", "edit"),
+            ("a", "attach"),
             ("Tab", "pane"),
-            ("Up/Down", "select"),
             ("Enter", "task"),
             ("d", "dashboard"),
             ("c", "chat"),
-            ("r", "refresh"),
-            ("Esc", "back"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -3702,7 +4859,12 @@ fn draw_groups(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
         let empty = vec![
             Line::from(Span::styled("No groups configured yet.", dim())),
             Line::from(""),
-            Line::from(Span::styled("Create one with:", dim())),
+            Line::from(vec![
+                Span::raw("Press "),
+                Span::styled("n", bold().fg(Color::Cyan)),
+                Span::raw(" to create a group,"),
+            ]),
+            Line::from(Span::styled("or use the CLI:", dim())),
             Line::from(Span::styled("  airc group create <name>", dim())),
             Line::from(Span::styled("    --lead <tpl>:<model>", dim())),
             Line::from(Span::styled("    --worker <tpl>:<model>", dim())),
@@ -4080,8 +5242,8 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width.saturating_sub(2)).max(10);
-    let height = height.min(area.height.saturating_sub(1)).max(3);
+    let width = width.min(area.width.saturating_sub(2).max(1)).min(area.width);
+    let height = height.min(area.height.saturating_sub(1).max(1)).min(area.height);
     Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -4090,61 +5252,474 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+fn draw_picker_box(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    notice: Option<(&str, Style)>,
+    items: &[(String, String)],
+    idx: usize,
+    footer: Option<&str>,
+) {
+    let frame_style = Style::default().fg(Color::Cyan);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut skip_from = if items.is_empty() {
+        0
+    } else {
+        idx.min(items.len() - 1)
+    };
+    if let Some((text, style)) = notice {
+        lines.push(Line::from(Span::styled(format!("  {text}"), style)));
+        if !items.is_empty() {
+            skip_from += 1;
+        }
+    }
+    for (i, (label, _)) in items.iter().enumerate() {
+        if i == idx {
+            lines.push(Line::from(Span::styled(
+                format!("> {label}"),
+                bold().fg(Color::Black).bg(Color::Cyan),
+            )));
+        } else {
+            lines.push(Line::from(format!("  {label}")));
+        }
+    }
+    let footer_rows = usize::from(footer.is_some());
+    let widest = lines
+        .iter()
+        .map(|l| l.width())
+        .chain(footer.iter().map(|f| f.chars().count() + 2))
+        .max()
+        .unwrap_or(10)
+        .max(title.chars().count() + 4);
+    let rect = centered(
+        area,
+        widest as u16 + 6,
+        (lines.len() + footer_rows) as u16 + 2,
+    );
+    let visible = rect.height.saturating_sub(2 + footer_rows as u16) as usize;
+    let first = skip_from.saturating_sub(visible.saturating_sub(1));
+    let mut shown: Vec<Line> = lines.into_iter().skip(first).take(visible).collect();
+    if let Some(hint) = footer {
+        shown.push(Line::from(Span::styled(format!(" {hint}"), dim())));
+    }
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(shown).block(
+            Block::bordered()
+                .border_style(frame_style)
+                .title(format!(" {title} ")),
+        ),
+        rect,
+    );
+}
+
+fn draw_prompt_box(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    text: &str,
+    hint: Option<&str>,
+    error: Option<&str>,
+) {
+    let frame_style = Style::default().fg(Color::Cyan);
+    let extra = error.or(hint);
+    let height = if extra.is_some() { 4 } else { 3 };
+    let rect = centered(area, 78, height);
+    let mut lines = vec![Line::from(text.to_string())];
+    if let Some(err) = error {
+        lines.push(Line::from(Span::styled(
+            format!("! {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    } else if let Some(h) = hint {
+        lines.push(Line::from(Span::styled(h.to_string(), dim())));
+    }
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_style(frame_style)
+                .title(format!(" {title} ")),
+        ),
+        rect,
+    );
+    if rect.width >= 3 && rect.height >= 3 {
+        let cursor_x =
+            rect.x + 1 + (text.chars().count() as u16).min(rect.width.saturating_sub(3));
+        frame.set_cursor_position((cursor_x, rect.y + 1));
+    }
+}
+
+fn format_editor_seat(seat: &GroupEditorSeat, is_lead: bool) -> String {
+    if seat.template.is_empty() && seat.model.is_empty() {
+        return "(not set — Enter to configure)".to_string();
+    }
+    let spec = match (seat.template.is_empty(), seat.model.is_empty()) {
+        (true, true) => "-".to_string(),
+        (false, true) => seat.template.clone(),
+        (true, false) => seat.model.clone(),
+        (false, false) => format!("{}:{}", seat.template, seat.model),
+    };
+    let nick = seat
+        .nick
+        .as_deref()
+        .map(clean_nick)
+        .filter(|s| !s.is_empty())
+        .map(|n| format!("@{n}"))
+        .unwrap_or_else(|| {
+            if is_lead {
+                "(unnamed)".to_string()
+            } else {
+                "[pool]".to_string()
+            }
+        });
+    if is_lead {
+        format!("★ {spec}  {nick}")
+    } else {
+        format!("{spec}  ×{}  {nick}", seat.count)
+    }
+}
+
+fn draw_seat_editor(
+    frame: &mut Frame,
+    area: Rect,
+    seat_ed: &GroupSeatEditor,
+    snap: &Snapshot,
+) {
+    let target_label = match seat_ed.target {
+        None => "Lead seat".to_string(),
+        Some(i) => format!("Worker seat {}", i + 1),
+    };
+    match seat_ed.step {
+        SeatStep::Menu { row } => {
+            let mut items = vec![
+                (format!("Template : {}", seat_ed.seat.template), "template".to_string()),
+                (format!("Model    : {}", seat_ed.seat.model), "model".to_string()),
+            ];
+            if seat_ed.target.is_some() {
+                items.push((format!("Count    : {}", seat_ed.seat.count), "count".to_string()));
+            }
+            let nick_label = seat_ed
+                .seat
+                .nick
+                .as_deref()
+                .map(clean_nick)
+                .filter(|s| !s.is_empty())
+                .map(|n| format!("@{n}"))
+                .unwrap_or_else(|| "(pool / unnamed)".to_string());
+            items.push((format!("Nick     : {nick_label}"), "nick".to_string()));
+            items.push(("[ Done ]".to_string(), "done".to_string()));
+            let hint = if seat_ed.target.is_some() {
+                "Enter edit · +/- count · Esc cancel"
+            } else {
+                "Enter edit · Esc cancel"
+            };
+            draw_picker_box(
+                frame,
+                area,
+                &target_label,
+                seat_ed
+                    .error
+                    .as_deref()
+                    .map(|e| (e, Style::default().fg(Color::Red))),
+                &items,
+                row,
+                Some(hint),
+            );
+        }
+        SeatStep::PickTemplate { idx } => {
+            let items = template_picker_items(snap, &seat_ed.seat.template);
+            draw_picker_box(
+                frame,
+                area,
+                &format!("{target_label}: client template"),
+                None,
+                &items,
+                idx,
+                Some("Enter select · Esc back"),
+            );
+        }
+        SeatStep::TypeTemplate => {
+            draw_prompt_box(
+                frame,
+                area,
+                &format!("{target_label}: client template id"),
+                &seat_ed.text,
+                Some("Letters, digits, '-' or '_' (e.g. claude, codex, gemini, ollama)"),
+                seat_ed.error.as_deref(),
+            );
+        }
+        SeatStep::PickModel { idx } => {
+            let (items, problem) =
+                seat_model_items(snap, &seat_ed.seat.template, &seat_ed.seat.model);
+            draw_picker_box(
+                frame,
+                area,
+                &format!("{target_label}: model for {}", seat_ed.seat.template),
+                problem
+                    .as_deref()
+                    .map(|p| (p, Style::default().fg(Color::Yellow))),
+                &items,
+                idx,
+                Some("Enter select · Esc back"),
+            );
+        }
+        SeatStep::TypeModel => {
+            draw_prompt_box(
+                frame,
+                area,
+                &format!("{target_label}: model name"),
+                &seat_ed.text,
+                Some("Model id expected by the template (e.g. opus, sonnet, qwen3:35b)"),
+                seat_ed.error.as_deref(),
+            );
+        }
+        SeatStep::TypeCount => {
+            draw_prompt_box(
+                frame,
+                area,
+                &format!("{target_label}: worker seat count"),
+                &seat_ed.text,
+                Some("Positive integer (>= 1)"),
+                seat_ed.error.as_deref(),
+            );
+        }
+        SeatStep::PickNick { idx } => {
+            let items = nick_picker_items(snap, seat_ed.seat.nick.as_deref());
+            draw_picker_box(
+                frame,
+                area,
+                &format!("{target_label}: account nick (optional)"),
+                None,
+                &items,
+                idx,
+                Some("Enter select · Esc back"),
+            );
+        }
+        SeatStep::TypeNick => {
+            draw_prompt_box(
+                frame,
+                area,
+                &format!("{target_label}: account nick (blank for pool)"),
+                &seat_ed.text,
+                Some("Optional account name without spaces (or blank for pool seat)"),
+                seat_ed.error.as_deref(),
+            );
+        }
+    }
+}
+
+fn draw_group_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &GroupEditorState,
+    snap: &Snapshot,
+) {
+    let title = if editor.is_edit {
+        format!(" Edit group: {} ", editor.name)
+    } else {
+        " New group ".to_string()
+    };
+    let fields = editor.fields();
+    let cursor = editor.cursor.min(fields.len().saturating_sub(1));
+    let or_hint = |val: &str, empty_label: &str| {
+        if val.trim().is_empty() {
+            empty_label.to_string()
+        } else {
+            val.to_string()
+        }
+    };
+
+    let rows: Vec<Line> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let selected = i == cursor;
+            let text = match field {
+                GroupEditorField::Name => {
+                    if editor.is_edit {
+                        format!("Name          : {}  (locked)", editor.name)
+                    } else {
+                        format!("Name          : {}", or_hint(&editor.name, "(required)"))
+                    }
+                }
+                GroupEditorField::Description => {
+                    format!(
+                        "Description   : {}",
+                        or_hint(&editor.description, "(optional)")
+                    )
+                }
+                GroupEditorField::Lead => {
+                    format!("Lead          : {}", format_editor_seat(&editor.lead, true))
+                }
+                GroupEditorField::Worker(idx) => {
+                    format!(
+                        "Worker {:<7}: {}",
+                        idx + 1,
+                        format_editor_seat(&editor.workers[*idx], false)
+                    )
+                }
+                GroupEditorField::AddWorker => "+ Add worker seat".to_string(),
+                GroupEditorField::TimeoutSecs => {
+                    format!("Timeout (s)   : {}", or_hint(&editor.timeout_secs, "(off)"))
+                }
+                GroupEditorField::ReviewPeers => {
+                    format!("Review peers  : {}", or_hint(&editor.review_peers, "(none)"))
+                }
+                GroupEditorField::ReviewQuorum => {
+                    format!(
+                        "Review quorum : {}",
+                        or_hint(&editor.review_quorum, "(all peers)")
+                    )
+                }
+                GroupEditorField::LeadPrompt => {
+                    format!("Lead prompt   : {}", or_hint(&editor.lead_prompt, "(none)"))
+                }
+                GroupEditorField::WorkerPrompt => {
+                    format!(
+                        "Worker prompt : {}",
+                        or_hint(&editor.worker_prompt, "(none)")
+                    )
+                }
+                GroupEditorField::Save => "[ Save Group ]".to_string(),
+                GroupEditorField::Cancel => "[ Cancel ]".to_string(),
+            };
+            if selected {
+                Line::from(Span::styled(
+                    format!("> {text}"),
+                    bold().fg(Color::Black).bg(Color::Cyan),
+                ))
+            } else if matches!(field, GroupEditorField::Save) {
+                Line::from(Span::styled(format!("  {text}"), bold().fg(Color::Green)))
+            } else if matches!(field, GroupEditorField::AddWorker) {
+                Line::from(Span::styled(format!("  {text}"), Style::default().fg(Color::Cyan)))
+            } else {
+                Line::from(format!("  {text}"))
+            }
+        })
+        .collect();
+
+    let rect = centered(area, 84, rows.len() as u16 + 4);
+    let visible = rect.height.saturating_sub(3) as usize;
+    let first = cursor.saturating_sub(visible.saturating_sub(1));
+    let mut shown: Vec<Line> = rows.into_iter().skip(first).take(visible).collect();
+    if let Some(err) = &editor.error {
+        shown.push(Line::from(Span::styled(
+            format!(" ! {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        shown.push(Line::from(Span::styled(
+            " Up/Down move · Enter edit · +/- count · d remove worker · s save · Esc cancel",
+            dim(),
+        )));
+    }
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(shown).block(
+            Block::bordered()
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        ),
+        rect,
+    );
+
+    if let Some(sub) = &editor.sub {
+        match sub {
+            GroupEditorSub::Text { field, text } => {
+                let (title, hint) = match field {
+                    GroupEditorField::Name => ("Group name", "Unique name without '/' or '\\'"),
+                    GroupEditorField::Description => ("Description (optional)", "Enter to keep, Esc to cancel"),
+                    GroupEditorField::TimeoutSecs => (
+                        "Inactivity timeout (seconds, optional)",
+                        "Positive integer or blank to disable",
+                    ),
+                    GroupEditorField::ReviewPeers => (
+                        "Peer reviewers (optional)",
+                        "Comma-separated named seats (e.g. lead, worker1) or blank",
+                    ),
+                    GroupEditorField::ReviewQuorum => (
+                        "Review quorum (optional)",
+                        "Integer 1..N, or blank for all peers",
+                    ),
+                    GroupEditorField::LeadPrompt => ("Lead prompt (optional)", "Custom prompt override or blank"),
+                    GroupEditorField::WorkerPrompt => ("Worker prompt (optional)", "Custom prompt override or blank"),
+                    _ => ("Edit", ""),
+                };
+                draw_prompt_box(frame, area, title, text, Some(hint), None);
+            }
+            GroupEditorSub::Seat(seat_ed) => draw_seat_editor(frame, area, seat_ed, snap),
+        }
+    }
+}
+
+fn draw_group_attach(
+    frame: &mut Frame,
+    area: Rect,
+    group_name: &str,
+    attached: &[String],
+    selected: &[String],
+    idx: usize,
+    snap: &Snapshot,
+) {
+    let title = format!("Attach group '{group_name}' to project");
+    if snap.projects.is_empty() {
+        draw_picker_box(
+            frame,
+            area,
+            &title,
+            Some(("No projects exist on the hub yet.", dim())),
+            &[],
+            0,
+            Some("Esc close"),
+        );
+        return;
+    }
+    let items: Vec<(String, String)> = snap
+        .projects
+        .iter()
+        .map(|p| {
+            let badge = if attached.iter().any(|c| c == &p.channel) {
+                "[attached]"
+            } else if selected.contains(&p.channel) {
+                "[selected]"
+            } else {
+                "[        ]"
+            };
+            let pm = p
+                .pm
+                .as_deref()
+                .map(|m| format!("  (PM @{m})"))
+                .unwrap_or_default();
+            (
+                format!("{badge} {:<16} {}{pm}", p.channel, p.name),
+                p.channel.clone(),
+            )
+        })
+        .collect();
+    draw_picker_box(
+        frame,
+        area,
+        &title,
+        None,
+        &items,
+        idx.min(items.len().saturating_sub(1)),
+        Some("Up/Down move · Space multi-select · Enter attach · Esc close"),
+    );
+}
+
 fn draw_modal(frame: &mut Frame, modal: &Modal, snap: &Snapshot, area: Rect) {
     let frame_style = Style::default().fg(Color::Cyan);
     match modal {
         Modal::Picker {
             title, items, idx, ..
         } => {
-            let widest = items
-                .iter()
-                .map(|(label, _)| label.chars().count())
-                .max()
-                .unwrap_or(10)
-                .max(title.chars().count());
-            let rect = centered(area, widest as u16 + 8, items.len() as u16 + 2);
-            let visible = rect.height.saturating_sub(2) as usize;
-            let first = idx.saturating_sub(visible.saturating_sub(1));
-            let lines: Vec<Line> = items
-                .iter()
-                .enumerate()
-                .skip(first)
-                .take(visible)
-                .map(|(i, (label, _))| {
-                    if i == *idx {
-                        Line::from(Span::styled(
-                            format!("> {label}"),
-                            bold().fg(Color::Black).bg(Color::Cyan),
-                        ))
-                    } else {
-                        Line::from(format!("  {label}"))
-                    }
-                })
-                .collect();
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(lines).block(
-                    Block::bordered()
-                        .border_style(frame_style)
-                        .title(format!(" {title} ")),
-                ),
-                rect,
-            );
+            draw_picker_box(frame, area, title, None, items, *idx, None);
         }
         Modal::Prompt { title, text, .. } => {
-            let rect = centered(area, 78, 3);
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(text.clone()).block(
-                    Block::bordered()
-                        .border_style(frame_style)
-                        .title(format!(" {title} ")),
-                ),
-                rect,
-            );
-            let cursor_x =
-                rect.x + 1 + (text.chars().count() as u16).min(rect.width.saturating_sub(3));
-            frame.set_cursor_position((cursor_x, rect.y + 1));
+            draw_prompt_box(frame, area, title, text, None, None);
         }
         Modal::Models { template, idx, .. } => {
             let (mut lines, problem): (Vec<Line>, Option<String>) = match model_items(snap, template) {
@@ -4190,6 +5765,13 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, snap: &Snapshot, area: Rect) {
                 rect,
             );
         }
+        Modal::GroupEditor(editor) => draw_group_editor(frame, area, editor, snap),
+        Modal::GroupAttach {
+            group_name,
+            attached,
+            selected,
+            idx,
+        } => draw_group_attach(frame, area, group_name, attached, selected, *idx, snap),
         Modal::Detail { task_id } => {
             let lines: Vec<Line> = match &snap.detail {
                 Some((id, lines)) if id == task_id => {
@@ -6197,6 +7779,8 @@ mod tests {
                     },
                 ],
                 projects: vec!["#sample-app".into()],
+                lead_prompt: Some("Lead custom prompt".into()),
+                worker_prompt: Some("Worker custom prompt".into()),
                 review_policy: Some(GroupReviewPolicyView {
                     peer_reviewers: vec!["lead".into(), "worker1".into()],
                     quorum: Some(1),
@@ -6219,6 +7803,8 @@ mod tests {
                     nick: None,
                 }],
                 projects: Vec::new(),
+                lead_prompt: None,
+                worker_prompt: None,
                 review_policy: None,
                 inactivity_timeout_secs: None,
             },
@@ -6382,5 +7968,329 @@ mod tests {
             })
         );
         assert_eq!(parsed.inactivity_timeout_secs, Some(300));
+        assert_eq!(parsed.lead_prompt, None);
+        assert_eq!(parsed.worker_prompt, None);
+    }
+
+    #[test]
+    fn group_editor_creates_new_group_with_lead_and_workers() {
+        let mut snap = fixture();
+        snap.templates = vec![TemplateView {
+            id: "claude".into(),
+            name: "Claude Code".into(),
+            installed: true,
+        }];
+        snap.models = Some((
+            "claude".into(),
+            Ok(vec![
+                ("opus".into(), Some("Opus 4".into())),
+                ("sonnet".into(), Some("Sonnet 4".into())),
+            ]),
+        ));
+        let mut app = App {
+            view: View::Groups,
+            ..App::default()
+        };
+
+        // Pressing 'n' even when no groups exist opens the interactive Group Editor modal.
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Char('n')]), None);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("New group"), "{screen}");
+        assert!(screen.contains("[ Save Group ]"), "{screen}");
+
+        // Fill Name ("backend").
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        type_text(&mut app, &snap, "backend");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+
+        // Move to Description and fill it.
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        type_text(&mut app, &snap, "Core team");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+
+        // Move to Lead, open template picker, select "claude" -> dispatches LoadModels("claude").
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Lead seat: client template"), "{screen}");
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::LoadModels("claude".into()))
+        );
+
+        // Pick model "opus" (index 0) -> opens nick picker.
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Lead seat: model for claude"), "{screen}");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+
+        // Pick account nick "@agent3.8" (index 2: after "(pool / unnamed)" and "@user").
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
+
+        // Move to "+ Add worker seat" and add a manual pool worker ("ollama", "qwen3:35b", count 3).
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        // Template picker has "Claude Code" (0) and "Type a template id..." (1).
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        type_text(&mut app, &snap, "ollama");
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Enter]),
+            Some(Action::LoadModels("ollama".into()))
+        );
+        // Model picker for "ollama" is loading; "Type a model name..." is index 0.
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        type_text(&mut app, &snap, "qwen3:35b");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        // Count prompt is pre-filled with "1"; backspace and type "3".
+        press(&mut app, &snap, &[KeyCode::Backspace]);
+        type_text(&mut app, &snap, "3");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        // Nick picker: index 0 is "(pool / unnamed)".
+        press(&mut app, &snap, &[KeyCode::Enter]);
+
+        // Move to Timeout (s) and set "600".
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        type_text(&mut app, &snap, "600");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+
+        // Press 's' to save.
+        let action = press(&mut app, &snap, &[KeyCode::Char('s')]);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            action,
+            Some(Action::Api {
+                path: "/v1/groups".into(),
+                body: json!({
+                    "name": "backend",
+                    "description": "Core team",
+                    "lead": {"template": "claude", "model": "opus", "count": 1, "nick": "agent3.8"},
+                    "workers": [
+                        {"template": "ollama", "model": "qwen3:35b", "count": 3}
+                    ],
+                    "lead_prompt": Value::Null,
+                    "worker_prompt": Value::Null,
+                    "review_policy": Value::Null,
+                    "inactivity_timeout_secs": 600,
+                }),
+                owner: true,
+                done: "Group 'backend' created".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn group_editor_edits_existing_group_preserving_prompts_and_adjusting_workers() {
+        let snap = groups_fixture();
+        let mut app = App {
+            view: View::Groups,
+            group_idx: 0,
+            ..App::default()
+        };
+
+        // Pressing 'e' opens GroupEditor pre-populated with "dev".
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Char('e')]), None);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Edit group: dev"), "{screen}");
+        assert!(screen.contains("dev  (locked)"), "{screen}");
+        assert!(screen.contains("Opus lead with local workers"), "{screen}");
+
+        // Trying to edit Name shows a locked message and keeps the modal open.
+        press(&mut app, &snap, &[KeyCode::Up, KeyCode::Enter]);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("cannot be renamed"), "{screen}");
+
+        // Move to Worker 2 (codex:gpt-5 @worker2) and delete it with 'd'.
+        press(
+            &mut app,
+            &snap,
+            &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Char('d')],
+        );
+        // Now Worker 2 is ollama:qwen3:35b ×3; increment its count with '+' to ×4.
+        press(&mut app, &snap, &[KeyCode::Char('+')]);
+        // Delete Worker 2 as well, leaving only Worker 1.
+        press(&mut app, &snap, &[KeyCode::Char('d')]);
+        // Trying to delete the last remaining worker is refused.
+        press(&mut app, &snap, &[KeyCode::Up, KeyCode::Char('d')]);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("at least one worker"), "{screen}");
+
+        // Edit Worker 1 via SeatStep::Menu: change model to "haiku" and commit with "[ Done ]".
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Worker seat 1"), "{screen}");
+        // Select Model row (index 1) -> PickModel -> TypeModel (last row).
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]),
+            Some(Action::LoadModels("claude".into()))
+        );
+        press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
+        press(&mut app, &snap, &[KeyCode::Backspace; 6]);
+        type_text(&mut app, &snap, "haiku");
+        press(&mut app, &snap, &[KeyCode::Enter]);
+        // Back in Menu: move to [ Done ] (row 4) and confirm.
+        press(
+            &mut app,
+            &snap,
+            &[
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
+        );
+
+        // Save via Ctrl+S and verify existing prompts and review_policy are preserved.
+        let action = handle_key(
+            &mut app,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+            &snap,
+        );
+        assert!(app.modal.is_none());
+        assert_eq!(
+            action,
+            Some(Action::Api {
+                path: "/v1/groups".into(),
+                body: json!({
+                    "name": "dev",
+                    "description": "Opus lead with local workers",
+                    "lead": {"template": "claude", "model": "opus", "count": 1, "nick": "lead"},
+                    "workers": [
+                        {"template": "claude", "model": "haiku", "count": 1, "nick": "worker1"}
+                    ],
+                    "lead_prompt": "Lead custom prompt",
+                    "worker_prompt": "Worker custom prompt",
+                    "review_policy": {"peer_reviewers": ["lead", "worker1"], "quorum": 1},
+                    "inactivity_timeout_secs": 300,
+                }),
+                owner: true,
+                done: "Group 'dev' updated".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn group_editor_validates_invalid_inputs_and_renders_small_terminals() {
+        let snap = groups_fixture();
+        let mut editor = GroupEditorState::new_group();
+        assert!(editor.build_upsert_payload().is_err());
+
+        editor.name = "bad/name".into();
+        assert!(editor.build_upsert_payload().is_err());
+
+        editor.name = "team".into();
+        editor.lead = GroupEditorSeat {
+            template: "claude".into(),
+            model: "opus".into(),
+            count: 1,
+            nick: Some("lead".into()),
+        };
+        editor.workers.push(GroupEditorSeat {
+            template: "claude".into(),
+            model: "sonnet".into(),
+            count: 1,
+            nick: Some("worker1".into()),
+        });
+        editor.timeout_secs = "0".into();
+        assert!(editor.build_upsert_payload().is_err());
+
+        editor.timeout_secs = "120".into();
+        editor.review_peers = "lead, unknown".into();
+        assert!(editor.build_upsert_payload().is_err());
+
+        editor.review_peers = "lead, worker1".into();
+        editor.review_quorum = "3".into();
+        assert!(editor.build_upsert_payload().is_err());
+
+        editor.review_quorum = "2".into();
+        assert!(editor.build_upsert_payload().is_ok());
+
+        let mut app = App {
+            view: View::Groups,
+            modal: Some(Modal::GroupEditor(Box::new(editor))),
+            ..App::default()
+        };
+        for (width, height) in [(110, 32), (60, 10), (20, 6), (1, 1)] {
+            render_to_text(&mut app, &snap, width, height).unwrap();
+        }
+    }
+
+    #[test]
+    fn group_attach_dialog_attaches_single_and_multiple_projects() {
+        let mut snap = groups_fixture();
+        snap.projects.push(ProjectView {
+            channel: "#cams".into(),
+            name: "CAMS".into(),
+            pm: Some("flash".into()),
+            ..ProjectView::default()
+        });
+        snap.projects.push(ProjectView {
+            channel: "#infra".into(),
+            name: "Infra".into(),
+            ..ProjectView::default()
+        });
+        snap.groups[0].name = "dev équipe".into();
+
+        let mut app = App {
+            view: View::Groups,
+            group_idx: 0,
+            project: Some("#cams".into()),
+            ..App::default()
+        };
+
+        // Pressing 'a' opens the Project Attachment dialog, pre-highlighting app.project ("#cams").
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Char('a')]), None);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("Attach group 'dev équipe' to project"), "{screen}");
+        assert!(screen.contains("[attached] #sample-app"), "{screen}");
+        assert!(screen.contains("[        ] #cams"), "{screen}");
+
+        // Enter attaches the highlighted project directly with URL-encoded group name.
+        let action = press(&mut app, &snap, &[KeyCode::Enter]);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            action,
+            Some(Action::Api {
+                path: "/v1/groups/dev%20%C3%A9quipe/attach".into(),
+                body: json!({"channel": "#cams"}),
+                owner: true,
+                done: "Attached group 'dev équipe' to #cams".into(),
+            })
+        );
+
+        // Multi-select with Space attaches multiple projects via Action::Many.
+        press(&mut app, &snap, &[KeyCode::Char('a')]);
+        press(
+            &mut app,
+            &snap,
+            &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Char(' ')],
+        );
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("[selected] #cams"), "{screen}");
+        assert!(screen.contains("[selected] #infra"), "{screen}");
+        let multi = press(&mut app, &snap, &[KeyCode::Enter]);
+        assert_eq!(
+            multi,
+            Some(Action::Many(vec![
+                Action::Api {
+                    path: "/v1/groups/dev%20%C3%A9quipe/attach".into(),
+                    body: json!({"channel": "#cams"}),
+                    owner: true,
+                    done: "Attached group 'dev équipe' to 2 project(s)".into(),
+                },
+                Action::Api {
+                    path: "/v1/groups/dev%20%C3%A9quipe/attach".into(),
+                    body: json!({"channel": "#infra"}),
+                    owner: true,
+                    done: "Attached group 'dev équipe' to 2 project(s)".into(),
+                },
+            ]))
+        );
+
+        // Empty projects snapshot shows a clear message and closes on Esc.
+        snap.projects.clear();
+        press(&mut app, &snap, &[KeyCode::Char('a')]);
+        let screen = render(&mut app, &snap);
+        assert!(screen.contains("No projects exist on the hub yet."), "{screen}");
+        press(&mut app, &snap, &[KeyCode::Esc]);
+        assert!(app.modal.is_none());
     }
 }
