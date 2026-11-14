@@ -4,6 +4,7 @@ mod gits;
 mod history;
 mod http;
 mod locks;
+mod logging;
 mod notes;
 mod projects;
 mod protocol;
@@ -125,10 +126,18 @@ async fn main() -> Result<()> {
                        --tls-bind <host:port>   IRC TLS listen address (default 127.0.0.1:6697)\n  \
                        --register-key <key>     Invite key required to register (env AIRCD_REGISTER_KEY;\n  \
                                                 default: generated once in aircd-owner.key beside the DB)\n  \
-                       --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)"
+                       --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)\n  \
+                       --windows-event-log      Forward server errors and security audits to Windows Application Event Log (env AIRCD_WINDOWS_EVENT_LOG=1)\n  \
+                       --windows-event-log-source <name>  Windows Event Log source name (default aircd)\n  \
+                       --syslog-target <target> Forward server errors and security audits to syslog (udp://host:port, tcp://host:port, unix:///path)\n  \
+                       --syslog-format <fmt>    Syslog message format: rfc5424 (default) or rfc3164\n  \
+                       --syslog-facility <fac>  Syslog facility: auto (default), daemon, auth, authpriv, user, syslog, or local0..local7"
                 );
         return Ok(());
     }
+    let server_config = config::ServerConfig::load(&argv)?;
+    let log_config = server_config.to_log_config()?;
+    let logger = logging::EventForwarder::new(log_config)?;
     let config::ServerConfig {
         bind: bind_addr,
         http_bind,
@@ -138,12 +147,13 @@ async fn main() -> Result<()> {
         tls_bind,
         register_key,
         open_registration,
-    } = config::ServerConfig::load(&argv)?;
+        ..
+    } = server_config;
 
     let (register_key, register_note) =
         resolve_register_key(register_key, open_registration, &db_path)?;
     let db = store::open(db_path)?;
-    let server = Server::new(db);
+    let server = Server::with_logger(db, logger.clone());
     let _webhook_worker = server.webhooks().spawn_worker();
 
     let tls_port = if tls_cert.is_some() && tls_key.is_some() {
@@ -171,7 +181,20 @@ async fn main() -> Result<()> {
         );
     }
 
-    match (tls_cert, tls_key) {
+    logger.log_security(
+        logging::Severity::Info,
+        "server.started",
+        "success",
+        Some("system"),
+        None,
+        None,
+        format!(
+            "aircd started (irc={bind_addr}, http={http_bind}, tls={})",
+            tls_cert.is_some() && tls_key.is_some()
+        ),
+    );
+
+    let run_result = match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             let acceptor = load_tls_config(&cert, &key)?;
             let plain_server = server.clone();
@@ -181,18 +204,28 @@ async fn main() -> Result<()> {
                 plain_server.listen(&bind_addr),
                 tls_server.listen_tls(&tls_bind, acceptor),
                 http::serve(http_server, &http_bind, runtime_info),
-            )?;
+            )
+            .map(|_| ())
         }
         (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!("both AIRCD_TLS_CERT and AIRCD_TLS_KEY must be set to enable TLS");
+            Err(anyhow::anyhow!(
+                "both AIRCD_TLS_CERT and AIRCD_TLS_KEY must be set to enable TLS"
+            ))
         }
         (None, None) => {
             let http_server = server.clone();
             tokio::try_join!(
                 server.listen(&bind_addr),
                 http::serve(http_server, &http_bind, runtime_info),
-            )?;
+            )
+            .map(|_| ())
         }
+    };
+
+    if let Err(err) = run_result {
+        logger.log_error("server.startup_error", format!("aircd server error: {err:#}"));
+        logger.flush();
+        return Err(err);
     }
 
     Ok(())

@@ -8,6 +8,11 @@ param(
     [string]$TlsCert = "",
     [string]$TlsKey = "",
     [string]$TlsBind = "127.0.0.1:6697",
+    [switch]$WindowsEventLog,
+    [string]$WindowsEventLogSource = "",
+    [string]$SyslogTarget = "",
+    [string]$SyslogFormat = "",
+    [string]$SyslogFacility = "",
     [string]$ExecutablePath = "",
     [switch]$Background,
     # Do nothing when a hub is already listening (used by the sign-in shortcut).
@@ -20,7 +25,7 @@ $ConfigModule = Join-Path $PSScriptRoot "AircdConfig.psm1"
 if (Test-Path -LiteralPath $ConfigModule -PathType Leaf) {
     Import-Module $ConfigModule -Force
     $Overrides = @{}
-    foreach ($Key in @("Bind", "HttpBind", "DbPath", "OpenRegistration", "RegisterKey", "TlsCert", "TlsKey", "TlsBind", "ExecutablePath")) {
+    foreach ($Key in @("Bind", "HttpBind", "DbPath", "OpenRegistration", "RegisterKey", "TlsCert", "TlsKey", "TlsBind", "WindowsEventLog", "WindowsEventLogSource", "SyslogTarget", "SyslogFormat", "SyslogFacility", "ExecutablePath")) {
         if ($PSBoundParameters.ContainsKey($Key)) {
             $Overrides[$Key] = $PSBoundParameters[$Key]
         }
@@ -34,6 +39,11 @@ if (Test-Path -LiteralPath $ConfigModule -PathType Leaf) {
     $TlsCert = $ResolvedCfg.TlsCert
     $TlsKey = $ResolvedCfg.TlsKey
     $TlsBind = $ResolvedCfg.TlsBind
+    $WindowsEventLog = [bool]$ResolvedCfg.WindowsEventLog
+    $WindowsEventLogSource = $ResolvedCfg.WindowsEventLogSource
+    $SyslogTarget = $ResolvedCfg.SyslogTarget
+    $SyslogFormat = $ResolvedCfg.SyslogFormat
+    $SyslogFacility = $ResolvedCfg.SyslogFacility
     $ExecutablePath = $ResolvedCfg.ExecutablePath
 } else {
     if (-not $PSBoundParameters.ContainsKey("Bind") -and $env:AIRCD_BIND) { $Bind = $env:AIRCD_BIND }
@@ -91,6 +101,11 @@ if (-not [string]::IsNullOrWhiteSpace($RegisterKey)) { $ArgList += @("--register
 if ($HasTlsCert) {
     $ArgList += @("--tls-cert", [IO.Path]::GetFullPath($TlsCert), "--tls-key", [IO.Path]::GetFullPath($TlsKey), "--tls-bind", $TlsBind)
 }
+if ($WindowsEventLog) { $ArgList += "--windows-event-log" }
+if (-not [string]::IsNullOrWhiteSpace($WindowsEventLogSource)) { $ArgList += @("--windows-event-log-source", $WindowsEventLogSource) }
+if (-not [string]::IsNullOrWhiteSpace($SyslogTarget)) { $ArgList += @("--syslog-target", $SyslogTarget) }
+if (-not [string]::IsNullOrWhiteSpace($SyslogFormat)) { $ArgList += @("--syslog-format", $SyslogFormat) }
+if (-not [string]::IsNullOrWhiteSpace($SyslogFacility)) { $ArgList += @("--syslog-facility", $SyslogFacility) }
 if ($Background) {
     $LogDir = if ($DbDir) { $DbDir } else { $RepoRoot }
     $LogOut = Join-Path $LogDir "aircd.stdout.log"

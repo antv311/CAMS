@@ -1,5 +1,8 @@
 //! Editable server settings and shared per-user configuration discovery.
 
+use crate::logging::{
+    validate_event_log_source, LogConfig, SyslogFacility, SyslogFormat, SyslogTarget,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -46,6 +49,11 @@ pub struct ServerConfig {
     pub tls_bind: String,
     pub register_key: Option<String>,
     pub open_registration: bool,
+    pub windows_event_log: bool,
+    pub windows_event_log_source: String,
+    pub syslog_target: Option<String>,
+    pub syslog_format: String,
+    pub syslog_facility: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -60,6 +68,11 @@ impl Default for ServerConfig {
             tls_bind: "127.0.0.1:6697".into(),
             register_key: None,
             open_registration: false,
+            windows_event_log: false,
+            windows_event_log_source: "aircd".into(),
+            syslog_target: None,
+            syslog_format: "rfc5424".into(),
+            syslog_facility: None,
         }
     }
 }
@@ -73,6 +86,30 @@ impl ServerConfig {
         )
     }
 
+    pub fn to_log_config(&self) -> Result<LogConfig> {
+        let windows_event_log_source = validate_event_log_source(&self.windows_event_log_source)?;
+        let syslog_target = self
+            .syslog_target
+            .as_deref()
+            .map(SyslogTarget::parse)
+            .transpose()?;
+        let syslog_format = SyslogFormat::parse(&self.syslog_format)?;
+        let syslog_facility = self
+            .syslog_facility
+            .as_deref()
+            .map(SyslogFacility::parse_optional)
+            .transpose()?
+            .flatten();
+        Ok(LogConfig {
+            windows_event_log: self.windows_event_log,
+            windows_event_log_source,
+            syslog_target,
+            syslog_format,
+            syslog_facility,
+            stderr_errors: true,
+        })
+    }
+
     fn load_with(
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
@@ -82,9 +119,19 @@ impl ServerConfig {
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let value = match arg.as_str() {
-                "--open-registration" => "true",
-                "--config" | "--bind" | "--http-bind" | "--db" | "--tls-cert" | "--tls-key"
-                | "--tls-bind" | "--register-key" => iter
+                "--open-registration" | "--windows-event-log" => "true",
+                "--config"
+                | "--bind"
+                | "--http-bind"
+                | "--db"
+                | "--tls-cert"
+                | "--tls-key"
+                | "--tls-bind"
+                | "--register-key"
+                | "--windows-event-log-source"
+                | "--syslog-target"
+                | "--syslog-format"
+                | "--syslog-facility" => iter
                     .next()
                     .filter(|value| !value.starts_with("--"))
                     .with_context(|| format!("{arg} requires a value"))?,
@@ -143,6 +190,11 @@ impl ServerConfig {
             ("AIRCD_TLS_BIND", "--tls-bind"),
             ("AIRCD_REGISTER_KEY", "--register-key"),
             ("AIRCD_OPEN_REGISTRATION", "--open-registration"),
+            ("AIRCD_WINDOWS_EVENT_LOG", "--windows-event-log"),
+            ("AIRCD_WINDOWS_EVENT_LOG_SOURCE", "--windows-event-log-source"),
+            ("AIRCD_SYSLOG_TARGET", "--syslog-target"),
+            ("AIRCD_SYSLOG_FORMAT", "--syslog-format"),
+            ("AIRCD_SYSLOG_FACILITY", "--syslog-facility"),
         ] {
             if let Some(value) = env(name) {
                 // Preserve the existing empty invite-key environment fallback.
@@ -162,6 +214,8 @@ impl ServerConfig {
             ("http_bind", &config.http_bind),
             ("db", &config.db),
             ("tls_bind", &config.tls_bind),
+            ("windows_event_log_source", &config.windows_event_log_source),
+            ("syslog_format", &config.syslog_format),
         ] {
             if value.trim().is_empty() {
                 bail!("server setting {name} must not be empty");
@@ -174,11 +228,14 @@ impl ServerConfig {
             ("tls_cert", &config.tls_cert),
             ("tls_key", &config.tls_key),
             ("register_key", &config.register_key),
+            ("syslog_target", &config.syslog_target),
+            ("syslog_facility", &config.syslog_facility),
         ] {
             if value.as_ref().is_some_and(|s| s.trim().is_empty()) {
                 bail!("server setting {name} must not be empty");
             }
         }
+        let _ = config.to_log_config()?;
         Ok(config)
     }
 
@@ -193,15 +250,26 @@ impl ServerConfig {
             "--tls-bind" => self.tls_bind = value.into(),
             "--register-key" => self.register_key = Some(value.into()),
             "--open-registration" => {
-                self.open_registration = match value.trim().to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" => true,
-                    "0" | "false" | "no" | "" => false,
-                    _ => bail!("open_registration must be true/false, yes/no, or 1/0"),
-                };
+                self.open_registration = parse_bool_setting("open_registration", value)?;
             }
+            "--windows-event-log" => {
+                self.windows_event_log = parse_bool_setting("windows_event_log", value)?;
+            }
+            "--windows-event-log-source" => self.windows_event_log_source = value.into(),
+            "--syslog-target" => self.syslog_target = Some(value.into()),
+            "--syslog-format" => self.syslog_format = value.into(),
+            "--syslog-facility" => self.syslog_facility = Some(value.into()),
             _ => unreachable!(),
         }
         Ok(())
+    }
+}
+
+fn parse_bool_setting(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" | "" => Ok(false),
+        _ => bail!("{name} must be true/false, yes/no, or 1/0"),
     }
 }
 
@@ -406,6 +474,73 @@ mod tests {
         assert!(!cfg.open_registration);
         assert!(cfg.register_key.is_none());
         assert_eq!(cfg.bind, "127.0.0.1:6667");
+        assert!(!cfg.windows_event_log);
+        assert_eq!(cfg.windows_event_log_source, "aircd");
+        assert!(cfg.syslog_target.is_none());
+        assert_eq!(cfg.syslog_format, "rfc5424");
+        assert!(cfg.syslog_facility.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn logging_forwarding_settings_respect_precedence_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "windows_event_log = true\n\
+             windows_event_log_source = 'cams-hub'\n\
+             syslog_target = 'udp://127.0.0.1:514'\n\
+             syslog_format = 'rfc3164'\n\
+             syslog_facility = 'local2'\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        let log_cfg = cfg.to_log_config()?;
+        assert!(log_cfg.windows_event_log);
+        assert_eq!(log_cfg.windows_event_log_source, "cams-hub");
+        assert_eq!(
+            log_cfg.syslog_target,
+            Some(SyslogTarget::Udp("127.0.0.1:514".into()))
+        );
+        assert_eq!(log_cfg.syslog_format, SyslogFormat::Rfc3164);
+        assert_eq!(log_cfg.syslog_facility, Some(SyslogFacility::Local2));
+
+        let env = environment(&[
+            ("AIRCD_WINDOWS_EVENT_LOG", "false"),
+            ("AIRCD_SYSLOG_TARGET", "tcp://127.0.0.1:6514"),
+            ("AIRCD_SYSLOG_FORMAT", "rfc5424"),
+            ("AIRCD_SYSLOG_FACILITY", "auto"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--windows-event-log".into(),
+                "--windows-event-log-source".into(),
+                "aircd-prod".into(),
+            ],
+            env,
+            &path,
+        )?;
+        let log_cfg = cfg.to_log_config()?;
+        assert!(log_cfg.windows_event_log);
+        assert_eq!(log_cfg.windows_event_log_source, "aircd-prod");
+        assert_eq!(
+            log_cfg.syslog_target,
+            Some(SyslogTarget::Tcp("127.0.0.1:6514".into()))
+        );
+        assert_eq!(log_cfg.syslog_format, SyslogFormat::Rfc5424);
+        assert_eq!(log_cfg.syslog_facility, None);
+
+        for bad in [
+            "syslog_target = 'not-a-host-port'",
+            "syslog_format = 'json'",
+            "syslog_facility = 'bogus'",
+            "windows_event_log_source = ' '",
+            "windows_event_log_source = 'bad/source'",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid config for {bad}"
+            );
+        }
         Ok(())
     }
 }

@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::logging::{EventForwarder, Severity};
 use crate::tokens;
 
 #[derive(Debug)]
@@ -30,13 +31,20 @@ pub struct Principal {
 pub struct AuthStore {
     db: Arc<Mutex<Connection>>,
     legacy_hits: Arc<AtomicU64>,
+    logger: EventForwarder,
 }
 
 impl AuthStore {
+    #[allow(dead_code)]
     pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+        Self::with_logger(db, EventForwarder::default())
+    }
+
+    pub fn with_logger(db: Arc<Mutex<Connection>>, logger: EventForwarder) -> Self {
         Self {
             db,
             legacy_hits: Arc::new(AtomicU64::new(0)),
+            logger,
         }
     }
 
@@ -54,9 +62,19 @@ impl AuthStore {
 
         let principal = self.authenticate_legacy(token)?;
         let total = self.legacy_hits.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!(
+        let msg = format!(
             "auth: legacy plaintext token accepted for principal {} (legacy_hits={})",
             principal.nick, total,
+        );
+        eprintln!("{msg}");
+        self.logger.log_security(
+            Severity::Warning,
+            "auth.legacy_token",
+            "success",
+            Some(&principal.id),
+            Some(&principal.id),
+            None,
+            msg,
         );
         Ok(principal)
     }

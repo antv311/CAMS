@@ -14,3 +14,11 @@ db = "aircd.sqlite3"
 # Prefer AIRCD_REGISTER_KEY to storing a credential in this file.
 # register_key = "replace-with-your-private-invite-key"
 open_registration = false
+
+# Forward server errors and security audit logs to Windows Application Event Log
+# (Windows only) and/or a syslog daemon.
+# windows_event_log = false
+# windows_event_log_source = "aircd"
+# syslog_target = "udp://127.0.0.1:514"   # or "tcp://127.0.0.1:6514" or "unix:///dev/log"
+# syslog_format = "rfc5424"               # or "rfc3164"
+# syslog_facility = "auto"                # auto = daemon (errors) / auth (security), or local0..local7

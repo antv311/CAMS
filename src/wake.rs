@@ -17,6 +17,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
+use crate::logging::EventForwarder;
 
 pub const DEFAULT_PROMPT: &str = "You are @{nick} on the aircd coordination hub at {server}. \
 You were woken because: {reason}. Read your notes with `airc --profile {nick} notes show`, then \
@@ -193,6 +194,7 @@ pub struct WakeManager {
     notifier: Arc<Mutex<Option<WakeNotifier>>>,
     /// Lowercased account id -> unix time its quota cooldown ends.
     quota_cooldowns: Arc<Mutex<HashMap<String, i64>>>,
+    logger: EventForwarder,
 }
 
 /// The line of a failed agent's output that says its provider is out of
@@ -440,7 +442,12 @@ struct GroupPrompt {
 mod prompt_tests;
 
 impl WakeManager {
+    #[allow(dead_code)]
     pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+        Self::with_logger(db, EventForwarder::default())
+    }
+
+    pub fn with_logger(db: Arc<Mutex<Connection>>, logger: EventForwarder) -> Self {
         Self {
             db,
             slots: Arc::new(Mutex::new(HashMap::new())),
@@ -448,6 +455,7 @@ impl WakeManager {
             server_url: Arc::new(Mutex::new("http://127.0.0.1:6680".to_string())),
             notifier: Arc::new(Mutex::new(None)),
             quota_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            logger,
         }
     }
 
@@ -892,7 +900,10 @@ impl WakeManager {
     async fn run_loop(&self, mut cfg: WakeConfig, mut ctx: WakeContext) {
         loop {
             if let Err(err) = self.run_once(&cfg, &ctx).await {
-                eprintln!("wake @{}: {err:#}", ctx.principal_id);
+                self.logger.log_error(
+                    "wake.run_error",
+                    format!("wake @{}: {err:#}", ctx.principal_id),
+                );
             }
             tokio::time::sleep(Duration::from_secs(cfg.cooldown_seconds.max(0) as u64)).await;
 

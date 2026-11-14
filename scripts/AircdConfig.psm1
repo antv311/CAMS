@@ -407,6 +407,11 @@ function Resolve-AircdWindowsConfig {
     }
 
     $TlsBindRes = & $ResolveSetting 'TlsBind' @('AIRCD_TLS_BIND') @('server', '') @('tls_bind') '127.0.0.1:6697'
+    $WinEventLogRes = & $ResolveSetting 'WindowsEventLog' @('AIRCD_WINDOWS_EVENT_LOG') @('server', '') @('windows_event_log') $false -IsBool
+    $WinEventSourceRes = & $ResolveSetting 'WindowsEventLogSource' @('AIRCD_WINDOWS_EVENT_LOG_SOURCE') @('server', '') @('windows_event_log_source') ''
+    $SyslogTargetRes = & $ResolveSetting 'SyslogTarget' @('AIRCD_SYSLOG_TARGET') @('server', '') @('syslog_target') ''
+    $SyslogFormatRes = & $ResolveSetting 'SyslogFormat' @('AIRCD_SYSLOG_FORMAT') @('server', '') @('syslog_format') ''
+    $SyslogFacilityRes = & $ResolveSetting 'SyslogFacility' @('AIRCD_SYSLOG_FACILITY') @('server', '') @('syslog_facility') ''
     $ExeRes = & $ResolveSetting 'ExecutablePath' @('AIRCD_EXECUTABLE') @('server', 'service', 'tray', '') @('executable_path', 'executable') '' -IsPath
 
     $NameRes = & $ResolveSetting 'Name' @('AIRCD_SERVICE_NAME') @('service', '') @('name', 'service_name') 'CAMS-Aircd'
@@ -418,24 +423,29 @@ function Resolve-AircdWindowsConfig {
     $StartupRes = & $ResolveSetting 'StartupDirectory' @('AIRCD_STARTUP_DIR') @('tray', '') @('startup_directory') $DefaultStartup -IsPath
 
     [pscustomobject]@{
-        RepoRoot         = $ResolvedRepoRoot
-        ConfigPath       = $ResolvedConfigPath
-        DataDir          = $DefaultDataDir
-        Bind             = $BindRes.Value
-        HttpBind         = $HttpBindRes.Value
-        DbPath           = $DbPathRes.Value
-        OpenRegistration = $OpenRegRes.Value
-        RegisterKey      = $RegKeyRes.Value
-        TlsCert          = $TlsCertRes.Value
-        TlsKey           = $TlsKeyRes.Value
-        TlsBind          = $TlsBindRes.Value
-        ExecutablePath   = $ExeRes.Value
-        Name             = $NameRes.Value
-        TaskPath         = $TaskPathRes.Value
-        Mode             = $ModeRes.Value
-        Trigger          = $TriggerRes.Value
-        Profile          = $ProfileRes.Value
-        StartupDirectory = $StartupRes.Value
+        RepoRoot              = $ResolvedRepoRoot
+        ConfigPath            = $ResolvedConfigPath
+        DataDir               = $DefaultDataDir
+        Bind                  = $BindRes.Value
+        HttpBind              = $HttpBindRes.Value
+        DbPath                = $DbPathRes.Value
+        OpenRegistration      = $OpenRegRes.Value
+        RegisterKey           = $RegKeyRes.Value
+        TlsCert               = $TlsCertRes.Value
+        TlsKey                = $TlsKeyRes.Value
+        TlsBind               = $TlsBindRes.Value
+        WindowsEventLog       = $WinEventLogRes.Value
+        WindowsEventLogSource = $WinEventSourceRes.Value
+        SyslogTarget          = $SyslogTargetRes.Value
+        SyslogFormat          = $SyslogFormatRes.Value
+        SyslogFacility        = $SyslogFacilityRes.Value
+        ExecutablePath        = $ExeRes.Value
+        Name                  = $NameRes.Value
+        TaskPath              = $TaskPathRes.Value
+        Mode                  = $ModeRes.Value
+        Trigger               = $TriggerRes.Value
+        Profile               = $ProfileRes.Value
+        StartupDirectory      = $StartupRes.Value
     }
 }
 

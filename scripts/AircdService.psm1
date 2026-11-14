@@ -74,11 +74,16 @@ function New-AircdServiceConfig {
         [string]$TlsCert = '',
         [string]$TlsKey = '',
         [string]$TlsBind = '127.0.0.1:6697',
+        [switch]$WindowsEventLog,
+        [string]$WindowsEventLogSource = '',
+        [string]$SyslogTarget = '',
+        [string]$SyslogFormat = '',
+        [string]$SyslogFacility = '',
         [string]$ExecutablePath = ''
     )
 
     $Overrides = @{}
-    foreach ($Key in @('Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath')) {
+    foreach ($Key in @('Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'WindowsEventLog', 'WindowsEventLogSource', 'SyslogTarget', 'SyslogFormat', 'SyslogFacility', 'ExecutablePath')) {
         if ($PSBoundParameters.ContainsKey($Key)) {
             $Overrides[$Key] = $PSBoundParameters[$Key]
         }
@@ -95,6 +100,11 @@ function New-AircdServiceConfig {
     $TlsCert = $ResolvedCfg.TlsCert
     $TlsKey = $ResolvedCfg.TlsKey
     $TlsBind = $ResolvedCfg.TlsBind
+    $WindowsEventLog = [bool]$ResolvedCfg.WindowsEventLog
+    $WindowsEventLogSource = $ResolvedCfg.WindowsEventLogSource
+    $SyslogTarget = $ResolvedCfg.SyslogTarget
+    $SyslogFormat = $ResolvedCfg.SyslogFormat
+    $SyslogFacility = $ResolvedCfg.SyslogFacility
     $ExecutablePath = $ResolvedCfg.ExecutablePath
 
     if ([string]::IsNullOrWhiteSpace($Name) -or $Name -notmatch '^[A-Za-z0-9._-]{1,64}$') {
@@ -129,6 +139,11 @@ function New-AircdServiceConfig {
         $null = Test-AircdNumericBind -Address $TlsBind -Label 'TLS'
         $ServerArgs += @('--tls-cert', $FullTlsCert, '--tls-key', $FullTlsKey, '--tls-bind', $TlsBind)
     }
+    if ($WindowsEventLog) { $ServerArgs += '--windows-event-log' }
+    if (-not [string]::IsNullOrWhiteSpace($WindowsEventLogSource)) { $ServerArgs += @('--windows-event-log-source', $WindowsEventLogSource) }
+    if (-not [string]::IsNullOrWhiteSpace($SyslogTarget)) { $ServerArgs += @('--syslog-target', $SyslogTarget) }
+    if (-not [string]::IsNullOrWhiteSpace($SyslogFormat)) { $ServerArgs += @('--syslog-format', $SyslogFormat) }
+    if (-not [string]::IsNullOrWhiteSpace($SyslogFacility)) { $ServerArgs += @('--syslog-facility', $SyslogFacility) }
 
     $ResolvedExe = ''
     if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {

@@ -8,6 +8,11 @@
     "tls_cert": "",
     "tls_key": "",
     "tls_bind": "127.0.0.1:6697",
+    "windows_event_log": false,
+    "windows_event_log_source": "aircd",
+    "syslog_target": "",
+    "syslog_format": "rfc5424",
+    "syslog_facility": "auto",
     "executable_path": ""
   },
   "service": {
