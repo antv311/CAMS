@@ -3495,6 +3495,7 @@ mod tests {
             ("codex", include_str!("../docs/templates/codex.json")),
             ("agy", include_str!("../docs/templates/agy.json")),
             ("lmstudio", include_str!("../docs/templates/lmstudio.json")),
+            ("bionic", include_str!("../docs/templates/bionic.json")),
         ] {
             let input: Value = serde_json::from_str(fixture)?;
             let (status, body) = api
