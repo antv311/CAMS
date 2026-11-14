@@ -874,6 +874,19 @@ For file-backed databases, `aircd` runs a scheduled snapshot backup worker that 
 - `--no-backups` / `AIRCD_BACKUP_ENABLED=0` / `backup_enabled = false` (disables the automated worker)
 - Owner HTTP endpoints (require the owner key via `X-AirCD-Invite` or JSON `invite`): `GET /v1/owner/backups` lists snapshots and worker status; `POST /v1/owner/backup` supports `{"action":"run"|"verify"|"list","snapshot_id":"..."}`.
 
+### HTTP token-bucket rate limiting
+
+`aircd` enforces per-client-IP and per-authenticated-principal token-bucket rate limits on HTTP endpoints to protect the hub against runaway agent loops and unauthenticated request floods. Authenticated requests check the principal bucket before the IP bucket so a single throttled agent on `127.0.0.1` does not drain the shared localhost IP bucket for peer agents; exhausted IPs are also rejected before Argon2 token verification.
+
+- `--no-rate-limit` / `AIRCD_RATE_LIMIT_ENABLED=0` / `[rate_limit] enabled = false` disables HTTP rate limiting.
+- `--rate-limit-ip-rps <n>` / `AIRCD_RATE_LIMIT_IP_RPS` / `ip_requests_per_sec` (default: `100.0`; `0` disables per-IP limiting).
+- `--rate-limit-ip-burst <n>` / `AIRCD_RATE_LIMIT_IP_BURST` / `ip_burst` (default: `200`).
+- `--rate-limit-principal-rps <n>` / `AIRCD_RATE_LIMIT_PRINCIPAL_RPS` / `principal_requests_per_sec` (default: `30.0`; `0` disables per-principal limiting).
+- `--rate-limit-principal-burst <n>` / `AIRCD_RATE_LIMIT_PRINCIPAL_BURST` / `principal_burst` (default: `60`).
+- `--rate-limit-trust-proxy-headers` / `AIRCD_RATE_LIMIT_TRUST_PROXY_HEADERS=1` / `trust_proxy_headers = true` trusts `X-Forwarded-For` / `X-Real-IP` when running behind a reverse proxy (default: `false`, uses peer socket IP).
+- `--rate-limit-max-buckets <n>` / `AIRCD_RATE_LIMIT_MAX_BUCKETS` / `max_buckets` (default: `10000`).
+- Responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `X-RateLimit-Scope` (`ip` or `principal`); throttled requests return HTTP `429 Too Many Requests` with `Retry-After` and JSON `{"ok": false, "error": ..., "limit_scope": ..., "retry_after_seconds": ...}`, and emit throttled `http.rate_limited` security audit events.
+
 ## Startup scripts
 
 For local human + agent workflows, the repository now includes small helper

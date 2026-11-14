@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::net::{IpAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use tokio::net::TcpListener;
 
 use crate::auth::{
@@ -18,6 +18,9 @@ use crate::auth::{
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::locks::LockConflictError;
 use crate::logging::{LogEvent, Severity};
+use crate::rate_limit::{
+    normalize_ip, LimitScope, RateLimitConfig, RateLimitHeaders, RateLimitRejection, RateLimiter,
+};
 use crate::server::{Server, SpawnError};
 use crate::store::{
     ClientTemplate, ClientTemplateInput, GroupInput, GroupMember, GroupMembershipUpdate,
@@ -35,12 +38,16 @@ pub struct HttpRuntimeInfo {
     /// Owner invite key. When set, `POST /v1/register` must present it.
     #[serde(skip)]
     pub register_key: Option<String>,
+    /// Token-bucket HTTP rate-limiting policy.
+    #[serde(skip)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Clone)]
 struct AppState {
     server: Server,
     info: HttpRuntimeInfo,
+    rate_limiter: RateLimiter,
 }
 
 #[derive(Debug)]
@@ -102,6 +109,221 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[derive(Clone)]
+enum CachedTokenAuth {
+    Ok(AuthContext),
+    Expired,
+    Invalid,
+}
+
+tokio::task_local! {
+    static REQUEST_TOKEN_AUTH: (String, CachedTokenAuth);
+}
+
+fn extract_client_ip(request: &Request, trust_proxy_headers: bool) -> IpAddr {
+    if trust_proxy_headers {
+        if let Some(forwarded) = request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(ip) = forwarded
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .find_map(|part| part.parse::<IpAddr>().ok())
+            {
+                return normalize_ip(ip);
+            }
+        }
+        if let Some(real_ip) = request
+            .headers()
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return normalize_ip(real_ip);
+        }
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| normalize_ip(ci.0.ip()))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn apply_rate_limit_headers(headers: &mut HeaderMap, rl: RateLimitHeaders) {
+    if let Ok(val) = HeaderValue::from_str(&rl.limit.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-limit"), val);
+    }
+    if let Ok(val) = HeaderValue::from_str(&rl.remaining.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-remaining"), val);
+    }
+    if let Ok(val) = HeaderValue::from_str(&rl.reset_after_secs.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-reset"), val);
+    }
+    headers.insert(
+        HeaderName::from_static("x-ratelimit-scope"),
+        HeaderValue::from_static(rl.scope.as_str()),
+    );
+}
+
+fn log_rate_limit_rejection(
+    state: &AppState,
+    rej: RateLimitRejection,
+    ip: IpAddr,
+    path: &str,
+    principal: Option<&crate::auth::Principal>,
+) {
+    let key = match rej.scope {
+        LimitScope::Ip => ip.to_string(),
+        LimitScope::Principal => principal
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| ip.to_string()),
+    };
+    let Some(suppressed) = state.rate_limiter.should_log_rejection(rej.scope, &key) else {
+        return;
+    };
+    let suppressed_note = if suppressed > 0 {
+        format!(" (suppressed {suppressed} prior rejections)")
+    } else {
+        String::new()
+    };
+    let actor = principal
+        .map(|p| p.id.clone())
+        .unwrap_or_else(|| ip.to_string());
+    let who = principal
+        .map(|p| format!("principal @{} ({ip})", p.nick))
+        .unwrap_or_else(|| format!("ip {ip}"));
+    state.server.logger().log_security(
+        Severity::Warning,
+        "http.rate_limited",
+        "failure",
+        Some(&actor),
+        Some(&ip.to_string()),
+        Some(path),
+        format!(
+            "HTTP rate limit exceeded (scope={}, {who}, path={path}, retry_after={}s){suppressed_note}",
+            rej.scope.as_str(),
+            rej.retry_after_secs
+        ),
+    );
+}
+
+fn rate_limit_response(
+    rej: RateLimitRejection,
+    principal: Option<&crate::auth::Principal>,
+) -> Response {
+    let target = match rej.scope {
+        LimitScope::Ip => "client IP".to_string(),
+        LimitScope::Principal => principal
+            .map(|p| format!("principal @{}", p.nick))
+            .unwrap_or_else(|| "principal".to_string()),
+    };
+    let message = format!(
+        "rate limit exceeded for {target} (retry after {}s)",
+        rej.retry_after_secs
+    );
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        with_cors_headers(),
+        Json(json!({
+            "ok": false,
+            "error": message,
+            "limit_scope": rej.scope.as_str(),
+            "retry_after_seconds": rej.retry_after_secs,
+        })),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    if let Ok(val) = HeaderValue::from_str(&rej.retry_after_secs.to_string()) {
+        headers.insert(header::RETRY_AFTER, val);
+    }
+    apply_rate_limit_headers(
+        headers,
+        RateLimitHeaders {
+            scope: rej.scope,
+            limit: rej.limit,
+            remaining: 0,
+            reset_after_secs: rej.reset_after_secs,
+        },
+    );
+    response
+}
+
+async fn rate_limit_requests(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.rate_limiter.is_enabled() || request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
+    let ip = extract_client_ip(&request, state.rate_limiter.trust_proxy_headers());
+    let path = request.uri().path().to_string();
+    let raw_token = extract_bearer_token(request.headers()).map(str::to_owned);
+
+    if let Some(raw) = raw_token {
+        // Reject already-exhausted IPs before running Argon2 verification.
+        if let Err(rej) = state.rate_limiter.peek_ip(ip) {
+            log_rate_limit_rejection(&state, rej, ip, &path, None);
+            return rate_limit_response(rej, None);
+        }
+
+        let auth_outcome = match state.server.auth().authenticate_context(&raw) {
+            Ok(ctx) => CachedTokenAuth::Ok(ctx),
+            Err(err) if err.downcast_ref::<TokenExpiredError>().is_some() => {
+                CachedTokenAuth::Expired
+            }
+            Err(_) => CachedTokenAuth::Invalid,
+        };
+
+        let rl_result = match &auth_outcome {
+            CachedTokenAuth::Ok(ctx) => {
+                state
+                    .rate_limiter
+                    .check_principal_and_ip(&ctx.principal.id, ip)
+            }
+            CachedTokenAuth::Expired | CachedTokenAuth::Invalid => state.rate_limiter.check_ip(ip),
+        };
+
+        let principal_ref = match &auth_outcome {
+            CachedTokenAuth::Ok(ctx) => Some(&ctx.principal),
+            _ => None,
+        };
+
+        let rl_headers = match rl_result {
+            Ok(headers) => headers,
+            Err(rej) => {
+                log_rate_limit_rejection(&state, rej, ip, &path, principal_ref);
+                return rate_limit_response(rej, principal_ref);
+            }
+        };
+
+        let mut response = REQUEST_TOKEN_AUTH
+            .scope((raw, auth_outcome), next.run(request))
+            .await;
+        if let Some(rl) = rl_headers {
+            apply_rate_limit_headers(response.headers_mut(), rl);
+        }
+        return response;
+    }
+
+    let rl_headers = match state.rate_limiter.check_ip(ip) {
+        Ok(headers) => headers,
+        Err(rej) => {
+            log_rate_limit_rejection(&state, rej, ip, &path, None);
+            return rate_limit_response(rej, None);
+        }
+    };
+    let mut response = next.run(request).await;
+    if let Some(rl) = rl_headers {
+        apply_rate_limit_headers(response.headers_mut(), rl);
+    }
+    response
+}
+
 async fn log_http_server_errors(
     State(state): State<AppState>,
     request: Request,
@@ -140,6 +362,7 @@ pub fn build_runtime_info(
         tls_port,
         detected_hosts: reachable_hosts(http_bind),
         register_key: None,
+        rate_limit: RateLimitConfig::default(),
     }
 }
 
@@ -203,13 +426,22 @@ pub async fn serve(server: Server, bind_addr: &str, info: HttpRuntimeInfo) -> Re
     let mut runtime = info;
     runtime.http_port = actual_port;
     println!("aircd HTTP welcome & API listening on http://{bind_addr} (port {actual_port})");
-    axum::serve(listener, router(server, runtime))
-        .await
-        .context("serve HTTP router")
+    axum::serve(
+        listener,
+        router(server, runtime).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve HTTP router")
 }
 
 pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
-    let state = AppState { server, info };
+    let rate_limiter = RateLimiter::new(info.rate_limit.clone())
+        .expect("invalid HTTP rate limit configuration");
+    let state = AppState {
+        server,
+        info,
+        rate_limiter,
+    };
     Router::new()
         .route("/", get(welcome_root))
         .route("/welcome", get(welcome_root))
@@ -303,6 +535,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/git/webhook", post(github_webhook_query))
         .route("/v1/git/webhook/{repo}", post(github_webhook_repo))
         .fallback(cors_preflight_or_404)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_requests,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             log_http_server_errors,
@@ -1565,6 +1801,7 @@ async fn login_agent(
         )
     })?;
     let ctx = authenticate_token_context(&state, raw_token)?;
+    let ctx_for_refresh = ctx.clone();
     let principal = ctx.principal;
     let req = body.map(|b| b.0).unwrap_or_default();
     if req.ttl_seconds == Some(0) {
@@ -1613,7 +1850,7 @@ async fn login_agent(
         let (_, refreshed) = state
             .server
             .auth()
-            .refresh_token(raw_token, req.ttl_seconds, false)
+            .refresh_token_with_context(ctx_for_refresh, raw_token, req.ttl_seconds, false)
             .map_err(ApiError::internal)?;
         (
             None,
@@ -1825,28 +2062,12 @@ async fn refresh_token_api(
         return Err(ApiError::bad_request("ttl_seconds must be at least 1"));
     }
     let rotate = req.rotate.unwrap_or(false);
+    let ctx = authenticate_token_context(&state, raw_token)?;
     let (principal, refreshed) = state
         .server
         .auth()
-        .refresh_token(raw_token, req.ttl_seconds, rotate)
-        .map_err(|err| {
-            if err.downcast_ref::<TokenExpiredError>().is_some() {
-                ApiError::unauthorized("Bearer token has expired")
-            } else if err.to_string().contains("invalid token") {
-                state.server.logger().log_security(
-                    Severity::Warning,
-                    "auth.http_failed",
-                    "failure",
-                    None,
-                    None,
-                    Some("/v1/tokens/refresh"),
-                    "HTTP authentication failed: invalid bearer token",
-                );
-                ApiError::unauthorized("Invalid bearer token")
-            } else {
-                ApiError::bad_request(err.to_string())
-            }
-        })?;
+        .refresh_token_with_context(ctx, raw_token, req.ttl_seconds, rotate)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     state.server.logger().log_security(
         Severity::Info,
@@ -3553,6 +3774,28 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn authenticate_token_context(state: &AppState, raw: &str) -> Result<AuthContext, ApiError> {
+    if let Some(outcome) = REQUEST_TOKEN_AUTH
+        .try_with(|(cached_raw, outcome)| (cached_raw == raw).then(|| outcome.clone()))
+        .ok()
+        .flatten()
+    {
+        return match outcome {
+            CachedTokenAuth::Ok(ctx) => Ok(ctx),
+            CachedTokenAuth::Expired => Err(ApiError::unauthorized("Bearer token has expired")),
+            CachedTokenAuth::Invalid => {
+                state.server.logger().log_security(
+                    Severity::Warning,
+                    "auth.http_failed",
+                    "failure",
+                    None,
+                    None,
+                    None,
+                    "HTTP authentication failed: invalid bearer token",
+                );
+                Err(ApiError::unauthorized("Invalid bearer token"))
+            }
+        };
+    }
     state
         .server
         .auth()
@@ -4073,6 +4316,7 @@ mod tests {
     include!("http_group_memory_tests.rs");
     include!("http_attachment_tests.rs");
     include!("http_group_activity_tests.rs");
+    include!("http_rate_limit_tests.rs");
 
     struct TemplateApi {
         server: Server,
@@ -5468,6 +5712,7 @@ mod tests {
             tls_port: None,
             detected_hosts: vec!["127.0.0.1".to_string()],
             register_key: None,
+            rate_limit: RateLimitConfig::default(),
         };
         tokio::spawn(async move {
             let _ = axum::serve(api_listener, router(server, info)).await;

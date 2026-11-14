@@ -11,6 +11,7 @@ mod logging;
 mod notes;
 mod projects;
 mod protocol;
+mod rate_limit;
 mod reports;
 mod rooms;
 mod server;
@@ -131,6 +132,13 @@ async fn main() -> Result<()> {
                                                 default: generated once in aircd-owner.key beside the DB)\n  \
                        --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)\n  \
                        --token-ttl-seconds <n>  Default bearer token lifetime in seconds (env AIRCD_TOKEN_TTL_SECONDS; default: non-expiring)\n  \
+                       --no-rate-limit          Disable HTTP token-bucket rate limiting (env AIRCD_RATE_LIMIT_ENABLED=0)\n  \
+                       --rate-limit-ip-rps <n>  HTTP token-bucket refill rate per client IP (env AIRCD_RATE_LIMIT_IP_RPS, default 100; 0 disables)\n  \
+                       --rate-limit-ip-burst <n>  HTTP token-bucket burst capacity per client IP (env AIRCD_RATE_LIMIT_IP_BURST, default 200)\n  \
+                       --rate-limit-principal-rps <n>  HTTP token-bucket refill rate per principal (env AIRCD_RATE_LIMIT_PRINCIPAL_RPS, default 30; 0 disables)\n  \
+                       --rate-limit-principal-burst <n>  HTTP token-bucket burst capacity per principal (env AIRCD_RATE_LIMIT_PRINCIPAL_BURST, default 60)\n  \
+                       --rate-limit-trust-proxy-headers  Trust X-Forwarded-For / X-Real-IP headers for rate-limit IP (env AIRCD_RATE_LIMIT_TRUST_PROXY_HEADERS=1)\n  \
+                       --rate-limit-max-buckets <n>  Max tracked IP/principal rate-limit buckets (env AIRCD_RATE_LIMIT_MAX_BUCKETS, default 10000)\n  \
                        --windows-event-log      Forward server errors and security audits to Windows Application Event Log (env AIRCD_WINDOWS_EVENT_LOG=1)\n  \
                        --windows-event-log-source <name>  Windows Event Log source name (default aircd)\n  \
                        --syslog-target <target> Forward server errors and security audits to syslog (udp://host:port, tcp://host:port, unix:///path)\n  \
@@ -165,6 +173,7 @@ async fn main() -> Result<()> {
         register_key,
         open_registration,
         auth: auth_config,
+        rate_limit: rate_limit_config,
         ..
     } = server_config;
 
@@ -189,6 +198,7 @@ async fn main() -> Result<()> {
     };
     let mut runtime_info = http::build_runtime_info(&bind_addr, &http_bind, tls_port);
     runtime_info.register_key = register_key;
+    runtime_info.rate_limit = rate_limit_config.clone();
     let wake_host = http_bind
         .rsplit_once(':')
         .map(|(host, _)| host)
@@ -220,6 +230,17 @@ async fn main() -> Result<()> {
                 backup_config.retention
             );
         }
+    }
+    if rate_limit_config.enabled {
+        println!(
+            "  rate limit:   ip={}/s (burst={}), principal={}/s (burst={})",
+            rate_limit_config.ip_requests_per_sec,
+            rate_limit_config.ip_burst,
+            rate_limit_config.principal_requests_per_sec,
+            rate_limit_config.principal_burst,
+        );
+    } else {
+        println!("  rate limit:   disabled");
     }
     for host in &runtime_info.detected_hosts {
         println!(

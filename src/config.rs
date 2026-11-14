@@ -8,6 +8,7 @@ use crate::db::{
 use crate::logging::{
     validate_event_log_source, LogConfig, SyslogFacility, SyslogFormat, SyslogTarget,
 };
+use crate::rate_limit::RateLimitConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,7 @@ pub struct ServerConfig {
     pub register_key: Option<String>,
     pub open_registration: bool,
     pub auth: AuthConfig,
+    pub rate_limit: RateLimitConfig,
     pub windows_event_log: bool,
     pub windows_event_log_source: String,
     pub syslog_target: Option<String>,
@@ -92,6 +94,7 @@ impl Default for ServerConfig {
             register_key: None,
             open_registration: false,
             auth: AuthConfig::default(),
+            rate_limit: RateLimitConfig::default(),
             windows_event_log: false,
             windows_event_log_source: "aircd".into(),
             syslog_target: None,
@@ -187,8 +190,10 @@ impl ServerConfig {
                 "--open-registration"
                 | "--windows-event-log"
                 | "--backup-enabled"
-                | "--backup-on-startup" => "true",
-                "--no-backups" => "false",
+                | "--backup-on-startup"
+                | "--rate-limit-enabled"
+                | "--rate-limit-trust-proxy-headers" => "true",
+                "--no-backups" | "--no-rate-limit" => "false",
                 "--config"
                 | "--bind"
                 | "--http-bind"
@@ -198,6 +203,11 @@ impl ServerConfig {
                 | "--tls-bind"
                 | "--register-key"
                 | "--token-ttl-seconds"
+                | "--rate-limit-ip-rps"
+                | "--rate-limit-ip-burst"
+                | "--rate-limit-principal-rps"
+                | "--rate-limit-principal-burst"
+                | "--rate-limit-max-buckets"
                 | "--windows-event-log-source"
                 | "--syslog-target"
                 | "--syslog-format"
@@ -274,6 +284,16 @@ impl ServerConfig {
             ("AIRCD_REGISTER_KEY", "--register-key"),
             ("AIRCD_OPEN_REGISTRATION", "--open-registration"),
             ("AIRCD_TOKEN_TTL_SECONDS", "--token-ttl-seconds"),
+            ("AIRCD_RATE_LIMIT_ENABLED", "--rate-limit-enabled"),
+            ("AIRCD_RATE_LIMIT_IP_RPS", "--rate-limit-ip-rps"),
+            ("AIRCD_RATE_LIMIT_IP_BURST", "--rate-limit-ip-burst"),
+            ("AIRCD_RATE_LIMIT_PRINCIPAL_RPS", "--rate-limit-principal-rps"),
+            ("AIRCD_RATE_LIMIT_PRINCIPAL_BURST", "--rate-limit-principal-burst"),
+            (
+                "AIRCD_RATE_LIMIT_TRUST_PROXY_HEADERS",
+                "--rate-limit-trust-proxy-headers",
+            ),
+            ("AIRCD_RATE_LIMIT_MAX_BUCKETS", "--rate-limit-max-buckets"),
             ("AIRCD_WINDOWS_EVENT_LOG", "--windows-event-log"),
             ("AIRCD_WINDOWS_EVENT_LOG_SOURCE", "--windows-event-log-source"),
             ("AIRCD_SYSLOG_TARGET", "--syslog-target"),
@@ -334,6 +354,7 @@ impl ServerConfig {
         if config.auth.token_ttl_seconds == Some(0) {
             bail!("server setting auth.token_ttl_seconds must be at least 1");
         }
+        config.rate_limit.validate()?;
         let _ = config.to_log_config()?;
         let _ = config.to_backup_config()?;
         let _ = config.to_sqlite_config()?;
@@ -362,6 +383,41 @@ impl ServerConfig {
                     bail!("server setting auth.token_ttl_seconds must be at least 1");
                 }
                 self.auth.token_ttl_seconds = Some(ttl);
+            }
+            "--rate-limit-enabled" | "--no-rate-limit" => {
+                self.rate_limit.enabled = parse_bool_setting("rate_limit.enabled", value)?;
+            }
+            "--rate-limit-ip-rps" => {
+                self.rate_limit.ip_requests_per_sec = value.trim().parse::<f64>().with_context(|| {
+                    format!("rate_limit.ip_requests_per_sec must be a number, got '{value}'")
+                })?;
+            }
+            "--rate-limit-ip-burst" => {
+                self.rate_limit.ip_burst = value.trim().parse::<u32>().with_context(|| {
+                    format!("rate_limit.ip_burst must be a non-negative integer, got '{value}'")
+                })?;
+            }
+            "--rate-limit-principal-rps" => {
+                self.rate_limit.principal_requests_per_sec =
+                    value.trim().parse::<f64>().with_context(|| {
+                        format!(
+                            "rate_limit.principal_requests_per_sec must be a number, got '{value}'"
+                        )
+                    })?;
+            }
+            "--rate-limit-principal-burst" => {
+                self.rate_limit.principal_burst = value.trim().parse::<u32>().with_context(|| {
+                    format!("rate_limit.principal_burst must be a non-negative integer, got '{value}'")
+                })?;
+            }
+            "--rate-limit-trust-proxy-headers" => {
+                self.rate_limit.trust_proxy_headers =
+                    parse_bool_setting("rate_limit.trust_proxy_headers", value)?;
+            }
+            "--rate-limit-max-buckets" => {
+                self.rate_limit.max_buckets = value.trim().parse::<usize>().with_context(|| {
+                    format!("rate_limit.max_buckets must be a positive integer, got '{value}'")
+                })?;
             }
             "--windows-event-log" => {
                 self.windows_event_log = parse_bool_setting("windows_event_log", value)?;
@@ -831,6 +887,75 @@ mod tests {
             &path,
         )?;
         assert_eq!(cfg.auth.token_ttl_seconds, Some(900));
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limit_settings_respect_precedence_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "[rate_limit]\n\
+             enabled = true\n\
+             ip_requests_per_sec = 50.0\n\
+             ip_burst = 100\n\
+             principal_requests_per_sec = 12.5\n\
+             principal_burst = 25\n\
+             trust_proxy_headers = true\n\
+             max_buckets = 2048\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.ip_requests_per_sec, 50.0);
+        assert_eq!(cfg.rate_limit.ip_burst, 100);
+        assert_eq!(cfg.rate_limit.principal_requests_per_sec, 12.5);
+        assert_eq!(cfg.rate_limit.principal_burst, 25);
+        assert!(cfg.rate_limit.trust_proxy_headers);
+        assert_eq!(cfg.rate_limit.max_buckets, 2048);
+
+        let env = environment(&[
+            ("AIRCD_RATE_LIMIT_ENABLED", "false"),
+            ("AIRCD_RATE_LIMIT_IP_RPS", "75"),
+            ("AIRCD_RATE_LIMIT_PRINCIPAL_BURST", "40"),
+            ("AIRCD_RATE_LIMIT_TRUST_PROXY_HEADERS", "false"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--rate-limit-enabled".into(),
+                "--rate-limit-ip-burst".into(),
+                "150".into(),
+                "--rate-limit-principal-rps".into(),
+                "20".into(),
+                "--rate-limit-max-buckets".into(),
+                "4096".into(),
+            ],
+            &env,
+            &path,
+        )?;
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.ip_requests_per_sec, 75.0);
+        assert_eq!(cfg.rate_limit.ip_burst, 150);
+        assert_eq!(cfg.rate_limit.principal_requests_per_sec, 20.0);
+        assert_eq!(cfg.rate_limit.principal_burst, 40);
+        assert!(!cfg.rate_limit.trust_proxy_headers);
+        assert_eq!(cfg.rate_limit.max_buckets, 4096);
+
+        let cfg = ServerConfig::load_with(&["--no-rate-limit".into()], &env, &path)?;
+        assert!(!cfg.rate_limit.enabled);
+
+        for bad in [
+            "[rate_limit]\nip_requests_per_sec = -1",
+            "[rate_limit]\nip_burst = 0",
+            "[rate_limit]\nprincipal_requests_per_sec = -0.5",
+            "[rate_limit]\nprincipal_burst = 0",
+            "[rate_limit]\nmax_buckets = 0",
+            "[rate_limit]\nunknown_key = 1",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid config for {bad}"
+            );
+        }
         Ok(())
     }
 }

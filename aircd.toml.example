@@ -19,6 +19,17 @@ open_registration = false
 # [auth]
 # token_ttl_seconds = 86400
 
+# HTTP token-bucket rate limiting by client IP and authenticated principal.
+# Set *_requests_per_sec = 0 to disable one dimension, or enabled = false to disable both.
+# [rate_limit]
+# enabled = true
+# ip_requests_per_sec = 100.0
+# ip_burst = 200
+# principal_requests_per_sec = 30.0
+# principal_burst = 60
+# trust_proxy_headers = false
+# max_buckets = 10000
+
 # Forward server errors and security audit logs to Windows Application Event Log
 # (Windows only) and/or a syslog daemon.
 # windows_event_log = false
