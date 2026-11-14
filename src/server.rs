@@ -1409,6 +1409,7 @@ impl Server {
         };
         let ids = match (action, task.status.as_str()) {
             ("create" | "assign" | "answer", _)
+            | ("priority", "assigned" | "in_progress" | "testing" | "changes_requested")
             | ("status", "changes_requested" | "merged" | "cancelled") => {
                 task.assignee.iter().cloned().collect()
             }
@@ -2894,6 +2895,39 @@ impl Server {
         Ok(task)
     }
 
+    /// Update the priority (`urgent`, `high`, `normal`, `low`) of an active task.
+    pub fn set_task_priority_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        priority: &str,
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        let parent = current
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        let is_lead = parent
+            .as_ref()
+            .is_some_and(|task| task.assignee.as_deref() == Some(actor.id.as_str()));
+        if !is_lead && !self.is_project_manager(actor, &current.channel)? {
+            return Err(anyhow!(
+                "only the parent task's assignee or a project manager can change task priority"
+            ));
+        }
+        let (task, changed) = self.tasks.set_priority(&current.id, priority, &actor.id)?;
+        if changed {
+            let text = format!(
+                "TASK {} priority set to {} by @{}: {}",
+                task.id, task.priority, actor.nick, task.title
+            );
+            self.broadcast_task_event(&task, "priority", "success", &actor.nick, text)?;
+        }
+        Ok(task)
+    }
+
     /// Move a task through its review workflow.
     ///
     /// The assignee starts work and asks for review; a project leader or
@@ -3209,7 +3243,7 @@ impl Server {
             mine.iter().map(|t| t.channel.clone()).collect();
         channels.extend(roles.keys().cloned());
 
-        let mut projects = Vec::new();
+        let mut ranked_projects = Vec::new();
         let mut review_count = 0usize;
         let mut question_count = 0usize;
         for channel in channels {
@@ -3257,10 +3291,21 @@ impl Server {
             }
             review_count += to_review.len();
             question_count += questions.len();
+            let top_task_rank = tasks
+                .iter()
+                .map(|t| crate::tasks::priority_rank(&t.priority))
+                .min()
+                .unwrap_or(u8::MAX);
+            let top_review_rank = to_review
+                .iter()
+                .map(|t| crate::tasks::priority_rank(&t.priority))
+                .min()
+                .unwrap_or(u8::MAX);
+            let best_rank = top_task_rank.min(top_review_rank);
             let channel_repos: Vec<&GitRepo> =
                 repos.iter().filter(|r| r.channel == channel).collect();
             let project = self.projects.get(&channel)?;
-            projects.push(serde_json::json!({
+            let entry = serde_json::json!({
                 "channel": channel,
                 "project": project.as_ref().map(|p| p.name.clone()),
                 "pm": project.and_then(|p| p.pm),
@@ -3269,8 +3314,14 @@ impl Server {
                 "tasks": tasks,
                 "to_review": to_review,
                 "questions": questions,
-            }));
+            });
+            ranked_projects.push((best_rank, top_task_rank, channel, entry));
         }
+
+        // Dispatch highest-priority project work first, breaking ties by channel name.
+        ranked_projects.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let projects: Vec<serde_json::Value> =
+            ranked_projects.into_iter().map(|(_, _, _, entry)| entry).collect();
 
         // What only the owner can decide, across every project.
         let needs_you = if Self::is_owner(actor) {
@@ -3284,6 +3335,8 @@ impl Server {
             "task_count": mine.len(),
             "review_count": review_count,
             "question_count": question_count,
+            "next_task": mine.first(),
+            "dispatch_queue": mine,
             "needs_you": needs_you,
             "projects": projects,
         }))
@@ -3756,6 +3809,12 @@ impl Server {
             .and_then(|task| task.get("repo"))
             .and_then(|repo| repo.as_str())
             .map(str::to_owned);
+        let task_priority = event
+            .task
+            .as_ref()
+            .and_then(|task| task.get("priority"))
+            .and_then(|priority| priority.as_str())
+            .map(str::to_owned);
 
         for principal_id in enabled {
             let lowered = principal_id.to_ascii_lowercase();
@@ -3805,6 +3864,7 @@ impl Server {
                 repo_path: self.repo_path_for(&event.channel, task_repo.as_deref()),
                 event: Some(event.event.clone()),
                 triggered_by: Some(event.from.clone()),
+                priority: task_priority.clone(),
             };
             if let Err(err) = self.wakes.request(ctx) {
                 self.logger
@@ -3864,6 +3924,7 @@ impl Server {
             task_id: None,
             event: Some("owner".to_string()),
             triggered_by: None,
+            priority: None,
         })
     }
 

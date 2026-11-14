@@ -1251,6 +1251,7 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
     let columns = [
         ("body", "TEXT"),
         ("kind", "TEXT NOT NULL DEFAULT 'task'"),
+        ("priority", "TEXT NOT NULL DEFAULT 'normal'"),
         ("assignee", "TEXT"),
         ("created_by", "TEXT"),
         ("repo", "TEXT"),
@@ -1279,6 +1280,10 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
 
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks (assignee, status)",
+        [],
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority, created_at)",
         [],
     )?;
     connection.execute(
@@ -1953,19 +1958,25 @@ mod tests {
         assert_eq!((legacy.created_at, legacy.updated_at), (10, 20));
         assert!(legacy.reviewer.is_none());
         assert!(legacy.parent_task_id.is_none());
+        assert_eq!(legacy.priority, "normal");
 
         let child = tasks.create_full(crate::tasks::NewTask {
             channel: "#one".to_string(),
             title: "Child".to_string(),
+            priority: Some("high".to_string()),
             assignee: Some("worker".to_string()),
             reviewer: Some("lead".to_string()),
             parent_task_id: Some("legacy".to_string()),
             ..Default::default()
         })?;
         let reloaded = tasks.get(&child.id)?.unwrap();
+        assert_eq!(reloaded.priority, "high");
         assert_eq!(reloaded.reviewer.as_deref(), Some("lead"));
         assert_eq!(reloaded.parent_task_id.as_deref(), Some("legacy"));
-        assert_eq!(tasks.inbox("worker")?.len(), 2);
+        let worker_inbox = tasks.inbox("worker")?;
+        assert_eq!(worker_inbox.len(), 2);
+        assert_eq!(worker_inbox[0].id, child.id);
+        assert_eq!(worker_inbox[1].id, "legacy");
         tasks.set_status(
             &child.id,
             "assigned",
@@ -1977,6 +1988,107 @@ mod tests {
         assert_eq!(
             tasks.review_queue("#one")?[0].reviewer.as_deref(),
             Some("lead")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_priority_queue_orders_inbox_list_and_review_queue() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        init_with(&connection, false)?;
+        let tasks = crate::tasks::TaskStore::new(SharedConnection::from_connection(connection), 60);
+
+        let low = tasks.create_full(crate::tasks::NewTask {
+            channel: "#alpha".into(),
+            title: "Low task".into(),
+            priority: Some("low".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let normal1 = tasks.create_full(crate::tasks::NewTask {
+            channel: "#alpha".into(),
+            title: "Normal 1".into(),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let high = tasks.create_full(crate::tasks::NewTask {
+            channel: "#beta".into(),
+            title: "High task".into(),
+            priority: Some("HIGH".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let urgent = tasks.create_full(crate::tasks::NewTask {
+            channel: "#gamma".into(),
+            title: "Urgent task".into(),
+            priority: Some("urgent".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let normal2 = tasks.create_full(crate::tasks::NewTask {
+            channel: "#alpha".into(),
+            title: "Normal 2".into(),
+            priority: Some("normal".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+
+        assert!(tasks
+            .create_full(crate::tasks::NewTask {
+                channel: "#alpha".into(),
+                title: "Bad priority".into(),
+                priority: Some("critical".into()),
+                ..Default::default()
+            })
+            .is_err());
+
+        let inbox_ids: Vec<_> = tasks
+            .inbox("worker")?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            inbox_ids,
+            vec![
+                urgent.id.clone(),
+                high.id.clone(),
+                normal1.id.clone(),
+                normal2.id.clone(),
+                low.id.clone()
+            ]
+        );
+
+        let alpha_ids: Vec<_> = tasks
+            .list("#alpha")?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            alpha_ids,
+            vec![normal1.id.clone(), normal2.id.clone(), low.id.clone()]
+        );
+
+        let (bumped, changed) = tasks.set_priority(&low.id, "urgent", "pm")?;
+        assert!(changed);
+        assert_eq!(bumped.priority, "urgent");
+        let (_, changed_again) = tasks.set_priority(&low.id, "urgent", "pm")?;
+        assert!(!changed_again);
+
+        let inbox_after: Vec<_> = tasks
+            .inbox("worker")?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        // Both low (now urgent, created earlier) and urgent share urgent priority, ordered FIFO.
+        assert_eq!(
+            inbox_after,
+            vec![
+                low.id.clone(),
+                urgent.id.clone(),
+                high.id.clone(),
+                normal1.id.clone(),
+                normal2.id.clone()
+            ]
         );
         Ok(())
     }

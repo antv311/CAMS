@@ -249,9 +249,10 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc project add <project> <nick> [--role R]` | Add a member or change a role |
 | `airc project pm <project> <nick>` | Owner: choose the project manager |
 | `airc room open <project> [title]` / `room list [project]` | Open the next sprint room / list rooms |
-| `airc task create <project or room> <title> [--assign N] [--kind K] [--body T]` | Create a task |
-| `airc task list <project>` / `task show <id>` | List open tasks / show one with its history |
+| `airc task create <project or room> <title> [--assign N] [--kind K] [--priority P] [--body T]` | Create a task (`priority`: `urgent`, `high`, `normal`, `low`) |
+| `airc task list <project> [--priority P]` / `task show <id>` | List open tasks in priority order / show one with its history |
 | `airc task assign <id> [nick]` | Assign, reassign, or return to the pool |
+| `airc task priority <id> <urgent\|high\|normal\|low>` | Change an active task's dispatch priority (PM or parent lead) |
 | `airc task status <id> <status> [--note T] [--branch B]` | Move through the workflow |
 | `airc task attach <id> <file>... [--kind log\|evidence] [--note T]` | Attach test logs or other evidence (`-` reads stdin with `--name`); `task status ... --attach FILE` uploads before moving |
 | `airc task attachments <id>` / `task download <id> <att-id> [-o PATH\|-]` | List a task's files / save one (sha256-checked) |
@@ -396,6 +397,13 @@ place is the task: it names its project channel, repo and branch.
   its ID and body are copied into the task history for the reviewer.
   Each handoff requires evidence, including after changes are requested.
   Missing or invalid evidence returns HTTP 400 without changing the task.
+- **Priority queue & inbox dispatch.** Tasks support four priority levels
+  (`urgent`, `high`, `normal` default, `low`). `airc inbox` (`GET /v1/inbox`),
+  `GET /v1/tasks`, and review queues dispatch highest-priority work first
+  (`urgent` -> `high` -> `normal` -> `low`, FIFO within each priority). `GET
+  /v1/inbox` orders project sections by highest pending priority and includes
+  `dispatch_queue` and `next_task`, while queued wake coalescing preserves the
+  highest-priority pending wake context.
 - **Inbox.** `airc inbox` (`GET /v1/inbox`) is the one call an agent makes
   when it wakes: its tasks across every project, each project's repo path,
   and anything waiting for its review.
@@ -404,11 +412,12 @@ place is the task: it names its project channel, repo and branch.
 | --- | --- |
 | `GET/POST /v1/projects` | List or create projects |
 | `GET/POST /v1/projects/members` | List members, add one or change a role |
-| `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`) |
+| `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `priority`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`) |
 | `GET /v1/tasks/{id}` | Task with its history, pending question and direct subtasks |
 | `POST /v1/tasks/{id}/assign` | Assign, reassign, or unassign (`assignee: null`) |
+| `POST /v1/tasks/{id}/priority` | Update priority (`urgent`, `high`, `normal`, `low`) on an active task |
 | `POST /v1/tasks/{id}/status` | Move through the workflow (`status`, `note`, `branch`, `report_body`, `report_id`) |
-| `GET /v1/inbox` | The caller's tasks and reviews, grouped by project |
+| `GET /v1/inbox` | The caller's priority-ordered tasks (`dispatch_queue`, `next_task`) and reviews, grouped by project |
 
 ## Groups
 

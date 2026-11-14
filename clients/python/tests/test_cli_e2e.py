@@ -497,6 +497,93 @@ class AircdCliE2ETest(unittest.TestCase):
         self.assertIsNotNone(res_after.get("rotated_token"))
         self.assertNotIn(res_after["rotated_token"], tokens)
 
+    def test_06_task_priority_queue_and_inbox_dispatch(self) -> None:
+        self._run_cli(
+            "--profile", "codex",
+            "project", "create", "prio", "--name", "Priority Queue",
+        )
+        self._run_cli(
+            "--profile", "codex",
+            "project", "add", "prio", "claude", "--role", "member",
+        )
+        t_low = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#prio", "Low task",
+                "--priority", "low", "--assign", "claude",
+            ).stdout
+        )["task"]
+        t_normal = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#prio", "Normal task",
+                "--assign", "claude",
+            ).stdout
+        )["task"]
+        t_urgent = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#prio", "Urgent task",
+                "--priority", "urgent", "--assign", "claude",
+            ).stdout
+        )["task"]
+        t_high = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#prio", "High task",
+                "--priority", "high", "--assign", "claude",
+            ).stdout
+        )["task"]
+
+        self.assertEqual(t_low["priority"], "low")
+        self.assertEqual(t_normal["priority"], "normal")
+        self.assertEqual(t_urgent["priority"], "urgent")
+        self.assertEqual(t_high["priority"], "high")
+
+        listed = json.loads(
+            self._run_cli("--profile", "claude", "--json", "task", "list", "#prio").stdout
+        )["tasks"]
+        self.assertEqual(
+            [t["id"] for t in listed],
+            [t_urgent["id"], t_high["id"], t_normal["id"], t_low["id"]],
+        )
+
+        only_high = json.loads(
+            self._run_cli(
+                "--profile", "claude", "--json",
+                "task", "list", "#prio", "--priority", "high",
+            ).stdout
+        )["tasks"]
+        self.assertEqual([t["id"] for t in only_high], [t_high["id"]])
+
+        inbox = json.loads(
+            self._run_cli("--profile", "claude", "--json", "inbox").stdout
+        )["inbox"]
+        self.assertEqual(inbox["next_task"]["id"], t_urgent["id"])
+        prio_proj = next(p for p in inbox["projects"] if p["channel"] == "#prio")
+        self.assertEqual(
+            [t["id"] for t in prio_proj["tasks"]],
+            [t_urgent["id"], t_high["id"], t_normal["id"], t_low["id"]],
+        )
+
+        # Bump t_low to urgent; FIFO places it ahead of t_urgent.
+        bumped = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "priority", t_low["id"], "urgent",
+            ).stdout
+        )["task"]
+        self.assertEqual(bumped["priority"], "urgent")
+
+        inbox_after = json.loads(
+            self._run_cli("--profile", "claude", "--json", "inbox").stdout
+        )["inbox"]
+        prio_proj_after = next(p for p in inbox_after["projects"] if p["channel"] == "#prio")
+        self.assertEqual(
+            [t["id"] for t in prio_proj_after["tasks"]],
+            [t_low["id"], t_urgent["id"], t_high["id"], t_normal["id"]],
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

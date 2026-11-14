@@ -727,6 +727,7 @@ class AircdHttpClient:
         *,
         body: Optional[str] = None,
         kind: str = "task",
+        priority: Optional[str] = None,
         assignee: Optional[str] = None,
         repo: Optional[str] = None,
         branch: Optional[str] = None,
@@ -738,10 +739,15 @@ class AircdHttpClient:
         id; ``reviewer`` names who reviews it (the hub defaults to the parent's
         assignee for subtasks, otherwise the project manager)."""
         payload = task_create_payload(
-            channel, title, body=body, kind=kind, assignee=assignee, repo=repo,
-            branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
+            channel, title, body=body, kind=kind, priority=priority, assignee=assignee,
+            repo=repo, branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
         )
         return self._request("POST", "/v1/tasks", payload=payload)["task"]
+
+    def set_task_priority(self, task_id: str, priority: str) -> dict[str, Any]:
+        """Set the priority (``urgent``, ``high``, ``normal``, or ``low``) of a task."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/priority"
+        return self._request("POST", path, payload={"priority": priority})["task"]
 
     def set_task_status(
         self,
@@ -920,6 +926,7 @@ def task_create_payload(
     *,
     body: Optional[str] = None,
     kind: str = "task",
+    priority: Optional[str] = None,
     assignee: Optional[str] = None,
     repo: Optional[str] = None,
     branch: Optional[str] = None,
@@ -927,8 +934,8 @@ def task_create_payload(
     parent: Optional[str] = None,
     reviewer: Optional[str] = None,
 ) -> dict[str, Any]:
-    """The POST /v1/tasks body. ``parent_task_id`` and ``reviewer`` are only sent
-    when set, so a hub without subtask support sees the same request as before."""
+    """The POST /v1/tasks body. ``parent_task_id``, ``reviewer``, and ``priority``
+    are only sent when set, so a hub without those features sees the same request as before."""
     payload: dict[str, Any] = {
         "channel": channel,
         "title": title,
@@ -939,6 +946,9 @@ def task_create_payload(
         "branch": branch,
         "issue_url": issue_url,
     }
+    priority = (priority or "").strip().lower()
+    if priority:
+        payload["priority"] = priority
     parent = (parent or "").strip()
     if parent:
         payload["parent_task_id"] = parent
