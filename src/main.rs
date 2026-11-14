@@ -1,3 +1,4 @@
+mod alerts;
 mod attachments;
 mod auth;
 mod backup;
@@ -145,7 +146,24 @@ async fn main() -> Result<()> {
                        --db-vacuum-min-freelist-ratio <f>  Minimum freelist ratio 0.0..=1.0 (env AIRCD_DB_VACUUM_MIN_FREELIST_RATIO, default 0.0)\n  \
                        --db-vacuum-batch-pages <n>  Max pages reclaimed per non-blocking vacuum step (env AIRCD_DB_VACUUM_BATCH_PAGES, default 64)\n  \
                        --db-vacuum-step-delay-ms <n>  Delay between vacuum steps in milliseconds (env AIRCD_DB_VACUUM_STEP_DELAY_MS, default 25)\n  \
-                       --db-vacuum-max-batches <n>  Max vacuum batches per scheduled pass (env AIRCD_DB_VACUUM_MAX_BATCHES, default 32; 0 unlimited)"
+                       --db-vacuum-max-batches <n>  Max vacuum batches per scheduled pass (env AIRCD_DB_VACUUM_MAX_BATCHES, default 32; 0 unlimited)\n  \
+                       --no-alerts              Disable Prometheus alert evaluator worker (env AIRCD_ALERTS_ENABLED=0)\n  \
+                       --alerts-eval-interval-secs <n>  Seconds between alert evaluations (env AIRCD_ALERTS_EVAL_INTERVAL_SECS, default 15; 0 disables timer)\n  \
+                       --alerts-webhook-url <url>  Optional direct webhook URL for alert notifications (env AIRCD_ALERTS_WEBHOOK_URL)\n  \
+                       --alerts-webhook-secret <sec>  Optional HMAC-SHA256 secret for direct alert webhook (env AIRCD_ALERTS_WEBHOOK_SECRET)\n  \
+                       --alerts-repeat-interval-secs <n>  Seconds between repeat firing notifications (env AIRCD_ALERTS_REPEAT_INTERVAL_SECS, default 3600)\n  \
+                       --no-alerts-send-resolved  Suppress resolved webhook notifications (env AIRCD_ALERTS_SEND_RESOLVED=0)\n  \
+                       --alerts-group-name <name>  Prometheus rule group name in /metrics/alerts/rules (env AIRCD_ALERTS_GROUP_NAME, default aircd_alerts)\n  \
+                       --alerts-wake-failure-rate-threshold <f>  Wake failure ratio 0.0..=1.0 (default 0.25)\n  \
+                       --alerts-wake-failure-window-secs <n>  Wake failure rolling window seconds (default 300)\n  \
+                       --alerts-wake-failure-min-samples <n>  Min completed wakes before failure rate triggers (default 5)\n  \
+                       --alerts-wake-failure-for-secs <n>  Sustained seconds before wake failure alert fires (default 120)\n  \
+                       --alerts-queue-backlog-threshold <n>  Pending wake + webhook backlog threshold (default 50)\n  \
+                       --alerts-queue-backlog-for-secs <n>  Sustained seconds before queue backlog alert fires (default 60)\n  \
+                       --alerts-disk-used-ratio-threshold <f>  Disk used ratio 0.0..=1.0 (default 0.90; 0 disables)\n  \
+                       --alerts-disk-min-free-bytes <n>  Minimum free bytes on DB volume (default 1073741824; 0 disables)\n  \
+                       --alerts-disk-pressure-for-secs <n>  Sustained seconds before disk pressure alert fires (default 60)\n  \
+                       --alerts-disk-path <path>  Override filesystem path checked for disk pressure"
                 );
         return Ok(());
     }
@@ -154,6 +172,7 @@ async fn main() -> Result<()> {
     let backup_config = server_config.to_backup_config()?;
     let sqlite_config = server_config.to_sqlite_config()?;
     let vacuum_config = server_config.to_vacuum_config()?;
+    let alert_config = server_config.to_alert_config()?;
     let tls_spec = server_config.to_tls_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
     let config::ServerConfig {
@@ -180,9 +199,11 @@ async fn main() -> Result<()> {
         auth_config.token_ttl_seconds,
     );
     server.vacuum().update_config(vacuum_config.clone());
+    server.alerts().update_config(alert_config.clone());
     let _webhook_worker = server.webhooks().spawn_worker();
     let _backup_worker = server.backups().spawn_worker();
     let _vacuum_worker = server.vacuum().spawn_worker();
+    let _alert_worker = server.spawn_alert_worker();
 
     let tls_acceptor = tls_spec
         .as_ref()
@@ -262,6 +283,19 @@ async fn main() -> Result<()> {
         );
     } else {
         println!("  db vacuum:    disabled");
+    }
+    if alert_config.enabled {
+        println!(
+            "  alerts:       enabled (interval={}s, webhook={})",
+            alert_config.eval_interval_secs,
+            if alert_config.webhook_url.is_some() {
+                "configured"
+            } else {
+                "none"
+            }
+        );
+    } else {
+        println!("  alerts:       disabled");
     }
     if rate_limit_config.enabled {
         println!(

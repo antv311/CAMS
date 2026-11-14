@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_rustls::TlsAcceptor;
 
+use crate::alerts::{AlertConfig, AlertDeliveryRecord, AlertEvalSnapshot, AlertManager};
 use crate::attachments::{AttachmentStore, NewAttachment, TaskAttachment};
 use crate::auth::{AuthStore, AuthTokenInfo, IssuedToken, Principal, Scope};
 use crate::backup::{BackupConfig, BackupManager};
@@ -78,6 +79,7 @@ pub struct Server {
     groups: GroupStore,
     backups: BackupManager,
     vacuum: VacuumManager,
+    alerts: AlertManager,
     logger: EventForwarder,
     metrics: Arc<MetricsRegistry>,
     // Lock before db/inner: registration, command effects, reissue and cleanup
@@ -182,11 +184,19 @@ impl Server {
             .unwrap_or(300);
 
         let metrics = Arc::new(MetricsRegistry::new());
+        let webhooks = WebhookStore::with_logger(db.clone(), logger.clone());
+        let alerts = AlertManager::new(
+            AlertConfig::default(),
+            db.db_path().map(std::path::Path::to_path_buf),
+            logger.clone(),
+            metrics.clone(),
+            webhooks.clone(),
+        );
         let server = Self {
             auth: AuthStore::with_config(db.clone(), logger.clone(), token_ttl_seconds),
             history: HistoryStore::new(db.clone()),
             tasks: TaskStore::with_metrics(db.clone(), lease_seconds, metrics.clone()),
-            webhooks: WebhookStore::with_logger(db.clone(), logger.clone()),
+            webhooks,
             reports: ReportStore::new(db.clone()),
             gits: GitRepoStore::new(db.clone()),
             locks: LockStore::new(db.clone()),
@@ -203,6 +213,7 @@ impl Server {
             groups: GroupStore::new(db.clone()),
             backups: BackupManager::new(db.clone(), backup_config, logger.clone()),
             vacuum: VacuumManager::new(db.clone(), VacuumConfig::default(), logger.clone()),
+            alerts,
             logger: logger.clone(),
             metrics,
             db,
@@ -290,6 +301,10 @@ impl Server {
 
     pub fn vacuum(&self) -> &VacuumManager {
         &self.vacuum
+    }
+
+    pub fn alerts(&self) -> &AlertManager {
+        &self.alerts
     }
 
     pub fn db(&self) -> &SharedConnection {
@@ -443,6 +458,8 @@ impl Server {
         }
         drop(db);
         let db_pages = self.db.try_page_stats().ok().flatten();
+        let disk = self.alerts.sample_disk();
+        let alert_states = self.alerts.metric_samples();
 
         Ok(MetricsSnapshot {
             irc_sessions,
@@ -457,12 +474,74 @@ impl Server {
             webhook_deliveries_by_status,
             db_pool: Some(self.db.pool_stats()),
             db_pages,
+            disk,
+            alert_states,
         })
     }
 
     pub fn render_prometheus_metrics(&self) -> Result<String> {
         let snap = self.metrics_snapshot()?;
         Ok(self.metrics.render_prometheus(&snap))
+    }
+
+    pub fn alert_eval_snapshot(&self) -> Result<AlertEvalSnapshot> {
+        let cfg = self.alerts.config();
+        let wake_failure = self
+            .metrics
+            .wake_failure_stats(std::time::Duration::from_secs(cfg.wake_failure_window_secs));
+        let (_, wake_pending, _) = self.wakes.runtime_session_counts();
+        let webhook_pending = self.webhooks.pending_delivery_count()?;
+        let disk = self.alerts.sample_disk();
+        Ok(AlertEvalSnapshot {
+            wake_failure,
+            wake_pending: wake_pending as u64,
+            webhook_pending,
+            queue_backlog_total: wake_pending as u64 + webhook_pending,
+            disk,
+        })
+    }
+
+    pub async fn evaluate_alerts(&self, notify: bool) -> Result<Vec<AlertDeliveryRecord>> {
+        let worker = self.clone();
+        let snap = tokio::task::spawn_blocking(move || worker.alert_eval_snapshot())
+            .await
+            .map_err(|err| anyhow!("alert snapshot task failed: {err}"))??;
+        let notifications = self.alerts.evaluate_with_snapshot(
+            std::time::Instant::now(),
+            unix_timestamp(),
+            &snap,
+            notify,
+        );
+        Ok(self.alerts.dispatch_notifications(notifications).await)
+    }
+
+    pub fn spawn_alert_worker(&self) -> tokio::task::JoinHandle<()> {
+        let server = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let cfg = server.alerts.config();
+                if !cfg.enabled || cfg.eval_interval_secs == 0 {
+                    server.alerts.notify_handle().notified().await;
+                    continue;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(cfg.eval_interval_secs.max(1))) => {}
+                    _ = server.alerts.notify_handle().notified() => {
+                        continue;
+                    }
+                }
+                let latest = server.alerts.config();
+                if !latest.enabled || latest.eval_interval_secs == 0 {
+                    continue;
+                }
+                if let Err(err) = server.evaluate_alerts(true).await {
+                    server.logger.log_error(
+                        "alert.evaluation_error",
+                        format!("prometheus alert evaluation failed: {err:#}"),
+                    );
+                }
+            }
+        })
     }
 
     /// Run once for deterministic tests, or from the background worker.

@@ -66,3 +66,29 @@ open_registration = false
 # db_vacuum_batch_pages = 64              # max pages reclaimed per non-blocking vacuum step
 # db_vacuum_step_delay_ms = 25            # pause between batches so active writers never starve
 # db_vacuum_max_batches_per_run = 32      # max batches per scheduled pass (0 unlimited)
+
+# Prometheus alerting rules exporter (/metrics/alerts/rules) & webhook alert evaluator.
+# [alerts]
+# enabled = true                          # enable background alert evaluation worker
+# eval_interval_secs = 15                 # seconds between rule evaluations (0 disables timer)
+# webhook_url = "http://127.0.0.1:9095/alerts"  # optional direct alert webhook (HTTPS or LAN/localhost HTTP)
+# webhook_secret = "change-me"            # optional HMAC-SHA256 secret for X-AirCD-Signature-256
+# repeat_interval_secs = 3600             # seconds between repeat notifications while firing (0 disables repeats)
+# send_resolved = true                    # send webhook notification when a firing alert resolves
+# group_name = "aircd_alerts"             # rule group name exported in /metrics/alerts/rules YAML
+# wake_failure_enabled = true
+# wake_failure_rate_threshold = 0.25      # 0.0..=1.0 ratio of (failed+timeout)/completed wakes
+# wake_failure_window_secs = 300          # rolling evaluation window in seconds
+# wake_failure_min_samples = 5            # minimum completed wakes before failure rate triggers
+# wake_failure_for_secs = 120             # sustained breach duration before firing
+# wake_failure_severity = "critical"      # info, warning, or critical
+# queue_backlog_enabled = true
+# queue_backlog_threshold = 50            # pending wake sessions + pending webhook deliveries
+# queue_backlog_for_secs = 60
+# queue_backlog_severity = "warning"
+# disk_pressure_enabled = true
+# disk_used_ratio_threshold = 0.90        # 0.0..=1.0 volume used fraction (0 disables ratio check)
+# disk_min_free_bytes = 1073741824        # 1 GiB minimum free bytes (0 disables byte floor)
+# disk_pressure_for_secs = 60
+# disk_pressure_severity = "critical"
+# disk_path = "."                         # optional filesystem path override (defaults to DB path)
