@@ -1401,7 +1401,7 @@ impl Server {
 
     fn task_done(&self, session: &Session, task_id: String) -> Result<()> {
         let principal = session.principal()?;
-        let _task = match self.done_task_api(&principal, &task_id) {
+        let _task = match self.done_task_api(principal, &task_id) {
             Ok(task) => task,
             Err(error) => {
                 let body = format!("TASK DONE {} failed: {}", task_id, error);
