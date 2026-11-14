@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
+use crate::metrics::MetricsRegistry;
 use crate::store::SharedConnection;
 
 /// Statuses after which a task no longer appears in lists or inboxes.
@@ -146,6 +148,7 @@ const QUESTION_COLUMNS: &str = "id, task_id, channel, asked_by, question, status
 pub struct TaskStore {
     db: SharedConnection,
     lease_seconds: i64,
+    metrics: Arc<MetricsRegistry>,
 }
 
 pub fn normalize_kind(raw: Option<&str>) -> Result<String> {
@@ -168,7 +171,19 @@ fn clean_opt(value: Option<String>) -> Option<String> {
 
 impl TaskStore {
     pub fn new(db: SharedConnection, lease_seconds: i64) -> Self {
-        Self { db, lease_seconds }
+        Self::with_metrics(db, lease_seconds, Arc::new(MetricsRegistry::new()))
+    }
+
+    pub fn with_metrics(
+        db: SharedConnection,
+        lease_seconds: i64,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Self {
+        Self {
+            db,
+            lease_seconds,
+            metrics,
+        }
     }
 
     pub fn create(&self, channel: &str, title: &str) -> Result<Task> {
@@ -212,7 +227,9 @@ impl TaskStore {
         )
         .context("insert task")?;
 
-        Self::get_locked(&db, &id)
+        let task = Self::get_locked(&db, &id)?;
+        self.metrics.record_task_created(&kind);
+        Ok(task)
     }
 
     pub fn get(&self, task_id: &str) -> Result<Option<Task>> {
@@ -242,6 +259,14 @@ impl TaskStore {
         let now = unix_timestamp();
         let lease_expires_at = now + self.lease_seconds;
         let db = self.db.write()?;
+        let prev_status: Option<String> = db
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("load task before claim")?;
 
         // Only the lease-based flow is claimable; assigned work has an owner.
         let changed = db
@@ -263,7 +288,10 @@ impl TaskStore {
             return Err(anyhow!("task is already claimed or done"));
         }
 
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&db, task_id)?;
+        self.metrics
+            .record_task_transition(prev_status.as_deref().unwrap_or("open"), "claimed");
+        Ok(task)
     }
 
     pub fn done(&self, task_id: &str, principal_id: &str) -> Result<Task> {
@@ -283,7 +311,10 @@ impl TaskStore {
             return Err(anyhow!("task is not claimed by this principal"));
         }
 
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&db, task_id)?;
+        self.metrics.record_task_transition("claimed", "done");
+        self.metrics.record_task_completed("done");
+        Ok(task)
     }
 
     pub fn release(&self, task_id: &str, principal_id: &str) -> Result<Task> {
@@ -303,7 +334,9 @@ impl TaskStore {
             return Err(anyhow!("task is not claimed by this principal"));
         }
 
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&db, task_id)?;
+        self.metrics.record_task_transition("claimed", "open");
+        Ok(task)
     }
 
     /// Give the task to `assignee`, or back to the pool when `None`. Work that
@@ -342,7 +375,12 @@ impl TaskStore {
             assignee.map(|a| format!("assignee={a}")).as_deref(),
             now,
         )?;
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&db, task_id)?;
+        if current.status != next_status {
+            self.metrics
+                .record_task_transition(&current.status, next_status);
+        }
+        Ok(task)
     }
 
     /// Write a status change. Permission and transition rules live in the
@@ -433,6 +471,10 @@ impl TaskStore {
         }
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        self.metrics.record_task_transition(expected_from, to);
+        if TERMINAL_STATUSES.contains(&to) {
+            self.metrics.record_task_completed(to);
+        }
         Ok(task)
     }
 
@@ -505,6 +547,9 @@ impl TaskStore {
         )?;
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        if current.status != to {
+            self.metrics.record_task_transition(&current.status, to);
+        }
         Ok(task)
     }
 
@@ -545,7 +590,11 @@ impl TaskStore {
             Some(question),
             now,
         )?;
-        Ok((Self::get_locked(&db, task_id)?, Self::question_locked(&db, &id)?))
+        let out = (Self::get_locked(&db, task_id)?, Self::question_locked(&db, &id)?);
+        self.metrics
+            .record_task_transition(&current.status, "blocked");
+        self.metrics.record_task_question("asked");
+        Ok(out)
     }
 
     /// The unanswered question on a task, if any.
@@ -582,10 +631,14 @@ impl TaskStore {
             Some(answer),
             now,
         )?;
-        Ok((
+        let out = (
             Self::get_locked(&db, task_id)?,
             Self::question_locked(&db, &question.id)?,
-        ))
+        );
+        self.metrics
+            .record_task_transition("blocked", &question.resume_status);
+        self.metrics.record_task_question("answered");
+        Ok(out)
     }
 
     /// Hand an open question up to the owner.
@@ -638,7 +691,13 @@ impl TaskStore {
             note,
             now,
         )?;
-        Self::question_locked(&db, &question.id)
+        let q = Self::question_locked(&db, &question.id)?;
+        self.metrics.record_task_question(if to == "escalated_pm" {
+            "escalated_pm"
+        } else {
+            "escalated"
+        });
+        Ok(q)
     }
 
     /// Questions with `status`, in one channel or everywhere.

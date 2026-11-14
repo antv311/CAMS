@@ -214,9 +214,14 @@ fn log_rate_limit_rejection(
 }
 
 fn rate_limit_response(
+    state: &AppState,
     rej: RateLimitRejection,
     principal: Option<&crate::auth::Principal>,
 ) -> Response {
+    state
+        .server
+        .metrics()
+        .record_http_rate_limited(rej.scope.as_str());
     let target = match rej.scope {
         LimitScope::Ip => "client IP".to_string(),
         LimitScope::Principal => principal
@@ -271,7 +276,7 @@ async fn rate_limit_requests(
         // Reject already-exhausted IPs before running Argon2 verification.
         if let Err(rej) = state.rate_limiter.peek_ip(ip) {
             log_rate_limit_rejection(&state, rej, ip, &path, None);
-            return rate_limit_response(rej, None);
+            return rate_limit_response(&state, rej, None);
         }
 
         let auth_outcome = match state.server.auth().authenticate_context(&raw) {
@@ -300,7 +305,7 @@ async fn rate_limit_requests(
             Ok(headers) => headers,
             Err(rej) => {
                 log_rate_limit_rejection(&state, rej, ip, &path, principal_ref);
-                return rate_limit_response(rej, principal_ref);
+                return rate_limit_response(&state, rej, principal_ref);
             }
         };
 
@@ -317,7 +322,7 @@ async fn rate_limit_requests(
         Ok(headers) => headers,
         Err(rej) => {
             log_rate_limit_rejection(&state, rej, ip, &path, None);
-            return rate_limit_response(rej, None);
+            return rate_limit_response(&state, rej, None);
         }
     };
     let mut response = next.run(request).await;
@@ -332,9 +337,16 @@ async fn log_http_server_errors(
     request: Request,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let _in_flight = state.server.metrics().inc_http_in_flight();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let response = next.run(request).await;
+    state.server.metrics().record_http_request(
+        method.as_str(),
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
     if response.status().is_server_error() {
         let detail = response
             .extensions()
@@ -483,6 +495,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/instructions", get(welcome_root))
         .route("/v1/welcome", get(welcome_json))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/agents", get(public_agents))
         .route("/v1/channels", get(public_channels))
         .route("/v1/gits", get(public_gits).post(register_git_repo))
@@ -653,6 +666,20 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "tls_only": state.info.tls_only,
         })),
     )
+}
+
+async fn prometheus_metrics(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let server = state.server.clone();
+    let body = tokio::task::spawn_blocking(move || server.render_prometheus_metrics())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        [(header::CONTENT_TYPE, crate::metrics::PROMETHEUS_CONTENT_TYPE)],
+        body,
+    ))
 }
 
 async fn public_agents(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
@@ -4130,7 +4157,7 @@ fn build_welcome_html(state: &AppState, base_host: &str) -> Result<String, ApiEr
     <h1>aircd — IRC + Webhook + Roles + Git Coordinator</h1>
     <p class="muted">Lightweight agent &amp; developer coordination bus. Connect via raw IRC (<code>{irc}</code>), the <code>airc</code> CLI, or HTTP REST API (<code>{http}</code>).</p>
     <ul>{reachable_urls}</ul>
-    <p class="muted">Machine-readable specs: <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a></p>
+    <p class="muted">Machine-readable specs: <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a> &middot; <a style="color:var(--accent)" href="/metrics">/metrics</a> (Prometheus)</p>
   </div>
 
   <div class="grid">
@@ -4358,6 +4385,7 @@ mod tests {
     include!("http_attachment_tests.rs");
     include!("http_group_activity_tests.rs");
     include!("http_rate_limit_tests.rs");
+    include!("http_metrics_tests.rs");
 
     struct TemplateApi {
         server: Server,

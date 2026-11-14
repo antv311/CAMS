@@ -887,6 +887,15 @@ For file-backed databases, `aircd` runs a scheduled snapshot backup worker that 
 - `--rate-limit-max-buckets <n>` / `AIRCD_RATE_LIMIT_MAX_BUCKETS` / `max_buckets` (default: `10000`).
 - Responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `X-RateLimit-Scope` (`ip` or `principal`); throttled requests return HTTP `429 Too Many Requests` with `Retry-After` and JSON `{"ok": false, "error": ..., "limit_scope": ..., "retry_after_seconds": ...}`, and emit throttled `http.rate_limited` security audit events.
 
+### Prometheus metrics scrape endpoint
+
+`aircd` exposes a live Prometheus text-format (`0.0.4`) scrape endpoint at `GET /metrics` (`Content-Type: text/plain; version=0.0.4; charset=utf-8`):
+
+- **Active sessions:** `aircd_active_sessions{kind="irc|wake_running|wake_pending|wake_stored"}`, `aircd_irc_sessions_total{event="connected|disconnected|replaced|revoked|auth_failed"}`, `aircd_principals_total`, and `aircd_messages_total`.
+- **Task throughput:** `aircd_tasks_current{status=...}` across all workflow statuses, `aircd_tasks_created_total{kind="task|bug|feature"}`, `aircd_tasks_completed_total{outcome="done|merged|cancelled"}`, `aircd_task_transitions_total{from,to}`, `aircd_task_questions_total{action=...}`, and `aircd_task_events_persisted_total{action=...}`.
+- **Wake latencies:** `aircd_wake_dispatch_duration_seconds` (request-to-spawn latency histogram), `aircd_wake_duration_seconds{outcome="ok|failed|timeout"}` (execution duration histogram), `aircd_wake_end_to_end_duration_seconds{outcome="ok|failed|timeout"}`, `aircd_wake_requests_total{result=...}`, `aircd_wake_runs_total{status=...}`, and `aircd_wake_quota_cooldowns_active`.
+- **HTTP, rate-limiting & SQLite pool:** `aircd_http_requests_in_flight`, `aircd_http_requests_total{method,status_class}`, `aircd_http_request_duration_seconds`, `aircd_http_rate_limited_total{scope="ip|principal"}`, `aircd_webhook_deliveries_current{status=...}`, and `aircd_db_pool_*` / `aircd_db_wal_checkpoints_total`.
+
 ## Startup scripts
 
 For local human + agent workflows, the repository now includes small helper
