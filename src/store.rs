@@ -1294,6 +1294,19 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks (parent_task_id)",
         [],
     )?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_dependencies (
+           task_id TEXT NOT NULL,
+           depends_on_task_id TEXT NOT NULL,
+           created_by TEXT,
+           created_at INTEGER NOT NULL,
+           PRIMARY KEY (task_id, depends_on_task_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_task_dependencies_task
+           ON task_dependencies (task_id);
+         CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on
+           ON task_dependencies (depends_on_task_id);",
+    )?;
 
     Ok(())
 }
@@ -2089,6 +2102,145 @@ mod tests {
                 normal1.id.clone(),
                 normal2.id.clone()
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_dependencies_store_enforces_cross_repo_dag_and_blocked_by_validation() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        init_with(&connection, false)?;
+        // Idempotent re-init keeps task_dependencies intact.
+        init_with(&connection, false)?;
+        let table_exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_dependencies'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(table_exists, 1);
+
+        let tasks = crate::tasks::TaskStore::new(SharedConnection::from_connection(connection), 60);
+
+        let t_backend = tasks.create_full(crate::tasks::NewTask {
+            channel: "#api".into(),
+            title: "Build backend schema".into(),
+            repo: Some("backend".into()),
+            assignee: Some("alice".into()),
+            ..Default::default()
+        })?;
+        let t_frontend = tasks.create_full(crate::tasks::NewTask {
+            channel: "#web".into(),
+            title: "Integrate frontend UI".into(),
+            repo: Some("frontend".into()),
+            assignee: Some("bob".into()),
+            blocked_by: vec![t_backend.id.clone(), format!("  {}  ", t_backend.id)],
+            ..Default::default()
+        })?;
+        assert_eq!(t_frontend.blocked_by, vec![t_backend.id.clone()]);
+
+        // Missing dependency rejected.
+        assert!(tasks
+            .create_full(crate::tasks::NewTask {
+                channel: "#web".into(),
+                title: "Bad dep".into(),
+                blocked_by: vec!["task_missing".into()],
+                ..Default::default()
+            })
+            .is_err());
+
+        // Self-dependency and cycles rejected.
+        assert!(tasks
+            .add_dependencies(&t_backend.id, std::slice::from_ref(&t_backend.id), "pm")
+            .is_err());
+        let cycle_err = tasks
+            .add_dependencies(&t_backend.id, std::slice::from_ref(&t_frontend.id), "pm")
+            .unwrap_err();
+        assert!(cycle_err.to_string().contains("circular"));
+
+        // 3-node transitive cycle rejected: t_mid -> t_frontend -> t_backend, then t_backend -> t_mid.
+        let t_mid = tasks.create_full(crate::tasks::NewTask {
+            channel: "#sdk".into(),
+            title: "Publish SDK".into(),
+            repo: Some("sdk".into()),
+            blocked_by: vec![t_frontend.id.clone()],
+            ..Default::default()
+        })?;
+        assert!(tasks
+            .set_dependencies(&t_backend.id, std::slice::from_ref(&t_mid.id), "pm")
+            .is_err());
+
+        // Cross-repo and cross-project flags populated.
+        let deps = tasks.dependencies(&t_frontend.id)?;
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].task_id, t_backend.id);
+        assert_eq!(deps[0].repo.as_deref(), Some("backend"));
+        assert!(!deps[0].resolved);
+        assert!(deps[0].cross_repo);
+        assert!(deps[0].cross_project);
+
+        let rev = tasks.dependents(&t_backend.id)?;
+        assert_eq!(rev.len(), 1);
+        assert_eq!(rev[0].task_id, t_frontend.id);
+
+        // Blocked task cannot advance to in_progress/testing/review/merged, nor be claimed.
+        let blocked_err = tasks
+            .set_status(&t_frontend.id, "assigned", "in_progress", "bob", None, None)
+            .unwrap_err();
+        assert!(blocked_err.to_string().contains(&t_backend.id));
+
+        let t_claimable = tasks.create_full(crate::tasks::NewTask {
+            channel: "#web".into(),
+            title: "Claimable after backend".into(),
+            repo: Some("frontend".into()),
+            blocked_by: vec![t_backend.id.clone()],
+            ..Default::default()
+        })?;
+        assert!(tasks.claim(&t_claimable.id, "bob").is_err());
+
+        // Filtering by repo and blocked state works.
+        assert_eq!(
+            tasks
+                .list_filtered_with_options("#web", None, Some("frontend"), Some(true))?
+                .len(),
+            2
+        );
+        assert!(tasks
+            .list_filtered_with_options("#web", None, Some("frontend"), Some(false))?
+            .is_empty());
+
+        // Completing the blocker unblocks dependents.
+        tasks.set_status(&t_backend.id, "assigned", "merged", "pm", Some("ok"), None)?;
+        assert!(tasks.unresolved_blockers(&t_frontend.id)?.is_empty());
+        let advanced = tasks.set_status(&t_frontend.id, "assigned", "in_progress", "bob", None, None)?;
+        assert_eq!(advanced.status, "in_progress");
+        let claimed = tasks.claim(&t_claimable.id, "bob")?;
+        assert_eq!(claimed.status, "claimed");
+
+        // Cancelling a blocker keeps dependents blocked unless unlinked, while cancelling a blocked task is allowed.
+        let t_to_cancel = tasks.create_full(crate::tasks::NewTask {
+            channel: "#api".into(),
+            title: "Cancelled prerequisite".into(),
+            ..Default::default()
+        })?;
+        let t_waiting = tasks.create_full(crate::tasks::NewTask {
+            channel: "#web".into(),
+            title: "Waiting on cancelled".into(),
+            assignee: Some("bob".into()),
+            blocked_by: vec![t_to_cancel.id.clone()],
+            ..Default::default()
+        })?;
+        tasks.set_status(&t_to_cancel.id, "open", "cancelled", "pm", Some("dropped"), None)?;
+        assert!(tasks
+            .set_status(&t_waiting.id, "assigned", "in_progress", "bob", None, None)
+            .is_err());
+        let (unlinked, removed) = tasks.remove_dependency(&t_waiting.id, &t_to_cancel.id, "pm")?;
+        assert!(removed);
+        assert!(unlinked.blocked_by.is_empty());
+        assert_eq!(
+            tasks
+                .set_status(&t_waiting.id, "assigned", "in_progress", "bob", None, None)?
+                .status,
+            "in_progress"
         );
         Ok(())
     }

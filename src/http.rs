@@ -559,6 +559,16 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/priority", post(set_task_priority))
+        .route(
+            "/v1/tasks/{id}/dependencies",
+            get(get_task_dependencies)
+                .post(add_task_dependencies)
+                .put(set_task_dependencies),
+        )
+        .route(
+            "/v1/tasks/{id}/dependencies/{dep_id}",
+            delete(remove_task_dependency),
+        )
         .route("/v1/tasks/{id}/status", post(set_task_status))
         .route("/v1/tasks/{id}/peer-review", post(peer_review_task))
         .route("/v1/tasks/{id}/ask", post(ask_task))
@@ -2723,6 +2733,8 @@ struct ChannelQuery {
 struct TaskListQuery {
     channel: Option<String>,
     priority: Option<String>,
+    repo: Option<String>,
+    blocked: Option<bool>,
 }
 
 async fn list_tasks(
@@ -2735,7 +2747,12 @@ async fn list_tasks(
     let tasks = state
         .server
         .tasks()
-        .list_filtered(&channel, q.priority.as_deref())
+        .list_filtered_with_options(
+            &channel,
+            q.priority.as_deref(),
+            q.repo.as_deref(),
+            q.blocked,
+        )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
         StatusCode::OK,
@@ -2757,6 +2774,7 @@ struct CreateTaskReq {
     issue_url: Option<String>,
     reviewer: Option<String>,
     parent_task_id: Option<String>,
+    blocked_by: Option<Vec<String>>,
 }
 
 async fn create_task(
@@ -2787,6 +2805,7 @@ async fn create_task(
                 sprint: None,
                 reviewer: req.reviewer,
                 parent_task_id: req.parent_task_id,
+                blocked_by: req.blocked_by.unwrap_or_default(),
             },
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -2844,6 +2863,200 @@ async fn set_task_priority(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+struct DependencyDetails {
+    dependencies: Vec<crate::tasks::TaskDependency>,
+    dependents: Vec<crate::tasks::TaskDependency>,
+    unresolved: Vec<crate::tasks::TaskDependency>,
+}
+
+fn dependency_payload(
+    server: &Server,
+    task: &crate::tasks::Task,
+) -> Result<DependencyDetails, ApiError> {
+    let dependencies = server
+        .tasks()
+        .dependencies(&task.id)
+        .map_err(ApiError::internal)?;
+    let dependents = server
+        .tasks()
+        .dependents(&task.id)
+        .map_err(ApiError::internal)?;
+    let unresolved = dependencies
+        .iter()
+        .filter(|d| !d.resolved)
+        .cloned()
+        .collect();
+    Ok(DependencyDetails {
+        dependencies,
+        dependents,
+        unresolved,
+    })
+}
+
+async fn get_task_dependencies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/tasks/{id}/dependencies",
+    )?;
+    let task = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task_id": task.id,
+            "blocked_by": task.blocked_by,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SetTaskDependenciesReq {
+    blocked_by: Vec<String>,
+}
+
+async fn set_task_dependencies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTaskDependenciesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Pm,
+        "/v1/tasks/{id}/dependencies",
+    )?
+    .principal;
+    let _ = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let task = state
+        .server
+        .set_task_dependencies_api(&actor, &id, &req.blocked_by)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task": task,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AddTaskDependenciesReq {
+    depends_on_task_id: Option<String>,
+    blocked_by: Option<Vec<String>>,
+}
+
+async fn add_task_dependencies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AddTaskDependenciesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Pm,
+        "/v1/tasks/{id}/dependencies",
+    )?
+    .principal;
+    let _ = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let mut ids = req.blocked_by.unwrap_or_default();
+    if let Some(single) = req.depends_on_task_id {
+        ids.push(single);
+    }
+    if ids.iter().all(|s| s.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "depends_on_task_id or blocked_by is required",
+        ));
+    }
+    let task = state
+        .server
+        .add_task_dependencies_api(&actor, &id, &ids)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task": task,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
+    ))
+}
+
+async fn remove_task_dependency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, dep_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Pm,
+        "/v1/tasks/{id}/dependencies/{dep_id}",
+    )?
+    .principal;
+    let _ = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let (task, removed) = state
+        .server
+        .remove_task_dependency_api(&actor, &id, &dep_id)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !removed {
+        return Err(ApiError::not_found(format!(
+            "dependency '{dep_id}' not found on task '{}'",
+            task.id
+        )));
+    }
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task": task,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
     ))
 }
 
@@ -2957,6 +3170,7 @@ async fn get_task(
         .attachments()
         .list(&task.id)
         .map_err(ApiError::internal)?;
+    let details = dependency_payload(&state.server, &task)?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -2966,7 +3180,11 @@ async fn get_task(
             "events": events,
             "question": question,
             "subtasks": subtasks,
-            "attachments": attachments
+            "attachments": attachments,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty()
         })),
     ))
 }
@@ -6060,6 +6278,8 @@ mod tests {
     ) -> Result<(u16, Value)> {
         let request = match method {
             "GET" => client.get(url),
+            "PUT" => client.put(url).json(&body),
+            "DELETE" => client.delete(url),
             _ => client.post(url).json(&body),
         };
         let response = request.bearer_auth(token).send().await?;
@@ -8548,6 +8768,364 @@ mod tests {
             ]
         );
         assert_eq!(inbox_after["inbox"]["next_task"]["id"], t_low);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cross_repo_task_dependencies_and_blocked_by_validation() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let base = &api.base;
+        let owner_tok = "human-token";
+        let pm_tok = tokens["pm"].as_str();
+        let worker_tok = tokens["worker"].as_str();
+        let lead_tok = tokens["lead"].as_str();
+
+        // Register repos on #one (backend) and #two (frontend), and add worker + pm to #two.
+        for (name, channel, path) in [
+            ("backend", "#one", "/repos/backend"),
+            ("frontend", "#two", "/repos/frontend"),
+        ] {
+            let (status, _) = call(
+                &api.client,
+                "POST",
+                format!("{base}/v1/gits"),
+                owner_tok,
+                json!({ "name": name, "channel": channel, "local_path": path }),
+            )
+            .await?;
+            assert_eq!(status, 201);
+        }
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/projects/members"),
+            owner_tok,
+            json!({ "channel": "#two", "nick": "worker", "role": "member" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // Missing dependency rejected on create.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({
+                "channel": "#one",
+                "title": "Bad dep",
+                "blocked_by": ["task_nonexistent"]
+            }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+
+        // Create backend blocker task in #one (repo=backend).
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({
+                "channel": "#one",
+                "title": "Backend API endpoint",
+                "repo": "backend",
+                "assignee": "lead"
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_backend = body["task"]["id"].as_str().unwrap().to_string();
+
+        // Create urgent frontend task in #two (repo=frontend) blocked by #one's backend task.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({
+                "channel": "#two",
+                "title": "Frontend integration",
+                "repo": "frontend",
+                "priority": "urgent",
+                "assignee": "worker",
+                "blocked_by": [t_backend.clone()]
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_frontend = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["blocked_by"], json!([t_backend]));
+
+        // Create ready normal task in #two for worker.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({
+                "channel": "#two",
+                "title": "Frontend styling",
+                "repo": "frontend",
+                "priority": "normal",
+                "assignee": "worker"
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_ready = body["task"]["id"].as_str().unwrap().to_string();
+
+        // Create lease-based open task in #two blocked by t_backend.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({
+                "channel": "#two",
+                "title": "Claimable frontend follow-up",
+                "repo": "frontend",
+                "blocked_by": [t_backend.clone()]
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_claimable = body["task"]["id"].as_str().unwrap().to_string();
+
+        // GET /v1/tasks/{id} and GET /v1/tasks/{id}/dependencies expose cross-repo metadata.
+        let (status, shown) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks/{t_frontend}"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(shown["is_blocked"], true);
+        assert_eq!(shown["dependencies"][0]["task_id"], t_backend);
+        assert_eq!(shown["dependencies"][0]["repo"], "backend");
+        assert_eq!(shown["dependencies"][0]["cross_repo"], true);
+        assert_eq!(shown["dependencies"][0]["cross_project"], true);
+        assert_eq!(shown["dependencies"][0]["resolved"], false);
+
+        let (status, backend_deps) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks/{t_backend}/dependencies"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(backend_deps["is_blocked"], false);
+        assert_eq!(backend_deps["dependents"].as_array().unwrap().len(), 2);
+
+        // Filtering GET /v1/tasks by ?repo= and ?blocked=true|false.
+        let (_, blocked_list) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=two&repo=frontend&blocked=true"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        let blocked_ids: Vec<&str> = blocked_list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(blocked_ids, vec![t_frontend.as_str(), t_claimable.as_str()]);
+
+        let (_, ready_list) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=two&repo=frontend&blocked=false"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        let ready_ids: Vec<&str> = ready_list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ready_ids, vec![t_ready.as_str()]);
+
+        // Inbox excludes blocked urgent task from next_task / dispatch_queue while keeping ready task.
+        let (_, inbox) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(inbox["inbox"]["task_count"], 2);
+        assert_eq!(inbox["inbox"]["ready_task_count"], 1);
+        assert_eq!(inbox["inbox"]["blocked_task_count"], 1);
+        assert_eq!(inbox["inbox"]["next_task"]["id"], t_ready);
+        assert_eq!(inbox["inbox"]["dispatch_queue"].as_array().unwrap().len(), 1);
+
+        // Blocked task cannot advance to in_progress nor be claimed.
+        let (status, err_body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_frontend}/status"),
+            worker_tok,
+            json!({ "status": "in_progress" }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        assert!(err_body["error"].as_str().unwrap().contains(&t_backend));
+
+        let (status, claim_err) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_claimable}/claim"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 409);
+        assert!(claim_err["error"].as_str().unwrap().contains(&t_backend));
+
+        // Cycle and self-dependency validation on /dependencies endpoints.
+        let (status, cycle_body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_backend}/dependencies"),
+            pm_tok,
+            json!({ "depends_on_task_id": t_frontend }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        assert!(cycle_body["error"].as_str().unwrap().contains("circular"));
+
+        let (status, _) = call(
+            &api.client,
+            "PUT",
+            format!("{base}/v1/tasks/{t_backend}/dependencies"),
+            pm_tok,
+            json!({ "blocked_by": [t_backend] }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // Non-PM worker cannot mutate task dependencies.
+        let (status, _) = call(
+            &api.client,
+            "DELETE",
+            format!("{base}/v1/tasks/{t_frontend}/dependencies/{t_backend}"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert!(status == 403 || status == 400);
+
+        // Complete backend task through testing -> review -> merged.
+        for (st, note) in [
+            ("in_progress", None),
+            ("testing", None),
+            ("review", Some("cargo test ok")),
+        ] {
+            let (status, _) = call(
+                &api.client,
+                "POST",
+                format!("{base}/v1/tasks/{t_backend}/status"),
+                lead_tok,
+                json!({ "status": st, "note": note }),
+            )
+            .await?;
+            assert_eq!(status, 200);
+        }
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_backend}/status"),
+            pm_tok,
+            json!({ "status": "merged", "note": "LGTM" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // Now t_frontend and t_claimable are unblocked, and t_frontend (urgent) leads inbox dispatch_queue!
+        let (status, deps_after) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks/{t_frontend}/dependencies"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(deps_after["is_blocked"], false);
+        assert_eq!(deps_after["dependencies"][0]["resolved"], true);
+
+        let (_, inbox_after) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(inbox_after["inbox"]["ready_task_count"], 2);
+        assert_eq!(inbox_after["inbox"]["blocked_task_count"], 0);
+        assert_eq!(inbox_after["inbox"]["next_task"]["id"], t_frontend);
+
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_frontend}/status"),
+            worker_tok,
+            json!({ "status": "in_progress" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_claimable}/claim"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // PUT + DELETE /dependencies and 404 when removing non-linked dependency.
+        let (status, _) = call(
+            &api.client,
+            "PUT",
+            format!("{base}/v1/tasks/{t_ready}/dependencies"),
+            owner_tok,
+            json!({ "blocked_by": [t_backend] }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "DELETE",
+            format!("{base}/v1/tasks/{t_ready}/dependencies/{t_backend}"),
+            owner_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "DELETE",
+            format!("{base}/v1/tasks/{t_ready}/dependencies/{t_backend}"),
+            owner_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 404);
+
         Ok(())
     }
 }

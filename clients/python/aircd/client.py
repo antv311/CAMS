@@ -734,6 +734,7 @@ class AircdHttpClient:
         issue_url: Optional[str] = None,
         parent: Optional[str] = None,
         reviewer: Optional[str] = None,
+        blocked_by: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Create a task and return it. ``parent`` makes it a subtask of that task
         id; ``reviewer`` names who reviews it (the hub defaults to the parent's
@@ -741,6 +742,7 @@ class AircdHttpClient:
         payload = task_create_payload(
             channel, title, body=body, kind=kind, priority=priority, assignee=assignee,
             repo=repo, branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
+            blocked_by=blocked_by,
         )
         return self._request("POST", "/v1/tasks", payload=payload)["task"]
 
@@ -748,6 +750,31 @@ class AircdHttpClient:
         """Set the priority (``urgent``, ``high``, ``normal``, or ``low``) of a task."""
         path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/priority"
         return self._request("POST", path, payload={"priority": priority})["task"]
+
+    def get_task_dependencies(self, task_id: str) -> dict[str, Any]:
+        """Return dependencies, dependents, and unresolved blockers for ``task_id``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/dependencies"
+        return self._request("GET", path)
+
+    def set_task_dependencies(self, task_id: str, blocked_by: list[str]) -> dict[str, Any]:
+        """Replace all ``blocked_by`` dependencies of ``task_id``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/dependencies"
+        return self._request("PUT", path, payload={"blocked_by": _clean_dep_ids(blocked_by)})
+
+    def add_task_dependency(self, task_id: str, depends_on_task_id: str) -> dict[str, Any]:
+        """Add a ``blocked_by`` dependency to ``task_id``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/dependencies"
+        return self._request("POST", path, payload={"depends_on_task_id": depends_on_task_id.strip()})
+
+    def remove_task_dependency(self, task_id: str, depends_on_task_id: str) -> dict[str, Any]:
+        """Remove one ``blocked_by`` dependency from ``task_id``."""
+        path = (
+            "/v1/tasks/"
+            + urllib.parse.quote(task_id.strip(), safe="")
+            + "/dependencies/"
+            + urllib.parse.quote(depends_on_task_id.strip(), safe="")
+        )
+        return self._request("DELETE", path)
 
     def set_task_status(
         self,
@@ -920,6 +947,18 @@ def _clean_nick(nick: Optional[str]) -> Optional[str]:
     return nick or None
 
 
+def _clean_dep_ids(raw: Optional[list[str]]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw or []:
+        for part in str(item).split(","):
+            cleaned = part.strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                out.append(cleaned)
+    return out
+
+
 def task_create_payload(
     channel: str,
     title: str,
@@ -933,9 +972,11 @@ def task_create_payload(
     issue_url: Optional[str] = None,
     parent: Optional[str] = None,
     reviewer: Optional[str] = None,
+    blocked_by: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """The POST /v1/tasks body. ``parent_task_id``, ``reviewer``, and ``priority``
-    are only sent when set, so a hub without those features sees the same request as before."""
+    """The POST /v1/tasks body. ``parent_task_id``, ``reviewer``, ``priority``,
+    and ``blocked_by`` are only sent when set, so a hub without those features
+    sees the same request as before."""
     payload: dict[str, Any] = {
         "channel": channel,
         "title": title,
@@ -955,6 +996,9 @@ def task_create_payload(
     reviewer = _clean_nick(reviewer)
     if reviewer:
         payload["reviewer"] = reviewer
+    cleaned_deps = _clean_dep_ids(blocked_by)
+    if cleaned_deps:
+        payload["blocked_by"] = cleaned_deps
     return payload
 
 

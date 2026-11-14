@@ -584,6 +584,136 @@ class AircdCliE2ETest(unittest.TestCase):
             [t_low["id"], t_urgent["id"], t_high["id"], t_normal["id"]],
         )
 
+    def test_07_cross_repo_task_dependencies_and_blocked_by(self) -> None:
+        repo_api = Path(self.tmp_dir.name) / "dep-api"
+        repo_web = Path(self.tmp_dir.name) / "dep-web"
+        repo_api.mkdir()
+        repo_web.mkdir()
+        subprocess.run(["git", "init", str(repo_api)], check=True, capture_output=True)
+        subprocess.run(["git", "init", str(repo_web)], check=True, capture_output=True)
+        self._run_cli("--profile", "codex", "project", "create", "#depapi", "--name", "Dep API")
+        self._run_cli("--profile", "codex", "project", "create", "#depweb", "--name", "Dep Web")
+        self._run_cli("--profile", "codex", "project", "add", "#depapi", "claude", "--role", "member")
+        self._run_cli("--profile", "codex", "project", "add", "#depweb", "claude", "--role", "member")
+        self._run_cli("--profile", "codex", "--json", "git", "register", str(repo_api), "--channel", "#depapi")
+        self._run_cli("--profile", "codex", "--json", "git", "register", str(repo_web), "--channel", "#depweb")
+
+        t_api = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#depapi", "Ship v2 API",
+                "--repo", "dep-api", "--assign", "codex",
+            ).stdout
+        )["task"]
+        t_web = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#depweb", "Consume v2 API",
+                "--repo", "dep-web", "--priority", "urgent", "--assign", "claude",
+                "--blocked-by", t_api["id"],
+            ).stdout
+        )["task"]
+        self.assertEqual(t_web["blocked_by"], [t_api["id"]])
+
+        # Inspect dependencies via `airc task deps` and `airc task show`
+        deps_info = json.loads(
+            self._run_cli("--profile", "claude", "--json", "task", "deps", t_web["id"]).stdout
+        )
+        self.assertTrue(deps_info["is_blocked"])
+        self.assertTrue(deps_info["dependencies"][0]["cross_repo"])
+        self.assertTrue(deps_info["dependencies"][0]["cross_project"])
+
+        shown = json.loads(
+            self._run_cli("--profile", "claude", "--json", "task", "show", t_web["id"]).stdout
+        )
+        self.assertTrue(shown["is_blocked"])
+        self.assertEqual(shown["dependencies"][0]["task_id"], t_api["id"])
+
+        # Filtered list (--blocked / --ready / --repo)
+        blocked_list = json.loads(
+            self._run_cli(
+                "--profile", "claude", "--json",
+                "task", "list", "#depweb", "--repo", "dep-web", "--blocked",
+            ).stdout
+        )["tasks"]
+        self.assertEqual([t["id"] for t in blocked_list], [t_web["id"]])
+
+        ready_list = json.loads(
+            self._run_cli(
+                "--profile", "claude", "--json",
+                "task", "list", "#depweb", "--repo", "dep-web", "--ready",
+            ).stdout
+        )["tasks"]
+        self.assertEqual(ready_list, [])
+
+        # Worker cannot start blocked task
+        blocked_start = self._run_cli(
+            "--profile", "claude", "task", "status", t_web["id"], "in_progress",
+            check=False,
+        )
+        self.assertNotEqual(blocked_start.returncode, 0)
+        self.assertIn(t_api["id"], blocked_start.stderr)
+
+        # Cycle rejected via `airc task deps --add`
+        cyc = self._run_cli(
+            "--profile", "codex", "task", "deps", t_api["id"], "--add", t_web["id"],
+            check=False,
+        )
+        self.assertNotEqual(cyc.returncode, 0)
+        self.assertIn("circular", cyc.stderr.lower())
+
+        # Merge blocker task -> dependent becomes unblocked and ready to start
+        self._run_cli("--profile", "codex", "task", "status", t_api["id"], "in_progress")
+        self._run_cli("--profile", "codex", "task", "status", t_api["id"], "testing")
+        self._run_cli(
+            "--profile", "codex", "task", "status", t_api["id"], "review",
+            "--note", "API tests pass",
+        )
+        self._run_cli("--profile", "codex", "task", "status", t_api["id"], "merged", "--note", "LGTM")
+
+        deps_after = json.loads(
+            self._run_cli("--profile", "claude", "--json", "task", "deps", t_web["id"]).stdout
+        )
+        self.assertFalse(deps_after["is_blocked"])
+        self.assertTrue(deps_after["dependencies"][0]["resolved"])
+
+        started = json.loads(
+            self._run_cli(
+                "--profile", "claude", "--json", "task", "status", t_web["id"], "in_progress",
+            ).stdout
+        )["task"]
+        self.assertEqual(started["status"], "in_progress")
+
+        # Add & remove/clear dependencies on a fresh task
+        t_extra = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "create", "#depweb", "Follow-up task", "--repo", "dep-web",
+            ).stdout
+        )["task"]
+        self._run_cli("--profile", "codex", "task", "deps", t_extra["id"], "--add", t_web["id"])
+        after_set = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "deps", t_extra["id"], "--set", t_api["id"], t_web["id"],
+            ).stdout
+        )
+        self.assertEqual(after_set["task"]["blocked_by"], [t_api["id"], t_web["id"]])
+        after_rm = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "deps", t_extra["id"], "--remove", t_api["id"],
+            ).stdout
+        )
+        self.assertEqual(after_rm["task"]["blocked_by"], [t_web["id"]])
+        after_clr = json.loads(
+            self._run_cli(
+                "--profile", "codex", "--json",
+                "task", "deps", t_extra["id"], "--clear",
+            ).stdout
+        )
+        self.assertEqual(after_clr["task"]["blocked_by"], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
