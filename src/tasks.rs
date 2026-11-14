@@ -28,8 +28,18 @@ pub const ALL_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
+/// Default dispatch priority when omitted (`urgent`, `high`, `normal`, `low`).
+pub const DEFAULT_PRIORITY: &str = "normal";
+
+const PRIORITY_ORDER_SQL: &str = "CASE priority \
+    WHEN 'urgent' THEN 0 \
+    WHEN 'high' THEN 1 \
+    WHEN 'normal' THEN 2 \
+    WHEN 'low' THEN 3 \
+    ELSE 2 END ASC";
+
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
-     body, kind, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
+     body, kind, priority, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
      reviewer, parent_task_id, review_round_json";
 
 #[derive(Clone, Debug, Serialize)]
@@ -44,6 +54,8 @@ pub struct Task {
     pub body: Option<String>,
     /// `task`, `bug` or `feature`.
     pub kind: String,
+    /// `urgent`, `high`, `normal` or `low`.
+    pub priority: String,
     pub assignee: Option<String>,
     pub created_by: Option<String>,
     pub repo: Option<String>,
@@ -100,6 +112,7 @@ pub struct NewTask {
     pub title: String,
     pub body: Option<String>,
     pub kind: Option<String>,
+    pub priority: Option<String>,
     pub assignee: Option<String>,
     pub created_by: Option<String>,
     pub repo: Option<String>,
@@ -163,6 +176,30 @@ pub fn normalize_kind(raw: Option<&str>) -> Result<String> {
     }
 }
 
+pub fn normalize_priority(raw: Option<&str>) -> Result<String> {
+    let clean = raw.unwrap_or(DEFAULT_PRIORITY).trim().to_ascii_lowercase();
+    match clean.as_str() {
+        "" | "normal" => Ok("normal".to_string()),
+        "urgent" => Ok("urgent".to_string()),
+        "high" => Ok("high".to_string()),
+        "low" => Ok("low".to_string()),
+        other => Err(anyhow!(
+            "task priority must be urgent, high, normal or low (got '{other}')"
+        )),
+    }
+}
+
+/// Lower rank means higher urgency (`urgent=0` < `high=1` < `normal=2` < `low=3`).
+pub fn priority_rank(priority: &str) -> u8 {
+    match priority.trim().to_ascii_lowercase().as_str() {
+        "urgent" => 0,
+        "high" => 1,
+        "normal" | "" => 2,
+        "low" => 3,
+        _ => 2,
+    }
+}
+
 fn clean_opt(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
@@ -198,15 +235,16 @@ impl TaskStore {
         let now = unix_timestamp();
         let id = format!("task_{}", Uuid::new_v4().simple());
         let kind = normalize_kind(new.kind.as_deref())?;
+        let priority = normalize_priority(new.priority.as_deref())?;
         let assignee = clean_opt(new.assignee);
         let status = if assignee.is_some() { "assigned" } else { "open" };
 
         let db = self.db.write()?;
         db.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
-                                body, kind, assignee, created_by, repo, branch, issue_url,
+                                body, kind, priority, assignee, created_by, repo, branch, issue_url,
                                 created_at, updated_at, sprint, reviewer, parent_task_id)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16)",
             params![
                 id,
                 new.channel,
@@ -214,6 +252,7 @@ impl TaskStore {
                 status,
                 clean_opt(new.body),
                 kind,
+                priority,
                 assignee,
                 clean_opt(new.created_by),
                 clean_opt(new.repo),
@@ -247,7 +286,7 @@ impl TaskStore {
     pub fn children(&self, parent_id: &str) -> Result<Vec<Task>> {
         let db = self.db.read()?;
         let mut statement = db.prepare(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at, rowid"
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE parent_task_id = ?1 ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
         ))?;
         let tasks = statement
             .query_map([parent_id], Self::from_row)?
@@ -381,6 +420,43 @@ impl TaskStore {
                 .record_task_transition(&current.status, next_status);
         }
         Ok(task)
+    }
+
+    /// Update the priority (`urgent`, `high`, `normal`, `low`) of an active task.
+    pub fn set_priority(&self, task_id: &str, priority: &str, actor_id: &str) -> Result<(Task, bool)> {
+        let normalized = normalize_priority(Some(priority))?;
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if TERMINAL_STATUSES.contains(&current.status.as_str()) {
+            return Err(anyhow!(
+                "task is {} and its priority cannot be changed",
+                current.status
+            ));
+        }
+        if current.priority == normalized {
+            return Ok((current, false));
+        }
+        tx.execute(
+            "UPDATE tasks SET priority = ?1, updated_at = ?2 WHERE id = ?3",
+            params![normalized, now, task_id],
+        )
+        .context("update task priority")?;
+        let note = format!("priority={} (was {})", normalized, current.priority);
+        Self::log_event_locked(
+            &tx,
+            task_id,
+            actor_id,
+            "priority",
+            Some(&current.status),
+            Some(&current.status),
+            Some(&note),
+            now,
+        )?;
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        Ok((task, true))
     }
 
     /// Write a status change. Permission and transition rules live in the
@@ -757,18 +833,29 @@ impl TaskStore {
     }
 
     pub fn list(&self, channel: &str) -> Result<Vec<Task>> {
+        self.list_filtered(channel, None)
+    }
+
+    pub fn list_filtered(&self, channel: &str, priority: Option<&str>) -> Result<Vec<Task>> {
+        let normalized_priority = priority
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| normalize_priority(Some(p)))
+            .transpose()?;
         let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
-                 WHERE channel = ?1 AND status NOT IN ('done', 'merged', 'cancelled')
-                 ORDER BY created_at ASC"
+                 WHERE channel = ?1
+                   AND status NOT IN ('done', 'merged', 'cancelled')
+                   AND (?2 IS NULL OR priority = ?2)
+                 ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
             ))
             .context("prepare task list")?;
 
         let tasks = statement
-            .query_map(params![channel], Self::from_row)?
+            .query_map(params![channel, normalized_priority], Self::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(tasks)
@@ -819,7 +906,8 @@ impl TaskStore {
         Ok(rows)
     }
 
-    /// Open work owned by `principal_id`, across every channel.
+    /// Open work owned by `principal_id`, across every channel, ordered by
+    /// priority (`urgent` -> `high` -> `normal` -> `low`) then FIFO.
     pub fn inbox(&self, principal_id: &str) -> Result<Vec<Task>> {
         let db = self.db.read()?;
         let mut statement = db
@@ -828,7 +916,7 @@ impl TaskStore {
                  FROM tasks
                  WHERE status NOT IN ('done', 'merged', 'cancelled')
                    AND (assignee = ?1 OR (claimed_by = ?1 AND status = 'claimed'))
-                 ORDER BY channel ASC, created_at ASC"
+                 ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
             ))
             .context("prepare inbox")?;
         let tasks = statement
@@ -837,7 +925,7 @@ impl TaskStore {
         Ok(tasks)
     }
 
-    /// Tasks waiting for review in `channel`.
+    /// Tasks waiting for review in `channel`, ordered by priority then FIFO.
     pub fn review_queue(&self, channel: &str) -> Result<Vec<Task>> {
         let db = self.db.read()?;
         let mut statement = db
@@ -845,7 +933,7 @@ impl TaskStore {
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
                  WHERE channel = ?1 AND status IN ('review', 'super_review')
-                 ORDER BY updated_at ASC"
+                 ORDER BY {PRIORITY_ORDER_SQL}, updated_at ASC, rowid ASC"
             ))
             .context("prepare review queue")?;
         let tasks = statement
@@ -919,22 +1007,25 @@ impl TaskStore {
             kind: row
                 .get::<_, Option<String>>(7)?
                 .unwrap_or_else(|| "task".to_string()),
-            assignee: row.get(8)?,
-            created_by: row.get(9)?,
-            repo: row.get(10)?,
-            branch: row.get(11)?,
-            issue_url: row.get(12)?,
-            created_at: row.get(13)?,
-            updated_at: row.get(14)?,
-            sprint: row.get(15)?,
-            reviewer: row.get(16)?,
-            parent_task_id: row.get(17)?,
+            priority: row
+                .get::<_, Option<String>>(8)?
+                .unwrap_or_else(|| DEFAULT_PRIORITY.to_string()),
+            assignee: row.get(9)?,
+            created_by: row.get(10)?,
+            repo: row.get(11)?,
+            branch: row.get(12)?,
+            issue_url: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
+            sprint: row.get(16)?,
+            reviewer: row.get(17)?,
+            parent_task_id: row.get(18)?,
             review_round: row
-                .get::<_, Option<String>>(18)?
+                .get::<_, Option<String>>(19)?
                 .map(|raw| {
                     serde_json::from_str(&raw).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            18,
+                            19,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         )

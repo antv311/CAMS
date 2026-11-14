@@ -558,6 +558,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}/release", post(release_task))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
+        .route("/v1/tasks/{id}/priority", post(set_task_priority))
         .route("/v1/tasks/{id}/status", post(set_task_status))
         .route("/v1/tasks/{id}/peer-review", post(peer_review_task))
         .route("/v1/tasks/{id}/ask", post(ask_task))
@@ -2718,18 +2719,24 @@ struct ChannelQuery {
     channel: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TaskListQuery {
+    channel: Option<String>,
+    priority: Option<String>,
+}
+
 async fn list_tasks(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<ChannelQuery>,
+    Query(q): Query<TaskListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/tasks")?;
     let channel = normalize_http_channel(q.channel.as_deref().unwrap_or("#general"));
     let tasks = state
         .server
         .tasks()
-        .list(&channel)
-        .map_err(ApiError::internal)?;
+        .list_filtered(&channel, q.priority.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -2743,6 +2750,7 @@ struct CreateTaskReq {
     title: String,
     body: Option<String>,
     kind: Option<String>,
+    priority: Option<String>,
     assignee: Option<String>,
     repo: Option<String>,
     branch: Option<String>,
@@ -2770,6 +2778,7 @@ async fn create_task(
                 title: req.title,
                 body: req.body,
                 kind: req.kind,
+                priority: req.priority,
                 assignee: req.assignee,
                 created_by: None,
                 repo: req.repo,
@@ -2805,6 +2814,31 @@ async fn assign_task(
     let task = state
         .server
         .assign_task_api(&actor, &id, req.assignee.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SetTaskPriorityReq {
+    priority: String,
+}
+
+async fn set_task_priority(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTaskPriorityReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/priority")?
+            .principal;
+    let task = state
+        .server
+        .set_task_priority_api(&actor, &id, &req.priority)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
         StatusCode::OK,
@@ -8307,6 +8341,213 @@ mod tests {
         handle.abort();
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_priority_queue_and_inbox_dispatch_order() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let base = &api.base;
+        let owner_tok = "human-token";
+        let pm_tok = tokens["pm"].as_str();
+        let worker_tok = tokens["worker"].as_str();
+        let lead_tok = tokens["lead"].as_str();
+
+        // Add worker to #two as well so we can verify cross-project priority ordering.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/projects/members"),
+            owner_tok,
+            json!({ "channel": "#two", "nick": "worker", "role": "member" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // Invalid priority is rejected.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "Invalid", "priority": "critical" }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // Create tasks across #one and #two with mixed priorities.
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "Low one", "priority": "low", "assignee": "worker" }),
+        )
+        .await?;
+        let t_low = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["priority"], "low");
+
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "Normal one", "assignee": "worker" }),
+        )
+        .await?;
+        let t_normal = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["priority"], "normal");
+
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({ "channel": "#two", "title": "Urgent two", "priority": "urgent", "assignee": "worker" }),
+        )
+        .await?;
+        let t_urgent = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["priority"], "urgent");
+
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "High one", "priority": "high", "assignee": "worker" }),
+        )
+        .await?;
+        let t_high = body["task"]["id"].as_str().unwrap().to_string();
+
+        // GET /v1/tasks returns priority-ordered tasks and supports ?priority= filtering.
+        let (status, list_one) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=one"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let one_ids: Vec<&str> = list_one["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(one_ids, vec![t_high.as_str(), t_normal.as_str(), t_low.as_str()]);
+
+        let (status, list_high) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=one&priority=high"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(list_high["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(list_high["tasks"][0]["id"], t_high);
+
+        // GET /v1/inbox returns global priority-ordered dispatch_queue, next_task,
+        // and orders projects by highest-priority task first (#two urgent before #one high).
+        let (status, inbox_body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let inbox = &inbox_body["inbox"];
+        assert_eq!(inbox["next_task"]["id"], t_urgent);
+        let dispatch_ids: Vec<&str> = inbox["dispatch_queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dispatch_ids,
+            vec![
+                t_urgent.as_str(),
+                t_high.as_str(),
+                t_normal.as_str(),
+                t_low.as_str(),
+            ]
+        );
+        assert_eq!(inbox["projects"][0]["channel"], "#two");
+        assert_eq!(inbox["projects"][1]["channel"], "#one");
+        let one_inbox_ids: Vec<&str> = inbox["projects"][1]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            one_inbox_ids,
+            vec![t_high.as_str(), t_normal.as_str(), t_low.as_str()]
+        );
+
+        // Non-PM worker cannot change task priority (403 Scope::Pm or 400).
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_low}/priority"),
+            worker_tok,
+            json!({ "priority": "urgent" }),
+        )
+        .await?;
+        assert!(status == 403 || status == 400);
+
+        // Lead without PM role cannot change an unrelated task's priority.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_low}/priority"),
+            lead_tok,
+            json!({ "priority": "urgent" }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // PM bumps t_low to urgent -> it moves ahead of t_urgent (created earlier, FIFO tie-break).
+        let (status, updated) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_low}/priority"),
+            pm_tok,
+            json!({ "priority": "urgent" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(updated["task"]["priority"], "urgent");
+
+        let (_, inbox_after) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        let dispatch_after: Vec<&str> = inbox_after["inbox"]["dispatch_queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dispatch_after,
+            vec![
+                t_low.as_str(),
+                t_urgent.as_str(),
+                t_high.as_str(),
+                t_normal.as_str(),
+            ]
+        );
+        assert_eq!(inbox_after["inbox"]["next_task"]["id"], t_low);
         Ok(())
     }
 }

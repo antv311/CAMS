@@ -192,6 +192,12 @@ pub struct WakeContext {
     pub event: Option<String>,
     /// Account id that caused the triggering event (for example, the DM sender).
     pub triggered_by: Option<String>,
+    /// Priority of the task triggering this wake (`urgent`, `high`, `normal`, `low`).
+    pub priority: Option<String>,
+}
+
+fn wake_priority_rank(ctx: &WakeContext) -> u8 {
+    crate::tasks::priority_rank(ctx.priority.as_deref().unwrap_or("normal"))
 }
 
 struct PendingWake {
@@ -1077,12 +1083,18 @@ impl WakeManager {
             let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
             let slot = slots.entry(ctx.principal_id.clone()).or_default();
             if slot.running {
-                let result = if slot.pending.is_some() {
-                    "coalesced"
-                } else {
-                    "queued"
+                let result = match slot.pending.as_ref() {
+                    Some(existing) => {
+                        if wake_priority_rank(&ctx) <= wake_priority_rank(&existing.ctx) {
+                            slot.pending = Some(PendingWake { ctx, queued_at });
+                        }
+                        "coalesced"
+                    }
+                    None => {
+                        slot.pending = Some(PendingWake { ctx, queued_at });
+                        "queued"
+                    }
                 };
-                slot.pending = Some(PendingWake { ctx, queued_at });
                 self.metrics.record_wake_request(result);
                 return Ok(true);
             }
@@ -1217,6 +1229,13 @@ impl WakeManager {
                 "task_title",
                 task.as_ref()
                     .map(|task| task.title.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "task_priority",
+                task.as_ref()
+                    .map(|task| task.priority.clone())
+                    .or_else(|| ctx.priority.clone())
                     .unwrap_or_default(),
             ),
             (
@@ -2195,6 +2214,50 @@ mod tests {
         assert!(wakes.request(channel_ctx("agent-b", "agent-a", "#cams"))?);
         wait_until_idle(&wakes, "agent-a").await;
         assert!(!wakes.request(dm_ctx("agent-a", "agent-b"))?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_wake_coalescing_preserves_highest_priority() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes.upsert("agent-a", fast_launcher(true))?;
+
+        // Hold the slot running without spawning a long external process.
+        {
+            let mut slots = wakes.slots.lock().unwrap();
+            slots.entry("agent-a".into()).or_default().running = true;
+        }
+
+        let make_task_ctx = |task_id: &str, priority: &str| WakeContext {
+            principal_id: "agent-a".into(),
+            nick: "agent-a".into(),
+            reason: format!("task {task_id} ({priority})"),
+            channel: "#cams".into(),
+            task_id: Some(task_id.into()),
+            priority: Some(priority.into()),
+            ..Default::default()
+        };
+
+        assert!(wakes.request(make_task_ctx("task_low", "low"))?);
+        assert!(wakes.request(make_task_ctx("task_urgent", "urgent"))?);
+        // A later normal or low wake must not downgrade the pending urgent wake.
+        assert!(wakes.request(make_task_ctx("task_normal", "normal"))?);
+        assert!(wakes.request(make_task_ctx("task_low_2", "low"))?);
+
+        {
+            let slots = wakes.slots.lock().unwrap();
+            let pending = slots["agent-a"].pending.as_ref().unwrap();
+            assert_eq!(pending.ctx.task_id.as_deref(), Some("task_urgent"));
+            assert_eq!(pending.ctx.priority.as_deref(), Some("urgent"));
+        }
+
+        // Another urgent wake updates to the latest urgent context.
+        assert!(wakes.request(make_task_ctx("task_urgent_2", "urgent"))?);
+        {
+            let slots = wakes.slots.lock().unwrap();
+            let pending = slots["agent-a"].pending.as_ref().unwrap();
+            assert_eq!(pending.ctx.task_id.as_deref(), Some("task_urgent_2"));
+        }
         Ok(())
     }
 }

@@ -108,6 +108,7 @@ pub struct RepoView {
 pub struct TaskView {
     pub id: String,
     pub kind: String,
+    pub priority: String,
     pub status: String,
     pub assignee: String,
     pub title: String,
@@ -787,6 +788,7 @@ async fn refresh(
                 .map(|t| TaskView {
                     id: text(&t["id"]),
                     kind: text(&t["kind"]),
+                    priority: t["priority"].as_str().unwrap_or("normal").to_string(),
                     status: text(&t["status"]),
                     assignee: t["assignee"]
                         .as_str()
@@ -1011,12 +1013,17 @@ pub fn task_detail_lines(body: &Value, parent: Option<&Value>, pm: Option<&str>)
             None => id.to_string(),
         },
     };
+    let priority_suffix = task["priority"]
+        .as_str()
+        .map(|p| format!("   priority {p}"))
+        .unwrap_or_default();
     let mut lines = vec![
         format!("{}  [{}]", text(&task["title"]), text(&task["kind"])),
         format!(
-            "{}   status {}   assignee {}",
+            "{}   status {}{}   assignee {}",
             text(&task["channel"]),
             text(&task["status"]),
+            priority_suffix,
             or_dash(&task["assignee"])
         ),
         format!(
@@ -2885,6 +2892,15 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
                     .and_then(|room| snap.projects[*p].rooms.iter().find(|r| r.channel == room))
                     .map(|r| r.label.clone())
                     .unwrap_or_default();
+                let priority_span = match task.priority.as_str() {
+                    "urgent" => Span::styled(
+                        "[urgent] ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    "high" => Span::styled("[high] ", Style::default().fg(Color::Yellow)),
+                    "low" => Span::styled("[low] ", dim()),
+                    _ => Span::raw(""),
+                };
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -2894,6 +2910,7 @@ fn draw_task_list(frame: &mut Frame, app: &mut App, snap: &Snapshot, bottom: Rec
                     Span::styled(format!("@{:<14}", task.assignee), bold()),
                     Span::styled(format!("{sprint:<4}"), Style::default().fg(Color::Magenta)),
                     Span::styled(branch, dim()),
+                    priority_span,
                     Span::raw(format!("[{}] {}", task.kind, task.title)),
                     Span::styled(
                         format!("  {}", task.id.chars().take(13).collect::<String>()),

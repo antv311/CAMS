@@ -136,6 +136,34 @@
     return 'badge-muted';
   }
 
+  function priorityBadgeClass(priority) {
+    switch (priority) {
+      case 'urgent':
+        return 'badge-danger';
+      case 'high':
+        return 'badge-warn';
+      case 'low':
+        return 'badge-muted';
+      default:
+        return 'badge-accent';
+    }
+  }
+
+  function priorityRank(priority) {
+    switch (priority) {
+      case 'urgent':
+        return 0;
+      case 'high':
+        return 1;
+      case 'normal':
+        return 2;
+      case 'low':
+        return 3;
+      default:
+        return 2;
+    }
+  }
+
   function statusGroupOf(status) {
     if (status === 'open' || status === 'assigned') return 'backlog';
     if (status === 'claimed' || status === 'in_progress' || status === 'testing') return 'active';
@@ -420,33 +448,36 @@
   function filteredTasks() {
     if (!state.snapshot) return [];
     const q = state.search.trim().toLowerCase();
-    return (state.snapshot.tasks || []).filter((t) => {
-      if (state.statusGroup !== 'all' && statusGroupOf(t.status) !== state.statusGroup) {
-        return false;
-      }
-      if (state.assigneeFilter) {
-        const owner = (t.assignee || t.claimed_by || '').toLowerCase();
-        if (owner !== state.assigneeFilter.toLowerCase()) return false;
-      }
-      if (!q) return true;
-      const hay = [
-        t.id,
-        t.title,
-        t.status,
-        t.kind,
-        t.assignee,
-        t.claimed_by,
-        t.reviewer,
-        t.branch,
-        t.repo,
-        t.sprint,
-        t.channel,
-      ]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase();
-      return hay.includes(q);
-    });
+    return (state.snapshot.tasks || [])
+      .filter((t) => {
+        if (state.statusGroup !== 'all' && statusGroupOf(t.status) !== state.statusGroup) {
+          return false;
+        }
+        if (state.assigneeFilter) {
+          const owner = (t.assignee || t.claimed_by || '').toLowerCase();
+          if (owner !== state.assigneeFilter.toLowerCase()) return false;
+        }
+        if (!q) return true;
+        const hay = [
+          t.id,
+          t.title,
+          t.status,
+          t.kind,
+          t.priority,
+          t.assignee,
+          t.claimed_by,
+          t.reviewer,
+          t.branch,
+          t.repo,
+          t.sprint,
+          t.channel,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return hay.includes(q);
+      })
+      .sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority));
   }
 
   function renderTasks() {
@@ -503,6 +534,7 @@
             <thead>
               <tr>
                 <th>Task</th>
+                <th>Priority</th>
                 <th>Status</th>
                 <th>Kind</th>
                 <th>Sprint</th>
@@ -518,12 +550,14 @@
                   const owner = t.assignee || t.claimed_by;
                   const isRunning = owner && runningAgents.has(owner.toLowerCase());
                   const hasQ = qMap.has(t.id);
+                  const prio = t.priority || 'normal';
                   return `
                     <tr class="clickable" data-task-id="${esc(t.id)}">
                       <td>
                         <div class="task-title">${esc(t.title)}</div>
                         <div class="small mono muted">${esc(shortId(t.id))}${hasQ ? ' · <span style="color:var(--danger)">question pending</span>' : ''}</div>
                       </td>
+                      <td><span class="badge ${priorityBadgeClass(prio)}">${esc(prio)}</span></td>
                       <td><span class="badge ${statusBadgeClass(t.status)}">${esc(t.status)}</span></td>
                       <td><span class="badge ${kindBadgeClass(t.kind)}">${esc(t.kind)}</span></td>
                       <td class="mono small">${esc(t.sprint || t.channel)}</td>
@@ -563,9 +597,11 @@
                       const owner = t.assignee || t.claimed_by;
                       const isRunning = owner && runningAgents.has(owner.toLowerCase());
                       const pq = qMap.get(t.id);
+                      const prio = t.priority || 'normal';
                       return `
                         <div class="task-card" data-task-id="${esc(t.id)}">
                           <div class="task-card-top">
+                            <span class="badge ${priorityBadgeClass(prio)}">${esc(prio)}</span>
                             <span class="badge ${statusBadgeClass(t.status)}">${esc(t.status)}</span>
                             <span class="badge ${kindBadgeClass(t.kind)}">${esc(t.kind)}</span>
                           </div>
@@ -867,8 +903,10 @@
       els.modalSubtitle.textContent = `${t.id} · ${t.channel}${t.sprint ? ' · ' + t.sprint : ''}`;
       els.modalTitle.textContent = t.title;
 
+      const prio = t.priority || 'normal';
       els.modalBody.innerHTML = `
         <div class="detail-grid">
+          <div class="detail-item"><span>Priority</span><span><span class="badge ${priorityBadgeClass(prio)}">${esc(prio)}</span></span></div>
           <div class="detail-item"><span>Status</span><span><span class="badge ${statusBadgeClass(t.status)}">${esc(t.status)}</span></span></div>
           <div class="detail-item"><span>Kind</span><span><span class="badge ${kindBadgeClass(t.kind)}">${esc(t.kind)}</span></span></div>
           <div class="detail-item"><span>Assignee</span><span>${t.assignee ? '@' + esc(t.assignee) : (t.claimed_by ? '@' + esc(t.claimed_by) : '—')}</span></div>

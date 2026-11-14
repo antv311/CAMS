@@ -879,6 +879,7 @@ def cmd_task(args: argparse.Namespace) -> int:
                 " ".join(args.title),
                 body=args.body,
                 kind=args.kind,
+                priority=args.priority,
                 assignee=args.assign,
                 repo=args.repo,
                 branch=args.branch,
@@ -889,7 +890,8 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         t = data["task"]
         owner = f" -> @{t['assignee']}" if t.get("assignee") else ""
-        lines = [f"Created {t['kind']} {t['id']} in {t['channel']}{owner}: {t['title']}"]
+        prio = f" [{t['priority']}]" if t.get("priority") and t["priority"] != "normal" else ""
+        lines = [f"Created {t['kind']} {t['id']}{prio} in {t['channel']}{owner}: {t['title']}"]
         if t.get("parent_task_id"):
             lines.append(f"  subtask of {t['parent_task_id']}")
         if t.get("reviewer"):
@@ -906,6 +908,17 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (assignee={t.get('assignee') or '-'})"])
+        return 0
+    if args.task_cmd == "priority":
+        data = http_json(
+            server,
+            "POST",
+            f"/v1/tasks/{urllib.parse.quote(args.id)}/priority",
+            token=token,
+            payload={"priority": args.priority},
+        )
+        t = data["task"]
+        print_out(args, data, [f"Task {t['id']} priority -> {t.get('priority', 'normal')}"])
         return 0
     if args.task_cmd == "status":
         note = review_note(server, token, args) if args.status == "review" else args.note
@@ -962,7 +975,7 @@ def cmd_task(args: argparse.Namespace) -> int:
         t = data["task"]
         lines = [
             f"{t['id']} [{t['kind']}/{t['status']}] {t['channel']}: {t['title']}",
-            f"assignee={t.get('assignee') or '-'} repo={t.get('repo') or '-'} "
+            f"assignee={t.get('assignee') or '-'} priority={t.get('priority') or 'normal'} repo={t.get('repo') or '-'} "
             f"branch={t.get('branch') or '-'} issue={t.get('issue_url') or '-'} sprint={t.get('sprint') or '-'}",
         ]
         if t.get("parent_task_id") or t.get("reviewer"):
@@ -1044,10 +1057,14 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         return 0
     if args.task_cmd == "list":
-        qs = urllib.parse.urlencode({"channel": args.channel})
+        params = {"channel": args.channel}
+        if getattr(args, "priority", None):
+            params["priority"] = args.priority
+        qs = urllib.parse.urlencode(params)
         data = http_json(server, "GET", f"/v1/tasks?{qs}", token=token)
         lines = [
-            f"{t['id']} [{t['status']}] claimed_by={t.get('claimed_by') or '-'}: {t['title']}"
+            f"{t['id']} [{t.get('priority') or 'normal'}/{t['status']}] "
+            f"assignee={t.get('assignee') or t.get('claimed_by') or '-'}: {t['title']}"
             for t in data.get("tasks", [])
         ]
         print_out(args, data, lines or [f"No tasks in {args.channel}."])
@@ -1518,11 +1535,11 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             lines.append(f"  repo {repo['name']}: {repo['local_path']}")
         for t in proj.get("tasks", []):
             lines.append(
-                f"  {t['id']} [{t['kind']}/{t['status']}] sprint={t.get('sprint') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
+                f"  {t['id']} [{t['kind']}/{t['status']}] priority={t.get('priority') or 'normal'} sprint={t.get('sprint') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
             )
         for t in proj.get("to_review", []):
             lines.append(
-                f"  REVIEW {t['id']} [{t.get('status', 'review')}] by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
+                f"  REVIEW {t['id']} [{t.get('status', 'review')}] priority={t.get('priority') or 'normal'} by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
             )
             if t.get("review_round"):
                 r = t["review_round"]
@@ -2850,6 +2867,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("title", nargs="+")
     p_tc.add_argument("--body", help="Full description; enough that a new assignee need not read the chat")
     p_tc.add_argument("--kind", choices=["task", "bug", "feature"], default="task")
+    p_tc.add_argument("--priority", choices=["urgent", "high", "normal", "low"], help="Dispatch priority (default normal)")
     p_tc.add_argument("--assign", metavar="NICK", help="Project member to give the task to")
     p_tc.add_argument("--repo")
     p_tc.add_argument("--branch")
@@ -2862,6 +2880,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_tas.add_argument("id")
     p_tas.add_argument("nick", nargs="?")
     p_tas.set_defaults(func=cmd_task)
+
+    p_tpr_set = task_sub.add_parser("priority", help="Set a task's dispatch priority")
+    p_tpr_set.add_argument("id")
+    p_tpr_set.add_argument("priority", choices=["urgent", "high", "normal", "low"])
+    p_tpr_set.set_defaults(func=cmd_task)
 
     p_tst = task_sub.add_parser("status", help="Move a task: in_progress, testing, review (needs --note with your test report), changes_requested, merged, cancelled")
     p_tst.add_argument("id")
@@ -2916,6 +2939,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_tl = task_sub.add_parser("list")
     p_tl.add_argument("channel", nargs="?", default="#general")
+    p_tl.add_argument("--priority", choices=["urgent", "high", "normal", "low"], help="Filter by priority")
     p_tl.set_defaults(func=cmd_task)
 
     for action in ("claim", "done", "release"):
