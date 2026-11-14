@@ -621,6 +621,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/reports/{id}", get(get_report))
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/export", get(export_tasks))
+        .route("/v1/tasks/batch", post(create_task_batch))
+        .route("/v1/tasks/bulk-status", post(bulk_task_status))
         .route("/v1/tasks/{id}/claim", post(claim_task))
         .route("/v1/tasks/{id}/done", post(done_task))
         .route("/v1/tasks/{id}/release", post(release_task))
@@ -3294,37 +3296,127 @@ async fn create_task(
     Json(req): Json<CreateTaskReq>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks")?.principal;
-    let raw_channel = req.channel.as_deref().ok_or_else(|| {
-        ApiError::bad_request("channel is required: name the project channel this task belongs to")
-    })?;
-    let channel = normalize_http_channel(raw_channel);
     let task = state
         .server
-        .create_task_full_api(
-            &actor,
-            crate::tasks::NewTask {
-                channel,
-                title: req.title,
-                body: req.body,
-                kind: req.kind,
-                priority: req.priority,
-                assignee: req.assignee,
-                created_by: None,
-                repo: req.repo,
-                branch: req.branch,
-                issue_url: req.issue_url,
-                sprint: None,
-                reviewer: req.reviewer,
-                parent_task_id: req.parent_task_id,
-                blocked_by: req.blocked_by.unwrap_or_default(),
-                timeout_seconds: req.timeout_seconds,
-            },
-        )
+        .create_task_full_api(&actor, req.into_new()?)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
         StatusCode::CREATED,
         with_cors_headers(),
         Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+impl CreateTaskReq {
+    fn into_new(self) -> Result<crate::tasks::NewTask, ApiError> {
+        let channel = self.channel.as_deref().ok_or_else(|| {
+            ApiError::bad_request(
+                "channel is required: name the project channel this task belongs to",
+            )
+        })?;
+        let channel = normalize_http_channel(channel);
+        Ok(crate::tasks::NewTask {
+            channel,
+            title: self.title,
+            body: self.body,
+            kind: self.kind,
+            priority: self.priority,
+            assignee: self.assignee,
+            created_by: None,
+            repo: self.repo,
+            branch: self.branch,
+            issue_url: self.issue_url,
+            sprint: None,
+            reviewer: self.reviewer,
+            parent_task_id: self.parent_task_id,
+            blocked_by: self.blocked_by.unwrap_or_default(),
+            timeout_seconds: self.timeout_seconds,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTaskBatchReq {
+    tasks: Vec<BatchTaskReq>,
+}
+
+#[derive(Deserialize)]
+struct BatchTaskReq {
+    key: Option<String>,
+    #[serde(flatten)]
+    task: CreateTaskReq,
+}
+
+async fn create_task_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateTaskBatchReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/batch")?.principal;
+    let entries = req
+        .tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            Ok(crate::server::BatchNewTask {
+                key: entry.key,
+                task: entry.task.into_new().map_err(|err| {
+                    ApiError::bad_request(format!("tasks[{index}]: {}", err.message))
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let (tasks, task_ids) = state
+        .server
+        .create_task_batch_api(&actor, entries)
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true, "tasks": tasks, "task_ids": task_ids,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BulkTaskStatusReq {
+    updates: Vec<crate::server::TaskStatusChange>,
+}
+
+async fn bulk_task_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BulkTaskStatusReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let scope = if req.updates.iter().any(|entry| {
+        !matches!(
+            entry
+                .status
+                .trim()
+                .to_ascii_lowercase()
+                .replace('-', "_")
+                .as_str(),
+            "in_progress" | "testing" | "review"
+        )
+    }) {
+        Scope::Pm
+    } else {
+        Scope::Write
+    };
+    let actor =
+        authenticate_scoped_request(&state, &headers, scope, "/v1/tasks/bulk-status")?.principal;
+    let tasks = state
+        .server
+        .bulk_task_status_api(&actor, req.updates)
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "tasks": tasks })),
     ))
 }
 
@@ -5278,6 +5370,7 @@ mod tests {
     include!("http_group_activity_tests.rs");
     include!("http_task_cascade_tests.rs");
     include!("http_task_timeout_tests.rs");
+    include!("http_task_batch_tests.rs");
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
     include!("http_alerts_tests.rs");

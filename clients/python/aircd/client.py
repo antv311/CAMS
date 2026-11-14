@@ -747,6 +747,22 @@ class AircdHttpClient:
         )
         return self._request("POST", "/v1/tasks", payload=payload)["task"]
 
+    def create_task_batch(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        """Atomically create 1..100 tasks; return ``tasks`` and local ``task_ids``.
+
+        Each item accepts the create-task HTTP fields and an optional ``key``.
+        Use ``$key`` in blocked_by or parent_task_id to reference a batch item.
+        """
+        return self._request("POST", "/v1/tasks/batch", payload={"tasks": tasks})
+
+    def bulk_task_status(self, updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Atomically apply 1..100 distinct task_id/status updates in list order.
+
+        Each item also accepts note, branch, report_body, report_id and commit.
+        The hub enforces the same permissions and evidence as set_task_status.
+        """
+        return self._request("POST", "/v1/tasks/bulk-status", payload={"updates": updates})["tasks"]
+
     def task_heartbeat(self, task_id: str) -> dict[str, Any]:
         """Renew this task's execution interval as its current executing holder."""
         path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/heartbeat"
