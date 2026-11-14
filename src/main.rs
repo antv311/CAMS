@@ -1,4 +1,5 @@
 mod auth;
+mod config;
 mod gits;
 mod history;
 mod http;
@@ -60,7 +61,7 @@ fn resolve_register_key(
     if let Some(key) = explicit {
         return Ok((
             Some(key.trim().to_string()),
-            "invite key required (from flag/env)".to_string(),
+            "invite key required (from flag/env/config)".to_string(),
         ));
     }
     if db_path == ":memory:" {
@@ -90,7 +91,10 @@ fn resolve_register_key(
         .with_context(|| format!("write owner invite key: {}", key_path.display()))?;
     Ok((
         Some(key),
-        format!("invite key required (new key written to {})", key_path.display()),
+        format!(
+            "invite key required (new key written to {})",
+            key_path.display()
+        ),
     ))
 }
 
@@ -102,55 +106,17 @@ async fn main() -> Result<()> {
         return tui::run(argv[1..].to_vec()).await;
     }
 
-    let mut bind_addr = std::env::var("AIRCD_BIND").unwrap_or_else(|_| "127.0.0.1:6667".to_string());
-    let mut http_bind =
-        std::env::var("AIRCD_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:6680".to_string());
-    let mut db_path = std::env::var("AIRCD_DB").unwrap_or_else(|_| "aircd.sqlite3".to_string());
-    let mut tls_cert = std::env::var("AIRCD_TLS_CERT").ok();
-    let mut tls_key = std::env::var("AIRCD_TLS_KEY").ok();
-    let mut tls_bind =
-        std::env::var("AIRCD_TLS_BIND").unwrap_or_else(|_| "127.0.0.1:6697".to_string());
-
-    let mut register_key = std::env::var("AIRCD_REGISTER_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty());
-    let mut open_registration = matches!(
-        std::env::var("AIRCD_OPEN_REGISTRATION").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes")
-    );
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--bind" => {
-                bind_addr = args.next().context("--bind requires host:port")?;
-            }
-            "--http-bind" => {
-                http_bind = args.next().context("--http-bind requires host:port")?;
-            }
-            "--db" => {
-                db_path = args.next().context("--db requires file path")?;
-            }
-            "--tls-cert" => {
-                tls_cert = Some(args.next().context("--tls-cert requires path")?);
-            }
-            "--tls-key" => {
-                tls_key = Some(args.next().context("--tls-key requires path")?);
-            }
-            "--tls-bind" => {
-                tls_bind = args.next().context("--tls-bind requires host:port")?;
-            }
-            "--register-key" => {
-                register_key = Some(args.next().context("--register-key requires a key")?);
-            }
-            "--open-registration" => {
-                open_registration = true;
-            }
-            "-h" | "--help" => {
-                println!(
+    if argv
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        println!(
                     "aircd - Lightweight IRC + Webhook + Roles + Equipment Locks + Git server\n\
                      Run `aircd tui` to open the dashboard and chat for a running hub.\n\
+                     Settings: flags > environment > aircd.toml > defaults.\n\
+                     Config: AIRCD_CONFIG or AIRCD_CONFIG_DIR/aircd.toml (see aircd.toml.example).\n\
                      Flags:\n  \
+                       --config <path>         Editable server TOML (env AIRCD_CONFIG)\n  \
                        --bind <host:port>       IRC TCP listen address (env AIRCD_BIND, default 127.0.0.1:6667)\n  \
                        --http-bind <host:port>  HTTP welcome & REST API (env AIRCD_HTTP_BIND, default 127.0.0.1:6680)\n  \
                        --db <path>              SQLite database path (env AIRCD_DB, default aircd.sqlite3)\n  \
@@ -161,13 +127,18 @@ async fn main() -> Result<()> {
                                                 default: generated once in aircd-owner.key beside the DB)\n  \
                        --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)"
                 );
-                return Ok(());
-            }
-            other => {
-                anyhow::bail!("unknown argument: {other} (use --help)");
-            }
-        }
+        return Ok(());
     }
+    let config::ServerConfig {
+        bind: bind_addr,
+        http_bind,
+        db: db_path,
+        tls_cert,
+        tls_key,
+        tls_bind,
+        register_key,
+        open_registration,
+    } = config::ServerConfig::load(&argv)?;
 
     let (register_key, register_note) =
         resolve_register_key(register_key, open_registration, &db_path)?;

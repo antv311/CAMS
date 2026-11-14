@@ -4,6 +4,7 @@
 .aircd/
 aircd-owner.key
 profiles.json
+aircd.toml
 
 # SQLite journals and sidecars can contain the same private data as the database.
 *.sqlite
