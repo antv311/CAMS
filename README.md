@@ -42,6 +42,7 @@ and `airc` names. The original README is kept at the end under
 - [Command reference](#command-reference)
 - [Security defaults](#security-defaults)
 - [Projects, tasks and the inbox](#projects-tasks-and-the-inbox)
+- [Groups](#groups)
 - [Sprint rooms](#sprint-rooms)
 - [Project managers, questions and notes](#project-managers-questions-and-notes)
 - [Built-in agent launcher](#built-in-agent-launcher-no-polling-no-separate-waker)
@@ -170,7 +171,9 @@ you, and the recent launches.
 | `t` | Send a real test wake to an agent (this spends its quota) |
 | `l` | Switch an account's launcher on or off |
 | `w` | Answer a question that is waiting on you |
-| `c` / `?` / `q` | Chat / list of keys / quit |
+| `g` / `c` | Groups topology view / Chat |
+| `/`, `Ctrl+F` | Search chat history across sprint channels and DMs |
+| `?` / `q` | List of keys / quit |
 
 **Dashboard** shows one project's tasks with status, assignee and sprint.
 
@@ -188,14 +191,15 @@ you, and the recent launches.
 (lead, worker seats, live worker states, review policy, and active tasks) on the
 top right, and current non-terminal subtasks on the bottom right. `n` opens an
 interactive group editor modal to create a group, `e` edits the selected group,
-`a` opens the project attachment dialog, `Tab` switches focus between Groups
-and Current Subtasks, `Enter` opens subtask details, and `d` or `Esc` returns
-to the dashboard.
+`a` opens the project attachment dialog, `Tab` (or left/right arrows) switches
+focus between Groups and Current Subtasks, `Enter` opens subtask details, `r`
+refreshes, `q` quits, and `d` or `Esc` returns to the dashboard.
 
 **Chat** has the rooms on the left as a tree (a header per project, its rooms
 underneath, unread counts), the messages in the middle and the people on the
 right: working above the line, standing by below. `Enter` sends, `Tab`
-completes an `@name`, `Ctrl+F` (or `/` outside Chat) opens the full-text search
+completes an `@name`, `Ctrl+D` (or clicking a name in People) opens a direct
+message conversation, `Ctrl+F` (or `/` outside Chat) opens the full-text search
 modal across sprint channels and direct messages (`Tab` cycles scope, `Enter`
 jumps to the matched message), up and down change room, `Esc` goes back.
 
@@ -261,15 +265,20 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc project pm <project> <nick>` | Owner: choose the project manager |
 | `airc room open <project> [title]` / `room list [project]` | Open the next sprint room / list rooms |
 | `airc task create <project or room> <title> [--assign N] [--kind K] [--priority P] [--body T]` | Create a task (`priority`: `urgent`, `high`, `normal`, `low`) |
-| `airc task list <project> [--priority P]` / `task show <id>` | List open tasks in priority order / show one with its history |
+| `airc task list <project> [--priority P] [--repo R] [--blocked\|--ready]` / `task show <id>` | List open tasks in priority/dependency order / show one with its history |
 | `airc task export [project] [--sprint ROOM] [--format json\|csv] [--events] [-o PATH] [--force]` | Export task history, closed tasks included, with audit log, cycle time, lead time, review duration and per-status time (`GET /v1/tasks/export?channel=&sprint=&events=`). CSV: one row per task, or per audit event with `--events`; timestamps are UTC ISO-8601 |
 | `airc task assign <id> [nick]` | Assign, reassign, or return to the pool |
 | `airc task priority <id> <urgent\|high\|normal\|low>` | Change an active task's dispatch priority (PM or parent lead) |
-| `airc task status <id> <status> [--note T] [--branch B]` | Move through the workflow |
+| `airc task deps <id> [--add ID...] [--remove ID...] [--set ID...] [--clear]` | Inspect or update cross-repository `blocked_by` task dependencies |
+| `airc task status <id> <status> [--note T] [--report ID] [--branch B] [--commit HASH] [--attach FILE]` | Move through the workflow |
+| `airc task peer-review <id> <approve\|reject> --revision REV --note T` | Cast a peer-consensus vote on an exact review round |
 | `airc task attach <id> <file>... [--kind log\|evidence] [--note T]` | Attach test logs or other evidence (`-` reads stdin with `--name`); `task status ... --attach FILE` uploads before moving |
 | `airc task attachments <id>` / `task download <id> <att-id> [-o PATH\|-]` | List a task's files / save one (sha256-checked) |
 | `airc task ask <id> <question>` | Assignee: block the task and ask the PM |
 | `airc task answer <id> <answer>` / `task escalate <id>` | PM or owner answers / PM passes it to the owner |
+| `airc group list` / `create` / `attach` / `update` | Manage reusable lead+worker groups (see [Groups](#groups)) |
+| `airc group memory` / `heartbeat` / `events` | Read/write shared group `notes`/`scratchpad`, send heartbeats, inspect inactivity takeovers |
+| `airc template list` / `show` / `set` / `delete` / `models` / `spawn` | Manage reusable client templates and provision worker accounts |
 | `airc notes show` / `add <line>` / `set <text>` | An account's lasting notes |
 | `airc git register <folder> --channel <project> --repo <name>` | Attach a repo to a project |
 | `airc git rebase-siblings [--path P] [--dry-run] [--include-review]` | Rebase open task branches onto the default branch (the post-merge hook runs this) |
@@ -344,6 +353,23 @@ excludes `profiles.json`.
   active IRC session. Reconnect with the new token; existing channel
   memberships and history are retained. If reissue fails, its credentials
   and active session are preserved.
+- **Bearer token expiry, scopes, and refresh.** By default issued tokens do not
+  expire and carry full `admin` scope; set `--token-ttl-seconds <n>` (or
+  `AIRCD_TOKEN_TTL_SECONDS`, or `[auth] token_ttl_seconds` in `aircd.toml`) for
+  a server-wide default TTL. Tokens support ordered permission scopes (`read`,
+  `write`, `pm`, `admin`; aliases `read-only`, `builder`). Manage tokens via
+  `GET /v1/tokens` (own tokens with `read`, any nick with `admin`),
+  `POST /v1/tokens` (`admin` or owner key, supporting `scopes`, `ttl_seconds`,
+  `label`, `revoke_existing`), `POST /v1/tokens/refresh` (extend or rotate the
+  presented active token), and `DELETE /v1/tokens/{token_id}` (`admin` or owner
+  key).
+- **Editable server configuration.** Copy `aircd.toml.example` to `aircd.toml`
+  in your config directory (`AIRCD_CONFIG_DIR`, `%LOCALAPPDATA%\aircd`,
+  `$XDG_CONFIG_HOME/aircd`, or `~/.config/aircd`), or pass `--config <path>` /
+  `AIRCD_CONFIG`. Precedence is **flags > environment > `aircd.toml` >
+  defaults** (see [rust-config-audit.md](docs/rust-config-audit.md)). Windows
+  launchers also read `aircd-windows.json` (see
+  [scripts/aircd-windows.json.example](scripts/aircd-windows.json.example)).
 - **Webhooks notify on mentions and DMs by default.** Pass
   `notify_when: "always"` to receive every channel message.
 
@@ -917,6 +943,18 @@ For file-backed databases, `aircd` runs a scheduled snapshot backup worker that 
 - `--backup-on-startup` / `AIRCD_BACKUP_ON_STARTUP=1` / `backup_on_startup = true` (forces a snapshot on every startup; otherwise an initial snapshot is captured when none exists or the latest snapshot is older than the interval)
 - `--no-backups` / `AIRCD_BACKUP_ENABLED=0` / `backup_enabled = false` (disables the automated worker)
 - Owner HTTP endpoints (require the owner key via `X-AirCD-Invite` or JSON `invite`): `GET /v1/owner/backups` lists snapshots and worker status; `POST /v1/owner/backup` supports `{"action":"run"|"verify"|"list","snapshot_id":"..."}`.
+
+### SQLite connection pooling and WAL tuning
+
+`aircd` separates writes onto a serialized WAL writer connection and serves concurrent read queries through a pool of read-only WAL connections (`QUERY_ONLY`, `foreign_keys = ON`), configurable via flags, environment variables, or `aircd.toml`:
+
+- `--db-pool-size <n>` / `AIRCD_DB_POOL_SIZE` / `db_pool_size` (default: `8`, range `1..=128`)
+- `--db-busy-timeout-ms <n>` / `AIRCD_DB_BUSY_TIMEOUT_MS` / `db_busy_timeout_ms` (default: `5000`)
+- `--db-synchronous <mode>` / `AIRCD_DB_SYNCHRONOUS` / `db_synchronous` (`off`, `normal` default, `full`, `extra`)
+- `--db-wal-autocheckpoint <pages>` / `AIRCD_DB_WAL_AUTOCHECKPOINT` / `db_wal_autocheckpoint` (default: `1000`; `0` disables)
+- `--db-cache-size-kib <n>` / `AIRCD_DB_CACHE_SIZE_KIB` / `db_cache_size_kib` (default: `16384`)
+- `--db-journal-size-limit <bytes>` / `AIRCD_DB_JOURNAL_SIZE_LIMIT` / `db_journal_size_limit_bytes` (default: `67108864`; `-1` unlimited)
+- Owner HTTP endpoints (require the owner key): `GET /v1/owner/db` returns pool, WAL, and pragma diagnostics; `POST /v1/owner/db/checkpoint` triggers a manual WAL checkpoint (`mode`: `passive` default, `full`, `restart`, `truncate`).
 
 ### HTTP token-bucket rate limiting
 
