@@ -296,6 +296,216 @@ class BionicToolsTests(unittest.TestCase):
         self.assertIn("timed out", res["error"])
 
 
+class BionicWorkspaceJailTests(unittest.TestCase):
+    """Workspace root jail and tool approval modes."""
+
+    def setUp(self) -> None:
+        self.outer = tempfile.TemporaryDirectory()
+        self.addCleanup(self.outer.cleanup)
+        base = Path(self.outer.name).resolve()
+        self.root = base / "repo"
+        self.root.mkdir()
+        (self.root / "inside.txt").write_text("inside\n", encoding="utf-8")
+        self.secret = base / "secret.txt"
+        self.secret.write_text("top secret\n", encoding="utf-8")
+        self.cwd = str(self.root)
+
+    def _call(self, name: str, args: dict[str, Any], **kw: Any) -> Any:
+        out = bionic.exec_tool(name, args, self.cwd, **kw)
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            return out
+
+    def test_file_tools_reject_paths_outside_root(self) -> None:
+        escapes = [
+            "../secret.txt",
+            "sub/../../secret.txt",
+            str(self.secret),
+            "~/bionic-jail-probe.txt",
+        ]
+        if os.name == "nt":
+            escapes += [str(self.secret).replace("\\", "/"), "\\bionic-jail-probe.txt"]
+        for path in escapes:
+            with self.subTest(path=path):
+                read = self._call("read_file", {"path": path})
+                self.assertIsInstance(read, dict)
+                self.assertTrue(read.get("denied"), read)
+                self.assertNotIn("top secret", json.dumps(read))
+                wrote = self._call("write_file", {"path": path, "content": "pwned"})
+                self.assertTrue(wrote.get("denied"), wrote)
+                edited = self._call("edit_file", {"path": path, "target": "top", "replacement": "x"})
+                self.assertTrue(edited.get("denied"), edited)
+        self.assertEqual(self.secret.read_text(encoding="utf-8"), "top secret\n")
+        self.assertFalse((Path.home() / "bionic-jail-probe.txt").exists())
+        self.assertFalse((self.root.parent / "pwned").exists())
+
+    def test_paths_inside_root_still_work(self) -> None:
+        self.assertEqual(self._call("read_file", {"path": "inside.txt"}), "inside\n")
+        self.assertEqual(self._call("read_file", {"path": str(self.root / "inside.txt")}), "inside\n")
+        self.assertEqual(self._call("read_file", {"path": "a/../inside.txt"}), "inside\n")
+        res = self._call("write_file", {"path": "new/dir/f.txt", "content": "ok"})
+        self.assertTrue(res["ok"])
+        self.assertTrue((self.root / "new" / "dir" / "f.txt").is_file())
+
+    def test_symlink_escape_is_denied(self) -> None:
+        link = self.root / "link"
+        try:
+            if os.name == "nt":
+                # Junctions need no privileges on Windows, unlike symlinks.
+                proc = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(self.root.parent)],
+                    capture_output=True,
+                )
+                if proc.returncode != 0:
+                    self.skipTest("cannot create junction")
+            else:
+                link.symlink_to(self.root.parent, target_is_directory=True)
+        except OSError:
+            self.skipTest("cannot create symlink")
+        res = self._call("read_file", {"path": "link/secret.txt"})
+        self.assertTrue(res.get("denied"), res)
+        res = self._call("write_file", {"path": "link/planted.txt", "content": "x"})
+        self.assertTrue(res.get("denied"), res)
+        self.assertFalse((self.root.parent / "planted.txt").exists())
+
+    def test_workspace_root_wider_than_cwd(self) -> None:
+        sub = self.root / "pkg"
+        sub.mkdir()
+        res = bionic.exec_tool("read_file", {"path": "../inside.txt"}, str(sub), workspace_root=self.cwd)
+        self.assertEqual(res, "inside\n")
+        res = json.loads(
+            bionic.exec_tool("read_file", {"path": "../../secret.txt"}, str(sub), workspace_root=self.cwd)
+        )
+        self.assertTrue(res["denied"])
+        # cwd outside the root is refused outright
+        res = json.loads(bionic.exec_tool("read_file", {"path": "x"}, str(self.root.parent), workspace_root=self.cwd))
+        self.assertIn("outside workspace root", res["error"])
+
+    def test_check_command_allows_workspace_commands(self) -> None:
+        ok = [
+            "git status",
+            "git log --format=%H -1 -- src/main.rs",
+            f'"{sys.executable}" -m unittest tests.test_x',
+            "airc --profile w1 task status task_1 review --branch feat/x --note \"ran tests/unit ok\"",
+            "airc --server http://127.0.0.1:6680 inbox",
+            "cat sub/../inside.txt > out/log.txt 2>&1",
+            "echo hi > /dev/null" if os.name != "nt" else "echo hi > nul",
+            "ls ./src | grep rs && cargo test",
+        ]
+        if os.name == "nt":
+            ok.append("dir /b /s")
+        for cmd in ok:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(bionic.check_command(cmd, self.cwd))
+
+    def test_check_command_blocks_escapes(self) -> None:
+        bad = [
+            "cat ../secret.txt",
+            f'type "{self.secret}"',
+            f"cat {self.secret.as_posix()}",
+            "cd .. && ls",
+            "ls ~",
+            "cat ~/.ssh/id_rsa",
+            "echo x > ../planted.txt",
+            "git -C .. status",
+            "cp inside.txt --target-directory=../",
+            "cat $HOME/.bashrc",
+            "cat $(echo ../secret.txt)",
+            "cat `echo x`",
+            "rm -rf /etc/passwd",
+        ]
+        if os.name == "nt":
+            bad += [r"type C:\Windows\win.ini", r"type \\server\share\x", r"type %USERPROFILE%\x"]
+        for cmd in bad:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(bionic.check_command(cmd, self.cwd))
+
+    def test_run_command_denied_before_execution(self) -> None:
+        marker = self.root.parent / "ran.txt"
+        cmd = f'"{sys.executable}" -c "open(\'ran.txt\', \'w\').close()" && echo x > ../ran.txt'
+        res = self._call("run_command", {"command": cmd})
+        self.assertTrue(res["denied"], res)
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.root / "ran.txt").exists())
+
+    def test_read_only_mode(self) -> None:
+        for name, args in (
+            ("run_command", {"command": "echo hi"}),
+            ("write_file", {"path": "x.txt", "content": "x"}),
+            ("edit_file", {"path": "inside.txt", "target": "inside", "replacement": "x"}),
+        ):
+            with self.subTest(tool=name):
+                res = self._call(name, args, approval="read-only")
+                self.assertTrue(res["denied"])
+                self.assertIn("read-only", res["error"])
+        self.assertFalse((self.root / "x.txt").exists())
+        self.assertEqual(self._call("read_file", {"path": "inside.txt"}, approval="read-only"), "inside\n")
+        names = {t["function"]["name"] for t in bionic.tools_for_approval("read-only")}
+        self.assertEqual(names, {"read_file"})
+        self.assertEqual(len(bionic.tools_for_approval("auto")), len(bionic.TOOLS))
+
+    def test_prompt_mode_uses_approver(self) -> None:
+        seen: list[str] = []
+
+        def deny(name: str, args: dict[str, Any]) -> bool:
+            seen.append(name)
+            return False
+
+        res = self._call("write_file", {"path": "x.txt", "content": "x"}, approval="prompt", approver=deny)
+        self.assertTrue(res["denied"])
+        self.assertIn("rejected", res["error"])
+        self.assertFalse((self.root / "x.txt").exists())
+
+        res = self._call(
+            "write_file", {"path": "x.txt", "content": "x"}, approval="prompt", approver=lambda n, a: True
+        )
+        self.assertTrue(res["ok"])
+
+        # Reads never prompt; jail violations are denied without asking.
+        self.assertEqual(self._call("read_file", {"path": "inside.txt"}, approval="prompt", approver=deny), "inside\n")
+        res = self._call("write_file", {"path": "../p.txt", "content": "x"}, approval="prompt", approver=deny)
+        self.assertTrue(res["denied"])
+        self.assertEqual(seen, ["write_file"])
+
+    def test_prompt_mode_without_terminal_denies(self) -> None:
+        with mock.patch("builtins.open", side_effect=OSError("no tty")):
+            self.assertFalse(bionic.tty_approver("run_command", {"command": "echo"}))
+
+    def test_config_workspace_root_and_approval(self) -> None:
+        parser = bionic.build_parser()
+        sub = self.root / "pkg"
+        sub.mkdir()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BIONIC_WORKSPACE_ROOT", None)
+            os.environ.pop("BIONIC_APPROVAL", None)
+            cfg = bionic.resolve_config(parser.parse_args(["--cwd", str(sub), "--list-models"]))
+            self.assertEqual(cfg.workspace_root, str(sub))
+            self.assertEqual(cfg.approval, "auto")
+            cfg = bionic.resolve_config(
+                parser.parse_args(
+                    ["--cwd", str(sub), "--workspace-root", self.cwd, "--approval", "read-only", "--list-models"]
+                )
+            )
+            self.assertEqual(cfg.workspace_root, self.cwd)
+            self.assertEqual(cfg.approval, "read-only")
+            os.environ["BIONIC_APPROVAL"] = "prompt"
+            os.environ["BIONIC_WORKSPACE_ROOT"] = self.cwd
+            cfg = bionic.resolve_config(parser.parse_args(["--cwd", str(sub), "--list-models"]))
+            self.assertEqual((cfg.workspace_root, cfg.approval), (self.cwd, "prompt"))
+            os.environ["BIONIC_APPROVAL"] = "yolo"
+            with self.assertRaises(bionic.BionicError):
+                bionic.resolve_config(parser.parse_args(["--cwd", str(sub), "--list-models"]))
+            os.environ.pop("BIONIC_APPROVAL")
+            with self.assertRaises(bionic.BionicError):
+                bionic.resolve_config(
+                    parser.parse_args(["--cwd", str(self.root.parent), "--workspace-root", self.cwd, "--list-models"])
+                )
+        prompt = bionic.build_system_prompt(self.cwd, workspace_root=self.cwd, approval="read-only")
+        self.assertIn("workspace root", prompt)
+        self.assertIn("read-only", prompt)
+
+
 class BionicServerLoopTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = _FakeBionicServer()

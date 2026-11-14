@@ -151,6 +151,8 @@ class BionicConfig:
     session_dir: Optional[str] = None
     emit_session_id: bool = False
     verbose: bool = False
+    workspace_root: str = ""
+    approval: str = "auto"
 
 
 @dataclass
@@ -225,6 +227,17 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
     cwd_path = Path(cwd_raw).expanduser().resolve()
     if not cwd_path.is_dir():
         raise BionicError(f"working directory does not exist: {cwd_path}")
+
+    root_raw = getattr(args, "workspace_root", None) or os.environ.get("BIONIC_WORKSPACE_ROOT", "").strip()
+    root_path = Path(root_raw).expanduser().resolve() if root_raw else cwd_path
+    if not root_path.is_dir():
+        raise BionicError(f"workspace root does not exist: {root_path}")
+    if not is_within(cwd_path, root_path):
+        raise BionicError(f"working directory {cwd_path} is outside workspace root {root_path}")
+
+    approval = (getattr(args, "approval", None) or os.environ.get("BIONIC_APPROVAL", "").strip() or "auto").lower()
+    if approval not in APPROVAL_MODES:
+        raise BionicError(f"approval mode must be one of {', '.join(APPROVAL_MODES)}, got {approval!r}")
 
     max_turns = getattr(args, "max_turns", None)
     if max_turns is None:
@@ -309,15 +322,157 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
         session_dir=session_dir,
         emit_session_id=emit_session_id,
         verbose=verbose,
+        workspace_root=str(root_path),
+        approval=approval,
     )
 
 
-def resolve_path(cwd: str, path_str: str) -> Path:
-    """Resolve a path relative to ``cwd`` when it is not absolute."""
+class WorkspaceViolation(ValueError):
+    """Raised when a tool call targets a path outside the workspace root."""
+
+
+def _real(path: Path) -> Path:
+    """Fully resolve ``path`` (following symlinks/junctions) without requiring existence."""
+    return Path(os.path.realpath(path))
+
+
+def is_within(path: Path, root: Path) -> bool:
+    """Return True when the fully resolved ``path`` is ``root`` or lies beneath it."""
+    real_path = _real(path)
+    real_root = _real(root)
+    return real_path == real_root or real_root in real_path.parents
+
+
+def resolve_path(cwd: str, path_str: str, workspace_root: Optional[str] = None) -> Path:
+    """Resolve ``path_str`` against ``cwd`` and enforce the workspace jail.
+
+    The result is fully resolved (``..`` segments collapsed and symlinks or
+    junctions followed), so traversal, absolute paths, ``~`` and links that
+    point outside ``workspace_root`` (default: ``cwd``) raise
+    :class:`WorkspaceViolation`.
+    """
     if not isinstance(path_str, str) or not path_str.strip():
         raise ValueError("path must be a non-empty string")
+    if "\x00" in path_str:
+        raise ValueError("path must not contain NUL characters")
+    root = Path(workspace_root or cwd)
     p = Path(path_str).expanduser()
-    return p if p.is_absolute() else Path(cwd) / p
+    # Path(cwd) / p also handles drive-relative ("D:x") and rooted ("\\x") Windows forms.
+    full = _real(Path(cwd) / p)
+    if not is_within(full, root):
+        raise WorkspaceViolation(f"Path {path_str!r} resolves to {full}, outside workspace root {_real(root)}")
+    return full
+
+
+APPROVAL_MODES = ("auto", "prompt", "read-only")
+MUTATING_TOOLS = frozenset({"run_command", "write_file", "edit_file"})
+
+# Splits a command line into quoted strings, shell operators, and bare words.
+_CMD_TOKEN_RE = re.compile(r'"[^"]*"?|\'[^\']*\'?|&&|\|\||>>|[|;&<>()]|[^\s"\'|;&<>()]+')
+_SEGMENT_BREAKS = frozenset({"&&", "||", "|", ";", "&", "(", ")"})
+_REDIRECTS = frozenset({">", ">>", "<"})
+_DEVICE_PATHS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin", "nul", "con"})
+_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+_WIN_SWITCH_RE = re.compile(r"^/[^/\\]*$")
+_NESTED_SHELL_RE = re.compile(r"\$\(|`")
+
+
+def _looks_like_path(value: str) -> bool:
+    if not value or "://" in value:
+        return False
+    if value.startswith(("/", "\\", "~")) or _WIN_DRIVE_RE.match(value):
+        return True
+    if "$" in value or "%" in value:
+        return True
+    parts = re.split(r"[\\/]", value)
+    return ".." in parts or len(parts) > 1
+
+
+def check_command(command: str, cwd: str, workspace_root: Optional[str] = None) -> Optional[str]:
+    """Best-effort static check that a shell command stays inside the workspace.
+
+    Returns a human-readable reason when the command references a path outside
+    ``workspace_root`` (default: ``cwd``), otherwise ``None``. The executable in
+    each pipeline segment may live anywhere (so ``python``, ``git`` or an
+    absolute interpreter path still work); every argument, redirect target and
+    ``--flag=value`` that looks like a path must resolve inside the root.
+    Commands can still escape through interpreted code (for example
+    ``python -c``), so this complements, not replaces, OS-level sandboxing.
+    """
+    root = workspace_root or cwd
+    on_windows = os.name == "nt"
+    if _NESTED_SHELL_RE.search(command):
+        return "command substitution ($(...) or backticks) is not allowed"
+    expect_executable = True
+    for raw in _CMD_TOKEN_RE.findall(command):
+        if raw in _SEGMENT_BREAKS:
+            expect_executable = True
+            continue
+        if raw in _REDIRECTS:
+            continue
+        token = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'" else raw.strip("\"'")
+        if expect_executable:
+            expect_executable = False
+            # Leading VAR=value assignments are not the executable.
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                expect_executable = True
+                token = token.split("=", 1)[1]
+            else:
+                continue
+        candidates = [token]
+        if token.startswith("-"):
+            candidates = [token.split("=", 1)[1]] if "=" in token else []
+        elif "=" in token and not _looks_like_path(token.split("=", 1)[0]):
+            candidates = [token.split("=", 1)[1]]
+        for cand in candidates:
+            if not _looks_like_path(cand) or cand.lower() in _DEVICE_PATHS:
+                continue
+            if on_windows and _WIN_SWITCH_RE.match(cand) and not _WIN_DRIVE_RE.match(cand):
+                continue  # cmd.exe switch such as /b or /s
+            expanded = os.path.expandvars(cand)
+            if on_windows:
+                expanded = re.sub(r"%([^%]+)%", lambda m: os.environ.get(m.group(1), m.group(0)), expanded)
+            if re.search(r"\$\{?[A-Za-z_]|%[A-Za-z_][^%]*%", expanded):
+                return f"argument {cand!r} references an unknown environment variable path"
+            try:
+                resolve_path(cwd, expanded, root)
+            except (WorkspaceViolation, ValueError, OSError):
+                return f"argument {cand!r} resolves outside workspace root {_real(Path(root))}"
+    return None
+
+
+def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
+    if name == "run_command":
+        return f"run_command: {args.get('command')}"
+    if name == "write_file":
+        content = args.get("content")
+        size = len(content) if isinstance(content, str) else 0
+        return f"write_file: {args.get('path')} ({size} chars)"
+    if name == "edit_file":
+        return f"edit_file: {args.get('path')}"
+    return f"{name}: {json.dumps(args)[:200]}"
+
+
+def tty_approver(name: str, args: dict[str, Any]) -> bool:
+    """Ask the operator on the controlling terminal; deny when none is attached."""
+    in_dev, out_dev = ("CONIN$", "CONOUT$") if os.name == "nt" else ("/dev/tty", "/dev/tty")
+    try:
+        with open(in_dev, "r", encoding="utf-8", errors="replace") as tin, open(
+            out_dev, "w", encoding="utf-8", errors="replace"
+        ) as tout:
+            tout.write(f"[approval] Allow {_describe_tool_call(name, args)}? [y/N] ")
+            tout.flush()
+            answer = tin.readline()
+    except OSError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def tools_for_approval(approval: str) -> list[dict[str, Any]]:
+    """Return the tool schemas the model should see for an approval mode."""
+    if approval == "read-only":
+        return [t for t in TOOLS if t["function"]["name"] not in MUTATING_TOOLS]
+    return TOOLS
 
 
 def _decode_output(data: str | bytes | None) -> str:
@@ -336,10 +491,71 @@ def exec_tool(
     command_timeout: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
     max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
     log: Optional[Callable[[str], None]] = None,
+    workspace_root: Optional[str] = None,
+    approval: str = "auto",
+    approver: Optional[Callable[[str, dict[str, Any]], bool]] = None,
 ) -> str:
-    """Execute one agent tool call and serialize its result as text/JSON."""
+    """Execute one agent tool call and serialize its result as text/JSON.
+
+    Every file path and command argument is confined to ``workspace_root``
+    (default: ``cwd``). ``approval`` controls mutating tools: ``auto`` runs
+    them, ``read-only`` refuses them, and ``prompt`` asks ``approver``
+    (default: :func:`tty_approver`) before each one.
+    """
     if not isinstance(args, dict):
         return json.dumps({"error": f"Tool {name} arguments must be a JSON object"})
+    if approval not in APPROVAL_MODES:
+        return json.dumps({"error": f"Unknown approval mode {approval!r}"})
+    root = workspace_root or cwd
+    if not is_within(Path(cwd), Path(root)):
+        return json.dumps({"error": f"Working directory {cwd} is outside workspace root {root}"})
+
+    try:
+        return _exec_tool_jailed(
+            name,
+            args,
+            cwd,
+            root,
+            command_timeout=command_timeout,
+            max_output_chars=max_output_chars,
+            log=log,
+            approval=approval,
+            approver=approver,
+        )
+    except WorkspaceViolation as err:
+        if log:
+            log(f"[jail] denied {name}: {err}")
+        return json.dumps({"error": f"Denied: {err}", "denied": True})
+
+
+def _exec_tool_jailed(
+    name: str,
+    args: dict[str, Any],
+    cwd: str,
+    root: str,
+    *,
+    command_timeout: float,
+    max_output_chars: int,
+    log: Optional[Callable[[str], None]],
+    approval: str,
+    approver: Optional[Callable[[str, dict[str, Any]], bool]],
+) -> str:
+    if name in MUTATING_TOOLS:
+        if approval == "read-only":
+            return json.dumps({"error": f"Denied: {name} is disabled in read-only approval mode", "denied": True})
+        if name == "run_command":
+            cmd = args.get("command")
+            if isinstance(cmd, str) and cmd.strip():
+                reason = check_command(cmd, cwd, root)
+                if reason:
+                    raise WorkspaceViolation(reason)
+        else:
+            resolve_path(cwd, str(args.get("path") or ""), root)
+        if approval == "prompt":
+            if not (approver or tty_approver)(name, args):
+                if log:
+                    log(f"[approval] rejected {_describe_tool_call(name, args)}")
+                return json.dumps({"error": f"Denied: operator rejected {name}", "denied": True})
 
     if name == "run_command":
         cmd = args.get("command")
@@ -386,7 +602,7 @@ def exec_tool(
         content = args.get("content")
         if not isinstance(content, str):
             return json.dumps({"error": "write_file requires a string 'content'"})
-        target = resolve_path(cwd, str(path_val or ""))
+        target = resolve_path(cwd, str(path_val or ""), root)
         if log:
             log(f"[tool] write_file: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -401,7 +617,7 @@ def exec_tool(
             return json.dumps({"error": "edit_file requires a non-empty string 'target'"})
         if not isinstance(replacement, str):
             return json.dumps({"error": "edit_file requires a string 'replacement'"})
-        target = resolve_path(cwd, str(path_val or ""))
+        target = resolve_path(cwd, str(path_val or ""), root)
         if not target.exists():
             return json.dumps({"error": f"File not found: {target}"})
         if target.is_dir():
@@ -426,7 +642,7 @@ def exec_tool(
         return json.dumps({"ok": True, "path": str(target)})
 
     if name == "read_file":
-        target = resolve_path(cwd, str(args.get("path") or ""))
+        target = resolve_path(cwd, str(args.get("path") or ""), root)
         if not target.exists():
             return json.dumps({"error": f"File not found: {target}"})
         if target.is_dir():
@@ -563,19 +779,37 @@ def resolve_model(config: BionicConfig) -> str:
     return model
 
 
-def build_system_prompt(cwd: str, custom_prompt: Optional[str] = None) -> str:
+def build_system_prompt(
+    cwd: str,
+    custom_prompt: Optional[str] = None,
+    *,
+    workspace_root: Optional[str] = None,
+    approval: str = "auto",
+) -> str:
     """Build the system prompt for the Bionic coding agent."""
     if custom_prompt is not None:
         return custom_prompt
     os_name = platform.system() or os.name
+    root = workspace_root or cwd
+    if approval == "read-only":
+        tool_line = (
+            "You are in read-only mode: only the read_file tool is available, so inspect "
+            "files and report findings without attempting changes."
+        )
+    else:
+        tool_line = (
+            "Use the provided tools (run_command, read_file, write_file, edit_file) "
+            "to inspect files, make changes, run coordination commands (such as `airc`), "
+            "and verify tests before replying."
+        )
     parts = [
         f"You are an autonomous coding agent running on {os_name}.",
         f"Your working directory is {cwd}.",
         (
-            "Use the provided tools (run_command, read_file, write_file, edit_file) "
-            "to inspect files, make changes, run coordination commands (such as `airc`), "
-            "and verify tests before replying."
+            f"All file paths and command arguments must stay inside the workspace root {root}; "
+            "tool calls that reference paths outside it are denied."
         ),
+        tool_line,
         (
             "Read files before modifying them, prefer edit_file for targeted changes, "
             "and never fabricate command output or file contents. When finished, give "
@@ -635,10 +869,16 @@ def run_agent(
     config: BionicConfig,
     *,
     log: Optional[Callable[[str], None]] = None,
+    approver: Optional[Callable[[str, dict[str, Any]], bool]] = None,
 ) -> RunResult:
     """Run the OpenAI tool-calling loop until a final response or ``max_turns``."""
     model = resolve_model(config)
-    system_prompt = build_system_prompt(config.cwd, config.system_prompt)
+    system_prompt = build_system_prompt(
+        config.cwd,
+        config.system_prompt,
+        workspace_root=config.workspace_root or config.cwd,
+        approval=config.approval,
+    )
     chat_url = normalize_base_url(config.base_url) + "/chat/completions"
 
     active_session_id = config.session_id
@@ -663,7 +903,7 @@ def run_agent(
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "tools": TOOLS,
+            "tools": tools_for_approval(config.approval),
             "tool_choice": "auto",
         }
         if config.temperature is not None:
@@ -726,6 +966,9 @@ def run_agent(
                         command_timeout=config.command_timeout,
                         max_output_chars=config.max_output_chars,
                         log=log,
+                        workspace_root=config.workspace_root or config.cwd,
+                        approval=config.approval,
+                        approver=approver,
                     )
                 except Exception as exc:
                     result = json.dumps({"error": str(exc)})
@@ -764,6 +1007,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cwd",
         help="Working directory for file and shell tools (env: BIONIC_CWD, default: current directory)",
+    )
+    parser.add_argument(
+        "--workspace-root",
+        help=(
+            "Directory that file and command tools are jailed to; must contain --cwd "
+            "(env: BIONIC_WORKSPACE_ROOT, default: the working directory)"
+        ),
+    )
+    parser.add_argument(
+        "--approval",
+        choices=APPROVAL_MODES,
+        help=(
+            "Tool approval mode: auto runs jailed tools unattended, prompt asks on the "
+            "terminal before each run_command/write_file/edit_file (denied when no terminal), "
+            "read-only exposes only read_file (env: BIONIC_APPROVAL, default: auto)"
+        ),
     )
     parser.add_argument(
         "--max-turns",
