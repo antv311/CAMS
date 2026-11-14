@@ -1,6 +1,11 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$ScriptConfigModule = Join-Path $PSScriptRoot 'AircdConfig.psm1'
+if (Test-Path -LiteralPath $ScriptConfigModule -PathType Leaf) {
+    Import-Module $ScriptConfigModule -Force
+}
+
 # Start-Process and Scheduled Task arguments follow Windows CommandLineToArgvW
 # rules, including embedded quotes and trailing backslashes.
 function Join-AircdServiceArguments {
@@ -57,12 +62,13 @@ function Test-AircdNumericBind {
 
 function New-AircdServiceConfig {
     param(
-        [string]$RepoRoot,
+        [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
+        [string]$ConfigPath = '',
         [string]$Name = 'CAMS-Aircd',
         [string]$TaskPath = '\',
         [string]$Bind = '127.0.0.1:6667',
         [string]$HttpBind = '127.0.0.1:6680',
-        [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3",
+        [string]$DbPath = '',
         [switch]$OpenRegistration,
         [string]$RegisterKey = '',
         [string]$TlsCert = '',
@@ -70,6 +76,26 @@ function New-AircdServiceConfig {
         [string]$TlsBind = '127.0.0.1:6697',
         [string]$ExecutablePath = ''
     )
+
+    $Overrides = @{}
+    foreach ($Key in @('Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath')) {
+        if ($PSBoundParameters.ContainsKey($Key)) {
+            $Overrides[$Key] = $PSBoundParameters[$Key]
+        }
+    }
+
+    $ResolvedCfg = Resolve-AircdWindowsConfig -RepoRoot $RepoRoot -ConfigPath $ConfigPath -Overrides $Overrides
+    $Name = $ResolvedCfg.Name
+    $TaskPath = $ResolvedCfg.TaskPath
+    $Bind = $ResolvedCfg.Bind
+    $HttpBind = $ResolvedCfg.HttpBind
+    $DbPath = $ResolvedCfg.DbPath
+    $OpenRegistration = [bool]$ResolvedCfg.OpenRegistration
+    $RegisterKey = $ResolvedCfg.RegisterKey
+    $TlsCert = $ResolvedCfg.TlsCert
+    $TlsKey = $ResolvedCfg.TlsKey
+    $TlsBind = $ResolvedCfg.TlsBind
+    $ExecutablePath = $ResolvedCfg.ExecutablePath
 
     if ([string]::IsNullOrWhiteSpace($Name) -or $Name -notmatch '^[A-Za-z0-9._-]{1,64}$') {
         throw "Invalid service/task name '$Name'. Use 1-64 characters from [A-Za-z0-9._-]."
@@ -84,7 +110,7 @@ function New-AircdServiceConfig {
 
     if ($DbPath -eq ':memory:') { throw 'Autonomous service installation requires a persistent database path.' }
     $FullDbPath = [IO.Path]::GetFullPath($DbPath)
-    $FullRepoRoot = [IO.Path]::GetFullPath($RepoRoot)
+    $FullRepoRoot = $ResolvedCfg.RepoRoot
 
     $ServerArgs = @('--bind', $Bind, '--http-bind', $HttpBind, '--db', $FullDbPath)
     if ($OpenRegistration) { $ServerArgs += '--open-registration' }
@@ -118,6 +144,9 @@ function New-AircdServiceConfig {
         Name            = $Name
         TaskPath        = $TaskPath
         RepoRoot        = $FullRepoRoot
+        ConfigPath      = $ResolvedCfg.ConfigPath
+        Mode            = $ResolvedCfg.Mode
+        Trigger         = $ResolvedCfg.Trigger
         Bind            = $Bind
         HttpBind        = $HttpBind
         DbPath          = $FullDbPath

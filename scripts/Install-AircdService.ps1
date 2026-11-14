@@ -19,6 +19,8 @@ Use -Mode Service (requires Administrator) to install a true Windows Service
 with automatic startup and SCM crash recovery.
 #>
 param(
+    [string]$ConfigPath = '',
+
     [ValidateSet('Auto', 'ScheduledTask', 'Service')]
     [string]$Mode = 'Auto',
 
@@ -29,7 +31,7 @@ param(
     [string]$TaskPath = '\',
     [string]$Bind = '127.0.0.1:6667',
     [string]$HttpBind = '127.0.0.1:6680',
-    [string]$DbPath = "$env:LOCALAPPDATA\aircd\aircd.sqlite3",
+    [string]$DbPath = '',
     [switch]$OpenRegistration,
     [string]$RegisterKey = '',
     [string]$TlsCert = '',
@@ -71,19 +73,25 @@ if ($StartNow -and ($Uninstall -or $Stop -or $Status)) {
 
 Import-Module (Join-Path $PSScriptRoot 'AircdService.psm1') -Force
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$Config = New-AircdServiceConfig `
-    -RepoRoot $RepoRoot `
-    -Name $Name `
-    -TaskPath $TaskPath `
-    -Bind $Bind `
-    -HttpBind $HttpBind `
-    -DbPath $DbPath `
-    -OpenRegistration:$OpenRegistration `
-    -RegisterKey $RegisterKey `
-    -TlsCert $TlsCert `
-    -TlsKey $TlsKey `
-    -TlsBind $TlsBind `
-    -ExecutablePath $ExecutablePath
+$CfgParams = @{ RepoRoot = $RepoRoot }
+foreach ($Key in @('ConfigPath', 'Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath')) {
+    if ($PSBoundParameters.ContainsKey($Key)) {
+        $CfgParams[$Key] = $PSBoundParameters[$Key]
+    }
+}
+$Config = New-AircdServiceConfig @CfgParams
+if (-not $PSBoundParameters.ContainsKey('Mode')) {
+    if ($Config.Mode -notin @('Auto', 'ScheduledTask', 'Service')) {
+        throw "Invalid configured service mode '$($Config.Mode)'. Expected Auto, ScheduledTask, or Service."
+    }
+    $Mode = $Config.Mode
+}
+if (-not $PSBoundParameters.ContainsKey('Trigger')) {
+    if ($Config.Trigger -notin @('Auto', 'AtStartup', 'AtLogOn')) {
+        throw "Invalid configured service trigger '$($Config.Trigger)'. Expected Auto, AtStartup, or AtLogOn."
+    }
+    $Trigger = $Config.Trigger
+}
 
 if ($Status) {
     $Report = Get-AircdServiceStatusReport -Config $Config -Mode $Mode

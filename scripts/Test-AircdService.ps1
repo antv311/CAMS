@@ -23,6 +23,13 @@ $Config = $null
 $Unrelated = $null
 $OtherProc = $null
 
+$SavedEnv = @{}
+foreach ($EnvName in @('AIRCD_CONFIG_DIR', 'AIRCD_DATA_DIR', 'AIRCD_CONFIG', 'AIRCD_WINDOWS_CONFIG', 'AIRCD_EXECUTABLE', 'AIRCD_BIND', 'AIRCD_HTTP_BIND', 'AIRCD_DB', 'AIRCD_OPEN_REGISTRATION', 'AIRCD_REGISTER_KEY', 'AIRCD_TLS_CERT', 'AIRCD_TLS_KEY', 'AIRCD_TLS_BIND', 'AIRCD_SERVICE_NAME', 'AIRCD_TASK_PATH', 'AIRCD_SERVICE_MODE', 'AIRCD_SERVICE_TRIGGER')) {
+    $Item = Get-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+    $SavedEnv[$EnvName] = if ($null -ne $Item) { $Item.Value } else { $null }
+    Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+}
+
 function Assert($Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
@@ -89,8 +96,11 @@ function Stop-TestProcesses {
 try {
     New-Item -ItemType Directory -Path `
         (Join-Path $TestRoot 'scripts'), `
+        (Join-Path $TestRoot 'isolated-config'), `
         (Join-Path $TestRoot 'target\release'), `
         (Join-Path $TestRoot 'target\debug') -Force | Out-Null
+    $env:AIRCD_CONFIG_DIR = Join-Path $TestRoot 'isolated-config'
+    $env:AIRCD_DATA_DIR = Join-Path $TestRoot 'isolated-data'
     Copy-Item -Path (Join-Path $PSScriptRoot '*.ps1'), (Join-Path $PSScriptRoot '*.psm1') -Destination (Join-Path $TestRoot 'scripts')
 
     $Release = Join-Path $TestRoot 'target\release\aircd.exe'
@@ -122,6 +132,29 @@ try {
     Assert-Throws { New-AircdServiceConfig -RepoRoot $TestRoot -TlsCert 'only-cert.pem' } 'together'
     $MissingBuildCfg = New-AircdServiceConfig -RepoRoot (Join-Path $TestRoot 'no-build') -Name $TaskName -Bind "127.0.0.1:$IrcPort" -HttpBind "127.0.0.1:$HttpPort" -DbPath $Db
     Assert-Throws { Resolve-AircdServiceExecutable $MissingBuildCfg } 'No aircd build found'
+
+    # 1b. Editable config file + env + CLI precedence for service installer.
+    $SvcCfgFile = Join-Path $TestRoot 'service-config.json'
+    $SvcFileDb = Join-Path $TestRoot 'cfg-data\service-from-file.sqlite3'
+    @{
+        server = @{
+            bind              = "127.0.0.1:$IrcPort"
+            http_bind         = "127.0.0.1:$HttpPort"
+            db_path           = 'cfg-data\service-from-file.sqlite3'
+            open_registration = $true
+        }
+        service = @{
+            name = "$TaskName-File"
+        }
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SvcCfgFile -Encoding UTF8
+    $FromFileCfg = New-AircdServiceConfig -RepoRoot $TestRoot -ConfigPath $SvcCfgFile
+    Assert ($FromFileCfg.Name -eq "$TaskName-File" -and $FromFileCfg.DbPath -eq $SvcFileDb -and ($FromFileCfg.ServerArguments -contains '--open-registration')) 'Service config file settings were not loaded.'
+    $env:AIRCD_SERVICE_NAME = "$TaskName-Env"
+    $FromEnvStatus = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer -ConfigPath $SvcCfgFile -Status -Json) -join "`n" | ConvertFrom-Json
+    Assert ($FromEnvStatus.name -eq "$TaskName-Env" -and $FromEnvStatus.db_path -eq $SvcFileDb -and $FromEnvStatus.bind -eq "127.0.0.1:$IrcPort") 'Install-AircdService.ps1 did not honor Env > ConfigFile precedence.'
+    $FromCliStatus = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer -ConfigPath $SvcCfgFile -Name "$TaskName-Cli" -Status -Json) -join "`n" | ConvertFrom-Json
+    Assert ($FromCliStatus.name -eq "$TaskName-Cli") 'Install-AircdService.ps1 did not honor CLI > Env precedence.'
+    Remove-Item Env:\AIRCD_SERVICE_NAME -ErrorAction SilentlyContinue
 
     # 2. Elevation & install plan matrix (simulated elevated + non-elevated).
     $NonElevAuto = Resolve-AircdServiceInstallPlan -Mode Auto -Trigger Auto -IsElevated $false
@@ -276,6 +309,13 @@ try {
 
     Write-Host 'PASS: service config validation, elevation guards, Windows Service host class, real Scheduled Task lifecycle (start, session-independent svchost parent, persistence, idempotent reinstall, newest-build restart, port protection, stop, and uninstall preserving DB/logs).'
 } finally {
+    foreach ($EnvName in $SavedEnv.Keys) {
+        if ($null -eq $SavedEnv[$EnvName]) {
+            Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -LiteralPath "Env:\$EnvName" -Value $SavedEnv[$EnvName]
+        }
+    }
     if ($Unrelated) { try { $Unrelated.Stop() } catch {} }
     if ($OtherProc) {
         try {

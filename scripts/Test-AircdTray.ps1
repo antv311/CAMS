@@ -8,6 +8,12 @@ $TestRoot = Join-Path $TempRoot ('aircd tray test ' + [guid]::NewGuid())
 $Config = $null
 $Unrelated = $null
 $Tui = $null
+$SavedEnv = @{}
+foreach ($EnvName in @('AIRCD_CONFIG_DIR', 'AIRCD_DATA_DIR', 'AIRCD_CONFIG', 'AIRCD_WINDOWS_CONFIG', 'AIRCD_EXECUTABLE', 'AIRCD_BIND', 'AIRCD_HTTP_BIND', 'AIRCD_DB', 'AIRCD_OPEN_REGISTRATION', 'AIRCD_REGISTER_KEY', 'AIRCD_TLS_CERT', 'AIRCD_TLS_KEY', 'AIRCD_TLS_BIND', 'AIRCD_PROFILE', 'AIRCD_STARTUP_DIR')) {
+    $Item = Get-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+    $SavedEnv[$EnvName] = if ($null -ne $Item) { $Item.Value } else { $null }
+    Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+}
 function Assert($Condition, [string]$Message) { if (!$Condition) { throw $Message } }
 function Assert-Throws([scriptblock]$Action, [string]$Pattern) {
     try { & $Action } catch {
@@ -39,7 +45,9 @@ function Get-TestTrays {
 }
 try {
     Assert (Test-Path -LiteralPath $AircdExe) 'Build aircd first or pass -AircdExe.'
-    New-Item -ItemType Directory -Path (Join-Path $TestRoot 'scripts'), (Join-Path $TestRoot 'target\release'), (Join-Path $TestRoot 'target\debug') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $TestRoot 'scripts'), (Join-Path $TestRoot 'isolated-config'), (Join-Path $TestRoot 'target\release'), (Join-Path $TestRoot 'target\debug') -Force | Out-Null
+    $env:AIRCD_CONFIG_DIR = Join-Path $TestRoot 'isolated-config'
+    $env:AIRCD_DATA_DIR = Join-Path $TestRoot 'isolated-data'
     Copy-Item -Path (Join-Path $PSScriptRoot '*.ps1'), (Join-Path $PSScriptRoot '*.psm1') -Destination (Join-Path $TestRoot 'scripts')
     $Release = Join-Path $TestRoot 'target\release\aircd.exe'
     $Debug = Join-Path $TestRoot 'target\debug\aircd.exe'
@@ -59,6 +67,21 @@ try {
     Assert ((Get-AircdTrayMutexName $Config) -eq (Get-AircdTrayMutexName $Config)) 'Mutex identity changed.'
     Assert ((Invoke-AircdTrayAction $Config 'Status').State -eq 'Stopped') 'Initial status should be stopped.'
     Assert-Throws { Invoke-AircdTrayAction $Config 'Tui' } 'before launching'
+
+    # Editable config file + env + CLI precedence for tray config.
+    $TrayCfgFile = Join-Path $TestRoot 'tray-config.json'
+    @{
+        server = @{ bind = "127.0.0.1:$IrcPort"; http_bind = "127.0.0.1:$HttpPort"; db_path = 'tray-data\tray.sqlite3'; open_registration = $true }
+        tray   = @{ profile = 'cfg-profile' }
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $TrayCfgFile -Encoding UTF8
+    $TrayFromFile = New-AircdTrayConfig -RepoRoot $TestRoot -ConfigPath $TrayCfgFile
+    Assert ($TrayFromFile.Profile -eq 'cfg-profile' -and $TrayFromFile.DbPath -eq [IO.Path]::GetFullPath((Join-Path $TestRoot 'tray-data\tray.sqlite3')) -and ($TrayFromFile.ServerArguments -contains '--open-registration')) 'Tray config file was not loaded.'
+    $env:AIRCD_PROFILE = 'env-profile'
+    $TrayFromEnv = New-AircdTrayConfig -RepoRoot $TestRoot -ConfigPath $TrayCfgFile
+    Assert ($TrayFromEnv.Profile -eq 'env-profile') 'Tray config did not honor Env > ConfigFile.'
+    $TrayFromCli = New-AircdTrayConfig -RepoRoot $TestRoot -ConfigPath $TrayCfgFile -Profile 'cli-profile'
+    Assert ($TrayFromCli.Profile -eq 'cli-profile') 'Tray config did not honor CLI > Env.'
+    Remove-Item Env:\AIRCD_PROFILE -ErrorAction SilentlyContinue
 
     # Run real menu Click handlers against a real hub on private ports/database.
     $script:MenuResult = $null
@@ -191,6 +214,13 @@ public static class TrayTuiFixture {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer -StartupDirectory $Startup -Uninstall
     Assert ($LASTEXITCODE -eq 0 -and !(Test-Path -LiteralPath $ShortcutPath) -and (Test-Path -LiteralPath "$LegacyPath.before-tray")) 'Uninstall failed.'
 } finally {
+    foreach ($EnvName in $SavedEnv.Keys) {
+        if ($null -eq $SavedEnv[$EnvName]) {
+            Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -LiteralPath "Env:\$EnvName" -Value $SavedEnv[$EnvName]
+        }
+    }
     if ($Unrelated) { $Unrelated.Stop() }
     foreach ($TrayInfo in @(Get-TestTrays)) {
         $CleanupProcess = Get-Process -Id $TrayInfo.ProcessId -ErrorAction SilentlyContinue
