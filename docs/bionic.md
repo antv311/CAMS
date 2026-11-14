@@ -82,6 +82,9 @@ No paths, model IDs, or hostnames outside `localhost` are hardcoded.
 | `--max-output-chars` | `BIONIC_MAX_OUTPUT_CHARS` | `16000` | Truncation limit for `read_file` and `run_command` |
 | `--temperature` | `BIONIC_TEMPERATURE` | *(unset)* | Optional sampling temperature |
 | `--max-tokens` | `BIONIC_MAX_TOKENS` | *(unset)* | Optional completion token cap per turn |
+| `--token-budget` | `BIONIC_TOKEN_BUDGET` | *(unset)* | Stop before a new turn once the run has spent this many total tokens (see [Token budgets](#token-budgets-and-task-cost-accounting)) |
+| `--task` | `BIONIC_TASK_ID`, then `AIRCD_WAKE_TASK` | *(the woken task)* | Hub task billed for every turn; its budget (and its parents') is enforced |
+| `--no-report-usage` | `BIONIC_NO_USAGE_REPORT` | `false` | Do not send token usage to the hub task |
 | `--system-prompt` | `BIONIC_SYSTEM_PROMPT` | *(generated)* | Override default system prompt (or `--system-prompt-file`) |
 | `--session-id` | — | *(none)* | Persist/resume message history for a session ID |
 | `--session-dir` | `BIONIC_SESSION_DIR` | `<tempdir>/aircd-bionic-sessions` | Directory where session JSON files are stored |
@@ -171,6 +174,46 @@ renderer the CLI uses.
 Because `aircd` captures a worker's stderr into the wake transcript, enabling
 `BIONIC_STREAM` on a hub template makes those transcripts include the model's
 token stream; leave it off for templates unless you want that.
+
+### Token budgets and task cost accounting
+
+Every turn's `usage` (prompt, completion and total tokens) is counted. When the
+server sends no `usage`, Bionic estimates it from message sizes (about four
+characters per token) so a budget still holds.
+
+- **Run budget.** `--token-budget N` caps the total tokens of one run (or of a
+  whole REPL session). Before each turn Bionic checks what is left; once it is
+  spent the run stops with `TokenBudgetError` (a `MaxTurnsError` subclass),
+  the CLI exits with code **3**, and `--json` prints
+  `{"ok": false, "reason": "token_budget", "budget": {...}}`. A turn never asks
+  for more completion tokens than remain (`max_tokens` is lowered).
+- **Hub task billing.** With `--task ID`, or automatically when the hub wakes
+  the worker for a task (`AIRCD_WAKE_TASK`), each turn is sent to
+  `POST /v1/tasks/{id}/usage` with the session id and model. The hub keeps
+  the records and rolls them up through the subtask tree. The hub URL and
+  token come from `AIRCD_PROFILE` (or the profile named after `AIRC_NICK`),
+  `AIRCD_TOKEN`, and `AIRCD_HTTP_URL` / `AIRC_SERVER`, the same sources `airc`
+  uses. If there are no credentials or the hub can't be reached, Bionic prints
+  a warning and keeps running under the local budget.
+- **Task budgets.** A PM, or the lead who owns the parent task, sets a ceiling
+  with `airc task budget <id> <tokens>` (or `airc task create ... --token-budget N`).
+  A budget covers the task's whole subtree, and every ancestor's budget also
+  applies, so subtasks share their parent's allowance. Bionic reads the tightest
+  remaining allowance before its first turn and after each report. It refuses to
+  start, or stops before the next turn, once that allowance reaches zero.
+
+```bash
+airc task budget task_parent 200000          # PM: cap the parent and its subtasks
+airc-bionic --task task_child -p "Fix the flaky test"
+airc task usage task_parent                  # own / subtask / total tokens, sessions, budgets
+airc task budget task_parent none            # lift the cap
+```
+
+`RunResult.budget` (SDK) and the `budget` key of `--json` output carry the
+ledger snapshot: `token_budget`, `spent`, `remaining`, `limited_by`
+(`run` or `task <id>`), `estimated_turns`, and for hub tasks `task_id`,
+`reported_turns` and `task_total_tokens`. With `--stream-format jsonl` a
+`budget` event follows each turn.
 
 ### Interactive REPL and debug mode (`--repl`, `--debug`)
 

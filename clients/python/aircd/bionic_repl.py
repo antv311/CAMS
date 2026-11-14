@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -136,6 +137,8 @@ class BionicRepl:
         self.out = out if out is not None else sys.stdout
         self.messages: list[dict[str, Any]] = []
         self.usage: dict[str, int] = {}
+        #: One token budget / hub-task ledger for the whole REPL session.
+        self.ledger: Optional[bionic.TokenLedger] = None
         self._stepping = False
         self._registry: Any = None
         self._session_file: Optional[Path] = None
@@ -291,6 +294,12 @@ class BionicRepl:
             renderer(event)
 
         log = self.say if self.config.verbose else None
+        if self.ledger is None and (self.config.token_budget is not None or self.config.task_id):
+            self.ledger = bionic.ledger_for(
+                self.config,
+                session_id=self.config.session_id or f"repl-{uuid.uuid4().hex[:12]}",
+                log=log,
+            )
         try:
             result = bionic.run_agent(
                 prompt,
@@ -300,6 +309,7 @@ class BionicRepl:
                 on_event=on_event,
                 messages=self.messages,
                 before_tool=self.before_tool,
+                ledger=self.ledger,
             )
         except KeyboardInterrupt:
             del self.messages[mark:]
@@ -502,6 +512,8 @@ class BionicRepl:
             self.cmd_load(arg)
         elif cmd == "usage":
             self.say(json.dumps(self.usage) if self.usage else "no usage reported yet")
+            if self.ledger is not None:
+                self.say("budget: " + json.dumps(self.ledger.snapshot()))
         elif cmd == "tools":
             self.cmd_tools()
         elif cmd == "tool":

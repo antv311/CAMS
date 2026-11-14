@@ -22,6 +22,7 @@ mod store;
 mod task_metrics;
 mod tasks;
 mod tls;
+mod token_usage;
 mod tokens;
 mod tui;
 mod vacuum;

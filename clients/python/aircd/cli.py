@@ -398,6 +398,76 @@ def upload_attachments(
     return out
 
 
+def token_budget_arg(raw: str) -> int | None:
+    """`task budget` value: a positive integer, or none/off/clear to remove it."""
+    if raw.strip().lower() in ("none", "off", "clear", "null"):
+        return None
+    try:
+        value = int(raw.replace("_", "").replace(",", ""))
+    except ValueError:
+        raise CliError(f"token budget must be a positive integer or 'none', got {raw!r}") from None
+    if value < 1:
+        raise CliError(f"token budget must be a positive integer or 'none', got {raw!r}")
+    return value
+
+
+def token_summary_line(report: dict[str, Any]) -> str | None:
+    """One line for `task show`: spent tokens and the tightest budget, or None if neither."""
+    total = (report.get("total") or {}).get("total_tokens", 0)
+    if not total and not report.get("budgets"):
+        return None
+    sub = (report.get("subtasks") or {}).get("total_tokens", 0)
+    line = f"tokens: {total:,} total"
+    if sub:
+        line += f" ({(report.get('own') or {}).get('total_tokens', 0):,} own + {sub:,} in subtasks)"
+    if report.get("remaining") is not None:
+        state = "EXCEEDED" if report.get("exceeded") else "left"
+        line += f"; {report['remaining']:,} {state}"
+        if report.get("token_budget") is not None:
+            line += f" of budget {report['token_budget']:,}"
+        if report.get("limited_by") and report["limited_by"] != report.get("task_id"):
+            line += f" (limited by parent {report['limited_by']})"
+    return line
+
+
+def token_report_lines(report: dict[str, Any]) -> list[str]:
+    def counts(c: dict[str, Any]) -> str:
+        return (
+            f"{c.get('total_tokens', 0):,} total "
+            f"({c.get('prompt_tokens', 0):,} prompt / {c.get('completion_tokens', 0):,} completion)"
+        )
+
+    lines = [
+        f"Task {report['task_id']} tokens",
+        f"  own:      {counts(report.get('own') or {})}",
+        f"  subtasks: {counts(report.get('subtasks') or {})}",
+        f"  total:    {counts(report.get('total') or {})}",
+    ]
+    budgets = report.get("budgets") or []
+    if not budgets:
+        lines.append("  budget:   none (set one with: airc task budget <id> <tokens>)")
+    for b in budgets:
+        whose = "this task" if b["task_id"] == report["task_id"] else f"parent {b['task_id']}"
+        flag = "  EXCEEDED" if b["remaining"] <= 0 else ""
+        lines.append(
+            f"  budget:   {b['token_budget']:,} on {whose}: {b['spent']:,} spent, {b['remaining']:,} left{flag}"
+        )
+    sessions = report.get("by_session") or []
+    if sessions:
+        lines.append("  sessions:")
+        for sess in sessions:
+            model = f" {sess['model']}" if sess.get("model") else ""
+            lines.append(
+                f"    {sess.get('session_id') or '-'} @{sess['recorded_by']}{model}: "
+                f"{sess.get('total_tokens', 0):,} tokens over {sess['records']} report(s)"
+            )
+    subtasks = [row for row in report.get("by_subtask") or [] if row.get("total_tokens")]
+    if subtasks:
+        lines.append("  by subtask:")
+        lines.extend(f"    {row['task_id']}: {row['total_tokens']:,} tokens" for row in subtasks)
+    return lines
+
+
 def print_out(args: argparse.Namespace, data: Any, human_lines: list[str] | None = None) -> None:
     if getattr(args, "json", False) or human_lines is None:
         print(json.dumps(data, indent=2))
@@ -901,7 +971,49 @@ def cmd_task(args: argparse.Namespace) -> int:
             lines.append(f"  reviewer @{t['reviewer']}")
         if t.get("blocked_by"):
             lines.append(f"  blocked_by {', '.join(t['blocked_by'])}")
+        if getattr(args, "token_budget", None) is not None:
+            budget = token_budget_arg(str(args.token_budget))
+            usage = http_json(
+                server, "POST", f"/v1/tasks/{urllib.parse.quote(t['id'], safe='')}/budget",
+                token=token, payload={"token_budget": budget},
+            )["usage"]
+            data["usage"] = usage
+            if budget is not None:
+                lines.append(f"  token budget {budget:,}")
         print_out(args, data, lines)
+        return 0
+    if args.task_cmd == "usage":
+        path = f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}/usage"
+        record = any(v is not None for v in (args.prompt, args.completion, args.total))
+        if record:
+            payload: dict[str, Any] = {
+                "prompt_tokens": args.prompt or 0,
+                "completion_tokens": args.completion or 0,
+            }
+            if args.total is not None:
+                payload["total_tokens"] = args.total
+            if args.session:
+                payload["session_id"] = args.session
+            if args.model:
+                payload["model"] = args.model
+            data = http_json(server, "POST", path, token=token, payload=payload)
+        else:
+            data = http_json(server, "GET", path, token=token)
+        lines = token_report_lines(data["usage"])
+        if record:
+            lines.insert(0, f"Recorded {data['recorded']['total_tokens']:,} tokens on {args.id}")
+        print_out(args, data, lines)
+        return 3 if record and data["usage"].get("exceeded") else 0
+    if args.task_cmd == "budget":
+        path = f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}/budget"
+        if args.tokens is None:
+            data = http_json(server, "GET", path, token=token)
+        else:
+            data = http_json(
+                server, "POST", path, token=token,
+                payload={"token_budget": token_budget_arg(args.tokens)},
+            )
+        print_out(args, data, token_report_lines(data["usage"]))
         return 0
     if args.task_cmd == "assign":
         data = http_json(
@@ -1079,6 +1191,9 @@ def cmd_task(args: argparse.Namespace) -> int:
                 else "the project manager"
             )
             lines.append(f"WAITING on {waiting}: @{q['asked_by']} asks: {q['question']}")
+        token_line = token_summary_line(data.get("tokens") or {})
+        if token_line:
+            lines.append(token_line)
         atts = data.get("attachments") or []
         if atts:
             lines.append(f"attachments ({len(atts)}): airc task download {t['id']} <attachment-id>")
@@ -1178,7 +1293,7 @@ TASK_EXPORT_COLUMNS = [
     "parent_task_id", "blocked_by", "repo", "branch", "issue_url",
     "created_at", "updated_at", "started_at", "first_review_at", "completed_at",
     "lead_time_seconds", "cycle_time_seconds", "review_seconds", "review_rounds",
-    "changes_requested", "time_in_status",
+    "changes_requested", "time_in_status", "own_tokens", "total_tokens", "token_budget",
 ]
 TASK_EVENT_COLUMNS = [
     "task_id", "channel", "sprint", "title", "at", "actor", "action", "from_status", "to_status", "note",
@@ -1214,6 +1329,10 @@ def task_export_rows(data: dict[str, Any], *, events: bool = False) -> tuple[lis
         row["time_in_status"] = ";".join(
             f"{status}={secs}" for status, secs in (metrics.get("time_in_status") or {}).items()
         )
+        tokens = metrics.get("tokens") or {}
+        row["own_tokens"] = (tokens.get("own") or {}).get("total_tokens")
+        row["total_tokens"] = (tokens.get("total") or {}).get("total_tokens")
+        row["token_budget"] = tokens.get("token_budget")
         rows.append(row)
     columns = TASK_EVENT_COLUMNS if events else TASK_EXPORT_COLUMNS
     for row in rows:
@@ -3082,7 +3201,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--reviewer", metavar="NICK", help="Who reviews it (default: the parent's assignee, else the PM)")
     p_tc.add_argument("--blocked-by", action="append", metavar="TASK_ID", help="Dependency task ID (cross-repo supported; repeatable or comma-separated)")
     p_tc.add_argument("--timeout-seconds", type=int, help="Positive execution timeout in seconds (default: inherit hub policy)")
+    p_tc.add_argument("--token-budget", metavar="TOKENS", help="Cap the model tokens this task and its subtasks may spend")
     p_tc.set_defaults(func=cmd_task)
+
+    p_tus = task_sub.add_parser(
+        "usage",
+        help="Show model tokens spent on a task and its subtasks; with --prompt/--completion, record usage",
+    )
+    p_tus.add_argument("id")
+    p_tus.add_argument("--prompt", type=int, metavar="N", help="Record N prompt tokens")
+    p_tus.add_argument("--completion", type=int, metavar="N", help="Record N completion tokens")
+    p_tus.add_argument("--total", type=int, metavar="N", help="Total tokens (default prompt + completion)")
+    p_tus.add_argument("--session", help="Session ID to group the record under")
+    p_tus.add_argument("--model", help="Model that spent the tokens")
+    p_tus.set_defaults(func=cmd_task)
+
+    p_tbu = task_sub.add_parser(
+        "budget",
+        help="Show or set a task's token budget (covers its subtasks); 'none' clears it",
+    )
+    p_tbu.add_argument("id")
+    p_tbu.add_argument("tokens", nargs="?", help="Positive token count, or 'none' to clear; omit to show")
+    p_tbu.set_defaults(func=cmd_task)
 
     p_tas = task_sub.add_parser("assign", help="Assign or reassign a task; omit NICK to return it to the pool")
     p_tas.add_argument("id")

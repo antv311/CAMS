@@ -603,6 +603,14 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
             "/v1/tasks/{id}/attachments/{attachment_id}",
             get(download_task_attachment),
         )
+        .route(
+            "/v1/tasks/{id}/usage",
+            get(get_task_usage).post(record_task_usage),
+        )
+        .route(
+            "/v1/tasks/{id}/budget",
+            get(get_task_usage).post(set_task_budget),
+        )
         .route("/v1/notes", get(get_notes).post(write_notes))
         .route("/v1/projects/pm", post(set_project_pm))
         .route("/v1/rooms", get(list_rooms).post(open_room))
@@ -3138,11 +3146,34 @@ async fn export_tasks(
     }
     let summary =
         crate::task_metrics::summarize(&rows.iter().map(|(t, m, _)| (*t, m)).collect::<Vec<_>>());
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    let token_reports = state
+        .server
+        .token_usage()
+        .summaries(&ids)
+        .map_err(ApiError::internal)?;
+    // Sum each task's own tokens so a parent and its subtasks are not double counted.
+    let mut token_totals = crate::token_usage::TokenCounts::default();
+    for report in token_reports.values() {
+        token_totals.prompt_tokens += report.own.prompt_tokens;
+        token_totals.completion_tokens += report.own.completion_tokens;
+        token_totals.total_tokens += report.own.total_tokens;
+    }
     let with_events = q.events.unwrap_or(true);
     let exported: Vec<Value> = rows
         .into_iter()
         .map(|(task, metrics, events)| {
             let mut entry = json!({ "task": task, "metrics": metrics });
+            entry["metrics"]["tokens"] = match token_reports.get(&task.id) {
+                Some(report) => json!({
+                    "own": report.own,
+                    "total": report.total,
+                    "token_budget": report.token_budget,
+                    "remaining": report.remaining,
+                    "exceeded": report.exceeded,
+                }),
+                None => Value::Null,
+            };
             if with_events {
                 entry["events"] = json!(events);
             }
@@ -3158,6 +3189,7 @@ async fn export_tasks(
             "sprint": sprint,
             "generated_at": now,
             "summary": summary,
+            "token_totals": token_totals,
             "tasks": exported,
         })),
     ))
@@ -3708,6 +3740,11 @@ async fn get_task(
         .attachments()
         .list(&task.id)
         .map_err(ApiError::internal)?;
+    let tokens = state
+        .server
+        .token_usage()
+        .report(&task.id)
+        .map_err(ApiError::internal)?;
     let details = dependency_payload(&state.server, &task)?;
     Ok((
         StatusCode::OK,
@@ -3719,11 +3756,132 @@ async fn get_task(
             "question": question,
             "subtasks": subtasks,
             "attachments": attachments,
+            "tokens": tokens,
             "dependencies": details.dependencies,
             "dependents": details.dependents,
             "unresolved_blockers": details.unresolved,
             "is_blocked": !details.unresolved.is_empty()
         })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RecordUsageReq {
+    #[serde(default)]
+    prompt_tokens: i64,
+    #[serde(default)]
+    completion_tokens: i64,
+    total_tokens: Option<i64>,
+    session_id: Option<String>,
+    model: Option<String>,
+}
+
+/// Tokens spent on a task, rolled up through its subtasks, with the
+/// tightest applicable budget.
+async fn get_task_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/tasks/{id}/usage")?;
+    let task = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let usage = state
+        .server
+        .token_usage()
+        .report(&task.id)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "usage": usage })),
+    ))
+}
+
+/// A worker reports the tokens of one or more model turns. Always recorded;
+/// `usage.exceeded` tells the worker to stop.
+async fn record_task_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<RecordUsageReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/usage")?
+            .principal;
+    let task = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let tokens = crate::token_usage::TokenCounts::new(
+        req.prompt_tokens,
+        req.completion_tokens,
+        req.total_tokens,
+    );
+    let usage = state
+        .server
+        .record_task_usage_api(
+            &actor,
+            &task.id,
+            req.session_id.as_deref(),
+            req.model.as_deref(),
+            tokens,
+        )
+        .map_err(|err| {
+            let message = err.to_string();
+            if message.contains("can report token usage") {
+                ApiError::forbidden(message)
+            } else {
+                ApiError::bad_request(message)
+            }
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "recorded": tokens, "usage": usage })),
+    ))
+}
+
+/// Set (`{"token_budget": N}`) or clear (`{"token_budget": null}`) a ceiling
+/// on the tokens a task and its subtasks may spend.
+async fn set_task_budget(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/budget")?
+        .principal;
+    let budget = match req.get("token_budget") {
+        None => {
+            return Err(ApiError::bad_request(
+                "token_budget is required (a positive integer, or null to clear it)",
+            ))
+        }
+        Some(Value::Null) => None,
+        Some(value) => Some(value.as_i64().ok_or_else(|| {
+            ApiError::bad_request("token_budget must be a positive integer or null")
+        })?),
+    };
+    let usage = state
+        .server
+        .set_task_token_budget_api(&actor, &id, budget)
+        .map_err(|err| {
+            let message = err.to_string();
+            if message.contains("not found") {
+                ApiError::not_found(message)
+            } else if message.contains("can set a token budget") {
+                ApiError::forbidden(message)
+            } else {
+                ApiError::bad_request(message)
+            }
+        })?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "usage": usage })),
     ))
 }
 
@@ -5257,6 +5415,7 @@ mod tests {
     include!("http_consensus_tests.rs");
     include!("http_group_memory_tests.rs");
     include!("http_attachment_tests.rs");
+    include!("http_token_usage_tests.rs");
     include!("http_group_activity_tests.rs");
     include!("http_task_cascade_tests.rs");
     include!("http_task_timeout_tests.rs");

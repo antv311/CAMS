@@ -58,6 +58,18 @@ class TaskExportRowsTest(unittest.TestCase):
         self.assertEqual(row["reviewer"], "")
         self.assertEqual(row["time_in_status"], "in_progress=40;review=40")
         self.assertEqual(list(row), cli.TASK_EXPORT_COLUMNS)
+        self.assertEqual((row["own_tokens"], row["total_tokens"], row["token_budget"]), ("", "", ""))
+
+    def test_task_rows_carry_token_metrics(self) -> None:
+        import copy
+
+        data = copy.deepcopy(SAMPLE)
+        data["tasks"][0]["metrics"]["tokens"] = {
+            "own": {"total_tokens": 120}, "total": {"total_tokens": 450}, "token_budget": 1000,
+            "remaining": 550, "exceeded": False,
+        }
+        row = next(csv.DictReader(io.StringIO(cli.render_task_export_csv(data))))
+        self.assertEqual((row["own_tokens"], row["total_tokens"], row["token_budget"]), ("120", "450", "1000"))
 
     def test_event_rows_one_per_audit_entry(self) -> None:
         rows = list(csv.DictReader(io.StringIO(cli.render_task_export_csv(SAMPLE, events=True))))
