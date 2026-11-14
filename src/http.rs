@@ -4073,6 +4073,7 @@ mod tests {
     include!("http_group_memory_tests.rs");
     include!("http_attachment_tests.rs");
     include!("http_group_activity_tests.rs");
+    include!("http_task_cascade_tests.rs");
 
     struct TemplateApi {
         server: Server,

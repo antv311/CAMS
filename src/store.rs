@@ -1248,6 +1248,13 @@ fn migrate_wake_configs(connection: &Connection) -> Result<()> {
 }
 
 fn migrate_tasks(connection: &Connection) -> Result<()> {
+    // Persist inherited pauses separately from a child's own unanswered question.
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_parent_blocks (
+            task_id TEXT PRIMARY KEY,
+            resume_status TEXT NOT NULL
+        );",
+    )?;
     let columns = [
         ("body", "TEXT"),
         ("kind", "TEXT NOT NULL DEFAULT 'task'"),

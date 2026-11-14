@@ -379,6 +379,19 @@ place is the task: it names its project channel, repo and branch.
   reviews in their inbox and may accept or request changes to another
   assignee's work. Project managers retain oversight of all reviews and
   the lead's combined parent result.
+- **Parent cancellation and blocking.** Cancelling a parent cancels all active
+  descendants, including nested subtasks; completed tasks remain unchanged.
+  Pending questions are closed as `cancelled`, leases are released, and review
+  votes are discarded. Asking a question on a parent pauses active descendants
+  as `blocked`. Answering it resumes only inherited pauses; a child's own
+  unanswered question stays blocked. Previously claimed work returns to `open`
+  for a fresh claim, and review work returns to `testing` for fresh evidence and
+  votes. Pauses survive a server restart. Child creation, assignment, claims,
+  answers, and workflow changes cannot bypass blocked or cancelled ancestors.
+  Each affected child gets an audit event and a notice in its own sprint room;
+  its assignee or former lease holder is notified. Task links, branches,
+  reports, and attachments remain available. Running agent processes and their
+  worktrees are preserved; the notice tells workers to stop or resume work.
 - **Delegation wakes.** Creating or assigning a task wakes its assignee.
   A subtask's question or review wakes its named reviewer (normally the lead);
   if no reviewer is recorded, it has left the project, or it is the assignee,

@@ -1,10 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
 use crate::store::SharedConnection;
+
+#[cfg(test)]
+#[path = "task_cascade_tests.rs"]
+mod cascade_tests;
 
 /// Statuses after which a task no longer appears in lists or inboxes.
 pub const TERMINAL_STATUSES: &[&str] = &["done", "merged", "cancelled"];
@@ -119,6 +124,18 @@ pub struct TaskEvent {
     pub created_at: i64,
 }
 
+/// Committed descendant changes, including a lease holder whose lease was cleared.
+pub struct TaskCascade {
+    pub task: Task,
+    pub action: &'static str,
+    pub previous_holder: Option<String>,
+}
+
+pub struct TaskUpdate {
+    pub task: Task,
+    pub cascaded: Vec<TaskCascade>,
+}
+
 /// A question that stops a task until someone answers it.
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskQuestion {
@@ -128,7 +145,7 @@ pub struct TaskQuestion {
     pub asked_by: String,
     pub question: String,
     /// `open` (waiting for the reviewer/PM), `escalated_pm` (waiting for the PM),
-    /// `escalated` (waiting for the owner) or `answered`.
+    /// `escalated` (waiting for the owner), `answered` or `cancelled`.
     pub status: String,
     /// The task status to return to once the question is answered.
     pub resume_status: String,
@@ -184,10 +201,25 @@ impl TaskStore {
         let id = format!("task_{}", Uuid::new_v4().simple());
         let kind = normalize_kind(new.kind.as_deref())?;
         let assignee = clean_opt(new.assignee);
-        let status = if assignee.is_some() { "assigned" } else { "open" };
+        let status = if assignee.is_some() {
+            "assigned"
+        } else {
+            "open"
+        };
 
-        let db = self.db.write()?;
-        db.execute(
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(parent_id) = clean_opt(new.parent_task_id.clone()) {
+            let parent = Self::get_locked(&tx, &parent_id)?;
+            if parent.channel != new.channel || TERMINAL_STATUSES.contains(&parent.status.as_str())
+            {
+                return Err(anyhow!(
+                    "parent must be active and belong to the same project"
+                ));
+            }
+            Self::require_unblocked_locked(&tx, &parent_id, true)?;
+        }
+        tx.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, assignee, created_by, repo, branch, issue_url,
                                 created_at, updated_at, sprint, reviewer, parent_task_id)
@@ -212,7 +244,9 @@ impl TaskStore {
         )
         .context("insert task")?;
 
-        Self::get_locked(&db, &id)
+        let task = Self::get_locked(&tx, &id)?;
+        tx.commit()?;
+        Ok(task)
     }
 
     pub fn get(&self, task_id: &str) -> Result<Option<Task>> {
@@ -243,6 +277,8 @@ impl TaskStore {
         let lease_expires_at = now + self.lease_seconds;
         let db = self.db.write()?;
 
+        Self::require_unblocked_locked(&db, task_id, true)?;
+
         // Only the lease-based flow is claimable; assigned work has an owner.
         let changed = db
             .execute(
@@ -269,6 +305,7 @@ impl TaskStore {
     pub fn done(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
         let db = self.db.write()?;
+        Self::require_unblocked_locked(&db, task_id, true)?;
 
         let changed = db
             .execute(
@@ -289,6 +326,7 @@ impl TaskStore {
     pub fn release(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
         let db = self.db.write()?;
+        Self::require_unblocked_locked(&db, task_id, true)?;
 
         let changed = db
             .execute(
@@ -313,8 +351,17 @@ impl TaskStore {
         let now = unix_timestamp();
         let db = self.db.write()?;
         let current = Self::get_locked(&db, task_id)?;
+        Self::require_unblocked_locked(&db, task_id, false)?;
+        if current.status == "blocked" {
+            return Err(anyhow!(
+                "task is blocked; resolve its blocker before reassigning"
+            ));
+        }
         if TERMINAL_STATUSES.contains(&current.status.as_str()) {
-            return Err(anyhow!("task is {} and cannot be reassigned", current.status));
+            return Err(anyhow!(
+                "task is {} and cannot be reassigned",
+                current.status
+            ));
         }
         let next_status = match (assignee, current.status.as_str()) {
             (None, _) => "open",
@@ -336,7 +383,11 @@ impl TaskStore {
             &db,
             task_id,
             actor_id,
-            if assignee.is_some() { "assign" } else { "unassign" },
+            if assignee.is_some() {
+                "assign"
+            } else {
+                "unassign"
+            },
             Some(&current.status),
             Some(next_status),
             assignee.map(|a| format!("assignee={a}")).as_deref(),
@@ -357,7 +408,9 @@ impl TaskStore {
         note: Option<&str>,
         branch: Option<&str>,
     ) -> Result<Task> {
-        self.set_status_with_round(task_id, expected_from, to, actor_id, note, branch, None)
+        Ok(self
+            .set_status_with_round(task_id, expected_from, to, actor_id, note, branch, None)?
+            .task)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -370,7 +423,7 @@ impl TaskStore {
         note: Option<&str>,
         branch: Option<&str>,
         round: Option<&ReviewRound>,
-    ) -> Result<Task> {
+    ) -> Result<TaskUpdate> {
         if !ALL_STATUSES.contains(&to) {
             return Err(anyhow!("unknown task status '{to}'"));
         }
@@ -378,6 +431,9 @@ impl TaskStore {
         let mut db = self.db.write()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = Self::get_locked(&tx, task_id)?;
+        if to != "cancelled" {
+            Self::require_unblocked_locked(&tx, task_id, false)?;
+        }
         if round.is_some_and(|r| current.assignee.as_deref() != Some(r.assignee.as_str())) {
             return Err(anyhow!(
                 "task assignee changed concurrently; reload and retry"
@@ -387,7 +443,7 @@ impl TaskStore {
             round.map(serde_json::to_string).transpose()?
         } else if matches!(
             to,
-            "changes_requested" | "in_progress" | "testing" | "cancelled"
+            "changes_requested" | "in_progress" | "testing" | "cancelled" | "blocked"
         ) {
             None
         } else {
@@ -401,13 +457,17 @@ impl TaskStore {
             .execute(
                 "UPDATE tasks
                  SET status = ?1, branch = COALESCE(?2, branch), updated_at = ?3,
-                     review_round_json = ?6
+                     review_round_json = ?6,
+                     claimed_by = CASE WHEN ?1 IN ('blocked', 'cancelled') THEN NULL ELSE claimed_by END,
+                     lease_expires_at = CASE WHEN ?1 IN ('blocked', 'cancelled') THEN NULL ELSE lease_expires_at END
                  WHERE id = ?4 AND status = ?5",
                 params![to, branch, now, task_id, expected_from, saved_round],
             )
             .context("update task status")?;
         if changed != 1 {
-            return Err(anyhow!("task status changed concurrently; reload and retry"));
+            return Err(anyhow!(
+                "task status changed concurrently; reload and retry"
+            ));
         }
         Self::log_event_locked(
             &tx,
@@ -431,9 +491,21 @@ impl TaskStore {
                 now,
             )?;
         }
+        if to == "cancelled" {
+            Self::cancel_questions_locked(&tx, task_id)?;
+            tx.execute(
+                "DELETE FROM task_parent_blocks WHERE task_id = ?1",
+                [task_id],
+            )?;
+        }
+        let cascaded = if matches!(to, "blocked" | "cancelled") || current.status == "blocked" {
+            Self::cascade_locked(&tx, task_id, to, actor_id, now)?
+        } else {
+            Vec::new()
+        };
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
-        Ok(task)
+        Ok(TaskUpdate { task, cascaded })
     }
 
     /// Validate and replace a peer's vote atomically with phase advancement.
@@ -454,6 +526,7 @@ impl TaskStore {
         let mut db = self.db.write()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = Self::get_locked(&tx, task_id)?;
+        Self::require_unblocked_locked(&tx, task_id, true)?;
         if !matches!(current.status.as_str(), "review" | "super_review") {
             return Err(anyhow!("task is not awaiting review"));
         }
@@ -509,10 +582,17 @@ impl TaskStore {
     }
 
     /// The assignee is stuck: record the question and park the task.
-    pub fn ask(&self, task_id: &str, actor_id: &str, question: &str) -> Result<(Task, TaskQuestion)> {
+    pub fn ask(
+        &self,
+        task_id: &str,
+        actor_id: &str,
+        question: &str,
+    ) -> Result<(TaskUpdate, TaskQuestion)> {
         let now = unix_timestamp();
-        let db = self.db.write()?;
-        let current = Self::get_locked(&db, task_id)?;
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        Self::require_unblocked_locked(&tx, task_id, true)?;
         if !matches!(
             current.status.as_str(),
             "assigned" | "in_progress" | "changes_requested"
@@ -523,20 +603,29 @@ impl TaskStore {
             ));
         }
         let id = format!("q_{}", Uuid::new_v4().simple());
-        db.execute(
+        tx.execute(
             "INSERT INTO task_questions
                (id, task_id, channel, asked_by, question, status, resume_status, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
-            params![id, task_id, current.channel, actor_id, question, current.status, now],
+            params![
+                id,
+                task_id,
+                current.channel,
+                actor_id,
+                question,
+                current.status,
+                now
+            ],
         )
         .context("record task question")?;
-        db.execute(
-            "UPDATE tasks SET status = 'blocked', updated_at = ?1 WHERE id = ?2",
+        tx.execute(
+            "UPDATE tasks SET status = 'blocked', updated_at = ?1,
+                claimed_by = NULL, lease_expires_at = NULL, review_round_json = NULL WHERE id = ?2",
             params![now, task_id],
         )
         .context("block task")?;
         Self::log_event_locked(
-            &db,
+            &tx,
             task_id,
             actor_id,
             "ask",
@@ -545,7 +634,11 @@ impl TaskStore {
             Some(question),
             now,
         )?;
-        Ok((Self::get_locked(&db, task_id)?, Self::question_locked(&db, &id)?))
+        let cascaded = Self::cascade_locked(&tx, task_id, "blocked", actor_id, now)?;
+        let task = Self::get_locked(&tx, task_id)?;
+        let question = Self::question_locked(&tx, &id)?;
+        tx.commit()?;
+        Ok((TaskUpdate { task, cascaded }, question))
     }
 
     /// The unanswered question on a task, if any.
@@ -555,25 +648,36 @@ impl TaskStore {
     }
 
     /// Answer the pending question and put the task back where it was.
-    pub fn answer(&self, task_id: &str, actor_id: &str, answer: &str) -> Result<(Task, TaskQuestion)> {
+    pub fn answer(
+        &self,
+        task_id: &str,
+        actor_id: &str,
+        answer: &str,
+    ) -> Result<(TaskUpdate, TaskQuestion)> {
         let now = unix_timestamp();
-        let db = self.db.write()?;
-        let question = Self::pending_question_locked(&db, task_id)?
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::require_unblocked_locked(&tx, task_id, false)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if current.status != "blocked" {
+            return Err(anyhow!("task is not blocked"));
+        }
+        let question = Self::pending_question_locked(&tx, task_id)?
             .ok_or_else(|| anyhow!("task has no unanswered question"))?;
-        db.execute(
+        tx.execute(
             "UPDATE task_questions
              SET status = 'answered', answer = ?1, answered_by = ?2, answered_at = ?3
              WHERE id = ?4",
             params![answer, actor_id, now, question.id],
         )
         .context("answer task question")?;
-        db.execute(
+        tx.execute(
             "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'blocked'",
             params![question.resume_status, now, task_id],
         )
         .context("unblock task")?;
         Self::log_event_locked(
-            &db,
+            &tx,
             task_id,
             actor_id,
             "answer",
@@ -582,10 +686,11 @@ impl TaskStore {
             Some(answer),
             now,
         )?;
-        Ok((
-            Self::get_locked(&db, task_id)?,
-            Self::question_locked(&db, &question.id)?,
-        ))
+        let cascaded = Self::cascade_locked(&tx, task_id, &question.resume_status, actor_id, now)?;
+        let task = Self::get_locked(&tx, task_id)?;
+        let question = Self::question_locked(&tx, &question.id)?;
+        tx.commit()?;
+        Ok((TaskUpdate { task, cascaded }, question))
     }
 
     /// Hand an open question up to the owner.
@@ -655,6 +760,143 @@ impl TaskStore {
             .query_map(params![status, channel], Self::question_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn inherited_pause_locked(db: &Connection, task_id: &str) -> Result<Option<String>> {
+        Ok(db
+            .query_row(
+                "SELECT resume_status FROM task_parent_blocks WHERE task_id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// UNION (rather than UNION ALL) also bounds traversal of legacy cyclic links.
+    fn blocking_ancestor_locked(
+        db: &Connection,
+        task_id: &str,
+        include_self: bool,
+    ) -> Result<Option<(String, String)>> {
+        Ok(db
+            .query_row(
+                "WITH RECURSIVE ancestors(id) AS (
+                SELECT CASE WHEN ?2 THEN id ELSE parent_task_id END FROM tasks WHERE id = ?1
+                UNION SELECT t.parent_task_id FROM tasks t JOIN ancestors a ON t.id = a.id
+             ) SELECT t.id, t.status FROM tasks t JOIN ancestors a ON t.id = a.id
+               WHERE t.status IN ('blocked', 'cancelled') LIMIT 1",
+                params![task_id, include_self],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn require_unblocked_locked(db: &Connection, task_id: &str, include_self: bool) -> Result<()> {
+        if let Some((id, status)) = Self::blocking_ancestor_locked(db, task_id, include_self)? {
+            return Err(anyhow!(
+                "task {id} is {status}; descendant work cannot continue"
+            ));
+        }
+        Ok(())
+    }
+
+    fn cancel_questions_locked(db: &Connection, task_id: &str) -> Result<()> {
+        db.execute(
+            "UPDATE task_questions SET status = 'cancelled'
+             WHERE task_id = ?1 AND status IN ('open', 'escalated_pm', 'escalated')",
+            [task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Called inside the same write transaction as the parent transition.
+    /// Traverse through completed children too, but never change their records.
+    fn cascade_locked(
+        db: &Connection,
+        root: &str,
+        to: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<Vec<TaskCascade>> {
+        let mut queue = VecDeque::from([root.to_string()]);
+        let mut visited = HashSet::from([root.to_string()]);
+        let mut changes = Vec::new();
+        while let Some(parent) = queue.pop_front() {
+            let children = {
+                let mut statement = db.prepare(&format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at, rowid"
+                ))?;
+                let rows = statement.query_map([parent], Self::from_row)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for child in children {
+                if !visited.insert(child.id.clone()) {
+                    continue;
+                }
+                queue.push_back(child.id.clone());
+                if TERMINAL_STATUSES.contains(&child.status.as_str()) {
+                    continue;
+                }
+                let (next, action) = if to == "cancelled" {
+                    Self::cancel_questions_locked(db, &child.id)?;
+                    db.execute(
+                        "DELETE FROM task_parent_blocks WHERE task_id = ?1",
+                        [&child.id],
+                    )?;
+                    ("cancelled".to_string(), "parent_cancel")
+                } else if to == "blocked" {
+                    if child.status == "blocked" {
+                        continue; // Its own question or an earlier ancestor pause remains authoritative.
+                    }
+                    let resume = match child.status.as_str() {
+                        "claimed" => "open", // The lease is released, so it must be claimed again.
+                        "review" | "super_review" => "testing", // Fresh evidence and votes are required.
+                        other => other,
+                    };
+                    db.execute(
+                        "INSERT OR IGNORE INTO task_parent_blocks(task_id, resume_status) VALUES (?1, ?2)",
+                        params![child.id, resume],
+                    )?;
+                    ("blocked".to_string(), "parent_block")
+                } else {
+                    let Some(resume) = Self::inherited_pause_locked(db, &child.id)? else {
+                        continue;
+                    };
+                    if child.status != "blocked"
+                        || Self::blocking_ancestor_locked(db, &child.id, false)?.is_some()
+                    {
+                        continue;
+                    }
+                    db.execute(
+                        "DELETE FROM task_parent_blocks WHERE task_id = ?1",
+                        [&child.id],
+                    )?;
+                    (resume, "parent_resume")
+                };
+                db.execute(
+                    "UPDATE tasks SET status = ?2, updated_at = ?3, claimed_by = NULL,
+                        lease_expires_at = NULL, review_round_json = NULL WHERE id = ?1",
+                    params![child.id, next, now],
+                )?;
+                let note = format!("ancestor_task={root} ancestor_status={to}");
+                Self::log_event_locked(
+                    db,
+                    &child.id,
+                    actor,
+                    action,
+                    Some(&child.status),
+                    Some(&next),
+                    Some(&note),
+                    now,
+                )?;
+                changes.push(TaskCascade {
+                    task: Self::get_locked(db, &child.id)?,
+                    action,
+                    previous_holder: child.claimed_by,
+                });
+            }
+        }
+        Ok(changes)
     }
 
     fn pending_question_locked(db: &Connection, task_id: &str) -> Result<Option<TaskQuestion>> {
