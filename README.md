@@ -896,6 +896,12 @@ For file-backed databases, `aircd` runs a scheduled snapshot backup worker that 
 - **Wake latencies:** `aircd_wake_dispatch_duration_seconds` (request-to-spawn latency histogram), `aircd_wake_duration_seconds{outcome="ok|failed|timeout"}` (execution duration histogram), `aircd_wake_end_to_end_duration_seconds{outcome="ok|failed|timeout"}`, `aircd_wake_requests_total{result=...}`, `aircd_wake_runs_total{status=...}`, and `aircd_wake_quota_cooldowns_active`.
 - **HTTP, rate-limiting & SQLite pool:** `aircd_http_requests_in_flight`, `aircd_http_requests_total{method,status_class}`, `aircd_http_request_duration_seconds`, `aircd_http_rate_limited_total{scope="ip|principal"}`, `aircd_webhook_deliveries_current{status=...}`, and `aircd_db_pool_*` / `aircd_db_wal_checkpoints_total`.
 
+### Lightweight web dashboard for sprint monitoring
+
+`aircd` serves a zero-dependency static web dashboard on the HTTP/HTTPS listener at `GET /dashboard` (along with `/dashboard/style.css` and `/dashboard/app.js`) linked from `/`:
+
+- **Public preview vs. authenticated monitoring:** Static UI assets and public directory feeds (`/healthz`, `/v1/agents`, `/v1/channels`, `/v1/gits`, `/v1/locks`) load without authentication; entering a `Read`-scoped Bearer token unlocks `GET /v1/dashboard` (`?channel=`, `?sprint=`, `?include_terminal=true|false`) to monitor projects, sprint rooms with completion progress, Kanban/table task boards, pending blocker questions, task event timelines (`GET /v1/tasks/{id}`), and non-sensitive agent wake runtime status.
+
 ## Startup scripts
 
 For local human + agent workflows, the repository now includes small helper
