@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
+use crate::logging::EventForwarder;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -77,10 +78,16 @@ pub struct WebhookStore {
     db: Arc<Mutex<Connection>>,
     notify: Arc<Notify>,
     http_client: reqwest::Client,
+    logger: EventForwarder,
 }
 
 impl WebhookStore {
+    #[allow(dead_code)]
     pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+        Self::with_logger(db, EventForwarder::default())
+    }
+
+    pub fn with_logger(db: Arc<Mutex<Connection>>, logger: EventForwarder) -> Self {
         let http_client = reqwest::Client::builder()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(10))
@@ -91,6 +98,7 @@ impl WebhookStore {
             db,
             notify: Arc::new(Notify::new()),
             http_client,
+            logger,
         }
     }
 
@@ -371,7 +379,9 @@ impl WebhookStore {
         tokio::spawn(async move {
             loop {
                 if let Err(err) = store.process_due_deliveries().await {
-                    eprintln!("webhooks worker error: {err:#}");
+                    store
+                        .logger
+                        .log_error("webhook.worker_error", format!("webhooks worker error: {err:#}"));
                 }
                 tokio::select! {
                     _ = store.notify.notified() => {}

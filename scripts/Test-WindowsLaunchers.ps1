@@ -10,7 +10,7 @@ $ConfigMod = Join-Path $TestRoot "scripts\AircdConfig.psm1"
 $Wrapper = Join-Path $TestRoot "aircd-server.cmd"
 
 $SavedEnv = @{}
-foreach ($EnvName in @("AIRCD_CONFIG_DIR", "AIRCD_DATA_DIR", "AIRCD_CONFIG", "AIRCD_WINDOWS_CONFIG", "AIRCD_EXECUTABLE", "AIRCD_BIND", "AIRCD_HTTP_BIND", "AIRCD_DB", "AIRCD_OPEN_REGISTRATION", "AIRCD_REGISTER_KEY")) {
+foreach ($EnvName in @("AIRCD_CONFIG_DIR", "AIRCD_DATA_DIR", "AIRCD_CONFIG", "AIRCD_WINDOWS_CONFIG", "AIRCD_EXECUTABLE", "AIRCD_BIND", "AIRCD_HTTP_BIND", "AIRCD_DB", "AIRCD_OPEN_REGISTRATION", "AIRCD_REGISTER_KEY", "AIRCD_WINDOWS_EVENT_LOG", "AIRCD_WINDOWS_EVENT_LOG_SOURCE", "AIRCD_SYSLOG_TARGET", "AIRCD_SYSLOG_FORMAT", "AIRCD_SYSLOG_FACILITY")) {
     $Item = Get-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
     $SavedEnv[$EnvName] = if ($null -ne $Item) { $Item.Value } else { $null }
     Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
@@ -105,6 +105,13 @@ open_registration = false
     $Output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Starter -Bind 127.0.0.1:20667
     Assert-Equal $LASTEXITCODE 17 "TOML/env/CLI precedence exit status"
     Assert-Equal ($Output -join '|') "release|--bind|127.0.0.1:20667|--http-bind|127.0.0.1:19680|--db|$TomlDb" "CLI > Env > TOML precedence"
+
+    # Logging forwarding config & env/CLI precedence in Start-Aircd.ps1
+    $env:AIRCD_SYSLOG_TARGET = "tcp://127.0.0.1:6514"
+    $env:AIRCD_SYSLOG_FORMAT = "rfc3164"
+    $Output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Starter -Bind 127.0.0.1:20667 -WindowsEventLog -WindowsEventLogSource "cams-hub" -SyslogFacility "local4"
+    Assert-Equal $LASTEXITCODE 17 "Logging forwarding exit status"
+    Assert-Equal ($Output -join '|') "release|--bind|127.0.0.1:20667|--http-bind|127.0.0.1:19680|--db|$TomlDb|--windows-event-log|--windows-event-log-source|cams-hub|--syslog-target|tcp://127.0.0.1:6514|--syslog-format|rfc3164|--syslog-facility|local4" "Logging forwarding flags"
 
     Write-Host "PASS: Windows launcher selection, paths with spaces, editable JSON/TOML config & env/CLI precedence, arguments and exit status"
 } finally {

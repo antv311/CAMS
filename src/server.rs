@@ -12,6 +12,7 @@ use crate::auth::{AuthStore, Principal};
 use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
 use crate::locks::{LockStore, ResourceLock};
+use crate::logging::{EventForwarder, LogEvent, Severity};
 use crate::notes::NoteStore;
 use crate::rooms::{Room, RoomStore};
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
@@ -70,6 +71,7 @@ pub struct Server {
     rooms: RoomStore,
     templates: ClientTemplateStore,
     groups: GroupStore,
+    logger: EventForwarder,
     // Lock before db/inner: registration, command effects, reissue and cleanup
     // must agree on which session owns a principal across credential changes.
     session_gate: Arc<Mutex<()>>,
@@ -132,7 +134,12 @@ struct Session {
 }
 
 impl Server {
+    #[allow(dead_code)]
     pub fn new(db: SharedConnection) -> Self {
+        Self::with_logger(db, EventForwarder::default())
+    }
+
+    pub fn with_logger(db: SharedConnection, logger: EventForwarder) -> Self {
         let lease_seconds = std::env::var("AIRCD_TASK_LEASE_SECONDS")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -140,19 +147,20 @@ impl Server {
             .unwrap_or(300);
 
         let server = Self {
-            auth: AuthStore::new(db.clone()),
+            auth: AuthStore::with_logger(db.clone(), logger.clone()),
             history: HistoryStore::new(db.clone()),
             tasks: TaskStore::new(db.clone(), lease_seconds),
-            webhooks: WebhookStore::new(db.clone()),
+            webhooks: WebhookStore::with_logger(db.clone(), logger.clone()),
             reports: ReportStore::new(db.clone()),
             gits: GitRepoStore::new(db.clone()),
             locks: LockStore::new(db.clone()),
             projects: ProjectStore::new(db.clone()),
-            wakes: WakeManager::new(db.clone()),
+            wakes: WakeManager::with_logger(db.clone(), logger.clone()),
             notes: NoteStore::new(db.clone()),
             rooms: RoomStore::new(db.clone()),
             templates: ClientTemplateStore::new(db.clone()),
             groups: GroupStore::new(db.clone()),
+            logger: logger.clone(),
             db,
             session_gate: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(ServerInner::default())),
@@ -160,12 +168,15 @@ impl Server {
         // The poster gets its own idle launcher so the server's launcher does
         // not hold a reference to itself. Posting never wakes anyone.
         let poster = Self {
-            wakes: WakeManager::new(server.db.clone()),
+            wakes: WakeManager::with_logger(server.db.clone(), logger),
             ..server.clone()
         };
         server.wakes.set_notifier(Arc::new(move |failure| {
             if let Err(err) = poster.post_wake_failure(failure) {
-                eprintln!("wake failure notice @{}: {err:#}", failure.principal_id);
+                poster.logger.log_error(
+                    "wake.failure_notice_error",
+                    format!("wake failure notice @{}: {err:#}", failure.principal_id),
+                );
             }
         }));
         server
@@ -224,6 +235,10 @@ impl Server {
         &self.auth
     }
 
+    pub fn logger(&self) -> &EventForwarder {
+        &self.logger
+    }
+
     /// Commit the credential reset before invalidating the active IRC session.
     /// Registration and IRC command effects cannot straddle this operation.
     pub fn reissue_token(&self, principal_id: &str) -> Result<String> {
@@ -240,6 +255,15 @@ impl Server {
                 .shutdown_tx
                 .send("Credentials reissued by owner".into());
         }
+        self.logger.log_security(
+            Severity::Info,
+            "token.reissued",
+            "success",
+            Some("owner"),
+            Some(principal_id),
+            None,
+            format!("Owner reissued token and revoked prior credentials for @{principal_id}"),
+        );
         Ok(token)
     }
 
@@ -302,7 +326,13 @@ impl Server {
             let server = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = server.handle_stream(stream).await {
-                    eprintln!("connection {peer_addr} closed: {error:#}");
+                    server.logger.log(
+                        LogEvent::server_error(
+                            "irc.connection_error",
+                            format!("connection {peer_addr} closed: {error:#}"),
+                        )
+                        .with_target(peer_addr.to_string()),
+                    );
                 }
             });
         }
@@ -322,12 +352,24 @@ impl Server {
                 let tls_stream = match acceptor.accept(stream).await {
                     Ok(stream) => stream,
                     Err(error) => {
-                        eprintln!("TLS handshake failed from {peer_addr}: {error:#}");
+                        server.logger.log(
+                            LogEvent::server_error(
+                                "irc.tls_handshake_failed",
+                                format!("TLS handshake failed from {peer_addr}: {error:#}"),
+                            )
+                            .with_target(peer_addr.to_string()),
+                        );
                         return;
                     }
                 };
                 if let Err(error) = server.handle_stream(tls_stream).await {
-                    eprintln!("connection {peer_addr} closed: {error:#}");
+                    server.logger.log(
+                        LogEvent::server_error(
+                            "irc.tls_connection_error",
+                            format!("connection {peer_addr} closed: {error:#}"),
+                        )
+                        .with_target(peer_addr.to_string()),
+                    );
                 }
             });
         }
@@ -677,6 +719,15 @@ impl Server {
         let principal = match self.auth.authenticate(token) {
             Ok(principal) => principal,
             Err(_) => {
+                self.logger.log_security(
+                    Severity::Warning,
+                    "auth.irc_failed",
+                    "failure",
+                    session.nick.as_deref(),
+                    None,
+                    Some("irc"),
+                    "IRC authentication failed: invalid token",
+                );
                 session.send(format!(":{SERVER_NAME} 464 * :Password incorrect"));
                 return Ok(());
             }
@@ -705,6 +756,15 @@ impl Server {
                 let _ = old_client
                     .shutdown_tx
                     .send(format!("Replaced by a newer session for {}", principal.id));
+                self.logger.log_security(
+                    Severity::Info,
+                    "auth.irc_session_replaced",
+                    "success",
+                    Some(&principal.id),
+                    Some(&principal.id),
+                    Some("irc"),
+                    format!("Replaced active IRC session for @{}", principal.nick),
+                );
             }
 
             for channel in &channels {
@@ -1769,6 +1829,15 @@ impl Server {
                 target.nick, actor.nick
             ),
         )?;
+        self.logger.log_security(
+            Severity::Info,
+            "project.pm_changed",
+            "success",
+            Some(&actor.id),
+            Some(&target.id),
+            Some(&channel),
+            format!("PM of {channel} set to @{} by @{}", target.nick, actor.nick),
+        );
         self.require_project(&channel)
     }
 
@@ -1987,6 +2056,18 @@ impl Server {
         self.projects.set_role(&channel, &target.id, &role)?;
         self.join_channels(&target, std::slice::from_ref(&channel))?;
         self.join_rooms(&target, &channel)?;
+        self.logger.log_security(
+            Severity::Info,
+            "project.member_changed",
+            "success",
+            Some(&actor.id),
+            Some(&target.id),
+            Some(&channel),
+            format!(
+                "Project member @{} role in {channel} set to '{}' by @{}",
+                target.nick, role, actor.nick
+            ),
+        );
         Ok(ProjectMember {
             principal_id: target.id,
             role,
@@ -2657,6 +2738,15 @@ impl Server {
             format!("{tag_str} :{SERVER_NAME} NOTICE {announce_channel} :{notice_body}"),
             message.seq,
         )?;
+        self.logger.log_security(
+            Severity::Info,
+            "role.changed",
+            "success",
+            Some(&actor.id),
+            Some(&updated.id),
+            Some(&announce_channel),
+            notice_body.clone(),
+        );
         self.emit_webhook(WebhookEvent {
             event: "role".to_string(),
             channel: announce_channel,
@@ -2990,7 +3080,10 @@ impl Server {
             self.webhooks
                 .enqueue_for_event(&event, &online, &members, &role_mentions)
         {
-            eprintln!("enqueue webhook error ({}): {err:#}", event.event);
+            self.logger.log_error(
+                "webhook.enqueue_error",
+                format!("enqueue webhook error ({}): {err:#}", event.event),
+            );
         }
     }
 
@@ -3068,7 +3161,8 @@ impl Server {
                 triggered_by: Some(event.from.clone()),
             };
             if let Err(err) = self.wakes.request(ctx) {
-                eprintln!("wake request error: {err:#}");
+                self.logger
+                    .log_error("wake.request_error", format!("wake request error: {err:#}"));
             }
         }
     }
@@ -3809,6 +3903,56 @@ mod tests {
             metadata_tags(42, "msg_abc", 1_776_250_000, true),
             "@seq=42;msg-id=msg_abc;time=1776250000;replay=1"
         );
+    }
+
+    #[test]
+    fn irc_auth_failure_legacy_token_and_session_replacement_forward_security_audits(
+    ) -> Result<()> {
+        let syslog_rx = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        syslog_rx.set_nonblocking(true)?;
+        let syslog_addr = syslog_rx.local_addr()?;
+
+        let forwarder = crate::logging::EventForwarder::new(crate::logging::LogConfig {
+            syslog_target: Some(crate::logging::SyslogTarget::Udp(syslog_addr.to_string())),
+            syslog_format: crate::logging::SyslogFormat::Rfc5424,
+            stderr_errors: false,
+            ..crate::logging::LogConfig::default()
+        })?;
+        let db = crate::store::open(":memory:")?;
+        let server = Server::with_logger(db, forwarder);
+
+        let mut bad_session = test_session("wrong-irc-secret", "agent-a");
+        server.try_register(&mut bad_session)?;
+        assert!(!bad_session.registered);
+
+        let mut first_session = test_session("agent-a-token", "agent-a");
+        server.try_register(&mut first_session)?;
+        assert!(first_session.registered);
+
+        let mut replacement_session = test_session("agent-a-token", "agent-a");
+        server.try_register(&mut replacement_session)?;
+        assert!(replacement_session.registered);
+
+        server.logger().flush();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok((n, _)) = syslog_rx.recv_from(&mut buf) {
+            received.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        let joined = received.join("\n");
+        for expected in [
+            "auth.irc_failed",
+            "auth.legacy_token",
+            "auth.irc_session_replaced",
+        ] {
+            assert!(
+                received.iter().any(|msg| msg.contains(expected)),
+                "missing IRC audit event '{expected}' in:\n{joined}"
+            );
+        }
+        assert!(!joined.contains("wrong-irc-secret"));
+        assert!(!joined.contains("agent-a-token"));
+        Ok(())
     }
 
     #[tokio::test]

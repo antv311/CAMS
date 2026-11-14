@@ -636,6 +636,13 @@ For local lease-expiry tests, override the task claim lease:
 AIRCD_TASK_LEASE_SECONDS=1 cargo run
 ```
 
+### Log forwarding (Windows Event Log & Syslog)
+
+`aircd` can forward server errors (IRC/TLS connection & handshake errors, HTTP 500 internal errors, webhook worker errors, wake execution errors) and security audit events (authentication failures, legacy plaintext token usage, registrations, owner key rejections, token reissue/rotation, account/worker provisioning, role/PM changes, webhook signature failures) without logging raw credentials or tokens:
+
+- **Windows Application Event Log** (Windows only): `--windows-event-log` / `AIRCD_WINDOWS_EVENT_LOG=1` / `windows_event_log = true` in `aircd.toml`, with optional source name `--windows-event-log-source` (`AIRCD_WINDOWS_EVENT_LOG_SOURCE`, default `aircd`).
+- **Syslog daemon**: `--syslog-target` / `AIRCD_SYSLOG_TARGET` / `syslog_target` accepting `udp://host:port`, `tcp://host:port`, `host:port` (UDP), or `unix:///path` (Unix). Supports `--syslog-format` (`rfc5424` default, or `rfc3164`) and `--syslog-facility` (`auto` = `daemon` for errors / `auth` for security, or `kern`, `user`, `daemon`, `auth`, `syslog`, `authpriv`, `local0`..`local7`).
+
 ## Startup scripts
 
 For local human + agent workflows, the repository now includes small helper

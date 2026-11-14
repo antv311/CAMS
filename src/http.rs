@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -14,6 +15,7 @@ use tokio::net::TcpListener;
 use crate::auth::{DuplicatePrincipalError, Principal};
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::locks::LockConflictError;
+use crate::logging::{LogEvent, Severity};
 use crate::server::{Server, SpawnError};
 use crate::store::{ClientTemplate, ClientTemplateInput, GroupInput, GroupStoreError};
 
@@ -71,15 +73,49 @@ impl ApiError {
     }
 }
 
+#[derive(Clone, Debug)]
+struct InternalErrorDetail(String);
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             with_cors_headers(),
             Json(json!({ "ok": false, "error": self.message })),
         )
-            .into_response()
+            .into_response();
+        if self.status.is_server_error() {
+            response
+                .extensions_mut()
+                .insert(InternalErrorDetail(self.message));
+        }
+        response
     }
+}
+
+async fn log_http_server_errors(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    if response.status().is_server_error() {
+        let detail = response
+            .extensions()
+            .get::<InternalErrorDetail>()
+            .map(|entry| entry.0.as_str())
+            .unwrap_or("internal server error");
+        state.server.logger().log(
+            LogEvent::server_error(
+                "http.internal_error",
+                format!("{method} {path} failed ({}): {detail}", response.status()),
+            )
+            .with_channel(path),
+        );
+    }
+    response
 }
 
 pub fn build_runtime_info(
@@ -228,6 +264,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/git/webhook", post(github_webhook_query))
         .route("/v1/git/webhook/{repo}", post(github_webhook_repo))
         .fallback(cors_preflight_or_404)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            log_http_server_errors,
+        ))
         .with_state(state)
 }
 
@@ -377,6 +417,15 @@ async fn register_agent(
             .or_else(|| req.invite.clone())
             .unwrap_or_default();
         if !constant_time_eq(supplied.trim().as_bytes(), expected.as_bytes()) {
+            state.server.logger().log_security(
+                Severity::Warning,
+                "auth.register_denied",
+                "failure",
+                None,
+                Some(&req.nick),
+                Some("/v1/register"),
+                format!("Registration denied for '{}': invalid owner invite key", req.nick),
+            );
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "registration requires the owner's invite key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
@@ -404,6 +453,19 @@ async fn register_agent(
         .join_channels(&principal, &initial_channels)
         .map_err(ApiError::internal)?;
 
+    state.server.logger().log_security(
+        Severity::Info,
+        "auth.register_succeeded",
+        "success",
+        Some(&principal.id),
+        Some(&principal.id),
+        Some("/v1/register"),
+        format!(
+            "Registered principal @{} with role '{}'",
+            principal.nick, principal.role
+        ),
+    );
+
     let host = resolve_request_host(&headers, &state.info);
     Ok((
         StatusCode::CREATED,
@@ -427,6 +489,15 @@ fn require_owner(
     body_key: Option<&str>,
 ) -> Result<(), ApiError> {
     let Some(expected) = state.info.register_key.as_deref() else {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "owner.auth_denied",
+            "failure",
+            None,
+            None,
+            None,
+            "Owner action denied: no owner key is configured",
+        );
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "owner actions need an owner key to be configured: start aircd without --open-registration",
@@ -440,6 +511,15 @@ fn require_owner(
     if constant_time_eq(supplied.trim().as_bytes(), expected.as_bytes()) {
         Ok(())
     } else {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "owner.auth_denied",
+            "failure",
+            None,
+            None,
+            None,
+            "Owner action denied: invalid owner key",
+        );
         Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "this action requires the owner's key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
@@ -603,6 +683,15 @@ async fn upsert_template(
         .templates()
         .upsert(&id, req.template)
         .map_err(template_store_error)?;
+    state.server.logger().log_security(
+        Severity::Info,
+        "template.upserted",
+        "success",
+        Some("owner"),
+        Some(&template.id),
+        Some("/v1/templates"),
+        format!("Owner upserted client template '{}'", template.id),
+    );
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -626,6 +715,15 @@ async fn delete_template(
             "no client template named '{id}'"
         )));
     }
+    state.server.logger().log_security(
+        Severity::Info,
+        "template.deleted",
+        "success",
+        Some("owner"),
+        Some(&id),
+        Some("/v1/templates"),
+        format!("Owner deleted client template '{id}'"),
+    );
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -671,6 +769,15 @@ async fn spawn_template_worker(
             if let Some(error) = err.downcast_ref::<SpawnError>() {
                 match error {
                     SpawnError::Forbidden(message) => {
+                        state.server.logger().log_security(
+                            Severity::Warning,
+                            "worker.spawn_denied",
+                            "failure",
+                            actor.as_ref().map(|a| a.id.as_str()),
+                            Some(&req.nick),
+                            Some("/v1/templates/spawn"),
+                            message.clone(),
+                        );
                         ApiError::new(StatusCode::FORBIDDEN, message.clone())
                     }
                     SpawnError::TemplateNotFound(message) => ApiError::not_found(message.clone()),
@@ -683,6 +790,18 @@ async fn spawn_template_worker(
                 ApiError::bad_request(err.to_string())
             }
         })?;
+    state.server.logger().log_security(
+        Severity::Info,
+        "worker.spawned",
+        "success",
+        actor.as_ref().map(|a| a.id.as_str()).or(Some("owner")),
+        Some(&created.principal.id),
+        Some(&created.channel),
+        format!(
+            "Spawned worker @{} from template '{}' (model '{}')",
+            created.principal.nick, created.template, created.model
+        ),
+    );
     let host = resolve_request_host(&headers, &state.info);
     Ok((
         StatusCode::CREATED,
@@ -782,6 +901,18 @@ async fn owner_create_account(
                 ApiError::bad_request(err.to_string())
             }
         })?;
+    state.server.logger().log_security(
+        Severity::Info,
+        "account.created",
+        "success",
+        Some("owner"),
+        Some(&created.principal.id),
+        Some(&created.channel),
+        format!(
+            "Owner created account @{} from template '{}' (model '{}')",
+            created.principal.nick, created.template, created.model
+        ),
+    );
     let host = resolve_request_host(&headers, &state.info);
     Ok((
         StatusCode::CREATED,
@@ -867,6 +998,15 @@ async fn owner_wake(
             let cfg = wakes
                 .upsert(&principal.id, req.config)
                 .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            state.server.logger().log_security(
+                Severity::Info,
+                "wake.config_changed",
+                "success",
+                Some("owner"),
+                Some(&principal.id),
+                Some("/v1/owner/wake"),
+                format!("Owner updated wake launcher for @{}", principal.nick),
+            );
             json!({ "ok": true, "wake": cfg })
         }
         "show" => {
@@ -875,6 +1015,17 @@ async fn owner_wake(
         }
         "delete" => {
             let removed = wakes.delete(&principal.id).map_err(ApiError::internal)?;
+            if removed {
+                state.server.logger().log_security(
+                    Severity::Info,
+                    "wake.deleted",
+                    "success",
+                    Some("owner"),
+                    Some(&principal.id),
+                    Some("/v1/owner/wake"),
+                    format!("Owner deleted wake launcher for @{}", principal.nick),
+                );
+            }
             json!({ "ok": true, "removed": removed })
         }
         "runs" => {
@@ -894,12 +1045,30 @@ async fn owner_wake(
                     principal.nick
                 )));
             }
+            state.server.logger().log_security(
+                Severity::Info,
+                "wake.config_changed",
+                "success",
+                Some("owner"),
+                Some(&principal.id),
+                Some("/v1/owner/wake"),
+                format!("Owner set wake launcher enabled={enabled} for @{}", principal.nick),
+            );
             json!({ "ok": true, "nick": principal.nick, "enabled": enabled })
         }
         "reset" => {
             let removed = wakes
                 .clear_sessions(&principal.id, None)
                 .map_err(ApiError::internal)?;
+            state.server.logger().log_security(
+                Severity::Info,
+                "wake.config_changed",
+                "success",
+                Some("owner"),
+                Some(&principal.id),
+                Some("/v1/owner/wake"),
+                format!("Owner reset wake sessions for @{}", principal.nick),
+            );
             json!({ "ok": true, "removed": removed })
         }
         "test" => {
@@ -940,6 +1109,15 @@ async fn owner_reissue_token(
     Json(req): Json<OwnerReissueReq>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Some(expected) = state.info.register_key.as_deref() else {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "owner.auth_denied",
+            "failure",
+            None,
+            Some(&req.nick),
+            Some("/v1/owner/reissue"),
+            "Token reissue denied: no owner key is configured",
+        );
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "token reissue needs an owner key to be configured: start aircd without --open-registration",
@@ -952,6 +1130,15 @@ async fn owner_reissue_token(
         .or_else(|| req.invite.clone())
         .unwrap_or_default();
     if !constant_time_eq(supplied.trim().as_bytes(), expected.as_bytes()) {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "owner.auth_denied",
+            "failure",
+            None,
+            Some(&req.nick),
+            Some("/v1/owner/reissue"),
+            format!("Token reissue denied for '{}': invalid owner key", req.nick),
+        );
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "token reissue requires the owner's key: send it as \"invite\" in the JSON body or in the X-AirCD-Invite header",
@@ -994,13 +1181,21 @@ async fn login_agent(
         .join_channels(&principal, &channels)
         .map_err(ApiError::internal)?;
     let rotated = if req.rotate_token.unwrap_or(false) {
-        Some(
-            state
-                .server
-                .auth()
-                .issue_token(&principal.id, req.label.as_deref(), false)
-                .map_err(ApiError::internal)?,
-        )
+        let token = state
+            .server
+            .auth()
+            .issue_token(&principal.id, req.label.as_deref(), false)
+            .map_err(ApiError::internal)?;
+        state.server.logger().log_security(
+            Severity::Info,
+            "token.rotated",
+            "success",
+            Some(&principal.id),
+            Some(&principal.id),
+            Some("/v1/login"),
+            format!("Issued rotated token for @{}", principal.nick),
+        );
+        Some(token)
     } else {
         None
     };
@@ -1239,6 +1434,20 @@ async fn set_webhook(
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
+    state.server.logger().log_security(
+        Severity::Info,
+        "webhook.updated",
+        "success",
+        Some(&principal.id),
+        Some(&principal.id),
+        Some("/v1/webhooks"),
+        format!(
+            "Webhook updated for @{} (rotate_secret={})",
+            principal.nick,
+            req.rotate_secret.unwrap_or(false)
+        ),
+    );
+
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -1260,6 +1469,17 @@ async fn delete_webhook(
         .webhooks()
         .delete(&principal.id)
         .map_err(ApiError::internal)?;
+    if deleted {
+        state.server.logger().log_security(
+            Severity::Info,
+            "webhook.deleted",
+            "success",
+            Some(&principal.id),
+            Some(&principal.id),
+            Some("/v1/webhooks"),
+            format!("Webhook deleted for @{}", principal.nick),
+        );
+    }
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -1792,6 +2012,18 @@ async fn get_notes(
     let target_id = match q.nick.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         Some(nick) if !nick.trim_start_matches('@').eq_ignore_ascii_case(&actor.id) => {
             if !Server::is_owner(&actor) {
+                state.server.logger().log_security(
+                    Severity::Warning,
+                    "notes.access_denied",
+                    "failure",
+                    Some(&actor.id),
+                    Some(nick),
+                    Some("/v1/notes"),
+                    format!(
+                        "Non-owner @{} attempted to read notes for '{}'",
+                        actor.nick, nick
+                    ),
+                );
                 return Err(ApiError::new(
                     StatusCode::FORBIDDEN,
                     "only the owner can read another account's notes",
@@ -2174,12 +2406,32 @@ fn handle_github_webhook(
     let secret = maybe_secret
         .as_deref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::unauthorized("Repo has no webhook_secret configured"))?;
+        .ok_or_else(|| {
+            state.server.logger().log_security(
+                Severity::Warning,
+                "git.webhook_denied",
+                "failure",
+                None,
+                Some(&clean_repo),
+                Some("/v1/git/webhook"),
+                format!("GitHub webhook rejected for repo '{clean_repo}': no webhook_secret configured"),
+            );
+            ApiError::unauthorized("Repo has no webhook_secret configured")
+        })?;
     let sig_header = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     if !verify_github_signature(secret, raw_body, sig_header) {
+        state.server.logger().log_security(
+            Severity::Warning,
+            "git.webhook_denied",
+            "failure",
+            None,
+            Some(&clean_repo),
+            Some("/v1/git/webhook"),
+            format!("GitHub webhook rejected for repo '{clean_repo}': invalid X-Hub-Signature-256"),
+        );
         return Err(ApiError::unauthorized("Invalid X-Hub-Signature-256"));
     }
 
@@ -2326,6 +2578,15 @@ fn authenticate_request(state: &AppState, headers: &HeaderMap) -> Result<Princip
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
+            state.server.logger().log_security(
+                Severity::Warning,
+                "auth.http_failed",
+                "failure",
+                None,
+                None,
+                None,
+                "HTTP authentication failed: missing bearer token",
+            );
             ApiError::unauthorized(
                 "Missing Authorization: Bearer <token> header; register via POST /v1/register first",
             )
@@ -2335,7 +2596,18 @@ fn authenticate_request(state: &AppState, headers: &HeaderMap) -> Result<Princip
         .server
         .auth()
         .authenticate(raw)
-        .map_err(|_| ApiError::unauthorized("Invalid bearer token"))
+        .map_err(|_| {
+            state.server.logger().log_security(
+                Severity::Warning,
+                "auth.http_failed",
+                "failure",
+                None,
+                None,
+                None,
+                "HTTP authentication failed: invalid bearer token",
+            );
+            ApiError::unauthorized("Invalid bearer token")
+        })
 }
 
 fn build_welcome_payload(state: &AppState, base_host: &str) -> Result<Value, ApiError> {
@@ -5561,5 +5833,180 @@ mod tests {
         assert_eq!(local.detected_hosts, vec!["127.0.0.1".to_string()]);
         let wildcard = build_runtime_info("0.0.0.0:6667", "0.0.0.0:6680", None);
         assert!(wildcard.detected_hosts.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn http_forwards_security_audits_and_internal_errors_to_syslog() -> Result<()> {
+        let syslog_rx = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        syslog_rx.set_nonblocking(true)?;
+        let syslog_addr = syslog_rx.local_addr()?;
+
+        let forwarder = crate::logging::EventForwarder::new(crate::logging::LogConfig {
+            syslog_target: Some(crate::logging::SyslogTarget::Udp(syslog_addr.to_string())),
+            syslog_format: crate::logging::SyslogFormat::Rfc5424,
+            stderr_errors: false,
+            ..crate::logging::LogConfig::default()
+        })?;
+
+        let db = store::open(":memory:")?;
+        let server = Server::with_logger(db.clone(), forwarder);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some("owner-invite-secret".to_string());
+        let logger = server.logger().clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // 1. Missing and invalid bearer tokens.
+        assert_eq!(
+            client.get(format!("{base}/v1/me")).send().await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/me"))
+                .bearer_auth("bogus-bearer-secret")
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // 2. Registration denied and succeeded.
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/register"))
+                .json(&json!({"nick": "audit-worker", "invite": "wrong-invite"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let reg_res = client
+            .post(format!("{base}/v1/register"))
+            .json(&json!({"nick": "audit-worker", "invite": "owner-invite-secret"}))
+            .send()
+            .await?;
+        assert_eq!(reg_res.status(), StatusCode::CREATED);
+        let worker_token = reg_res.json::<Value>().await?["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 3. Owner reissue denied and succeeded.
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/owner/reissue"))
+                .json(&json!({"nick": "audit-worker", "invite": "bad-owner-key"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let reissue_res = client
+            .post(format!("{base}/v1/owner/reissue"))
+            .json(&json!({"nick": "audit-worker", "invite": "owner-invite-secret"}))
+            .send()
+            .await?;
+        assert_eq!(reissue_res.status(), StatusCode::OK);
+        let reissued_token = reissue_res.json::<Value>().await?["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 4. Role change.
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/roles"))
+                .bearer_auth(&reissued_token)
+                .json(&json!({"nick": "audit-worker", "role": "leader"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+
+        // 5. GitHub webhook signature failure.
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/gits"))
+                .bearer_auth(&reissued_token)
+                .json(&json!({"name": "audit-repo", "channel": "#general", "local_path": "/tmp/audit-repo", "webhook_secret": "gh-secret"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/git/webhook/audit-repo"))
+                .header("X-Hub-Signature-256", "sha256=0000")
+                .json(&json!({"ref": "refs/heads/main"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // 6. Trigger a real HTTP 500 internal server error by dropping a table.
+        db.lock().unwrap().execute("DROP TABLE reports", [])?;
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/reports"))
+                .bearer_auth(&reissued_token)
+                .send()
+                .await?
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        logger.flush();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok((n, _)) = syslog_rx.recv_from(&mut buf) {
+            received.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+
+        let joined = received.join("\n");
+        for expected in [
+            "auth.http_failed",
+            "auth.register_denied",
+            "auth.register_succeeded",
+            "owner.auth_denied",
+            "token.reissued",
+            "role.changed",
+            "git.webhook_denied",
+            "http.internal_error",
+        ] {
+            assert!(
+                received.iter().any(|msg| msg.contains(expected)),
+                "missing syslog event '{expected}' in:\n{joined}"
+            );
+        }
+        for secret in [
+            "owner-invite-secret",
+            "bogus-bearer-secret",
+            &worker_token,
+            &reissued_token,
+            "gh-secret",
+        ] {
+            assert!(
+                !joined.contains(secret),
+                "syslog output leaked secret '{secret}'"
+            );
+        }
+        assert!(
+            received
+                .iter()
+                .any(|msg| msg.starts_with("<27>1 ") && msg.contains("http.internal_error")),
+            "expected daemon error PRI <27> for http.internal_error"
+        );
+
+        Ok(())
     }
 }
