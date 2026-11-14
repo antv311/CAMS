@@ -24,7 +24,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 DEFAULT_BASE_URL = "http://localhost:1235/v1"
 DEFAULT_API_KEY = "lm-studio"
@@ -32,6 +32,7 @@ DEFAULT_MAX_TURNS = 30
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_OUTPUT_CHARS = 16000
+STREAM_FORMATS = ("text", "jsonl")
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -192,6 +193,8 @@ class BionicConfig:
     verbose: bool = False
     workspace_root: str = ""
     approval: str = "auto"
+    stream: bool = False
+    stream_format: str = "text"
 
 
 @dataclass
@@ -345,6 +348,13 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
     emit_session_id = bool(getattr(args, "emit_session_id", False) or session_id is not None)
     verbose = bool(getattr(args, "verbose", False) or _parse_bool_env("BIONIC_VERBOSE"))
 
+    cli_stream_format = getattr(args, "stream_format", None)
+    stream_format = (cli_stream_format or os.environ.get("BIONIC_STREAM_FORMAT", "").strip() or "text").lower()
+    if stream_format not in STREAM_FORMATS:
+        raise BionicError(f"stream format must be one of {', '.join(STREAM_FORMATS)}, got {stream_format!r}")
+    # --stream-format on the command line implies --stream; the env var alone does not.
+    stream = bool(getattr(args, "stream", False) or cli_stream_format or _parse_bool_env("BIONIC_STREAM"))
+
     return BionicConfig(
         base_url=base_url,
         api_key=api_key,
@@ -363,6 +373,8 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
         verbose=verbose,
         workspace_root=str(root_path),
         approval=approval,
+        stream=stream,
+        stream_format=stream_format,
     )
 
 
@@ -1059,6 +1071,60 @@ def _exec_tool_jailed(
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
+def _build_request(
+    url: str,
+    *,
+    method: str,
+    payload: Optional[dict[str, Any]],
+    api_key: str,
+    accept: str = "application/json",
+) -> urllib.request.Request:
+    headers = {"Accept": accept}
+    data: Optional[bytes] = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return urllib.request.Request(url, data=data, headers=headers, method=method)
+
+
+def _error_detail(parsed: Any, fallback: str) -> str:
+    err_obj = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(err_obj, dict) and err_obj.get("message"):
+        return str(err_obj["message"])
+    if err_obj:
+        return str(err_obj)
+    return fallback
+
+
+def _http_error(err: urllib.error.HTTPError, url: str) -> BionicError:
+    detail = ""
+    try:
+        body = err.read().decode("utf-8", errors="replace").strip()
+        if body:
+            try:
+                detail = _error_detail(json.loads(body), body)
+            except json.JSONDecodeError:
+                detail = body
+    except Exception:
+        detail = ""
+    msg = f"Bionic API HTTP {err.code} from {url}"
+    if detail:
+        msg = f"{msg}: {detail}"
+    return BionicError(msg)
+
+
+def _parse_json_object(raw: str, url: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise BionicError(f"Invalid JSON response from {url}: {err}") from err
+    if not isinstance(parsed, dict):
+        raise BionicError(f"Expected JSON object from {url}, got {type(parsed).__name__}")
+    return parsed
+
+
 def _http_json(
     url: str,
     *,
@@ -1067,50 +1133,166 @@ def _http_json(
     api_key: str = "",
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    headers = {"Accept": "application/json"}
-    data: Optional[bytes] = None
-    if payload is not None:
-        headers["Content-Type"] = "application/json"
-        data = json.dumps(payload).encode("utf-8")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    req = _build_request(url, method=method, payload=payload, api_key=api_key)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as err:
-        detail = ""
-        try:
-            body = err.read().decode("utf-8", errors="replace").strip()
-            if body:
-                try:
-                    parsed = json.loads(body)
-                    err_obj = parsed.get("error") if isinstance(parsed, dict) else None
-                    if isinstance(err_obj, dict) and err_obj.get("message"):
-                        detail = str(err_obj["message"])
-                    elif isinstance(parsed, dict) and parsed.get("error"):
-                        detail = str(parsed["error"])
-                    else:
-                        detail = body
-                except json.JSONDecodeError:
-                    detail = body
-        except Exception:
-            detail = ""
-        msg = f"Bionic API HTTP {err.code} from {url}"
-        if detail:
-            msg = f"{msg}: {detail}"
-        raise BionicError(msg) from err
+        raise _http_error(err, url) from err
     except urllib.error.URLError as err:
         raise BionicError(f"Could not connect to Bionic API at {url}: {err.reason}") from err
+    return _parse_json_object(raw, url)
 
+
+StreamEmit = Callable[[str, str], None]
+
+
+def iter_sse_data(lines: Iterable[bytes]) -> Iterator[str]:
+    """Yield the ``data`` payload of each Server-Sent Event in a byte-line stream.
+
+    Multi-line ``data:`` fields are joined with newlines; comments (``:``) and
+    other fields (``event:``, ``id:``, ``retry:``) are ignored.
+    """
+    data_lines: list[str] = []
+    for raw in lines:
+        # UTF-8 continuation bytes never equal b"\n", so per-line decoding is safe.
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if data_lines:
+                yield "\n".join(data_lines)
+                data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if field != "data":
+            continue
+        data_lines.append(value[1:] if value.startswith(" ") else value)
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
+def accumulate_stream(events: Iterable[str], emit: Optional[StreamEmit] = None) -> dict[str, Any]:
+    """Fold OpenAI ``chat.completion.chunk`` SSE payloads into one assistant message.
+
+    ``emit(kind, text)`` is called for each ``"token"`` (content) and
+    ``"reasoning"`` delta as it arrives. Tool-call fragments are merged by
+    ``index`` so the returned message matches a non-streamed ``message``.
+    """
+    content: list[str] = []
+    reasoning: list[str] = []
+    calls: dict[int, dict[str, Any]] = {}
+    saw_chunk = False
+    for data in events:
+        if data.strip() == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError as err:
+            raise BionicError(f"Invalid JSON in Bionic stream chunk: {err}: {data[:200]}") from err
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("error"):
+            raise BionicError(f"Bionic API stream error: {_error_detail(obj, json.dumps(obj)[:400])}")
+        saw_chunk = True
+        choices = obj.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            continue  # e.g. a trailing usage-only chunk
+        delta = choices[0].get("delta")
+        if not isinstance(delta, dict):
+            delta = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
+
+        text = delta.get("content")
+        if isinstance(text, str) and text:
+            content.append(text)
+            if emit is not None:
+                emit("token", text)
+        think = delta.get("reasoning_content")
+        if think is None:
+            think = delta.get("reasoning")
+        if isinstance(think, str) and think:
+            reasoning.append(think)
+            if emit is not None:
+                emit("reasoning", think)
+
+        for pos, frag in enumerate(delta.get("tool_calls") or []):
+            if not isinstance(frag, dict):
+                continue
+            idx = frag.get("index")
+            if not isinstance(idx, int):
+                idx = pos
+            slot = calls.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            if frag.get("id"):
+                slot["id"] = str(frag["id"])
+            if frag.get("type"):
+                slot["type"] = str(frag["type"])
+            fn = frag.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            if isinstance(name, str) and name and not slot["function"]["name"].endswith(name):
+                slot["function"]["name"] += name
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                slot["function"]["arguments"] += args
+            elif args is not None:
+                slot["function"]["arguments"] = json.dumps(args)
+
+    if not saw_chunk:
+        raise BionicError("Bionic API stream ended without any completion chunks")
+
+    msg: dict[str, Any] = {"role": "assistant", "content": "".join(content) if content else None}
+    if reasoning:
+        msg["reasoning_content"] = "".join(reasoning)
+    if calls:
+        tool_calls = []
+        for idx in sorted(calls):
+            call = calls[idx]
+            if not call["id"]:
+                del call["id"]
+            tool_calls.append(call)
+        msg["tool_calls"] = tool_calls
+    return msg
+
+
+def _http_chat_stream(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    api_key: str = "",
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    emit: Optional[StreamEmit] = None,
+) -> dict[str, Any]:
+    """POST a streaming chat completion and return the assembled assistant message.
+
+    Falls back to a plain JSON body when the server ignores ``"stream": true``.
+    """
+    req = _build_request(
+        url,
+        method="POST",
+        payload={**payload, "stream": True},
+        api_key=api_key,
+        accept="text/event-stream, application/json",
+    )
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as err:
-        raise BionicError(f"Invalid JSON response from {url}: {err}") from err
-    if not isinstance(parsed, dict):
-        raise BionicError(f"Expected JSON object from {url}, got {type(parsed).__name__}")
-    return parsed
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "text/event-stream" not in ctype:
+                body = _parse_json_object(resp.read().decode("utf-8", errors="replace"), url)
+                choices = body.get("choices")
+                msg = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+                if not isinstance(msg, dict):
+                    raise BionicError(f"Bionic API returned no choices: {json.dumps(body)[:400]}")
+                if emit is not None and isinstance(msg.get("content"), str) and msg["content"]:
+                    emit("token", msg["content"])
+                return msg
+            return accumulate_stream(iter_sse_data(resp), emit)
+    except urllib.error.HTTPError as err:
+        raise _http_error(err, url) from err
+    except urllib.error.URLError as err:
+        raise BionicError(f"Could not connect to Bionic API at {url}: {err.reason}") from err
+    except OSError as err:  # socket timeout / reset mid-stream
+        raise BionicError(f"Bionic API stream from {url} was interrupted: {err}") from err
 
 
 def _is_embedding_model(entry: dict[str, Any], model_id: str) -> bool:
@@ -1257,14 +1439,95 @@ def _normalize_assistant_message(msg: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _tool_result_error(result: str) -> Optional[str]:
+    try:
+        parsed = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return str(parsed["error"])
+    return None
+
+
+class StreamRenderer:
+    """Render ``run_agent`` progress events to a text stream (stderr by default).
+
+    ``text`` writes tokens as they arrive plus ``[tool]`` lines; ``jsonl``
+    writes one JSON event per line for machine-readable execution logs.
+    """
+
+    def __init__(self, fmt: str = "text", out: Any = None) -> None:
+        if fmt not in STREAM_FORMATS:
+            raise BionicError(f"stream format must be one of {', '.join(STREAM_FORMATS)}, got {fmt!r}")
+        self.fmt = fmt
+        self.out = out if out is not None else sys.stderr
+        self._mode = ""  # "", "token" or "reasoning": what the current line holds
+
+    def _write(self, text: str) -> None:
+        try:
+            self.out.write(text)
+        except UnicodeEncodeError:
+            enc = getattr(self.out, "encoding", None) or "ascii"
+            self.out.write(text.encode(enc, errors="replace").decode(enc, errors="replace"))
+        self.out.flush()
+
+    def _end_line(self) -> None:
+        if self._mode:
+            self._write("\n")
+            self._mode = ""
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        if self.fmt == "jsonl":
+            self._write(json.dumps(event, ensure_ascii=False) + "\n")
+            return
+        kind = event.get("type")
+        if kind in ("token", "reasoning"):
+            if self._mode != kind:
+                self._end_line()
+                if kind == "reasoning":
+                    self._write("[thinking] ")
+                self._mode = kind
+            self._write(str(event.get("text") or ""))
+        elif kind == "tool_call":
+            self._end_line()
+            args = event.get("arguments") or ""
+            try:
+                parsed = json.loads(args) if isinstance(args, str) and args else {}
+            except json.JSONDecodeError:
+                parsed = None
+            desc = (
+                _describe_tool_call(str(event.get("name") or ""), parsed)
+                if isinstance(parsed, dict)
+                else f"{event.get('name')} {str(args)[:200]}"
+            )
+            self._write(f"[tool] {desc}\n")
+        elif kind == "tool_result":
+            self._end_line()
+            if event.get("error"):
+                self._write(f"[tool] {event.get('name')} failed: {event['error']}\n")
+        elif kind == "done":
+            self._end_line()
+
+
 def run_agent(
     prompt: str,
     config: BionicConfig,
     *,
     log: Optional[Callable[[str], None]] = None,
     approver: Optional[Callable[[str, dict[str, Any]], bool]] = None,
+    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> RunResult:
-    """Run the OpenAI tool-calling loop until a final response or ``max_turns``."""
+    """Run the OpenAI tool-calling loop until a final response or ``max_turns``.
+
+    ``on_event`` receives progress events as dicts with a ``type`` key:
+    ``turn``, ``token`` / ``reasoning`` (only when ``config.stream``),
+    ``tool_call``, ``tool_result`` and ``done``.
+    """
+
+    def notify(event: dict[str, Any]) -> None:
+        if on_event is not None:
+            on_event(event)
+
     model = resolve_model(config)
     system_prompt = build_system_prompt(
         config.cwd,
@@ -1304,19 +1567,29 @@ def run_agent(
         if config.max_tokens is not None:
             payload["max_tokens"] = config.max_tokens
 
-        resp = _http_json(
-            chat_url,
-            method="POST",
-            payload=payload,
-            api_key=config.api_key,
-            timeout=config.timeout,
-        )
-        choices = resp.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise BionicError(f"Bionic API returned no choices: {json.dumps(resp)[:400]}")
-        msg = choices[0].get("message")
-        if not isinstance(msg, dict):
-            raise BionicError(f"Bionic API choice missing 'message': {json.dumps(choices[0])[:400]}")
+        notify({"type": "turn", "turn": turn, "model": model})
+        if config.stream:
+            msg = _http_chat_stream(
+                chat_url,
+                payload=payload,
+                api_key=config.api_key,
+                timeout=config.timeout,
+                emit=lambda kind, text, _turn=turn: notify({"type": kind, "turn": _turn, "text": text}),
+            )
+        else:
+            resp = _http_json(
+                chat_url,
+                method="POST",
+                payload=payload,
+                api_key=config.api_key,
+                timeout=config.timeout,
+            )
+            choices = resp.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise BionicError(f"Bionic API returned no choices: {json.dumps(resp)[:400]}")
+            msg = choices[0].get("message")
+            if not isinstance(msg, dict):
+                raise BionicError(f"Bionic API choice missing 'message': {json.dumps(choices[0])[:400]}")
 
         cleaned = _normalize_assistant_message(msg)
         messages.append(cleaned)
@@ -1328,6 +1601,7 @@ def run_agent(
                 final_text = str(msg["reasoning_content"]).strip()
             if session_file is not None:
                 _save_session_messages(session_file, messages)
+            notify({"type": "done", "turns": turn, "tool_calls": total_tool_calls})
             return RunResult(
                 content=final_text,
                 model=model,
@@ -1338,13 +1612,24 @@ def run_agent(
 
         for idx, tc in enumerate(tool_calls):
             total_tool_calls += 1
-            tc_id = str(tc.get("id") or f"call_{turn}_{idx}")
+            tc_id = str((tc.get("id") if isinstance(tc, dict) else None) or f"call_{turn}_{idx}")
+            if isinstance(tc, dict) and not tc.get("id"):
+                tc["id"] = tc_id  # keep assistant tool_calls and tool replies paired in history
             fn = tc.get("function") if isinstance(tc, dict) else None
+            name = str(fn.get("name") or "") if isinstance(fn, dict) else ""
             if not isinstance(fn, dict):
                 result = json.dumps({"error": "Malformed tool_call: missing 'function'"})
             else:
-                name = str(fn.get("name") or "")
                 raw_args = fn.get("arguments")
+                notify(
+                    {
+                        "type": "tool_call",
+                        "turn": turn,
+                        "id": tc_id,
+                        "name": name,
+                        "arguments": raw_args if isinstance(raw_args, str) else json.dumps(raw_args),
+                    }
+                )
                 try:
                     if raw_args is None or raw_args == "":
                         parsed_args: Any = {}
@@ -1365,6 +1650,16 @@ def run_agent(
                     )
                 except Exception as exc:
                     result = json.dumps({"error": str(exc)})
+            notify(
+                {
+                    "type": "tool_result",
+                    "turn": turn,
+                    "id": tc_id,
+                    "name": name,
+                    "error": _tool_result_error(result),
+                    "chars": len(result),
+                }
+            )
             messages.append(
                 {
                     "role": "tool",
@@ -1461,6 +1756,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include embedding models when listing models with --list-models",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "Stream tokens and tool activity to stderr as they arrive via SSE; stdout is unchanged "
+            "(env: BIONIC_STREAM)"
+        ),
+    )
+    parser.add_argument(
+        "--stream-format",
+        choices=STREAM_FORMATS,
+        help=(
+            "Live feedback format: text (tokens + [tool] lines) or jsonl (one JSON event per line); "
+            "implies --stream (env: BIONIC_STREAM_FORMAT, default: text)"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON result to stdout")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log tool calls to stderr")
     return parser
@@ -1491,7 +1802,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise BionicError("prompt must not be empty")
 
         log = (lambda msg: print(msg, file=sys.stderr)) if config.verbose else None
-        result = run_agent(prompt, config, log=log)
+        on_event = StreamRenderer(config.stream_format) if config.stream else None
+        result = run_agent(prompt, config, log=log, on_event=on_event)
         if config.emit_session_id and result.session_id:
             print(f"session_id: {result.session_id}", file=sys.stderr)
         if args.json:

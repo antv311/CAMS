@@ -82,6 +82,44 @@ No paths, model IDs, or hostnames outside `localhost` are hardcoded.
 | `--session-id` | — | *(none)* | Persist/resume message history for a session ID |
 | `--session-dir` | `BIONIC_SESSION_DIR` | `<tempdir>/aircd-bionic-sessions` | Directory where session JSON files are stored |
 | `--emit-session-id` | — | `false` | Print `session_id: <id>` on stderr for `aircd` tracking |
+| `--stream` | `BIONIC_STREAM` | `false` | Request SSE token streaming and show live progress on stderr |
+| `--stream-format` | `BIONIC_STREAM_FORMAT` | `text` | `text` or `jsonl` live feedback (the CLI flag implies `--stream`) |
+
+### Streaming (`--stream`)
+
+With `--stream`, each turn is sent with `"stream": true` and the
+`text/event-stream` reply is assembled from `chat.completion.chunk` deltas:
+content tokens, `reasoning_content`/`reasoning` deltas, and tool-call fragments
+merged by `index` (missing tool-call IDs get a generated `call_<turn>_<n>` that
+is also written into history, so tool replies stay paired). If the server
+ignores the flag and returns plain JSON, the runner uses that body as-is.
+
+Live feedback always goes to **stderr**. **stdout is unchanged**: it still holds
+only the final answer (or the `--json` object), so `aircd` wakes and scripts
+that parse stdout keep working.
+
+- `--stream-format text` (default) prints tokens as they arrive, reasoning on
+  `[thinking] …` lines, and `[tool] write_file: out.txt (9 chars)` style lines
+  for each tool call (plus `[tool] <name> failed: …` on errors).
+- `--stream-format jsonl` prints one JSON event per line, for real-time execution
+  logs: `{"type":"turn","turn":1,"model":…}`, `{"type":"token","turn":1,"text":…}`,
+  `{"type":"reasoning",…}`, `{"type":"tool_call","id":…,"name":…,"arguments":…}`,
+  `{"type":"tool_result","id":…,"name":…,"error":null,"chars":…}`, and
+  `{"type":"done","turns":…,"tool_calls":…}`.
+
+```powershell
+airc-bionic --model auto --stream -p "Run the tests and summarize failures"
+airc-bionic --model auto --stream-format jsonl -p "..." 2> run-log.jsonl
+```
+
+From Python, pass `on_event=` to `aircd.bionic.run_agent` to receive the same
+event dicts (`turn`, `tool_call`, `tool_result`, `done` fire in both modes;
+`token`/`reasoning` only when `config.stream` is set). `StreamRenderer` is the
+renderer the CLI uses.
+
+Because `aircd` captures a worker's stderr into the wake transcript, enabling
+`BIONIC_STREAM` on a hub template makes those transcripts include the model's
+token stream; leave it off for templates unless you want that.
 
 ## Client template (`docs/templates/bionic.json`)
 
