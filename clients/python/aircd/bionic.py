@@ -1,0 +1,867 @@
+"""Function-calling agent runner for LM Studio Bionic and OpenAI-compatible servers.
+
+Bridges CAMS wakes (or standalone CLI invocations) to a local or remote
+OpenAI-compatible ``/v1/chat/completions`` endpoint such as LM Studio Bionic
+(default ``http://localhost:1235/v1``), exposing file and shell tools so local
+tool-calling models can operate as autonomous CAMS workers and group members.
+
+Configuration precedence (highest wins):
+    CLI flags -> environment variables -> built-in defaults.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+DEFAULT_BASE_URL = "http://localhost:1235/v1"
+DEFAULT_API_KEY = "lm-studio"
+DEFAULT_MAX_TURNS = 30
+DEFAULT_TIMEOUT_SECONDS = 300.0
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 120.0
+DEFAULT_MAX_OUTPUT_CHARS = 16000
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+class BionicError(RuntimeError):
+    """Raised when configuration, model discovery, or API execution fails."""
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Execute a shell command in the working directory and return "
+                "JSON with exit_code, stdout, and stderr."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute.",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read text content from a file path, optionally limited to an "
+                "inclusive 1-based line range."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read."},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Optional 1-based starting line number.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional 1-based ending line number (inclusive).",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write full text content to a file path, creating parent "
+                "directories if needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write."},
+                    "content": {"type": "string", "description": "Full file content."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace one exact unique occurrence of target text in an "
+                "existing file with replacement text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit."},
+                    "target": {
+                        "type": "string",
+                        "description": "Exact existing text to replace (must match once).",
+                    },
+                    "replacement": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                },
+                "required": ["path", "target", "replacement"],
+            },
+        },
+    },
+]
+
+
+@dataclass
+class BionicConfig:
+    """Runtime settings for the Bionic agent runner."""
+
+    base_url: str = DEFAULT_BASE_URL
+    api_key: str = DEFAULT_API_KEY
+    model: str = ""
+    cwd: str = ""
+    max_turns: int = DEFAULT_MAX_TURNS
+    timeout: float = DEFAULT_TIMEOUT_SECONDS
+    command_timeout: float = DEFAULT_COMMAND_TIMEOUT_SECONDS
+    max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    system_prompt: Optional[str] = None
+    session_id: Optional[str] = None
+    session_dir: Optional[str] = None
+    emit_session_id: bool = False
+    verbose: bool = False
+
+
+@dataclass
+class RunResult:
+    """Outcome of a single Bionic agent run."""
+
+    content: str
+    model: str
+    turns: int
+    tool_calls: int
+    session_id: Optional[str] = None
+
+
+def _env_first(*names: str) -> str:
+    for name in names:
+        val = os.environ.get(name, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _parse_int(raw: str, name: str, *, minimum: int = 1) -> int:
+    try:
+        value = int(raw)
+    except ValueError as err:
+        raise BionicError(f"{name} must be an integer, got {raw!r}") from err
+    if value < minimum:
+        raise BionicError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def _parse_float(raw: str, name: str, *, minimum: Optional[float] = None) -> float:
+    try:
+        value = float(raw)
+    except ValueError as err:
+        raise BionicError(f"{name} must be a number, got {raw!r}") from err
+    if minimum is not None and value <= minimum:
+        raise BionicError(f"{name} must be > {minimum}, got {value}")
+    return value
+
+
+def _parse_bool_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def normalize_base_url(url: str) -> str:
+    """Normalize an OpenAI-compatible base URL."""
+    clean = url.strip().rstrip("/")
+    if not clean:
+        raise BionicError("base URL must not be empty")
+    if not clean.startswith(("http://", "https://")):
+        clean = f"http://{clean}"
+    return clean
+
+
+def resolve_config(args: argparse.Namespace) -> BionicConfig:
+    """Resolve runtime configuration from CLI flags, environment, and defaults."""
+    raw_url = (
+        getattr(args, "base_url", None)
+        or _env_first("BIONIC_BASE_URL", "AIRCD_BIONIC_BASE_URL", "OPENAI_BASE_URL")
+        or DEFAULT_BASE_URL
+    )
+    base_url = normalize_base_url(raw_url)
+
+    api_key = getattr(args, "api_key", None)
+    if api_key is None:
+        api_key = _env_first("BIONIC_API_KEY", "OPENAI_API_KEY") or DEFAULT_API_KEY
+
+    model = (getattr(args, "model", None) or os.environ.get("BIONIC_MODEL", "")).strip()
+
+    cwd_raw = getattr(args, "cwd", None) or os.environ.get("BIONIC_CWD", "") or os.getcwd()
+    cwd_path = Path(cwd_raw).expanduser().resolve()
+    if not cwd_path.is_dir():
+        raise BionicError(f"working directory does not exist: {cwd_path}")
+
+    max_turns = getattr(args, "max_turns", None)
+    if max_turns is None:
+        env_turns = os.environ.get("BIONIC_MAX_TURNS", "").strip()
+        max_turns = _parse_int(env_turns, "BIONIC_MAX_TURNS", minimum=1) if env_turns else DEFAULT_MAX_TURNS
+    elif max_turns < 1:
+        raise BionicError(f"--max-turns must be >= 1, got {max_turns}")
+
+    timeout = getattr(args, "timeout", None)
+    if timeout is None:
+        env_timeout = os.environ.get("BIONIC_TIMEOUT", "").strip()
+        timeout = _parse_float(env_timeout, "BIONIC_TIMEOUT", minimum=0.0) if env_timeout else DEFAULT_TIMEOUT_SECONDS
+    elif timeout <= 0:
+        raise BionicError(f"--timeout must be > 0, got {timeout}")
+
+    command_timeout = getattr(args, "command_timeout", None)
+    if command_timeout is None:
+        env_cmd_timeout = os.environ.get("BIONIC_COMMAND_TIMEOUT", "").strip()
+        command_timeout = (
+            _parse_float(env_cmd_timeout, "BIONIC_COMMAND_TIMEOUT", minimum=0.0)
+            if env_cmd_timeout
+            else DEFAULT_COMMAND_TIMEOUT_SECONDS
+        )
+    elif command_timeout <= 0:
+        raise BionicError(f"--command-timeout must be > 0, got {command_timeout}")
+
+    max_output_chars = getattr(args, "max_output_chars", None)
+    if max_output_chars is None:
+        env_max_out = os.environ.get("BIONIC_MAX_OUTPUT_CHARS", "").strip()
+        max_output_chars = (
+            _parse_int(env_max_out, "BIONIC_MAX_OUTPUT_CHARS", minimum=256)
+            if env_max_out
+            else DEFAULT_MAX_OUTPUT_CHARS
+        )
+    elif max_output_chars < 256:
+        raise BionicError(f"--max-output-chars must be >= 256, got {max_output_chars}")
+
+    temperature = getattr(args, "temperature", None)
+    if temperature is None:
+        env_temp = os.environ.get("BIONIC_TEMPERATURE", "").strip()
+        if env_temp:
+            temperature = _parse_float(env_temp, "BIONIC_TEMPERATURE")
+
+    max_tokens = getattr(args, "max_tokens", None)
+    if max_tokens is None:
+        env_max_tok = os.environ.get("BIONIC_MAX_TOKENS", "").strip()
+        if env_max_tok:
+            max_tokens = _parse_int(env_max_tok, "BIONIC_MAX_TOKENS", minimum=1)
+
+    system_prompt = getattr(args, "system_prompt", None)
+    system_prompt_file = getattr(args, "system_prompt_file", None)
+    if system_prompt_file:
+        try:
+            system_prompt = Path(system_prompt_file).read_text(encoding="utf-8")
+        except OSError as err:
+            raise BionicError(f"cannot read system prompt file {system_prompt_file}: {err}") from err
+    elif system_prompt is None:
+        env_sys = os.environ.get("BIONIC_SYSTEM_PROMPT")
+        if env_sys:
+            system_prompt = env_sys
+
+    session_id = getattr(args, "session_id", None)
+    if session_id is not None:
+        session_id = session_id.strip() or None
+    session_dir = getattr(args, "session_dir", None) or os.environ.get("BIONIC_SESSION_DIR", "").strip() or None
+    emit_session_id = bool(getattr(args, "emit_session_id", False) or session_id is not None)
+    verbose = bool(getattr(args, "verbose", False) or _parse_bool_env("BIONIC_VERBOSE"))
+
+    return BionicConfig(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        cwd=str(cwd_path),
+        max_turns=max_turns,
+        timeout=timeout,
+        command_timeout=command_timeout,
+        max_output_chars=max_output_chars,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        system_prompt=system_prompt,
+        session_id=session_id,
+        session_dir=session_dir,
+        emit_session_id=emit_session_id,
+        verbose=verbose,
+    )
+
+
+def resolve_path(cwd: str, path_str: str) -> Path:
+    """Resolve a path relative to ``cwd`` when it is not absolute."""
+    if not isinstance(path_str, str) or not path_str.strip():
+        raise ValueError("path must be a non-empty string")
+    p = Path(path_str).expanduser()
+    return p if p.is_absolute() else Path(cwd) / p
+
+
+def _decode_output(data: str | bytes | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
+
+
+def exec_tool(
+    name: str,
+    args: dict[str, Any],
+    cwd: str,
+    *,
+    command_timeout: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+    log: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Execute one agent tool call and serialize its result as text/JSON."""
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"Tool {name} arguments must be a JSON object"})
+
+    if name == "run_command":
+        cmd = args.get("command")
+        if not isinstance(cmd, str) or not cmd.strip():
+            return json.dumps({"error": "run_command requires a non-empty 'command' string"})
+        if log:
+            log(f"[tool] run_command: {cmd}")
+        half_limit = max(256, max_output_chars // 2)
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=command_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = _decode_output(exc.stdout)[-half_limit:]
+            stderr = _decode_output(exc.stderr)[-half_limit:]
+            return json.dumps(
+                {
+                    "error": f"Command timed out after {command_timeout}s",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+            )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        truncated = len(stdout) > half_limit or len(stderr) > half_limit
+        return json.dumps(
+            {
+                "exit_code": proc.returncode,
+                "stdout": stdout[-half_limit:],
+                "stderr": stderr[-half_limit:],
+                "truncated": truncated,
+            }
+        )
+
+    if name == "write_file":
+        path_val = args.get("path")
+        content = args.get("content")
+        if not isinstance(content, str):
+            return json.dumps({"error": "write_file requires a string 'content'"})
+        target = resolve_path(cwd, str(path_val or ""))
+        if log:
+            log(f"[tool] write_file: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return json.dumps({"ok": True, "path": str(target), "bytes": len(content.encode("utf-8"))})
+
+    if name == "edit_file":
+        path_val = args.get("path")
+        target_text = args.get("target")
+        replacement = args.get("replacement")
+        if not isinstance(target_text, str) or not target_text:
+            return json.dumps({"error": "edit_file requires a non-empty string 'target'"})
+        if not isinstance(replacement, str):
+            return json.dumps({"error": "edit_file requires a string 'replacement'"})
+        target = resolve_path(cwd, str(path_val or ""))
+        if not target.exists():
+            return json.dumps({"error": f"File not found: {target}"})
+        if target.is_dir():
+            return json.dumps({"error": f"Path is a directory: {target}"})
+        if log:
+            log(f"[tool] edit_file: {target}")
+        original = target.read_text(encoding="utf-8", errors="replace")
+        matches = original.count(target_text)
+        if matches == 0:
+            return json.dumps({"error": "Target text not found in file"})
+        if matches > 1:
+            return json.dumps(
+                {
+                    "error": (
+                        f"Target text matched {matches} times; include more surrounding "
+                        "context so it matches uniquely"
+                    )
+                }
+            )
+        updated = original.replace(target_text, replacement, 1)
+        target.write_text(updated, encoding="utf-8")
+        return json.dumps({"ok": True, "path": str(target)})
+
+    if name == "read_file":
+        target = resolve_path(cwd, str(args.get("path") or ""))
+        if not target.exists():
+            return json.dumps({"error": f"File not found: {target}"})
+        if target.is_dir():
+            entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+            return json.dumps({"error": f"Path is a directory: {target}", "entries": entries[:200]})
+        if log:
+            log(f"[tool] read_file: {target}")
+        text = target.read_text(encoding="utf-8", errors="replace")
+        start_line = args.get("start_line")
+        end_line = args.get("end_line")
+        if start_line is not None or end_line is not None:
+            lines = text.splitlines(keepends=True)
+            start = 1 if start_line is None else max(1, int(start_line))
+            end = len(lines) if end_line is None else min(len(lines), int(end_line))
+            if start > end and len(lines) > 0:
+                return json.dumps({"error": f"Invalid line range {start}..{end} (file has {len(lines)} lines)"})
+            text = "".join(lines[start - 1 : end])
+        if len(text) > max_output_chars:
+            return text[:max_output_chars] + f"\n...[truncated at {max_output_chars} chars; use start_line/end_line]"
+        return text
+
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+
+def _http_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: Optional[dict[str, Any]] = None,
+    api_key: str = "",
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    headers = {"Accept": "application/json"}
+    data: Optional[bytes] = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as err:
+        detail = ""
+        try:
+            body = err.read().decode("utf-8", errors="replace").strip()
+            if body:
+                try:
+                    parsed = json.loads(body)
+                    err_obj = parsed.get("error") if isinstance(parsed, dict) else None
+                    if isinstance(err_obj, dict) and err_obj.get("message"):
+                        detail = str(err_obj["message"])
+                    elif isinstance(parsed, dict) and parsed.get("error"):
+                        detail = str(parsed["error"])
+                    else:
+                        detail = body
+                except json.JSONDecodeError:
+                    detail = body
+        except Exception:
+            detail = ""
+        msg = f"Bionic API HTTP {err.code} from {url}"
+        if detail:
+            msg = f"{msg}: {detail}"
+        raise BionicError(msg) from err
+    except urllib.error.URLError as err:
+        raise BionicError(f"Could not connect to Bionic API at {url}: {err.reason}") from err
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise BionicError(f"Invalid JSON response from {url}: {err}") from err
+    if not isinstance(parsed, dict):
+        raise BionicError(f"Expected JSON object from {url}, got {type(parsed).__name__}")
+    return parsed
+
+
+def _is_embedding_model(entry: dict[str, Any], model_id: str) -> bool:
+    model_type = str(entry.get("type") or "").strip().lower()
+    if model_type in ("embedding", "embeddings"):
+        return True
+    tokens = set(re.split(r"[-_/.:]+", model_id.lower()))
+    return "embedding" in tokens or "embed" in tokens
+
+
+def list_models(
+    base_url: str,
+    *,
+    api_key: str = "",
+    timeout: float = 30.0,
+    include_all: bool = False,
+) -> list[dict[str, str]]:
+    """Query ``GET {base_url}/models`` and return normalized model entries."""
+    url = normalize_base_url(base_url) + "/models"
+    body = _http_json(url, method="GET", api_key=api_key, timeout=timeout)
+    raw_list = body.get("data")
+    if not isinstance(raw_list, list):
+        raw_list = body.get("models")
+    if not isinstance(raw_list, list):
+        raise BionicError(f"Model list response from {url} did not contain 'data' or 'models'")
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in raw_list:
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id") or entry.get("modelKey") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        if not include_all and _is_embedding_model(entry, model_id):
+            continue
+        seen.add(model_id)
+        item: dict[str, str] = {"id": model_id}
+        display = str(entry.get("display_name") or entry.get("displayName") or "").strip()
+        if display and display != model_id:
+            item["display_name"] = display
+        out.append(item)
+    return out
+
+
+def resolve_model(config: BionicConfig) -> str:
+    """Resolve the model name, supporting ``auto`` discovery via ``/models``."""
+    model = config.model.strip()
+    if not model:
+        raise BionicError(
+            "Model is required: pass --model <id>, set BIONIC_MODEL, or use --model auto"
+        )
+    if model.lower() == "auto":
+        models = list_models(config.base_url, api_key=config.api_key, timeout=min(config.timeout, 30.0))
+        if not models:
+            raise BionicError(f"No usable chat models returned by {config.base_url}/models")
+        return models[0]["id"]
+    return model
+
+
+def build_system_prompt(cwd: str, custom_prompt: Optional[str] = None) -> str:
+    """Build the system prompt for the Bionic coding agent."""
+    if custom_prompt is not None:
+        return custom_prompt
+    os_name = platform.system() or os.name
+    parts = [
+        f"You are an autonomous coding agent running on {os_name}.",
+        f"Your working directory is {cwd}.",
+        (
+            "Use the provided tools (run_command, read_file, write_file, edit_file) "
+            "to inspect files, make changes, run coordination commands (such as `airc`), "
+            "and verify tests before replying."
+        ),
+        (
+            "Read files before modifying them, prefer edit_file for targeted changes, "
+            "and never fabricate command output or file contents. When finished, give "
+            "a concise, accurate final answer."
+        ),
+    ]
+    nick = os.environ.get("AIRC_NICK", "").strip()
+    server = os.environ.get("AIRC_SERVER", "").strip()
+    if nick or server:
+        hub_bits = [bit for bit in (f"@{nick}" if nick else "", f"hub {server}" if server else "") if bit]
+        parts.append(f"CAMS runtime context: {', '.join(hub_bits)}.")
+    return " ".join(parts)
+
+
+def _resolve_session_file(session_id: str, session_dir: Optional[str]) -> Path:
+    if not _SESSION_ID_RE.match(session_id):
+        raise BionicError(
+            "session_id must contain only ASCII letters, digits, '-' or '_' (max 128 chars)"
+        )
+    root = Path(session_dir).expanduser() if session_dir else Path(tempfile.gettempdir()) / "aircd-bionic-sessions"
+    return root / f"{session_id}.json"
+
+
+def _load_session_messages(path: Path) -> Optional[list[dict[str, Any]]]:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, list) and all(isinstance(m, dict) for m in data):
+        return data
+    return None
+
+
+def _save_session_messages(path: Path, messages: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(messages), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _normalize_assistant_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Keep only standard OpenAI assistant fields when feeding history back."""
+    cleaned: dict[str, Any] = {
+        "role": "assistant",
+        "content": msg.get("content") if msg.get("content") is not None else "",
+    }
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        cleaned["tool_calls"] = tool_calls
+    return cleaned
+
+
+def run_agent(
+    prompt: str,
+    config: BionicConfig,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+) -> RunResult:
+    """Run the OpenAI tool-calling loop until a final response or ``max_turns``."""
+    model = resolve_model(config)
+    system_prompt = build_system_prompt(config.cwd, config.system_prompt)
+    chat_url = normalize_base_url(config.base_url) + "/chat/completions"
+
+    active_session_id = config.session_id
+    session_file: Optional[Path] = None
+    messages: Optional[list[dict[str, Any]]] = None
+
+    if active_session_id is not None:
+        session_file = _resolve_session_file(active_session_id, config.session_dir)
+        messages = _load_session_messages(session_file)
+    elif config.emit_session_id:
+        active_session_id = uuid.uuid4().hex
+        session_file = _resolve_session_file(active_session_id, config.session_dir)
+
+    if messages is None:
+        messages = [{"role": "system", "content": system_prompt}]
+    elif messages and messages[0].get("role") == "system":
+        messages[0] = {"role": "system", "content": system_prompt}
+    messages.append({"role": "user", "content": prompt})
+
+    total_tool_calls = 0
+    for turn in range(1, config.max_turns + 1):
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+        }
+        if config.temperature is not None:
+            payload["temperature"] = config.temperature
+        if config.max_tokens is not None:
+            payload["max_tokens"] = config.max_tokens
+
+        resp = _http_json(
+            chat_url,
+            method="POST",
+            payload=payload,
+            api_key=config.api_key,
+            timeout=config.timeout,
+        )
+        choices = resp.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise BionicError(f"Bionic API returned no choices: {json.dumps(resp)[:400]}")
+        msg = choices[0].get("message")
+        if not isinstance(msg, dict):
+            raise BionicError(f"Bionic API choice missing 'message': {json.dumps(choices[0])[:400]}")
+
+        cleaned = _normalize_assistant_message(msg)
+        messages.append(cleaned)
+
+        tool_calls = cleaned.get("tool_calls") or []
+        if not tool_calls:
+            final_text = str(cleaned.get("content") or "").strip()
+            if not final_text and msg.get("reasoning_content"):
+                final_text = str(msg["reasoning_content"]).strip()
+            if session_file is not None:
+                _save_session_messages(session_file, messages)
+            return RunResult(
+                content=final_text,
+                model=model,
+                turns=turn,
+                tool_calls=total_tool_calls,
+                session_id=active_session_id,
+            )
+
+        for idx, tc in enumerate(tool_calls):
+            total_tool_calls += 1
+            tc_id = str(tc.get("id") or f"call_{turn}_{idx}")
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(fn, dict):
+                result = json.dumps({"error": "Malformed tool_call: missing 'function'"})
+            else:
+                name = str(fn.get("name") or "")
+                raw_args = fn.get("arguments")
+                try:
+                    if raw_args is None or raw_args == "":
+                        parsed_args: Any = {}
+                    elif isinstance(raw_args, str):
+                        parsed_args = json.loads(raw_args)
+                    else:
+                        parsed_args = raw_args
+                    result = exec_tool(
+                        name,
+                        parsed_args,
+                        config.cwd,
+                        command_timeout=config.command_timeout,
+                        max_output_chars=config.max_output_chars,
+                        log=log,
+                    )
+                except Exception as exc:
+                    result = json.dumps({"error": str(exc)})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": result,
+                }
+            )
+
+    if session_file is not None:
+        _save_session_messages(session_file, messages)
+    raise BionicError(f"Reached max_turns={config.max_turns} without a final response")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the CLI argument parser for ``airc-bionic``."""
+    parser = argparse.ArgumentParser(
+        prog="airc-bionic",
+        description="Function-calling agent runner for LM Studio Bionic and OpenAI-compatible servers.",
+    )
+    parser.add_argument("-p", "--prompt", help="Prompt to send to the agent (pass '-' to read stdin)")
+    parser.add_argument(
+        "--model",
+        help="Model ID to run (or 'auto' to pick the first chat model; env: BIONIC_MODEL)",
+    )
+    parser.add_argument(
+        "--base-url",
+        help=f"OpenAI-compatible base URL (env: BIONIC_BASE_URL, default: {DEFAULT_BASE_URL})",
+    )
+    parser.add_argument(
+        "--api-key",
+        help="Bearer API key (env: BIONIC_API_KEY, default: lm-studio)",
+    )
+    parser.add_argument(
+        "--cwd",
+        help="Working directory for file and shell tools (env: BIONIC_CWD, default: current directory)",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        help=f"Maximum LLM tool-calling turns (env: BIONIC_MAX_TURNS, default: {DEFAULT_MAX_TURNS})",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        help=f"HTTP request timeout in seconds (env: BIONIC_TIMEOUT, default: {int(DEFAULT_TIMEOUT_SECONDS)})",
+    )
+    parser.add_argument(
+        "--command-timeout",
+        type=float,
+        help=(
+            "Timeout in seconds per run_command tool call "
+            f"(env: BIONIC_COMMAND_TIMEOUT, default: {int(DEFAULT_COMMAND_TIMEOUT_SECONDS)})"
+        ),
+    )
+    parser.add_argument(
+        "--max-output-chars",
+        type=int,
+        help=f"Maximum characters returned from read_file/run_command (default: {DEFAULT_MAX_OUTPUT_CHARS})",
+    )
+    parser.add_argument("--temperature", type=float, help="Sampling temperature (env: BIONIC_TEMPERATURE)")
+    parser.add_argument("--max-tokens", type=int, help="Max completion tokens per turn (env: BIONIC_MAX_TOKENS)")
+    parser.add_argument("--system-prompt", help="Override default system prompt (env: BIONIC_SYSTEM_PROMPT)")
+    parser.add_argument("--system-prompt-file", help="Read system prompt override from a UTF-8 file")
+    parser.add_argument("--session-id", help="Resume or create a saved local session by ID")
+    parser.add_argument("--session-dir", help="Directory for saved sessions (env: BIONIC_SESSION_DIR)")
+    parser.add_argument(
+        "--emit-session-id",
+        action="store_true",
+        help="Emit `session_id: <id>` to stderr for aircd resume/pm session tracking",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Query /models on the Bionic server and print JSON for aircd model discovery",
+    )
+    parser.add_argument(
+        "--all-models",
+        action="store_true",
+        help="Include embedding models when listing models with --list-models",
+    )
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result to stdout")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Log tool calls to stderr")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entrypoint for ``airc-bionic``."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        config = resolve_config(args)
+        if args.list_models:
+            models = list_models(
+                config.base_url,
+                api_key=config.api_key,
+                timeout=min(config.timeout, 30.0),
+                include_all=args.all_models,
+            )
+            print(json.dumps({"data": models}))
+            return 0
+
+        if not args.prompt:
+            parser.error("-p/--prompt is required unless --list-models is specified")
+
+        prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+        if not prompt.strip():
+            raise BionicError("prompt must not be empty")
+
+        log = (lambda msg: print(msg, file=sys.stderr)) if config.verbose else None
+        result = run_agent(prompt, config, log=log)
+        if config.emit_session_id and result.session_id:
+            print(f"session_id: {result.session_id}", file=sys.stderr)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "model": result.model,
+                        "turns": result.turns,
+                        "tool_calls": result.tool_calls,
+                        "session_id": result.session_id,
+                        "content": result.content,
+                    }
+                )
+            )
+        else:
+            print(result.content)
+        return 0
+    except BionicError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,19 +1,29 @@
 # Worker template presets
 
-These opt-in fixtures supply default `claude`, `codex`, `agy` and `lmstudio` templates.
+These opt-in fixtures supply default `claude`, `codex`, `agy`, `lmstudio` and
+`bionic` templates.
 They do not overwrite stored templates or run installers or client commands.
 Install each client separately and set `command` to its executable path if it
 is not on the server's PATH. Choose permissions and session settings for your
 deployment before saving a template. Each preset starts a fresh conversation.
 Model names are supplied when provisioning; the presets do not pin model lists.
-The LM Studio preset discovers local and LM Link models using
-`lms ls --llm --json`. Connect LM Link in LM Studio on the hub machine first.
-If `lms` is not on the hub process's PATH, set both `command` and the first
-entry of `models_command` to the installed `lms` executable's full path.
+The `lmstudio` preset runs `lms chat` (chat-only, no coding tools) and discovers
+local and LM Link models using `lms ls --llm --json`. Connect LM Link in
+LM Studio on the hub machine first. If `lms` is not on the hub process's PATH,
+set both `command` and the first entry of `models_command` to the installed
+`lms` executable's full path.
 
-An owner can install a fixture with `POST /v1/templates/claude` (or `codex` or
-`agy` or `lmstudio`), sending the JSON file as the body and the owner key in
-`X-AirCD-Invite`. This is a full replacement of that template ID.
+The `bionic` preset uses [`airc-bionic`](../bionic.md), CAMS's function-calling
+agent runner for LM Studio Bionic (`http://localhost:1235/v1`) and compatible
+OpenAI servers. Unlike `lmstudio`, `bionic` gives local models file and shell
+tools (`run_command`, `read_file`, `write_file`, `edit_file`) so they can act as
+coding workers and group members. Install the Python package (`pip install -e
+clients/python`) so `airc-bionic` is on `PATH`, or point `command` and
+`models_command[0]` to the installed executable path.
+
+An owner can install a fixture with `POST /v1/templates/claude` (or `codex`,
+`agy`, `lmstudio`, or `bionic`), sending the JSON file as the body and the owner
+key in `X-AirCD-Invite`. This is a full replacement of that template ID.
 Once saved, choose `m` -> create a new account -> LM Studio in the TUI.
 The model picker shows the discovered model names and uses each `modelKey`
 as the model argument when creating the account's launcher.

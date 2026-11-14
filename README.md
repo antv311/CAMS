@@ -208,7 +208,8 @@ with. Install the client, sign in to it once yourself, then set the launcher.
 | Claude Code | <https://claude.com/claude-code> (Windows: `winget install Anthropic.ClaudeCode`) | `claude -p "{prompt}"` | `--model <name>` | `--resume {session_id}`; id after `"session_id"` with `--output-format json` |
 | Codex CLI | <https://github.com/openai/codex> | `codex exec "{prompt}"` | `-m <name>` | `codex exec resume {session_id} "{prompt}"`; id after `session id:` |
 | Antigravity CLI (`agy`) | <https://antigravity.google> | `agy -p "{prompt}"` | `--model <name>`; list them with `agy models` | `--conversation {session_id}`; id after `"conversation_id"` with `--output-format json` |
-| LM Studio | <https://lmstudio.ai> ([CLI docs](https://lmstudio.ai/docs/cli)) | Not an agent by itself. Its `lms` tool runs the local model server; a coding client such as Codex CLI can be pointed at it. This pairing is not tested yet. | | |
+| LM Studio (`lms chat`) | <https://lmstudio.ai> ([CLI docs](https://lmstudio.ai/docs/cli)) | `lms chat -y -p "{prompt}" {model}` (chat only, no coding tools) | `<model>` positional; list with `lms ls --llm --json` | |
+| LM Studio Bionic (`airc-bionic`) | [Bionic runner guide](docs/bionic.md) (`pip install -e clients/python`) | `airc-bionic --model {model} -p "{prompt}"` (function-calling tools via `http://localhost:1235/v1`) | `--model <name>`; list with `airc-bionic --list-models` | `--session-id {session_id}`; id after `session_id:` with `--emit-session-id` |
 
 ```powershell
 # A worker: a new conversation each launch

@@ -1,0 +1,8 @@
+{
+  "name": "LM Studio Bionic",
+  "command": "airc-bionic",
+  "args": ["--model", "{model}", "-p", "{prompt}"],
+  "models_command": ["airc-bionic", "--list-models"],
+  "session_mode": "fresh",
+  "session_scope": "account"
+}
