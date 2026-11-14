@@ -1950,6 +1950,45 @@ class StreamRenderer:
             self._end_line()
 
 
+class RunAborted(BionicError):
+    """Raised by a ``before_tool`` hook to stop a run (e.g. the REPL's abort)."""
+
+
+@dataclass
+class ToolStep:
+    """One pending tool call handed to a ``run_agent`` ``before_tool`` hook."""
+
+    turn: int
+    id: str
+    name: str
+    #: Parsed arguments; the hook may replace or mutate them before execution.
+    arguments: Any
+    runner: Callable[[Any], str] = field(repr=False, default=lambda _args: "")
+    #: Set by :meth:`execute`; when the hook returns ``None`` after executing,
+    #: this result is used instead of running the tool a second time.
+    result: Optional[str] = None
+
+    def execute(self) -> str:
+        """Run the tool now with the current ``arguments`` and remember the result."""
+        self.result = self.runner(self.arguments)
+        return self.result
+
+
+ToolHook = Callable[[ToolStep], Optional[str]]
+
+
+def system_prompt_for(config: BionicConfig, tool_schemas: list[dict[str, Any]]) -> str:
+    """System prompt ``run_agent`` sends for ``config`` with these tool schemas."""
+    plugin_names = [t["function"]["name"] for t in tool_schemas if t["function"]["name"] not in BUILTIN_TOOL_NAMES]
+    return build_system_prompt(
+        config.cwd,
+        config.system_prompt,
+        workspace_root=config.workspace_root or config.cwd,
+        approval=config.approval,
+        plugin_tools=plugin_names,
+    )
+
+
 def run_agent(
     prompt: str,
     config: BionicConfig,
@@ -1957,12 +1996,25 @@ def run_agent(
     log: Optional[Callable[[str], None]] = None,
     approver: Optional[Callable[[str, dict[str, Any]], bool]] = None,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    messages: Optional[list[dict[str, Any]]] = None,
+    before_tool: Optional["ToolHook"] = None,
 ) -> RunResult:
     """Run the OpenAI tool-calling loop until a final response or ``max_turns``.
 
     ``on_event`` receives progress events as dicts with a ``type`` key:
     ``turn``, ``token`` / ``reasoning`` (only when ``config.stream``),
     ``tool_call``, ``tool_result`` and ``done``.
+
+    ``messages`` lets the caller own the conversation (the interactive REPL
+    does): the list is extended in place with the prompt, assistant turns and
+    tool results, its system message is refreshed, and ``config.session_id``
+    is only used as the save target, never loaded over it.
+
+    ``before_tool`` is called before each well-formed tool call with a
+    :class:`ToolStep`; it may edit ``step.arguments``, run the tool itself
+    via ``step.execute()``, or return a string to use as the tool result
+    instead of executing. Returning ``None`` executes the tool normally.
+    Raising :class:`RunAborted` stops the run.
     """
 
     def notify(event: dict[str, Any]) -> None:
@@ -1978,25 +2030,19 @@ def run_agent(
     else:
         model = resolve_model(config)
     tool_schemas = tools_for_approval(config.approval, registry)
-    plugin_names = [t["function"]["name"] for t in tool_schemas if t["function"]["name"] not in BUILTIN_TOOL_NAMES]
     if log and len(registry):
         log(f"[plugins] loaded {len(registry)} tool(s) from {', '.join(registry.dirs)}: {', '.join(registry.tools)}")
-    system_prompt = build_system_prompt(
-        config.cwd,
-        config.system_prompt,
-        workspace_root=config.workspace_root or config.cwd,
-        approval=config.approval,
-        plugin_tools=plugin_names,
-    )
+    system_prompt = system_prompt_for(config, tool_schemas)
     chat_url = normalize_base_url(config.base_url) + "/chat/completions"
 
     active_session_id = config.session_id
     session_file: Optional[Path] = None
-    messages: Optional[list[dict[str, Any]]] = None
+    caller_owns_messages = messages is not None
 
     if active_session_id is not None:
         session_file = _resolve_session_file(active_session_id, config.session_dir)
-        messages = _load_session_messages(session_file)
+        if not caller_owns_messages:
+            messages = _load_session_messages(session_file)
     elif config.emit_session_id:
         active_session_id = uuid.uuid4().hex
         session_file = _resolve_session_file(active_session_id, config.session_dir)
@@ -2005,6 +2051,8 @@ def run_agent(
         messages = [{"role": "system", "content": system_prompt}]
     elif messages and messages[0].get("role") == "system":
         messages[0] = {"role": "system", "content": system_prompt}
+    elif caller_owns_messages and not messages:
+        messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
     total_tool_calls = 0
@@ -2101,18 +2149,31 @@ def run_agent(
                         parsed_args = json.loads(raw_args)
                     else:
                         parsed_args = raw_args
-                    result = exec_tool(
-                        name,
-                        parsed_args,
-                        config.cwd,
-                        command_timeout=config.command_timeout,
-                        max_output_chars=config.max_output_chars,
-                        log=log,
-                        workspace_root=config.workspace_root or config.cwd,
-                        approval=config.approval,
-                        approver=approver,
-                        registry=registry,
-                    )
+
+                    def _execute(args: Any, _name: str = name) -> str:
+                        return exec_tool(
+                            _name,
+                            args,
+                            config.cwd,
+                            command_timeout=config.command_timeout,
+                            max_output_chars=config.max_output_chars,
+                            log=log,
+                            workspace_root=config.workspace_root or config.cwd,
+                            approval=config.approval,
+                            approver=approver,
+                            registry=registry,
+                        )
+
+                    override: Optional[str] = None
+                    if before_tool is not None:
+                        step = ToolStep(turn=turn, id=tc_id, name=name, arguments=parsed_args, runner=_execute)
+                        override = before_tool(step)
+                        if override is None and step.result is not None:
+                            override = step.result  # the hook already ran it via step.execute()
+                        parsed_args = step.arguments
+                    result = override if override is not None else _execute(parsed_args)
+                except RunAborted:
+                    raise
                 except Exception as exc:
                     result = json.dumps({"error": str(exc)})
             notify(
@@ -2530,6 +2591,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate plugins and print the tools the model would be offered as JSON, then exit",
     )
+    parser.add_argument(
+        "--repl",
+        action="store_true",
+        help=(
+            "Start an interactive multi-turn session: chat with the agent, inspect the context, "
+            "run tools by hand and step through tool calls (type /help inside)"
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Start the REPL in step mode: pause before every tool call to run, skip, edit or fake it (implies --repl)",
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON result to stdout")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log tool calls to stderr")
     return parser
@@ -2566,8 +2640,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 2
             return 0
 
+        if args.repl or args.debug:
+            from aircd.bionic_repl import run_repl
+
+            prompt = args.prompt
+            if prompt == "-":
+                prompt = sys.stdin.read()
+            return run_repl(config, step=args.debug, initial_prompt=prompt)
+
         if not args.prompt:
-            parser.error("-p/--prompt is required unless --list-models, --list-tools or --health is specified")
+            parser.error(
+                "-p/--prompt is required unless --repl, --list-models, --list-tools or --health is specified"
+            )
 
         prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
         if not prompt.strip():
