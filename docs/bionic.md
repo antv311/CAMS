@@ -172,6 +172,70 @@ Because `aircd` captures a worker's stderr into the wake transcript, enabling
 `BIONIC_STREAM` on a hub template makes those transcripts include the model's
 token stream; leave it off for templates unless you want that.
 
+### Interactive REPL and debug mode (`--repl`, `--debug`)
+
+`airc-bionic --repl` opens an interactive session that keeps one conversation
+across prompts, which is useful for trying prompts against a local model,
+checking exactly what the model sees, and testing tools without writing a
+script. All the usual flags apply (`--model`, `--cwd`, `--workspace-root`,
+`--approval`, `--tools-dir`, `--stream`, `--session-id` …), and every prompt goes
+through the same jail, approval and plugin code as a one-shot run. `-p` sends a
+first prompt before the REPL starts reading input.
+
+```powershell
+airc-bionic --model auto --repl
+airc-bionic --model auto --debug            # same, with step mode on from the start
+airc-bionic --model auto --repl --session-id scratch   # resume/persist a saved session
+```
+
+Type a prompt to send it. For a multi-line prompt, put `"""` on a line by itself
+before and after it, or end each line with `\`. Commands:
+
+| Command | What it does |
+|---|---|
+| `/context [N\|all]` | List the messages in context with their index (last 20 by default) |
+| `/show N` | Print message N in full as JSON (tool-call arguments, raw tool results) |
+| `/system` | Print the system prompt |
+| `/undo` | Drop the last prompt and everything the agent did for it |
+| `/retry` | `/undo`, then send the same prompt again |
+| `/reset` | Start an empty conversation |
+| `/save FILE`, `/load FILE` | Write or read the conversation as OpenAI messages JSON (session files work too) |
+| `/usage` | Token totals for the REPL session |
+| `/tools` | List the tools the model is offered (built-in and plugin) |
+| `/tool NAME [JSON]` | Run a tool yourself, e.g. `/tool read_file {"path": "README.md"}`; jail and approval still apply, and the result is not added to the context |
+| `/step [on\|off]` | Toggle step mode |
+| `/approval MODE` | Switch between `auto`, `prompt` and `read-only` |
+| `/model [ID]`, `/models` | Show or change the model; list chat models on the server |
+| `/set KEY VALUE` | `temperature`, `max_tokens`, `max_turns`, `timeout`, `command_timeout` (`none` clears the optional ones) |
+| `/stream [on\|off]` | Stream tokens while the model writes |
+| `/config` | Show the effective settings (API key masked) |
+| `/exit` | Quit (Ctrl-D, or Ctrl-Z then Enter on Windows, works too) |
+
+In **step mode** the REPL pauses before every tool call the model makes, shows
+the call's name and arguments, and asks what to do:
+
+- `r` / Enter runs the tool and shows its result;
+- `s` skips it, and the model gets `{"error": "Skipped by the operator …", "skipped": true}`;
+- `e` takes replacement arguments (a JSON object) and then asks again;
+- `f` takes text to send back as the tool result without running anything;
+- `c` stops pausing for the rest of the current prompt;
+- `i` prints the conversation so far;
+- `a` aborts the prompt.
+
+Edited arguments only change what runs: the transcript keeps the arguments the
+model actually sent. If a prompt is aborted, interrupted with Ctrl-C or fails
+with a server error, it is rolled back, so the next prompt starts from a clean
+context. When `max_turns` is hit, the partial transcript is kept so you can
+inspect it, and `/undo` removes it. With `--approval prompt`, approval
+questions are asked inside the REPL.
+
+From Python, `aircd.bionic_repl.BionicRepl` takes an `input_fn` and `out`
+stream to drive the same session programmatically. The building blocks are the
+`messages=` (caller-owned conversation list) and `before_tool=` (a hook that
+receives a `ToolStep`, can edit `step.arguments`, call `step.execute()`, return
+a replacement result, or raise `RunAborted`) parameters of
+`aircd.bionic.run_agent`.
+
 ## Python SDK (`BionicAgent`)
 
 For programmatic workflows, `aircd.BionicAgent` (also importable from
