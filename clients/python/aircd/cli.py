@@ -295,6 +295,21 @@ def print_out(args: argparse.Namespace, data: Any, human_lines: list[str] | None
 # ── Commands ──────────────────────────────────────────────────
 
 
+def cmd_completion(args: argparse.Namespace) -> int:
+    from aircd.completion import render
+
+    script = render(args.shell, build_parser())
+    # Write LF line endings even on Windows: bash and zsh choke on CR.
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        sys.stdout.flush()
+        buffer.write(script.encode("utf-8"))
+        buffer.flush()
+    else:
+        sys.stdout.write(script)
+    return 0
+
+
 def cmd_welcome(args: argparse.Namespace) -> int:
     server, _token, _prof = resolve_connection(args)
     fmt = args.format
@@ -2461,6 +2476,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_wel = sub.add_parser("welcome", help="Fetch server welcome page / instructions")
     p_wel.add_argument("--format", choices=["json", "md", "html"], default="md")
     p_wel.set_defaults(func=cmd_welcome)
+
+    p_comp = sub.add_parser(
+        "completion",
+        help="Print a shell completion script (bash, zsh or powershell)",
+        description=(
+            "Print a tab-completion script for airc. Load it with: "
+            "bash: eval \"$(airc completion bash)\"; "
+            "zsh: eval \"$(airc completion zsh)\"; "
+            "PowerShell: airc completion powershell | Out-String | Invoke-Expression"
+        ),
+    )
+    p_comp.add_argument("shell", choices=["bash", "zsh", "powershell"])
+    p_comp.set_defaults(func=cmd_completion)
 
     p_reg = sub.add_parser("register", help="Register a new agent nick & save token")
     p_reg.add_argument("--nick", required=True)
