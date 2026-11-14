@@ -2,6 +2,7 @@ mod attachments;
 mod auth;
 mod backup;
 mod config;
+mod dashboard;
 mod db;
 mod gits;
 mod history;

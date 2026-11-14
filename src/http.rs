@@ -493,7 +493,12 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/", get(welcome_root))
         .route("/welcome", get(welcome_root))
         .route("/instructions", get(welcome_root))
+        .route("/dashboard", get(dashboard_html))
+        .route("/dashboard/", get(dashboard_html))
+        .route("/dashboard/style.css", get(dashboard_css))
+        .route("/dashboard/app.js", get(dashboard_js))
         .route("/v1/welcome", get(welcome_json))
+        .route("/v1/dashboard", get(get_dashboard))
         .route("/healthz", get(healthz))
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/agents", get(public_agents))
@@ -680,6 +685,85 @@ async fn prometheus_metrics(State(state): State<AppState>) -> Result<impl IntoRe
         [(header::CONTENT_TYPE, crate::metrics::PROMETHEUS_CONTENT_TYPE)],
         body,
     ))
+}
+
+async fn dashboard_html() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        with_cors_headers(),
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::dashboard::DASHBOARD_HTML,
+    )
+}
+
+async fn dashboard_css() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        with_cors_headers(),
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::dashboard::DASHBOARD_CSS,
+    )
+}
+
+async fn dashboard_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        with_cors_headers(),
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::dashboard::DASHBOARD_JS,
+    )
+}
+
+#[derive(Deserialize)]
+struct DashboardQuery {
+    channel: Option<String>,
+    sprint: Option<String>,
+    include_terminal: Option<bool>,
+}
+
+async fn get_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DashboardQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let viewer =
+        authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/dashboard")?.principal;
+    let channel = q
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_http_channel);
+    let sprint = q
+        .sprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_http_channel);
+    let include_terminal = q.include_terminal.unwrap_or(true);
+    let server = state.server.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        crate::dashboard::build_dashboard_snapshot(
+            &server,
+            &viewer,
+            channel.as_deref(),
+            sprint.as_deref(),
+            include_terminal,
+        )
+    })
+    .await
+    .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+    .map_err(ApiError::internal)?;
+    Ok((StatusCode::OK, with_cors_headers(), Json(snapshot)))
 }
 
 async fn public_agents(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
@@ -4157,7 +4241,7 @@ fn build_welcome_html(state: &AppState, base_host: &str) -> Result<String, ApiEr
     <h1>aircd — IRC + Webhook + Roles + Git Coordinator</h1>
     <p class="muted">Lightweight agent &amp; developer coordination bus. Connect via raw IRC (<code>{irc}</code>), the <code>airc</code> CLI, or HTTP REST API (<code>{http}</code>).</p>
     <ul>{reachable_urls}</ul>
-    <p class="muted">Machine-readable specs: <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a> &middot; <a style="color:var(--accent)" href="/metrics">/metrics</a> (Prometheus)</p>
+    <p class="muted">Web &amp; machine-readable endpoints: <a style="color:var(--accent)" href="/dashboard">Sprint Dashboard</a> &middot; <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a> &middot; <a style="color:var(--accent)" href="/metrics">/metrics</a> (Prometheus)</p>
   </div>
 
   <div class="grid">
@@ -4386,6 +4470,7 @@ mod tests {
     include!("http_group_activity_tests.rs");
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
+    include!("http_dashboard_tests.rs");
 
     struct TemplateApi {
         server: Server,

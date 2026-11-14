@@ -774,6 +774,51 @@ impl TaskStore {
         Ok(tasks)
     }
 
+    /// List tasks across all or one project/sprint, optionally including terminal statuses.
+    pub fn list_all(
+        &self,
+        channel: Option<&str>,
+        sprint: Option<&str>,
+        include_terminal: bool,
+    ) -> Result<Vec<Task>> {
+        let db = self.db.read()?;
+        let mut statement = db
+            .prepare(&format!(
+                "SELECT {TASK_COLUMNS}
+                 FROM tasks
+                 WHERE (?1 IS NULL OR channel = ?1)
+                   AND (?2 IS NULL OR sprint = ?2)
+                   AND (?3 = 1 OR status NOT IN ('done', 'merged', 'cancelled'))
+                 ORDER BY updated_at DESC, created_at DESC, rowid DESC"
+            ))
+            .context("prepare full task list")?;
+
+        let include_flag = if include_terminal { 1i64 } else { 0i64 };
+        let tasks = statement
+            .query_map(params![channel, sprint, include_flag], Self::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(tasks)
+    }
+
+    /// All currently unanswered questions (`open`, `escalated_pm`, `escalated`),
+    /// optionally scoped to one project channel.
+    pub fn pending_questions_all(&self, channel: Option<&str>) -> Result<Vec<TaskQuestion>> {
+        let db = self.db.read()?;
+        let mut statement = db
+            .prepare(&format!(
+                "SELECT {QUESTION_COLUMNS} FROM task_questions
+                 WHERE status IN ('open', 'escalated_pm', 'escalated')
+                   AND (?1 IS NULL OR channel = ?1)
+                 ORDER BY created_at DESC, rowid DESC"
+            ))
+            .context("prepare pending questions")?;
+        let rows = statement
+            .query_map(params![channel], Self::question_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Open work owned by `principal_id`, across every channel.
     pub fn inbox(&self, principal_id: &str) -> Result<Vec<Task>> {
         let db = self.db.read()?;

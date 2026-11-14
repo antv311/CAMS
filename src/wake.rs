@@ -159,6 +159,24 @@ pub struct WakeRun {
     pub log_tail: Option<String>,
 }
 
+/// Non-sensitive runtime wake status for an agent account (safe for Read-scoped views).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AgentWakeSummary {
+    pub launcher_configured: bool,
+    pub launcher_enabled: bool,
+    pub command_found: bool,
+    pub session_mode: Option<String>,
+    pub running: bool,
+    pub pending: bool,
+    pub quota_cooldown_until: Option<i64>,
+    pub last_run_status: Option<String>,
+    pub last_run_started_at: Option<i64>,
+    pub last_run_finished_at: Option<i64>,
+    pub last_run_channel: Option<String>,
+    pub last_run_task_id: Option<String>,
+    pub last_run_exit_code: Option<i64>,
+}
+
 /// Why and where an account is being woken.
 #[derive(Clone, Debug, Default)]
 pub struct WakeContext {
@@ -518,6 +536,111 @@ impl WakeManager {
             guard.len()
         };
         (running, pending, cooldowns)
+    }
+
+    /// Snapshot of non-sensitive wake/launcher runtime state keyed by lowercase principal id.
+    pub fn agent_wake_summaries(&self) -> Result<HashMap<String, AgentWakeSummary>> {
+        let mut out: HashMap<String, AgentWakeSummary> = HashMap::new();
+
+        {
+            let slots = self.slots.lock().expect("wake slots mutex poisoned");
+            for (principal_id, slot) in slots.iter() {
+                if slot.running || slot.pending.is_some() {
+                    let entry = out
+                        .entry(principal_id.trim().to_ascii_lowercase())
+                        .or_default();
+                    entry.running = slot.running;
+                    entry.pending = slot.pending.is_some();
+                }
+            }
+        }
+
+        let now = unix_timestamp();
+        {
+            let mut cooldowns = self
+                .quota_cooldowns
+                .lock()
+                .expect("quota cooldown mutex poisoned");
+            cooldowns.retain(|_, until| *until > now);
+            for (principal_id, until) in cooldowns.iter() {
+                let entry = out
+                    .entry(principal_id.trim().to_ascii_lowercase())
+                    .or_default();
+                entry.quota_cooldown_until = Some(*until);
+            }
+        }
+
+        let db = self.db.read()?;
+        {
+            let mut stmt = db
+                .prepare("SELECT principal_id, command, enabled, session_mode FROM wake_configs")
+                .context("prepare wake config summaries")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (principal_id, command, enabled, session_mode) = row?;
+                let entry = out
+                    .entry(principal_id.trim().to_ascii_lowercase())
+                    .or_default();
+                entry.launcher_configured = true;
+                entry.launcher_enabled = enabled != 0;
+                entry.command_found = command_found(&command);
+                entry.session_mode = session_mode;
+            }
+        }
+
+        {
+            let mut stmt = db
+                .prepare(
+                    "SELECT r.principal_id, r.status, r.started_at, r.finished_at, r.channel, r.task_id, r.exit_code
+                     FROM wake_runs r
+                     INNER JOIN (
+                         SELECT principal_id, MAX(rowid) AS max_rowid
+                         FROM wake_runs
+                         GROUP BY principal_id
+                     ) latest ON r.rowid = latest.max_rowid",
+                )
+                .context("prepare latest wake run summaries")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    principal_id,
+                    status,
+                    started_at,
+                    finished_at,
+                    channel,
+                    task_id,
+                    exit_code,
+                ) = row?;
+                let entry = out
+                    .entry(principal_id.trim().to_ascii_lowercase())
+                    .or_default();
+                entry.last_run_status = Some(status);
+                entry.last_run_started_at = Some(started_at);
+                entry.last_run_finished_at = finished_at;
+                entry.last_run_channel = Some(channel);
+                entry.last_run_task_id = task_id;
+                entry.last_run_exit_code = exit_code;
+            }
+        }
+
+        Ok(out)
     }
 
     /// Where launch failures are reported.
