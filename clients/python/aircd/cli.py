@@ -167,6 +167,123 @@ def require_token(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     return server, token, prof
 
 
+# Largest attachment the hub stores (MAX_ATTACHMENT_BYTES in src/attachments.rs).
+MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
+ATTACHMENT_KINDS = ("log", "evidence")
+
+
+def http_bytes(
+    server: str,
+    method: str,
+    path: str,
+    *,
+    token: str = "",
+    data: bytes | None = None,
+    content_type: str | None = None,
+    timeout: float = 60.0,
+) -> tuple[bytes, dict[str, str]]:
+    """Send or fetch a raw body (file attachments). Errors read like http_json's."""
+    headers = {"Accept": "application/json, */*"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if data is not None:
+        headers["Content-Type"] = content_type or "application/octet-stream"
+    req = urllib.request.Request(f"{server.rstrip('/')}{path}", data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", errors="replace")
+        try:
+            msg = json.loads(raw).get("error") or raw
+        except Exception:
+            msg = raw or str(err)
+        raise CliError(f"HTTP {err.code} {method} {path}: {msg}") from None
+    except urllib.error.URLError as err:
+        raise CliError(f"Cannot reach aircd at {server}: {err.reason}") from None
+
+
+def format_size(size: float) -> str:
+    if size < 1024:
+        return f"{int(size)} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size / (1024 * 1024):.1f} MiB"
+
+
+def attachment_filename(disposition: str) -> str | None:
+    """The filename from a Content-Disposition header, if any."""
+    for part in disposition.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key.lower() == "filename" and value:
+            return value.strip().strip('"')
+    return None
+
+
+def attachment_line(att: dict[str, Any]) -> str:
+    note = f" - {att['note']}" if att.get("note") else ""
+    return (
+        f"{att['id']} [{att.get('kind', '?')}] {att['filename']} "
+        f"({format_size(int(att.get('size') or 0))}, {att.get('content_type', '?')}) "
+        f"by @{att.get('uploaded_by', '?')}{note}"
+    )
+
+
+def read_attachment_source(source: str, name: str | None) -> tuple[bytes, str]:
+    """The bytes and file name of one `task attach` argument; `-` reads stdin."""
+    if source == "-":
+        if not name:
+            raise CliError("--name is required when attaching from stdin (-)")
+        data = sys.stdin.buffer.read()
+    else:
+        path = Path(source)
+        if not path.is_file():
+            raise CliError(f"no such file: {source}")
+        size = path.stat().st_size
+        if size > MAX_ATTACHMENT_BYTES:
+            raise CliError(
+                f"{source} is {format_size(size)}; the hub keeps attachments up to "
+                f"{format_size(MAX_ATTACHMENT_BYTES)} - trim the log (for example to its last lines) first"
+            )
+        data = path.read_bytes()
+    if not data:
+        raise CliError(f"{source} is empty; nothing to attach")
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise CliError(f"{source} is larger than {format_size(MAX_ATTACHMENT_BYTES)}")
+    return data, name or Path(source).name
+
+
+def upload_attachments(
+    server: str,
+    token: str,
+    task_id: str,
+    sources: list[str],
+    *,
+    kind: str | None = None,
+    note: str | None = None,
+    name: str | None = None,
+    content_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Upload each file in turn. Every file is read and checked before any upload."""
+    if name and len(sources) > 1:
+        raise CliError("--name can only be used with a single file")
+    files = [read_attachment_source(src, name) for src in sources]
+    out = []
+    for data, filename in files:
+        query = {"name": filename}
+        if kind:
+            query["kind"] = kind
+        if note:
+            query["note"] = note
+        path = (
+            f"/v1/tasks/{urllib.parse.quote(task_id, safe='')}/attachments?"
+            + urllib.parse.urlencode(query)
+        )
+        raw, _headers = http_bytes(server, "POST", path, token=token, data=data, content_type=content_type)
+        out.append(json.loads(raw.decode("utf-8"))["attachment"])
+    return out
+
+
 def print_out(args: argparse.Namespace, data: Any, human_lines: list[str] | None = None) -> None:
     if getattr(args, "json", False) or human_lines is None:
         print(json.dumps(data, indent=2))
@@ -661,6 +778,10 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 0
     if args.task_cmd == "status":
         note = review_note(server, token, args) if args.status == "review" else args.note
+        attached = []
+        if getattr(args, "attach", None):
+            # Upload first, so the evidence is there when the reviewer wakes.
+            attached = upload_attachments(server, token, args.id, args.attach, kind="log")
         payload = {"status": args.status, "note": note, "branch": args.branch}
         if getattr(args, "commit", None):
             payload["commit"] = args.commit
@@ -677,7 +798,11 @@ def cmd_task(args: argparse.Namespace) -> int:
             payload=payload,
         )
         t = data["task"]
-        print_out(args, data, [f"Task {t['id']} -> {t['status']} (branch={t.get('branch') or '-'})"])
+        if attached:
+            data["attachments"] = attached
+        lines = [f"Attached: {attachment_line(att)}" for att in attached]
+        lines.append(f"Task {t['id']} -> {t['status']} (branch={t.get('branch') or '-'})")
+        print_out(args, data, lines)
         return 0
     if args.task_cmd == "peer-review":
         data = http_json(
@@ -731,6 +856,10 @@ def cmd_task(args: argparse.Namespace) -> int:
                 else "the project manager"
             )
             lines.append(f"WAITING on {waiting}: @{q['asked_by']} asks: {q['question']}")
+        atts = data.get("attachments") or []
+        if atts:
+            lines.append(f"attachments ({len(atts)}): airc task download {t['id']} <attachment-id>")
+            lines.extend(f"  {attachment_line(att)}" for att in atts)
         for ev in data.get("events", []):
             note = f" - {ev['note']}" if ev.get("note") else ""
             lines.append(
@@ -738,6 +867,50 @@ def cmd_task(args: argparse.Namespace) -> int:
                 f"by @{ev['actor_id']}{note}"
             )
         print_out(args, data, lines)
+        return 0
+    if args.task_cmd == "attach":
+        atts = upload_attachments(
+            server, token, args.id, args.files,
+            kind=args.kind, note=args.note, name=args.name, content_type=args.content_type,
+        )
+        lines = [f"Attached to {args.id}: {attachment_line(att)}" for att in atts]
+        print_out(args, {"ok": True, "task_id": args.id, "attachments": atts}, lines)
+        return 0
+    if args.task_cmd == "attachments":
+        data = http_json(
+            server, "GET", f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}/attachments", token=token,
+        )
+        atts = data.get("attachments") or []
+        lines = [attachment_line(att) for att in atts] or [f"Task {args.id} has no attachments."]
+        print_out(args, data, lines)
+        return 0
+    if args.task_cmd == "download":
+        path = (
+            f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}/attachments/"
+            f"{urllib.parse.quote(args.attachment_id, safe='')}"
+        )
+        raw, headers = http_bytes(server, "GET", path, token=token)
+        expected = headers.get("x-aircd-sha256")
+        actual = hashlib.sha256(raw).hexdigest()
+        if expected and expected != actual:
+            raise CliError(f"download of {args.attachment_id} is corrupt (sha256 {actual}, hub says {expected})")
+        if args.output == "-":
+            sys.stdout.buffer.write(raw)
+            sys.stdout.buffer.flush()
+            return 0
+        filename = Path(attachment_filename(headers.get("content-disposition", "")) or args.attachment_id).name
+        dest = Path(args.output) if args.output else Path(filename)
+        if dest.is_dir():
+            dest = dest / filename
+        if dest.exists() and not args.force:
+            raise CliError(f"{dest} already exists; pass --force to overwrite it")
+        dest.write_bytes(raw)
+        print_out(
+            args,
+            {"ok": True, "task_id": args.id, "attachment_id": args.attachment_id,
+             "path": str(dest), "size": len(raw), "sha256": actual},
+            [f"Saved {args.attachment_id} to {dest} ({format_size(len(raw))})"],
+        )
         return 0
     if args.task_cmd == "list":
         qs = urllib.parse.urlencode({"channel": args.channel})
@@ -2495,7 +2668,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_tst.add_argument("--report", metavar="REPORT_ID", help="Attach a report from 'airc report create --task-id ID' as the test report")
     p_tst.add_argument("--branch")
     p_tst.add_argument("--commit", help="Full submitted commit hash (required for group peer review unless supplied by --report)")
+    p_tst.add_argument("--attach", action="append", metavar="FILE", help="Upload FILE (a test log) to the task before moving it; repeatable")
     p_tst.set_defaults(func=cmd_task)
+
+    p_tat = task_sub.add_parser("attach", help="Attach test logs or other evidence files to a task")
+    p_tat.add_argument("id")
+    p_tat.add_argument("files", nargs="+", metavar="FILE", help="Files to upload; '-' reads stdin (needs --name)")
+    p_tat.add_argument("--kind", choices=ATTACHMENT_KINDS, default="log", help="log (test/build output, default) or evidence")
+    p_tat.add_argument("--note", help="What the file shows, e.g. 'cargo test --bin aircd: 228 passed'")
+    p_tat.add_argument("--name", help="File name to store (single file or stdin only)")
+    p_tat.add_argument("--content-type", help="MIME type (default: guessed by the hub from the name)")
+    p_tat.set_defaults(func=cmd_task)
+
+    p_tal = task_sub.add_parser("attachments", help="List a task's attached files")
+    p_tal.add_argument("id")
+    p_tal.set_defaults(func=cmd_task)
+
+    p_tdl = task_sub.add_parser("download", help="Download one attachment of a task")
+    p_tdl.add_argument("id")
+    p_tdl.add_argument("attachment_id")
+    p_tdl.add_argument("-o", "--output", help="File or directory to save to; '-' writes to stdout (default: ./<file name>)")
+    p_tdl.add_argument("--force", action="store_true", help="Overwrite an existing file")
+    p_tdl.set_defaults(func=cmd_task)
 
     p_tpr = task_sub.add_parser("peer-review", help="Approve or reject an exact group review revision")
     p_tpr.add_argument("id")

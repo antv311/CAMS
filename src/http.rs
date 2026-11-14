@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -263,6 +263,18 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}/ask", post(ask_task))
         .route("/v1/tasks/{id}/answer", post(answer_task))
         .route("/v1/tasks/{id}/escalate", post(escalate_task))
+        .route(
+            "/v1/tasks/{id}/attachments",
+            get(list_task_attachments)
+                .post(upload_task_attachment)
+                .layer(DefaultBodyLimit::max(
+                    crate::attachments::MAX_ATTACHMENT_BYTES + 64 * 1024,
+                )),
+        )
+        .route(
+            "/v1/tasks/{id}/attachments/{attachment_id}",
+            get(download_task_attachment),
+        )
         .route("/v1/notes", get(get_notes).post(write_notes))
         .route("/v1/projects/pm", post(set_project_pm))
         .route("/v1/rooms", get(list_rooms).post(open_room))
@@ -2008,13 +2020,145 @@ async fn get_task(
         .tasks()
         .children(&task.id)
         .map_err(ApiError::internal)?;
+    let attachments = state
+        .server
+        .attachments()
+        .list(&task.id)
+        .map_err(ApiError::internal)?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
-        Json(
-            json!({ "ok": true, "task": task, "events": events, "question": question, "subtasks": subtasks }),
-        ),
+        Json(json!({
+            "ok": true,
+            "task": task,
+            "events": events,
+            "question": question,
+            "subtasks": subtasks,
+            "attachments": attachments
+        })),
     ))
+}
+
+#[derive(Deserialize)]
+struct AttachQuery {
+    name: Option<String>,
+    filename: Option<String>,
+    kind: Option<String>,
+    note: Option<String>,
+}
+
+/// Upload one file as the raw request body. The name, kind (`log` or
+/// `evidence`) and an optional note travel in the query string.
+async fn upload_task_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<AttachQuery>,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let filename = q
+        .name
+        .or(q.filename)
+        .ok_or_else(|| ApiError::bad_request("name is required (?name=<file name>)"))?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let attachment = state
+        .server
+        .attach_task_file_api(
+            &actor,
+            &task.id,
+            &filename,
+            content_type,
+            q.kind.as_deref(),
+            q.note.as_deref(),
+            &body,
+        )
+        .map_err(|err| {
+            let message = err.to_string();
+            if message.contains("can attach files") {
+                ApiError::new(StatusCode::FORBIDDEN, message)
+            } else {
+                ApiError::bad_request(message)
+            }
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "attachment": attachment })),
+    ))
+}
+
+async fn list_task_attachments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let attachments = state
+        .server
+        .attachments()
+        .list(&task.id)
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task_id": task.id, "attachments": attachments })),
+    ))
+}
+
+/// The stored bytes, always as a download so a browser never renders them.
+async fn download_task_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, attachment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let _ = authenticate_request(&state, &headers)?;
+    let (meta, data) = state
+        .server
+        .attachments()
+        .get(id.trim(), attachment_id.trim())
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "task '{}' has no attachment '{}'",
+                id.trim(),
+                attachment_id.trim()
+            ))
+        })?;
+    let disposition = format!("attachment; filename=\"{}\"", meta.filename);
+    let mut response = (StatusCode::OK, with_cors_headers(), data).into_response();
+    let out = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_TYPE, meta.content_type.as_str()),
+        (header::CONTENT_DISPOSITION, disposition.as_str()),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::ETAG, meta.sha256.as_str()),
+    ] {
+        if let Ok(value) = header::HeaderValue::from_str(value) {
+            out.insert(name, value);
+        }
+    }
+    if !out.contains_key(header::CONTENT_DISPOSITION) {
+        out.insert(
+            header::CONTENT_DISPOSITION,
+            header::HeaderValue::from_static("attachment"),
+        );
+    }
+    out.insert(
+        header::HeaderName::from_static("x-aircd-sha256"),
+        header::HeaderValue::from_str(&meta.sha256).map_err(|e| ApiError::internal(e.into()))?,
+    );
+    Ok(response)
 }
 
 async fn get_inbox(
@@ -3288,6 +3432,7 @@ mod tests {
 
     include!("http_delegation_tests.rs");
     include!("http_consensus_tests.rs");
+    include!("http_attachment_tests.rs");
 
     struct TemplateApi {
         server: Server,

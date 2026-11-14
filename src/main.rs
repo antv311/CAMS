@@ -1,3 +1,4 @@
+mod attachments;
 mod auth;
 mod backup;
 mod config;
