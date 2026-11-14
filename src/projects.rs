@@ -6,9 +6,9 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
 
 use crate::history::unix_timestamp;
+use crate::store::SharedConnection;
 
 /// Project roles that may assign work and decide reviews.
 pub const MANAGER_ROLES: &[&str] = &["leader", "coordinator"];
@@ -36,11 +36,11 @@ pub struct ProjectMember {
 
 #[derive(Clone)]
 pub struct ProjectStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
 }
 
 impl ProjectStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self { db }
     }
 
@@ -61,7 +61,7 @@ impl ProjectStore {
             return Err(anyhow!("project name is required"));
         }
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let inserted = db
             .execute(
                 "INSERT OR IGNORE INTO projects (channel, name, description, created_by, created_at)
@@ -82,12 +82,12 @@ impl ProjectStore {
     }
 
     pub fn get(&self, channel: &str) -> Result<Option<Project>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         Self::get_locked(&db, channel)
     }
 
     pub fn list(&self) -> Result<Vec<Project>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT channel, name, description, created_by, created_at, pm
@@ -101,7 +101,7 @@ impl ProjectStore {
     }
 
     pub fn set_pm(&self, channel: &str, principal_id: Option<&str>) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let changed = db
             .execute(
                 "UPDATE projects SET pm = ?1 WHERE channel = ?2",
@@ -115,7 +115,7 @@ impl ProjectStore {
     }
 
     pub fn set_role(&self, channel: &str, principal_id: &str, role: &str) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "INSERT INTO project_roles (channel, principal_id, role, updated_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -128,7 +128,7 @@ impl ProjectStore {
     }
 
     pub fn role_of(&self, channel: &str, principal_id: &str) -> Result<Option<String>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             "SELECT role FROM project_roles WHERE channel = ?1 AND principal_id = ?2",
             params![channel, principal_id],
@@ -139,7 +139,7 @@ impl ProjectStore {
     }
 
     pub fn members(&self, channel: &str) -> Result<Vec<ProjectMember>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT principal_id, role FROM project_roles
@@ -159,7 +159,7 @@ impl ProjectStore {
 
     /// Projects where `principal_id` holds any role.
     pub fn projects_of(&self, principal_id: &str) -> Result<Vec<(String, String)>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT channel, role FROM project_roles

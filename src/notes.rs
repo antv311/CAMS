@@ -4,11 +4,11 @@
 //! fresh launch or a reset conversation still knows what matters.
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
 
 use crate::history::unix_timestamp;
+use crate::store::SharedConnection;
 
 /// Notes are a working memory, not an archive.
 pub const MAX_NOTES_CHARS: usize = 16_000;
@@ -22,16 +22,16 @@ pub struct AccountNotes {
 
 #[derive(Clone)]
 pub struct NoteStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
 }
 
 impl NoteStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self { db }
     }
 
     pub fn get(&self, principal_id: &str) -> Result<AccountNotes> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let row: Option<(String, i64)> = db
             .query_row(
                 "SELECT body, updated_at FROM account_notes WHERE principal_id = ?1",
@@ -76,7 +76,7 @@ impl NoteStore {
             ));
         }
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "INSERT INTO account_notes (principal_id, body, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(principal_id)

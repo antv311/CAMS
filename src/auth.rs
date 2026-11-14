@@ -3,9 +3,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::logging::{EventForwarder, Severity};
+use crate::store::SharedConnection;
 use crate::tokens;
 
 #[derive(Debug)]
@@ -29,18 +30,18 @@ pub struct Principal {
 
 #[derive(Clone)]
 pub struct AuthStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     legacy_hits: Arc<AtomicU64>,
     logger: EventForwarder,
 }
 
 impl AuthStore {
     #[allow(dead_code)]
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self::with_logger(db, EventForwarder::default())
     }
 
-    pub fn with_logger(db: Arc<Mutex<Connection>>, logger: EventForwarder) -> Self {
+    pub fn with_logger(db: SharedConnection, logger: EventForwarder) -> Self {
         Self {
             db,
             legacy_hits: Arc::new(AtomicU64::new(0)),
@@ -88,9 +89,9 @@ impl AuthStore {
     }
 
     fn authenticate_new(&self, token_id: &str, secret: &str) -> Result<Option<Principal>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
-        let row: Option<(String, String, String, Option<String>, String)> = db
-            .query_row(
+        let row: Option<(String, String, String, Option<String>, String)> = {
+            let db = self.db.read()?;
+            db.query_row(
                 "SELECT p.id, p.nick, t.token_hash, p.team, COALESCE(p.role, 'member')
                  FROM principal_tokens t
                  JOIN principals p ON p.id = t.principal_id
@@ -107,7 +108,8 @@ impl AuthStore {
                 },
             )
             .optional()
-            .context("principal_tokens lookup")?;
+            .context("principal_tokens lookup")?
+        };
 
         let Some((id, nick, token_hash, team, role)) = row else {
             return Ok(None);
@@ -130,7 +132,7 @@ impl AuthStore {
             return Err(anyhow!("invalid token"));
         }
 
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT id, nick, team, COALESCE(role, 'member')
@@ -159,7 +161,7 @@ impl AuthStore {
         raw_role: Option<&str>,
         raw_team: Option<&str>,
     ) -> Result<(Principal, String)> {
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut db = self.db.write()?;
         let tx = db.transaction().context("start registration transaction")?;
         let created = Self::register_principal_on(&tx, raw_nick, raw_role, raw_team)?;
         tx.commit().context("commit registration transaction")?;
@@ -232,7 +234,7 @@ impl AuthStore {
             return Err(anyhow!("Target agent nick is required"));
         }
 
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let principal_id: Option<String> = db
             .query_row(
                 "SELECT id FROM principals WHERE LOWER(id) = LOWER(?1) OR LOWER(nick) = LOWER(?1)",
@@ -268,7 +270,7 @@ impl AuthStore {
             .filter(|s| !s.is_empty())
             .unwrap_or("cli");
 
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut db = self.db.write()?;
         let tx = db.transaction().context("start token issue transaction")?;
         if revoke_existing {
             tx.execute(
@@ -295,7 +297,7 @@ impl AuthStore {
         let token_hash = tokens::hash(&secret).context("hash reissued token")?;
         // (principal_id, label) is unique, so every reissue needs its own label.
         let label = format!("owner-reissue-{token_id}");
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut db = self.db.write()?;
         let tx = db
             .transaction()
             .context("start token reissue transaction")?;
@@ -329,7 +331,7 @@ impl AuthStore {
         if clean.is_empty() {
             return Ok(None);
         }
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             "SELECT id, nick, team, COALESCE(role, 'member')
              FROM principals
@@ -349,7 +351,7 @@ impl AuthStore {
     }
 
     pub fn list_principals(&self) -> Result<Vec<Principal>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut stmt = db
             .prepare(
                 "SELECT id, nick, team, COALESCE(role, 'member')

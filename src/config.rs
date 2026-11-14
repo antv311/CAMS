@@ -1,6 +1,10 @@
 //! Editable server settings and shared per-user configuration discovery.
 
 use crate::backup::{default_owner_key_path, BackupConfig};
+use crate::db::{
+    SqlitePoolConfig, SqliteSynchronous, DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_CACHE_SIZE_KIB,
+    DEFAULT_DB_POOL_SIZE, DEFAULT_JOURNAL_SIZE_LIMIT_BYTES, DEFAULT_WAL_AUTOCHECKPOINT,
+};
 use crate::logging::{
     validate_event_log_source, LogConfig, SyslogFacility, SyslogFormat, SyslogTarget,
 };
@@ -60,6 +64,12 @@ pub struct ServerConfig {
     pub backup_interval_secs: u64,
     pub backup_retention: usize,
     pub backup_on_startup: bool,
+    pub db_pool_size: usize,
+    pub db_busy_timeout_ms: u64,
+    pub db_synchronous: String,
+    pub db_wal_autocheckpoint: u32,
+    pub db_cache_size_kib: i64,
+    pub db_journal_size_limit_bytes: i64,
 }
 
 impl Default for ServerConfig {
@@ -84,6 +94,12 @@ impl Default for ServerConfig {
             backup_interval_secs: 3600,
             backup_retention: 10,
             backup_on_startup: false,
+            db_pool_size: DEFAULT_DB_POOL_SIZE,
+            db_busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
+            db_synchronous: "normal".into(),
+            db_wal_autocheckpoint: DEFAULT_WAL_AUTOCHECKPOINT,
+            db_cache_size_kib: DEFAULT_CACHE_SIZE_KIB,
+            db_journal_size_limit_bytes: DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
         }
     }
 }
@@ -138,6 +154,19 @@ impl ServerConfig {
         })
     }
 
+    pub fn to_sqlite_config(&self) -> Result<SqlitePoolConfig> {
+        let cfg = SqlitePoolConfig {
+            read_pool_size: self.db_pool_size,
+            busy_timeout_ms: self.db_busy_timeout_ms,
+            synchronous: SqliteSynchronous::parse(&self.db_synchronous)?,
+            wal_autocheckpoint: self.db_wal_autocheckpoint,
+            cache_size_kib: self.db_cache_size_kib,
+            journal_size_limit_bytes: self.db_journal_size_limit_bytes,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     fn load_with(
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
@@ -166,7 +195,13 @@ impl ServerConfig {
                 | "--syslog-facility"
                 | "--backup-dir"
                 | "--backup-interval-secs"
-                | "--backup-retention" => iter
+                | "--backup-retention"
+                | "--db-pool-size"
+                | "--db-busy-timeout-ms"
+                | "--db-synchronous"
+                | "--db-wal-autocheckpoint"
+                | "--db-cache-size-kib"
+                | "--db-journal-size-limit" => iter
                     .next()
                     .filter(|value| !value.starts_with("--"))
                     .with_context(|| format!("{arg} requires a value"))?,
@@ -239,6 +274,12 @@ impl ServerConfig {
             ("AIRCD_BACKUP_INTERVAL_SECS", "--backup-interval-secs"),
             ("AIRCD_BACKUP_RETENTION", "--backup-retention"),
             ("AIRCD_BACKUP_ON_STARTUP", "--backup-on-startup"),
+            ("AIRCD_DB_POOL_SIZE", "--db-pool-size"),
+            ("AIRCD_DB_BUSY_TIMEOUT_MS", "--db-busy-timeout-ms"),
+            ("AIRCD_DB_SYNCHRONOUS", "--db-synchronous"),
+            ("AIRCD_DB_WAL_AUTOCHECKPOINT", "--db-wal-autocheckpoint"),
+            ("AIRCD_DB_CACHE_SIZE_KIB", "--db-cache-size-kib"),
+            ("AIRCD_DB_JOURNAL_SIZE_LIMIT", "--db-journal-size-limit"),
         ] {
             if let Some(value) = env(name) {
                 // Preserve the existing empty invite-key environment fallback.
@@ -282,6 +323,7 @@ impl ServerConfig {
         }
         let _ = config.to_log_config()?;
         let _ = config.to_backup_config()?;
+        let _ = config.to_sqlite_config()?;
         Ok(config)
     }
 
@@ -323,6 +365,39 @@ impl ServerConfig {
             }
             "--backup-on-startup" => {
                 self.backup_on_startup = parse_bool_setting("backup_on_startup", value)?;
+            }
+            "--db-pool-size" => {
+                self.db_pool_size = value
+                    .trim()
+                    .parse::<usize>()
+                    .with_context(|| format!("db_pool_size must be a positive integer, got '{value}'"))?;
+            }
+            "--db-busy-timeout-ms" => {
+                self.db_busy_timeout_ms = value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("db_busy_timeout_ms must be a non-negative integer, got '{value}'"))?;
+            }
+            "--db-synchronous" => {
+                self.db_synchronous = value.into();
+            }
+            "--db-wal-autocheckpoint" => {
+                self.db_wal_autocheckpoint = value
+                    .trim()
+                    .parse::<u32>()
+                    .with_context(|| format!("db_wal_autocheckpoint must be a non-negative integer, got '{value}'"))?;
+            }
+            "--db-cache-size-kib" => {
+                self.db_cache_size_kib = value
+                    .trim()
+                    .parse::<i64>()
+                    .with_context(|| format!("db_cache_size_kib must be a non-negative integer, got '{value}'"))?;
+            }
+            "--db-journal-size-limit" => {
+                self.db_journal_size_limit_bytes = value
+                    .trim()
+                    .parse::<i64>()
+                    .with_context(|| format!("db_journal_size_limit_bytes must be an integer >= -1, got '{value}'"))?;
             }
             _ => unreachable!(),
         }
@@ -655,6 +730,63 @@ mod tests {
         assert_eq!(backup_cfg.interval_secs, 120);
         assert_eq!(backup_cfg.retention, 4);
         assert!(backup_cfg.on_startup);
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_settings_respect_precedence_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "db_pool_size = 12\n\
+             db_busy_timeout_ms = 8000\n\
+             db_synchronous = 'full'\n\
+             db_wal_autocheckpoint = 2000\n\
+             db_cache_size_kib = 32768\n\
+             db_journal_size_limit_bytes = 134217728\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        let sqlite_cfg = cfg.to_sqlite_config()?;
+        assert_eq!(sqlite_cfg.read_pool_size, 12);
+        assert_eq!(sqlite_cfg.busy_timeout_ms, 8000);
+        assert_eq!(sqlite_cfg.synchronous, SqliteSynchronous::Full);
+        assert_eq!(sqlite_cfg.wal_autocheckpoint, 2000);
+        assert_eq!(sqlite_cfg.cache_size_kib, 32768);
+        assert_eq!(sqlite_cfg.journal_size_limit_bytes, 134_217_728);
+
+        let env = environment(&[
+            ("AIRCD_DB_POOL_SIZE", "6"),
+            ("AIRCD_DB_SYNCHRONOUS", "normal"),
+            ("AIRCD_DB_BUSY_TIMEOUT_MS", "4500"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--db-pool-size".into(),
+                "16".into(),
+                "--db-wal-autocheckpoint".into(),
+                "500".into(),
+            ],
+            env,
+            &path,
+        )?;
+        let sqlite_cfg = cfg.to_sqlite_config()?;
+        assert_eq!(sqlite_cfg.read_pool_size, 16);
+        assert_eq!(sqlite_cfg.synchronous, SqliteSynchronous::Normal);
+        assert_eq!(sqlite_cfg.busy_timeout_ms, 4500);
+        assert_eq!(sqlite_cfg.wal_autocheckpoint, 500);
+
+        for bad in [
+            "db_pool_size = 0",
+            "db_pool_size = 999",
+            "db_synchronous = 'bogus'",
+            "db_cache_size_kib = -1",
+            "db_journal_size_limit_bytes = -2",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid config for {bad}"
+            );
+        }
         Ok(())
     }
 }

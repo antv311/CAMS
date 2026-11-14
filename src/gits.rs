@@ -5,9 +5,9 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::Sha256;
-use std::sync::{Arc, Mutex};
 
 use crate::history::unix_timestamp;
+use crate::store::SharedConnection;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -28,11 +28,11 @@ pub struct GitRepo {
 
 #[derive(Clone)]
 pub struct GitRepoStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
 }
 
 impl GitRepoStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self { db }
     }
 
@@ -52,7 +52,7 @@ impl GitRepoStore {
         }
 
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let existing_secret: Option<String> = db
             .query_row(
                 "SELECT webhook_secret FROM git_repos WHERE name = ?1",
@@ -107,7 +107,7 @@ impl GitRepoStore {
     }
 
     pub fn get_with_secret(&self, name: &str) -> Result<Option<(GitRepo, Option<String>)>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             "SELECT name, channel, local_path, remote_url, default_branch, webhook_secret,
                     last_commit, last_branch, last_event_at, created_at, updated_at
@@ -137,7 +137,7 @@ impl GitRepoStore {
     }
 
     pub fn list(&self) -> Result<Vec<GitRepo>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut stmt = db
             .prepare(
                 "SELECT name, channel, local_path, remote_url, default_branch, webhook_secret,
@@ -160,7 +160,7 @@ impl GitRepoStore {
         commit: Option<&str>,
     ) -> Result<()> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "UPDATE git_repos
              SET last_branch = COALESCE(?2, last_branch),

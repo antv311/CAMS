@@ -1,6 +1,7 @@
 mod auth;
 mod backup;
 mod config;
+mod db;
 mod gits;
 mod history;
 mod http;
@@ -137,13 +138,20 @@ async fn main() -> Result<()> {
                        --backup-interval-secs <n>  Seconds between scheduled backups (env AIRCD_BACKUP_INTERVAL_SECS, default 3600; 0 disables timer)\n  \
                        --backup-retention <n>   Number of snapshots to retain (env AIRCD_BACKUP_RETENTION, default 10)\n  \
                        --backup-on-startup      Capture a snapshot immediately on startup (env AIRCD_BACKUP_ON_STARTUP=1)\n  \
-                       --no-backups             Disable automated snapshot backup worker (env AIRCD_BACKUP_ENABLED=0)"
+                       --no-backups             Disable automated snapshot backup worker (env AIRCD_BACKUP_ENABLED=0)\n  \
+                       --db-pool-size <n>       Read-only SQLite connection pool size (env AIRCD_DB_POOL_SIZE, default 8)\n  \
+                       --db-busy-timeout-ms <n> SQLite busy_timeout in milliseconds (env AIRCD_DB_BUSY_TIMEOUT_MS, default 5000)\n  \
+                       --db-synchronous <mode>  SQLite WAL synchronous mode: off, normal, full, extra (env AIRCD_DB_SYNCHRONOUS, default normal)\n  \
+                       --db-wal-autocheckpoint <pages>  WAL auto-checkpoint threshold in pages (env AIRCD_DB_WAL_AUTOCHECKPOINT, default 1000)\n  \
+                       --db-cache-size-kib <n>  Per-connection SQLite cache size in KiB (env AIRCD_DB_CACHE_SIZE_KIB, default 16384)\n  \
+                       --db-journal-size-limit <bytes>  WAL journal size limit in bytes (env AIRCD_DB_JOURNAL_SIZE_LIMIT, default 67108864)"
                 );
         return Ok(());
     }
     let server_config = config::ServerConfig::load(&argv)?;
     let log_config = server_config.to_log_config()?;
     let backup_config = server_config.to_backup_config()?;
+    let sqlite_config = server_config.to_sqlite_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
     let config::ServerConfig {
         bind: bind_addr,
@@ -159,7 +167,7 @@ async fn main() -> Result<()> {
 
     let (register_key, register_note) =
         resolve_register_key(register_key, open_registration, &db_path)?;
-    let db = store::open(db_path)?;
+    let db = store::open_with_config(&db_path, sqlite_config.clone())?;
     let server = Server::with_logger_and_backup(db, logger.clone(), backup_config.clone());
     let _webhook_worker = server.webhooks().spawn_worker();
     let _backup_worker = server.backups().spawn_worker();
@@ -182,6 +190,18 @@ async fn main() -> Result<()> {
         .wakes()
         .set_server_url(&format!("http://{wake_host}:{}", runtime_info.http_port));
     println!("  registration: {register_note}");
+    println!(
+        "  database:     {} (pool={}, busy={}ms, sync={}, autocheckpoint={}p)",
+        db_path,
+        if db_path == ":memory:" {
+            1
+        } else {
+            sqlite_config.read_pool_size
+        },
+        sqlite_config.busy_timeout_ms,
+        sqlite_config.synchronous,
+        sqlite_config.wal_autocheckpoint,
+    );
     if backup_config.enabled {
         if let Some(dir) = backup_config.effective_backup_dir() {
             println!(

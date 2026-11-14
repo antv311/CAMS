@@ -2,9 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::fmt;
-use std::sync::{Arc, Mutex};
 
 use crate::history::unix_timestamp;
+use crate::store::SharedConnection;
 
 const DEFAULT_LOCK_TTL_SECONDS: i64 = 1800;
 const MIN_LOCK_TTL_SECONDS: i64 = 30;
@@ -42,11 +42,11 @@ pub struct ResourceLock {
 
 #[derive(Clone)]
 pub struct LockStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
 }
 
 impl LockStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self { db }
     }
 
@@ -69,8 +69,12 @@ impl LockStore {
         let now = unix_timestamp();
         let expires_at = now + ttl;
 
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut db = self.db.write()?;
         let tx = db.transaction().context("start lock acquire tx")?;
+        let _ = tx.execute(
+            "DELETE FROM resource_locks WHERE expires_at <= ?1",
+            params![now],
+        );
 
         if let Some(existing) = Self::get_locked(&tx, &resource)? {
             if existing.expires_at > now && !existing.owner_id.eq_ignore_ascii_case(owner_id) {
@@ -107,7 +111,7 @@ impl LockStore {
     ) -> Result<Option<ResourceLock>> {
         let resource = sanitize_resource_name(raw_resource)?;
         let now = unix_timestamp();
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut db = self.db.write()?;
         let tx = db.transaction().context("start lock release tx")?;
 
         let Some(existing) = Self::get_locked(&tx, &resource)? else {
@@ -134,11 +138,7 @@ impl LockStore {
 
     pub fn list(&self, channel: Option<&str>) -> Result<Vec<ResourceLock>> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
-        let _ = db.execute(
-            "DELETE FROM resource_locks WHERE expires_at <= ?1",
-            params![now],
-        );
+        let db = self.db.read()?;
 
         let mut stmt = db
             .prepare(

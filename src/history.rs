@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+use crate::store::SharedConnection;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StoredMessage {
@@ -17,18 +18,18 @@ pub struct StoredMessage {
 
 #[derive(Clone)]
 pub struct HistoryStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
 }
 
 impl HistoryStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self { db }
     }
 
     pub fn append(&self, channel: &str, sender_id: &str, body: &str) -> Result<StoredMessage> {
         let msg_id = format!("msg_{}", Uuid::new_v4().simple());
         let created_at = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
 
         db.execute(
             "INSERT INTO messages (msg_id, channel, sender_id, body, created_at)
@@ -51,7 +52,7 @@ impl HistoryStore {
 
     pub fn after(&self, channel: &str, after_seq: i64, limit: i64) -> Result<Vec<StoredMessage>> {
         let capped_limit = limit.clamp(1, 500);
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT seq, msg_id, channel, sender_id, body, created_at
@@ -83,7 +84,7 @@ impl HistoryStore {
             return self.after(channel, after_seq, limit);
         }
         let capped_limit = limit.clamp(1, 500);
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT seq, msg_id, channel, sender_id, body, created_at
@@ -129,7 +130,7 @@ impl HistoryStore {
         let me = principal_id.trim().to_ascii_lowercase();
         let left_pattern = format!("@dm:{me}:%");
         let right_pattern = format!("@dm:%:{me}");
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
 
         let mut statement = db
             .prepare(
@@ -165,7 +166,7 @@ impl HistoryStore {
     }
 
     pub fn recent_channels(&self) -> Result<Vec<(String, i64, Option<i64>)>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut stmt = db
             .prepare(
                 "SELECT channel,
