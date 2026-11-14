@@ -21,8 +21,13 @@ pub use timeout::TaskTimeoutConfig;
 #[path = "task_timeout_tests.rs"]
 mod timeout_tests;
 
+#[path = "task_conditions.rs"]
+mod conditions;
+pub(crate) use conditions::deserialize_output;
+pub use conditions::TaskCondition;
+
 /// Statuses after which a task no longer appears in lists or inboxes.
-pub const TERMINAL_STATUSES: &[&str] = &["done", "merged", "cancelled"];
+pub const TERMINAL_STATUSES: &[&str] = &["done", "merged", "cancelled", "skipped"];
 
 /// Every status a task may hold. `open`/`claimed`/`done` are the original
 /// lease-based flow; the rest model assigned work that goes through review.
@@ -39,6 +44,8 @@ pub const ALL_STATUSES: &[&str] = &[
     "merged",
     "done",
     "cancelled",
+    "dormant",
+    "skipped",
 ];
 
 /// Default dispatch priority when omitted (`urgent`, `high`, `normal`, `low`).
@@ -53,7 +60,8 @@ const PRIORITY_ORDER_SQL: &str = "CASE priority \
 
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
      body, kind, priority, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
-     reviewer, parent_task_id, review_round_json, timeout_seconds, execution_heartbeat_at";
+     reviewer, parent_task_id, review_round_json, timeout_seconds, execution_heartbeat_at, \
+     condition_json, optional, optional_enabled, output_json";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Task {
@@ -86,6 +94,10 @@ pub struct Task {
     pub review_round: Option<ReviewRound>,
     /// Task IDs that must be `done` or `merged` before this task can proceed.
     pub blocked_by: Vec<String>,
+    pub condition: Option<TaskCondition>,
+    pub optional: bool,
+    pub optional_enabled: bool,
+    pub output: Option<serde_json::Value>,
 }
 
 /// Summary of one dependency link (either a blocker or a dependent task).
@@ -153,6 +165,8 @@ pub struct NewTask {
     pub parent_task_id: Option<String>,
     pub blocked_by: Vec<String>,
     pub timeout_seconds: Option<u32>,
+    pub condition: Option<TaskCondition>,
+    pub optional: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -186,6 +200,7 @@ pub(crate) struct PreparedTaskStatus {
     pub note: Option<String>,
     pub branch: Option<String>,
     pub round: Option<ReviewRound>,
+    pub output: Option<serde_json::Value>,
 }
 
 /// A question that stops a task until someone answers it.
@@ -348,11 +363,13 @@ impl TaskStore {
             Self::link_new_task_locked(&tx, id, new, now)
                 .with_context(|| format!("tasks[{index}]"))?;
         }
+        let settled = Self::settle_conditions_locked(&tx, "aircd", now)?;
         let tasks = entries
             .iter()
             .map(|(id, _)| Self::get_locked(&tx, id))
             .collect::<Result<Vec<_>>>()?;
         tx.commit()?;
+        self.record_cascade_metrics(&settled);
         for task in &tasks {
             self.metrics.record_task_created(&task.kind);
         }
@@ -367,7 +384,9 @@ impl TaskStore {
         let priority = normalize_priority(new.priority.as_deref())?;
         let assignee = clean_opt(new.assignee);
         let created_by = clean_opt(new.created_by);
-        let status = if assignee.is_some() {
+        let status = if new.optional || new.condition.is_some() {
+            "dormant"
+        } else if assignee.is_some() {
             "assigned"
         } else {
             "open"
@@ -375,8 +394,9 @@ impl TaskStore {
         db.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, priority, assignee, created_by, repo, branch, issue_url,
-                                created_at, updated_at, sprint, reviewer, parent_task_id, timeout_seconds)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16, ?17)",
+                                created_at, updated_at, sprint, reviewer, parent_task_id, timeout_seconds,
+                                condition_json, optional)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 id,
                 new.channel,
@@ -394,7 +414,9 @@ impl TaskStore {
                 clean_opt(new.sprint),
                 clean_opt(new.reviewer),
                 clean_opt(new.parent_task_id),
-                new.timeout_seconds
+                new.timeout_seconds,
+                new.condition.as_ref().map(serde_json::to_string).transpose()?,
+                new.optional
             ],
         )
         .context("insert task")?;
@@ -405,6 +427,7 @@ impl TaskStore {
     fn link_new_task_locked(db: &Connection, id: &str, new: &NewTask, now: i64) -> Result<()> {
         let blocked_by = normalize_dep_ids(&new.blocked_by);
         let created_by = clean_opt(new.created_by.clone());
+        Self::validate_condition_locked(db, &Self::get_locked(db, id)?)?;
         let status = if clean_opt(new.assignee.clone()).is_some() {
             "assigned"
         } else {
@@ -419,7 +442,23 @@ impl TaskStore {
                     "parent must be active and belong to the same project"
                 ));
             }
-            Self::require_unblocked_locked(db, &parent_id, true)?;
+            // Planning below dormant nodes is allowed; execution remains guarded.
+            let blocked: bool = db.query_row(
+                "WITH RECURSIVE ancestors(id) AS (
+                SELECT ?1 UNION SELECT t.parent_task_id FROM tasks t JOIN ancestors a ON t.id = a.id
+            ) SELECT EXISTS(SELECT 1 FROM tasks t JOIN ancestors a ON t.id = a.id
+                WHERE t.status IN ('blocked', 'cancelled', 'skipped'))",
+                [&parent_id],
+                |row| row.get(0),
+            )?;
+            if blocked {
+                return Err(anyhow!("parent task or ancestor is blocked"));
+            }
+            if Self::blocking_ancestor_locked(db, &parent_id, true)?
+                .is_some_and(|(_, status)| status == "dormant")
+            {
+                db.execute("UPDATE tasks SET status = 'dormant' WHERE id = ?1", [id])?;
+            }
         }
         for dep_id in &blocked_by {
             db.execute(
@@ -532,7 +571,17 @@ impl TaskStore {
         Ok(task)
     }
 
+    #[cfg(test)]
     pub fn done(&self, task_id: &str, principal_id: &str) -> Result<Task> {
+        Ok(self.done_with_output(task_id, principal_id, None)?.task)
+    }
+
+    pub fn done_with_output(
+        &self,
+        task_id: &str,
+        principal_id: &str,
+        output: Option<&serde_json::Value>,
+    ) -> Result<TaskUpdate> {
         let now = unix_timestamp();
         let mut db = self.db.write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -564,11 +613,25 @@ impl TaskStore {
             return Err(anyhow!("task is not claimed by this principal"));
         }
 
+        let current = Self::get_locked(&tx, task_id)?;
+        Self::save_output_locked(&tx, &current, "done", output)?;
+        Self::log_event_locked(
+            &tx,
+            task_id,
+            principal_id,
+            "status",
+            Some("claimed"),
+            Some("done"),
+            None,
+            now,
+        )?;
+        let cascaded = Self::settle_conditions_locked(&tx, principal_id, now)?;
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
         self.metrics.record_task_transition("claimed", "done");
         self.metrics.record_task_completed("done");
-        Ok(task)
+        self.record_cascade_metrics(&cascaded);
+        Ok(TaskUpdate { task, cascaded })
     }
 
     pub fn release(&self, task_id: &str, principal_id: &str) -> Result<Task> {
@@ -614,6 +677,7 @@ impl TaskStore {
             ));
         }
         let next_status = match (assignee, current.status.as_str()) {
+            (_, "dormant") => "dormant",
             (None, _) => "open",
             // Reassignment invalidates both the evidence and peer votes.
             (Some(_), "review" | "super_review") if current.review_round.is_some() => "assigned",
@@ -778,7 +842,7 @@ impl TaskStore {
             if current != change.current {
                 return Err(anyhow!("updates[{index}]: task changed concurrently or by an earlier cascade; reload and retry"));
             }
-            let update = self
+            let mut update = self
                 .set_status_locked(
                     &tx,
                     &current.id,
@@ -791,6 +855,11 @@ impl TaskStore {
                     now,
                 )
                 .with_context(|| format!("updates[{index}]"))?;
+            Self::save_output_locked(&tx, &current, &change.to, change.output.as_ref())?;
+            update
+                .cascaded
+                .extend(Self::settle_conditions_locked(&tx, actor_id, now)?);
+            update.task = Self::get_locked(&tx, &current.id)?;
             if update
                 .cascaded
                 .iter()
@@ -833,6 +902,9 @@ impl TaskStore {
             return Err(anyhow!("unknown task status '{to}'"));
         }
         let current = Self::get_locked(db, task_id)?;
+        if current.status == "dormant" && to != "cancelled" {
+            return Err(anyhow!("dormant task must activate before execution"));
+        }
         if self.execution_expired(&current, now)
             && matches!(to, "in_progress" | "testing" | "review" | "done")
         {
@@ -1120,7 +1192,9 @@ impl TaskStore {
             Some(answer),
             now,
         )?;
-        let cascaded = Self::cascade_locked(&tx, task_id, &question.resume_status, actor_id, now)?;
+        let mut cascaded =
+            Self::cascade_locked(&tx, task_id, &question.resume_status, actor_id, now)?;
+        cascaded.extend(Self::settle_conditions_locked(&tx, actor_id, now)?);
         let task = Self::get_locked(&tx, task_id)?;
         let question = Self::question_locked(&tx, &question.id)?;
         tx.commit()?;
@@ -1238,7 +1312,7 @@ impl TaskStore {
                 SELECT CASE WHEN ?2 THEN id ELSE parent_task_id END FROM tasks WHERE id = ?1
                 UNION SELECT t.parent_task_id FROM tasks t JOIN ancestors a ON t.id = a.id
              ) SELECT t.id, t.status FROM tasks t JOIN ancestors a ON t.id = a.id
-               WHERE t.status IN ('blocked', 'cancelled') LIMIT 1",
+               WHERE t.status IN ('blocked', 'cancelled', 'dormant', 'skipped') LIMIT 1",
                 params![task_id, include_self],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -1252,6 +1326,11 @@ impl TaskStore {
             ));
         }
         Ok(())
+    }
+
+    pub fn execution_blocked(&self, task_id: &str) -> Result<bool> {
+        let db = self.db.read()?;
+        Ok(Self::blocking_ancestor_locked(&db, task_id, true)?.is_some())
     }
 
     fn cancel_questions_locked(db: &Connection, task_id: &str) -> Result<()> {
@@ -1291,13 +1370,20 @@ impl TaskStore {
                 if TERMINAL_STATUSES.contains(&child.status.as_str()) {
                     continue;
                 }
-                let (next, action) = if to == "cancelled" {
+                let (next, action) = if matches!(to, "cancelled" | "skipped") {
                     Self::cancel_questions_locked(db, &child.id)?;
                     db.execute(
                         "DELETE FROM task_parent_blocks WHERE task_id = ?1",
                         [&child.id],
                     )?;
-                    ("cancelled".to_string(), "parent_cancel")
+                    (
+                        to.to_string(),
+                        if to == "skipped" {
+                            "parent_skip"
+                        } else {
+                            "parent_cancel"
+                        },
+                    )
                 } else if to == "blocked" {
                     if child.status == "blocked" {
                         continue; // Its own question or an earlier ancestor pause remains authoritative.
@@ -1421,7 +1507,7 @@ impl TaskStore {
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
                  WHERE channel = ?1
-                   AND status NOT IN ('done', 'merged', 'cancelled')
+                   AND status NOT IN ('done', 'merged', 'cancelled', 'skipped')
                    AND (?2 IS NULL OR priority = ?2)
                    AND (?3 IS NULL OR LOWER(COALESCE(repo, '')) = LOWER(?3))
                  ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
@@ -1462,7 +1548,7 @@ impl TaskStore {
                  FROM tasks
                  WHERE (?1 IS NULL OR channel = ?1)
                    AND (?2 IS NULL OR sprint = ?2)
-                   AND (?3 = 1 OR status NOT IN ('done', 'merged', 'cancelled'))
+                   AND (?3 = 1 OR status NOT IN ('done', 'merged', 'cancelled', 'skipped'))
                  ORDER BY updated_at DESC, created_at DESC, rowid DESC"
             ))
             .context("prepare full task list")?;
@@ -1502,7 +1588,7 @@ impl TaskStore {
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
-                 WHERE status NOT IN ('done', 'merged', 'cancelled')
+                 WHERE status NOT IN ('done', 'merged', 'cancelled', 'skipped', 'dormant')
                    AND (assignee = ?1 OR (claimed_by = ?1 AND status = 'claimed'))
                  ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
             ))
@@ -1884,9 +1970,6 @@ impl TaskStore {
         new_deps: &[String],
         ignore_existing_edges_from_task: bool,
     ) -> Result<Option<Vec<String>>> {
-        if new_deps.is_empty() {
-            return Ok(None);
-        }
         let mut adj: HashMap<String, Vec<String>> = HashMap::new();
         let mut stmt = db
             .prepare("SELECT task_id, depends_on_task_id FROM task_dependencies ORDER BY rowid ASC")
@@ -1899,32 +1982,44 @@ impl TaskStore {
             if ignore_existing_edges_from_task && src == task_id {
                 continue;
             }
-            adj.entry(src).or_default().push(dst);
+            adj.entry(format!("finish:{src}"))
+                .or_default()
+                .push(format!("finish:{dst}"));
         }
 
-        for start in new_deps {
-            let mut visited: HashSet<String> = HashSet::new();
-            let mut parent: HashMap<String, String> = HashMap::new();
-            let mut queue: VecDeque<String> = VecDeque::new();
-            visited.insert(start.clone());
-            queue.push_back(start.clone());
-            while let Some(node) = queue.pop_front() {
-                if node == task_id {
-                    let mut path = vec![task_id.to_string()];
-                    let mut cur = node;
-                    while let Some(prev) = parent.get(&cur) {
-                        path.push(prev.clone());
-                        cur = prev.clone();
+        for dep in new_deps {
+            adj.entry(format!("finish:{task_id}"))
+                .or_default()
+                .push(format!("finish:{dep}"));
+        }
+        for (source, target) in Self::condition_edges_locked(db)? {
+            adj.entry(source).or_default().push(target);
+        }
+        for root in [format!("finish:{task_id}"), format!("activate:{task_id}")] {
+            for start in adj.get(&root).into_iter().flatten() {
+                let mut visited: HashSet<String> = HashSet::new();
+                let mut parent: HashMap<String, String> = HashMap::new();
+                let mut queue: VecDeque<String> = VecDeque::new();
+                visited.insert(start.clone());
+                queue.push_back(start.clone());
+                while let Some(node) = queue.pop_front() {
+                    if node == root {
+                        let mut path = vec![root.clone()];
+                        let mut cur = node;
+                        while let Some(prev) = parent.get(&cur) {
+                            path.push(prev.clone());
+                            cur = prev.clone();
+                        }
+                        path.push(root.clone());
+                        path.reverse();
+                        return Ok(Some(path));
                     }
-                    path.push(task_id.to_string());
-                    path.reverse();
-                    return Ok(Some(path));
-                }
-                if let Some(neighbors) = adj.get(&node) {
-                    for next in neighbors {
-                        if visited.insert(next.clone()) {
-                            parent.insert(next.clone(), node.clone());
-                            queue.push_back(next.clone());
+                    if let Some(neighbors) = adj.get(&node) {
+                        for next in neighbors {
+                            if visited.insert(next.clone()) {
+                                parent.insert(next.clone(), node.clone());
+                                queue.push_back(next.clone());
+                            }
                         }
                     }
                 }
@@ -2089,6 +2184,10 @@ impl TaskStore {
                 })
                 .transpose()?,
             blocked_by: Vec::new(),
+            condition: conditions::json_column(row, 22)?,
+            optional: row.get(23)?,
+            optional_enabled: row.get(24)?,
+            output: conditions::json_column(row, 25)?,
         })
     }
 }

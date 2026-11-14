@@ -33,6 +33,8 @@ pub struct StatusCounts {
     pub merged: usize,
     pub done: usize,
     pub cancelled: usize,
+    pub dormant: usize,
+    pub skipped: usize,
     pub completed: usize,
     pub active: usize,
 }
@@ -53,6 +55,8 @@ impl StatusCounts {
             "merged" => self.merged += 1,
             "done" => self.done += 1,
             "cancelled" => self.cancelled += 1,
+            "dormant" => self.dormant += 1,
+            "skipped" => self.skipped += 1,
             _ => {}
         }
         if matches!(status, "merged" | "done") {

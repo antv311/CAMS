@@ -937,6 +937,18 @@ def cmd_report(args: argparse.Namespace) -> int:
     raise CliError("Unsupported report subcommand")
 
 
+def _task_json_object(raw: str | None, option: str) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    try:
+        value = json.loads(Path(raw[1:]).read_text(encoding="utf-8") if raw.startswith("@") else raw)
+    except (OSError, ValueError) as exc:
+        raise CliError(f"{option}: invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise CliError(f"{option} must be a JSON object")
+    return value
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     server, token, _prof = require_token(args)
     if args.task_cmd == "create":
@@ -959,6 +971,8 @@ def cmd_task(args: argparse.Namespace) -> int:
                 reviewer=args.reviewer,
                 blocked_by=getattr(args, "blocked_by", None),
                 timeout_seconds=getattr(args, "timeout_seconds", None),
+                condition=_task_json_object(getattr(args, "condition", None), "--condition"),
+                optional=getattr(args, "optional", False),
             ),
         )
         t = data["task"]
@@ -1104,6 +1118,9 @@ def cmd_task(args: argparse.Namespace) -> int:
             # Upload first, so the evidence is there when the reviewer wakes.
             attached = upload_attachments(server, token, args.id, args.attach, kind="log")
         payload = {"status": args.status, "note": note, "branch": args.branch}
+        output = _task_json_object(getattr(args, "output_json", None), "--output-json")
+        if output is not None:
+            payload["output"] = output
         if getattr(args, "commit", None):
             payload["commit"] = args.commit
         report_id = (getattr(args, "report", None) or "").strip()
@@ -1157,6 +1174,10 @@ def cmd_task(args: argparse.Namespace) -> int:
         ]
         if t.get("parent_task_id") or t.get("reviewer"):
             lines.append(f"parent={t.get('parent_task_id') or '-'} reviewer={t.get('reviewer') or '-'}")
+        if t.get("condition") is not None or t.get("optional"):
+            lines.append(f"condition={json.dumps(t.get('condition'))} optional={bool(t.get('optional'))} enabled={bool(t.get('optional_enabled'))}")
+        if t.get("output") is not None:
+            lines.append(f"output={json.dumps(t['output'], ensure_ascii=False)}")
         if data.get("dependencies"):
             for d in data["dependencies"]:
                 state = "resolved" if d.get("resolved") else "BLOCKING"
@@ -1273,12 +1294,18 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 0
     if args.task_cmd == "export":
         return _cmd_task_export(args, server, token)
-    if args.task_cmd in ("claim", "done", "release"):
+    if args.task_cmd in ("claim", "done", "release", "enable"):
+        payload = None
+        if args.task_cmd == "done":
+            output = _task_json_object(getattr(args, "output_json", None), "--output-json")
+            if output is not None:
+                payload = {"output": output}
         data = http_json(
             server,
             "POST",
             f"/v1/tasks/{urllib.parse.quote(args.id)}/{args.task_cmd}",
             token=token,
+            payload=payload,
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (claimed_by={t.get('claimed_by') or '-'})"])
@@ -3201,6 +3228,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--reviewer", metavar="NICK", help="Who reviews it (default: the parent's assignee, else the PM)")
     p_tc.add_argument("--blocked-by", action="append", metavar="TASK_ID", help="Dependency task ID (cross-repo supported; repeatable or comma-separated)")
     p_tc.add_argument("--timeout-seconds", type=int, help="Positive execution timeout in seconds (default: inherit hub policy)")
+    p_tc.add_argument("--condition", help="Branch predicate as a JSON object, or @path to a UTF-8 JSON file")
+    p_tc.add_argument("--optional", action="store_true", help="Keep this child dormant until the parent lead or PM enables it")
     p_tc.add_argument("--token-budget", metavar="TOKENS", help="Cap the model tokens this task and its subtasks may spend")
     p_tc.set_defaults(func=cmd_task)
 
@@ -3257,6 +3286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tst.add_argument("--report", metavar="REPORT_ID", help="Attach a report from 'airc report create --task-id ID' as the test report")
     p_tst.add_argument("--branch")
     p_tst.add_argument("--commit", help="Full submitted commit hash (required for group peer review unless supplied by --report)")
+    p_tst.add_argument("--output-json", help="Immutable output object at successful completion; JSON or @path")
     p_tst.add_argument("--attach", action="append", metavar="FILE", help="Upload FILE (a test log) to the task before moving it; repeatable")
     p_tst.set_defaults(func=cmd_task)
 
@@ -3324,9 +3354,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_tx.add_argument("--force", action="store_true", help="Overwrite an existing --output file")
     p_tx.set_defaults(func=cmd_task)
 
-    for action in ("claim", "done", "release"):
+    for action in ("claim", "done", "release", "enable"):
         p_ta = task_sub.add_parser(action)
         p_ta.add_argument("id")
+        if action == "done":
+            p_ta.add_argument("--output-json", help="Immutable output object; JSON or @path")
         p_ta.set_defaults(func=cmd_task)
 
     p_tw = task_sub.add_parser(

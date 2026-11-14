@@ -742,7 +742,7 @@ fn nicks_match(a: &str, b: &str) -> bool {
 }
 
 fn is_terminal_status(status: &str) -> bool {
-    matches!(status, "done" | "merged" | "cancelled")
+    matches!(status, "done" | "merged" | "cancelled" | "skipped")
 }
 
 /// Rank a task's activity state for member/worker status indicators.

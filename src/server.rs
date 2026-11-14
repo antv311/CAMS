@@ -1771,7 +1771,7 @@ impl Server {
 
     fn task_done(&self, session: &Session, task_id: String) -> Result<()> {
         let principal = session.principal()?;
-        let task = match self.tasks.done(&task_id, &principal.id) {
+        let _task = match self.done_task_api(principal, &task_id) {
             Ok(task) => task,
             Err(error) => {
                 let body = format!("TASK DONE {} failed: {}", task_id, error);
@@ -1783,16 +1783,6 @@ impl Server {
                 return Ok(());
             }
         };
-        self.broadcast_task_event(
-            &task,
-            "done",
-            "success",
-            &principal.nick,
-            format!(
-                "TASK {} completed by {}: {}",
-                task.id, principal.nick, task.title
-            ),
-        )?;
         Ok(())
     }
 
@@ -1871,17 +1861,35 @@ impl Server {
         actor: &str,
     ) -> Result<()> {
         for change in changes {
-            let recipients = change
+            let mut recipients: HashSet<String> = change
                 .task
                 .assignee
                 .iter()
                 .chain(change.previous_holder.iter())
                 .map(|id| id.to_ascii_lowercase())
                 .collect();
-            let text = format!(
-                "TASK {} {} because ancestor {} is {}: {}",
-                change.task.id, change.task.status, root.id, root.status, change.task.title
-            );
+            if change.task.status == "dormant"
+                || matches!(change.action, "condition_skip" | "parent_skip")
+                || (change.action == "parent_resume"
+                    && self.tasks.execution_blocked(&change.task.id)?)
+            {
+                recipients.clear();
+            }
+            let text = if change.action.starts_with("condition_") {
+                format!(
+                    "TASK {} {} -> {} ({}): {}",
+                    change.task.id,
+                    change.previous_status,
+                    change.task.status,
+                    change.action,
+                    change.task.title
+                )
+            } else {
+                format!(
+                    "TASK {} {} because ancestor {} is {}: {}",
+                    change.task.id, change.task.status, root.id, root.status, change.task.title
+                )
+            };
             self.broadcast_task_event_to(
                 &change.task,
                 change.action,
@@ -1964,6 +1972,14 @@ impl Server {
         task: &Task,
         action: &str,
     ) -> Result<HashSet<String>> {
+        if task.status == "dormant"
+            || (matches!(
+                action,
+                "create" | "assign" | "priority" | "answer" | "unblocked"
+            ) && self.tasks.execution_blocked(&task.id)?)
+        {
+            return Ok(HashSet::new());
+        }
         if let Some(round) = &task.review_round {
             if matches!(action, "status" | "peer_review")
                 && matches!(task.status.as_str(), "review" | "super_review")
@@ -3755,6 +3771,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn set_task_status_revision_api(
         &self,
         actor: &Principal,
@@ -3766,9 +3783,35 @@ impl Server {
         report_id: Option<&str>,
         commit: Option<&str>,
     ) -> Result<Task> {
+        self.set_task_status_output_api(
+            actor,
+            task_id,
+            raw_to,
+            note,
+            branch,
+            report_body,
+            report_id,
+            commit,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_task_status_output_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        raw_to: &str,
+        note: Option<&str>,
+        branch: Option<&str>,
+        report_body: Option<&str>,
+        report_id: Option<&str>,
+        commit: Option<&str>,
+        output: Option<serde_json::Value>,
+    ) -> Result<Task> {
         let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let current = self.get_task_api(task_id)?;
-        let change = self.prepare_task_status_revision(
+        let mut change = self.prepare_task_status_revision(
             actor,
             current,
             raw_to,
@@ -3778,6 +3821,8 @@ impl Server {
             report_id,
             commit,
         )?;
+        TaskStore::validate_output(output.as_ref(), &change.to)?;
+        change.output = output;
         let update = self
             .tasks
             .set_status_batch(std::slice::from_ref(&change), &actor.id)
@@ -3913,6 +3958,7 @@ impl Server {
             note: (!evidence.is_empty()).then_some(evidence),
             branch: branch.map(str::to_string),
             round,
+            output: None,
         })
     }
 
@@ -4081,6 +4127,7 @@ impl Server {
         let unresolved_map = self.tasks.unresolved_blockers_map(&mine_ids)?;
         let dispatch_queue: Vec<&Task> = mine
             .iter()
+            .filter(|t| !self.tasks.execution_blocked(&t.id).unwrap_or(true))
             .filter(|t| unresolved_map.get(&t.id).is_none_or(|b| b.is_empty()))
             .collect();
         let blocked_task_count = mine.len() - dispatch_queue.len();
@@ -4142,6 +4189,7 @@ impl Server {
             question_count += questions.len();
             let top_task_rank = tasks
                 .iter()
+                .filter(|t| !self.tasks.execution_blocked(&t.id).unwrap_or(true))
                 .filter(|t| unresolved_map.get(&t.id).is_none_or(|b| b.is_empty()))
                 .map(|t| crate::tasks::priority_rank(&t.priority))
                 .min()
@@ -4210,7 +4258,20 @@ impl Server {
     }
 
     pub fn done_task_api(&self, actor: &Principal, task_id: &str) -> Result<Task> {
-        let task = self.tasks.done(task_id.trim(), &actor.id)?;
+        self.done_task_output_api(actor, task_id, None)
+    }
+
+    pub fn done_task_output_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        output: Option<&serde_json::Value>,
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let update = self
+            .tasks
+            .done_with_output(task_id.trim(), &actor.id, output)?;
+        let task = update.task;
         self.broadcast_task_event(
             &task,
             "done",
@@ -4221,8 +4282,45 @@ impl Server {
                 task.id, actor.nick, task.title
             ),
         )?;
+        self.broadcast_task_cascades(&task, update.cascaded, &actor.nick)?;
         self.notify_unblocked_dependents(&task, &actor.nick);
         Ok(task)
+    }
+
+    pub fn enable_optional_task_api(&self, actor: &Principal, task_id: &str) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        let parent = current
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        let is_lead = parent
+            .as_ref()
+            .is_some_and(|task| task.assignee.as_deref() == Some(actor.id.as_str()))
+            && self
+                .projects
+                .role_of(&current.channel, &actor.id)?
+                .is_some();
+        if !is_lead && !self.is_project_manager(actor, &current.channel)? {
+            return Err(anyhow!(
+                "only the parent lead or project manager can enable optional work"
+            ));
+        }
+        let update = self.tasks.enable_optional(&current.id, &actor.id)?;
+        self.broadcast_task_event_to(
+            &update.task,
+            "optional_enable",
+            "success",
+            &actor.nick,
+            format!(
+                "TASK {} optional execution enabled by @{}",
+                current.id, actor.nick
+            ),
+            HashSet::new(),
+        )?;
+        self.broadcast_task_cascades(&update.task, update.cascaded, &actor.nick)?;
+        Ok(update.task)
     }
 
     pub fn release_task_api(&self, actor: &Principal, task_id: &str) -> Result<Task> {

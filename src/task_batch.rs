@@ -20,6 +20,8 @@ pub struct TaskStatusChange {
     pub report_body: Option<String>,
     pub report_id: Option<String>,
     pub commit: Option<String>,
+    #[serde(default, deserialize_with = "crate::tasks::deserialize_output")]
+    pub output: Option<serde_json::Value>,
 }
 
 fn check_batch_len(len: usize) -> Result<()> {
@@ -49,7 +51,9 @@ fn parent_snapshot(id: &str, new: &NewTask) -> Task {
         id: id.to_string(),
         channel: new.channel.clone(),
         title: new.title.clone(),
-        status: if new.assignee.is_some() {
+        status: if new.optional || new.condition.is_some() {
+            "dormant"
+        } else if new.assignee.is_some() {
             "assigned"
         } else {
             "open"
@@ -74,6 +78,10 @@ fn parent_snapshot(id: &str, new: &NewTask) -> Task {
         parent_task_id: new.parent_task_id.clone(),
         review_round: None,
         blocked_by: new.blocked_by.clone(),
+        condition: new.condition.clone(),
+        optional: new.optional,
+        optional_enabled: false,
+        output: None,
     }
 }
 
@@ -123,6 +131,11 @@ impl Server {
                 .map(|id| resolve_reference(id, &keys))
                 .collect::<Result<_>>()
                 .with_context(|| format!("tasks[{index}]"))?;
+            if let Some(condition) = &mut new.condition {
+                condition
+                    .resolve_sibling(|id| resolve_reference(id, &keys))
+                    .with_context(|| format!("tasks[{index}]"))?;
+            }
             pending.push((index, new));
         }
         let local_ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -191,7 +204,7 @@ impl Server {
                     "updates[{index}]: task IDs must be nonblank and distinct"
                 ));
             }
-            let change = self
+            let mut change = self
                 .get_task_api(id)
                 .and_then(|current| {
                     self.prepare_task_status_revision(
@@ -206,6 +219,8 @@ impl Server {
                     )
                 })
                 .with_context(|| format!("updates[{index}]"))?;
+            TaskStore::validate_output(entry.output.as_ref(), &change.to)?;
+            change.output = entry.output;
             changes.push(change);
         }
         let updates = self.tasks.set_status_batch(&changes, &actor.id)?;
