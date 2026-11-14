@@ -14,6 +14,9 @@ db = "aircd.sqlite3"
 # tls_client_auth = "required"          # none, optional, or required (default required if tls_client_ca is set)
 # http_tls_bind = "0.0.0.0:6443"        # HTTPS API listener using the TLS/mTLS config
 # tls_only = false                      # true disables plaintext IRC and HTTP listeners
+# tls_reload_enabled = true             # hot-reload certs/CA on file change or Unix SIGHUP
+# tls_watch_interval_ms = 2000          # file watcher poll interval in ms (0 disables polling)
+# tls_reload_debounce_ms = 250          # quiet period in ms after file change before reload
 
 # By default a random owner key is generated once beside the database.
 # Prefer AIRCD_REGISTER_KEY to storing a credential in this file.

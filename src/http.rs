@@ -485,7 +485,7 @@ pub async fn serve_tls(
     server: Server,
     bind_addr: &str,
     info: HttpRuntimeInfo,
-    acceptor: tokio_rustls::TlsAcceptor,
+    acceptor: impl Into<crate::tls::DynamicTlsAcceptor>,
 ) -> Result<()> {
     serve_tls_with_shutdown(
         server,
@@ -501,7 +501,7 @@ pub async fn serve_tls_with_shutdown(
     server: Server,
     bind_addr: &str,
     info: HttpRuntimeInfo,
-    acceptor: tokio_rustls::TlsAcceptor,
+    acceptor: impl Into<crate::tls::DynamicTlsAcceptor>,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let tcp = TcpListener::bind(bind_addr)
@@ -583,6 +583,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
             "/v1/owner/drain",
             get(owner_drain_status).post(owner_trigger_drain),
         )
+        .route("/v1/owner/tls", get(owner_tls_status))
+        .route("/v1/owner/tls/reload", post(owner_tls_reload))
         .route("/v1/login", post(login_agent))
         .route("/v1/tokens", get(list_tokens_api).post(issue_token_api))
         .route("/v1/tokens/refresh", post(refresh_token_api))
@@ -769,6 +771,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "tls_port": state.info.tls_port,
             "tls_client_auth": state.info.tls_client_auth,
             "tls_only": state.info.tls_only,
+            "tls_generation": state.server.tls_reloader().map(|r| r.generation()),
         })),
     )
 }
@@ -2560,6 +2563,68 @@ async fn owner_trigger_drain(
             "phase": state.server.shutdown_phase().as_str(),
         })),
     ))
+}
+
+#[derive(Deserialize, Default)]
+struct OwnerTlsReloadReq {
+    invite: Option<String>,
+    reason: Option<String>,
+}
+
+async fn owner_tls_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, None)?;
+    let reloader = state.server.tls_reloader();
+    let status = reloader.as_ref().map(|r| r.status());
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "tls_enabled": reloader.is_some(),
+            "tls_client_auth": state.info.tls_client_auth,
+            "tls_only": state.info.tls_only,
+            "status": status,
+        })),
+    ))
+}
+
+async fn owner_tls_reload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OwnerTlsReloadReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let reloader = state
+        .server
+        .tls_reloader()
+        .ok_or_else(|| ApiError::bad_request("TLS is not enabled on this server"))?;
+    let trigger = match req.reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(reason) => format!("owner_api ({reason})"),
+        None => "owner_api".to_string(),
+    };
+    let reloader_for_blocking = reloader.clone();
+    let result = tokio::task::spawn_blocking(move || reloader_for_blocking.reload(&trigger))
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?;
+    match result {
+        Ok(status) => Ok((
+            StatusCode::OK,
+            with_cors_headers(),
+            Json(json!({
+                "ok": true,
+                "reloaded": true,
+                "status": status,
+            })),
+        )),
+        Err(err) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("TLS certificate reload failed (previous certificates remain active): {err:#}"),
+        )),
+    }
 }
 
 #[derive(Deserialize, Default)]

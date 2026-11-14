@@ -528,5 +528,208 @@ class AircdMtlsTests(unittest.TestCase):
             )
 
 
+class AircdTlsHotReloadTests(unittest.TestCase):
+    def test_hot_reload_via_file_watcher_and_owner_api_preserves_active_irc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pki1 = _generate_pki(tmp_path / "pki1")
+            pki2 = _generate_pki(tmp_path / "pki2")
+
+            live_dir = tmp_path / "live"
+            live_dir.mkdir(parents=True, exist_ok=True)
+            live_ca = live_dir / "ca.crt"
+            live_cert = live_dir / "server.crt"
+            live_key = live_dir / "server.key"
+            shutil.copy2(pki1["ca_cert"], live_ca)
+            shutil.copy2(pki1["server_cert"], live_cert)
+            shutil.copy2(pki1["server_key"], live_key)
+
+            used: set[int] = set()
+            ports: list[int] = []
+            while len(ports) < 4:
+                p = _free_port()
+                if p not in used:
+                    used.add(p)
+                    ports.append(p)
+            irc_port, irc_tls_port, http_port, https_port = ports
+            https_url = f"https://127.0.0.1:{https_port}"
+            invite_key = "hot-reload-owner-secret"
+
+            proc = subprocess.Popen(
+                [
+                    str(_binary_path()),
+                    "--bind",
+                    f"127.0.0.1:{irc_port}",
+                    "--http-bind",
+                    f"127.0.0.1:{http_port}",
+                    "--db",
+                    str(tmp_path / "reload.sqlite3"),
+                    "--register-key",
+                    invite_key,
+                    "--tls-cert",
+                    str(live_cert),
+                    "--tls-key",
+                    str(live_key),
+                    "--tls-bind",
+                    f"127.0.0.1:{irc_tls_port}",
+                    "--tls-client-ca",
+                    str(live_ca),
+                    "--tls-client-auth",
+                    "required",
+                    "--http-tls-bind",
+                    f"127.0.0.1:{https_port}",
+                    "--tls-only",
+                    "--tls-watch-interval-ms",
+                    "100",
+                    "--tls-reload-debounce-ms",
+                    "50",
+                ],
+                cwd=str(REPO_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                hub1 = AircdHttpClient(
+                    https_url,
+                    timeout=3.0,
+                    tls_ca_path=str(pki1["ca_cert"]),
+                    tls_cert_path=str(pki1["client_cert"]),
+                    tls_key_path=str(pki1["client_key"]),
+                )
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        out, err = proc.communicate(timeout=2)
+                        raise RuntimeError(f"aircd exited early: {out}\n{err}")
+                    try:
+                        h = hub1._request("GET", "/healthz")
+                        if h.get("ok"):
+                            break
+                    except Exception:
+                        time.sleep(0.15)
+                else:
+                    raise RuntimeError("aircd did not become ready")
+
+                acct = hub1._request(
+                    "POST",
+                    "/v1/register",
+                    payload={"nick": "hot-irc-agent", "invite": invite_key},
+                )
+                token = acct["token"]
+
+                # Open an active mTLS IRC socket and keep it alive across both reloads.
+                ctx1 = build_ssl_context(
+                    tls_ca_path=str(pki1["ca_cert"]),
+                    tls_cert_path=str(pki1["client_cert"]),
+                    tls_key_path=str(pki1["client_key"]),
+                )
+                raw_sock = socket.create_connection(("127.0.0.1", irc_tls_port), timeout=5.0)
+                irc_sock = ctx1.wrap_socket(raw_sock, server_hostname="localhost")
+                try:
+                    irc_sock.sendall(
+                        f"CAP REQ :echo-message\r\nPASS {token}\r\nNICK hot-irc-agent\r\nUSER hot-irc-agent 0 * :live\r\nCAP END\r\nJOIN #ops\r\n".encode(
+                            "utf-8"
+                        )
+                    )
+                    buf = b""
+                    join_deadline = time.monotonic() + 5.0
+                    while time.monotonic() < join_deadline:
+                        buf += irc_sock.recv(4096)
+                        if b"JOIN #ops" in buf:
+                            break
+                    self.assertIn(b"JOIN #ops", buf)
+
+                    # 1. File-watcher rotation: switch server cert+key to pki2 and trust BOTH CA1 and CA2.
+                    combined_ca = pki1["ca_cert"].read_text(encoding="utf-8") + "\n" + pki2["ca_cert"].read_text(
+                        encoding="utf-8"
+                    )
+                    live_ca.write_text(combined_ca, encoding="utf-8")
+                    shutil.copy2(pki2["server_cert"], live_cert)
+                    shutil.copy2(pki2["server_key"], live_key)
+
+                    hub2 = AircdHttpClient(
+                        https_url,
+                        timeout=3.0,
+                        invite=invite_key,
+                        tls_ca_path=str(pki2["ca_cert"]),
+                        tls_cert_path=str(pki2["client_cert"]),
+                        tls_key_path=str(pki2["client_key"]),
+                    )
+                    watch_deadline = time.monotonic() + 10.0
+                    reloaded_ok = False
+                    last_err: Optional[Exception] = None
+                    while time.monotonic() < watch_deadline:
+                        try:
+                            status_resp = hub2._request(
+                                "GET",
+                                "/v1/owner/tls",
+                                owner=True,
+                            )
+                            if status_resp["status"]["active"]["generation"] >= 2:
+                                reloaded_ok = True
+                                self.assertEqual(status_resp["status"]["last_trigger"], "file_watcher")
+                                self.assertEqual(status_resp["status"]["active"]["client_ca_count"], 2)
+                                break
+                        except (AircdHttpError, ssl.SSLError, OSError) as exc:
+                            last_err = exc
+                        time.sleep(0.1)
+                    self.assertTrue(reloaded_ok, f"file watcher did not hot-reload within timeout: {last_err}")
+
+                    # Active IRC connection from before reload still works without reconnecting.
+                    irc_sock.sendall(b"PRIVMSG #ops :alive-after-watcher\r\n")
+                    msg_deadline = time.monotonic() + 5.0
+                    msg_buf = b""
+                    while time.monotonic() < msg_deadline:
+                        msg_buf += irc_sock.recv(4096)
+                        if b"alive-after-watcher" in msg_buf:
+                            break
+                    self.assertIn(b"alive-after-watcher", msg_buf)
+
+                    # 2. Explicit API reload: replace CA bundle with CA2 only (revoking CA1 for new connections).
+                    shutil.copy2(pki2["ca_cert"], live_ca)
+                    api_reload = hub2._request(
+                        "POST",
+                        "/v1/owner/tls/reload",
+                        payload={"invite": invite_key, "reason": "revoke_ca1"},
+                    )
+                    self.assertTrue(api_reload["reloaded"])
+                    self.assertGreaterEqual(api_reload["status"]["active"]["generation"], 3)
+                    self.assertEqual(api_reload["status"]["active"]["client_ca_count"], 1)
+
+                    # New connection with CA1 client cert is now rejected even trusting CA2 server cert.
+                    revoked_client = AircdHttpClient(
+                        https_url,
+                        timeout=3.0,
+                        tls_ca_path=str(pki2["ca_cert"]),
+                        tls_cert_path=str(pki1["client_cert"]),
+                        tls_key_path=str(pki1["client_key"]),
+                    )
+                    with self.assertRaises((ssl.SSLError, AircdHttpError, OSError)):
+                        revoked_client._request("GET", "/healthz")
+
+                    # Existing IRC connection from CA1 remains connected and responsive!
+                    irc_sock.sendall(b"PRIVMSG #ops :still-alive-after-api-reload\r\n")
+                    msg2_deadline = time.monotonic() + 5.0
+                    msg2_buf = b""
+                    while time.monotonic() < msg2_deadline:
+                        msg2_buf += irc_sock.recv(4096)
+                        if b"still-alive-after-api-reload" in msg2_buf:
+                            break
+                    self.assertIn(b"still-alive-after-api-reload", msg2_buf)
+                finally:
+                    irc_sock.close()
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                for s in (proc.stdout, proc.stderr):
+                    if s:
+                        s.close()
+
+
 if __name__ == "__main__":
     unittest.main()

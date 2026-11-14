@@ -3,12 +3,13 @@ use rusqlite::params;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::{watch, Notify};
-use tokio_rustls::TlsAcceptor;
+
+use crate::tls::{DynamicTlsAcceptor, TlsReloader};
 
 use crate::alerts::{AlertConfig, AlertDeliveryRecord, AlertEvalSnapshot, AlertManager};
 use crate::attachments::{AttachmentStore, NewAttachment, TaskAttachment};
@@ -101,6 +102,7 @@ pub struct Server {
     task_gate: Arc<Mutex<()>>,
     inner: Arc<Mutex<ServerInner>>,
     shutdown: ShutdownCoordinator,
+    tls_reloader: Arc<RwLock<Option<Arc<TlsReloader>>>>,
     active_irc_tasks: Arc<AtomicUsize>,
     irc_idle_notify: Arc<Notify>,
 }
@@ -244,6 +246,7 @@ impl Server {
             task_gate: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(ServerInner::default())),
             shutdown: ShutdownCoordinator::default(),
+            tls_reloader: Arc::new(RwLock::new(None)),
             active_irc_tasks: Arc::new(AtomicUsize::new(0)),
             irc_idle_notify: Arc::new(Notify::new()),
         };
@@ -339,6 +342,20 @@ impl Server {
 
     pub fn shutdown(&self) -> &ShutdownCoordinator {
         &self.shutdown
+    }
+
+    pub fn set_tls_reloader(&self, reloader: Arc<TlsReloader>) {
+        *self
+            .tls_reloader
+            .write()
+            .expect("tls reloader slot lock poisoned") = Some(reloader);
+    }
+
+    pub fn tls_reloader(&self) -> Option<Arc<TlsReloader>> {
+        self.tls_reloader
+            .read()
+            .expect("tls reloader slot lock poisoned")
+            .clone()
     }
 
     pub fn is_draining(&self) -> bool {
@@ -1062,7 +1079,11 @@ impl Server {
     }
 
     #[allow(dead_code)]
-    pub async fn listen_tls(self, bind_addr: &str, acceptor: TlsAcceptor) -> Result<()> {
+    pub async fn listen_tls(
+        self,
+        bind_addr: &str,
+        acceptor: impl Into<DynamicTlsAcceptor>,
+    ) -> Result<()> {
         self.listen_tls_with_shutdown(bind_addr, acceptor, crate::shutdown::never_stop_rx())
             .await
     }
@@ -1070,9 +1091,10 @@ impl Server {
     pub async fn listen_tls_with_shutdown(
         self,
         bind_addr: &str,
-        acceptor: TlsAcceptor,
+        acceptor: impl Into<DynamicTlsAcceptor>,
         mut stop_rx: watch::Receiver<bool>,
     ) -> Result<()> {
+        let acceptor = acceptor.into();
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("bind {bind_addr}"))?;
@@ -1092,7 +1114,7 @@ impl Server {
                 }
                 accepted = listener.accept() => accepted?,
             };
-            let acceptor = acceptor.clone();
+            let acceptor = acceptor.current();
             let server = self.clone();
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(stream).await {

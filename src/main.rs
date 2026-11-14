@@ -115,6 +115,9 @@ async fn main() -> Result<()> {
                        --tls-client-auth <mode> mTLS mode: none, optional, or required (default: required if --tls-client-ca is set)\n  \
                        --http-tls-bind <addr>   Optional HTTPS welcome & API listen address (uses TLS/mTLS config)\n  \
                        --tls-only               Disable plaintext IRC and HTTP listeners (env AIRCD_TLS_ONLY=1)\n  \
+                       --no-tls-reload          Disable automatic TLS cert/CA file watcher and SIGHUP hot-reload (env AIRCD_TLS_RELOAD_ENABLED=0)\n  \
+                       --tls-watch-interval-ms <ms>  TLS cert/CA file watcher poll interval in ms (env AIRCD_TLS_WATCH_INTERVAL_MS, default 2000; 0 disables polling)\n  \
+                       --tls-reload-debounce-ms <ms>  TLS reload debounce period after file change in ms (env AIRCD_TLS_RELOAD_DEBOUNCE_MS, default 250)\n  \
                        --register-key <key>     Invite key required to register (env AIRCD_REGISTER_KEY;\n  \
                                                 default: generated once in aircd-owner.key beside the DB)\n  \
                        --open-registration      Let anyone who can reach the server register (env AIRCD_OPEN_REGISTRATION=1)\n  \
@@ -181,6 +184,7 @@ async fn main() -> Result<()> {
     let alert_config = server_config.to_alert_config()?;
     let shutdown_config = server_config.to_shutdown_config()?;
     let tls_spec = server_config.to_tls_config()?;
+    let tls_reload_config = server_config.to_tls_reload_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
     let task_timeout_config = server_config.task_timeout.clone();
     task_timeout_config.validate()?;
@@ -217,10 +221,25 @@ async fn main() -> Result<()> {
     let vacuum_worker = server.vacuum().spawn_worker_with_shutdown(stop_rx.clone());
     let alert_worker = server.spawn_alert_worker_with_shutdown(stop_rx.clone());
 
-    let tls_acceptor = tls_spec
+    let tls_reloader = tls_spec
         .as_ref()
-        .map(tls::build_tls_acceptor)
+        .map(|spec| {
+            tls::TlsReloader::new(
+                spec.clone(),
+                tls_reload_config.clone(),
+                logger.clone(),
+                server.metrics().clone(),
+            )
+            .map(std::sync::Arc::new)
+        })
         .transpose()?;
+    if let Some(reloader) = &tls_reloader {
+        server.set_tls_reloader(reloader.clone());
+    }
+    let tls_reload_worker = tls_reloader
+        .as_ref()
+        .map(|reloader| reloader.spawn_worker_with_shutdown(stop_rx.clone()));
+    let tls_acceptor = tls_reloader.as_ref().map(|reloader| reloader.acceptor());
     let tls_client_auth_mode = tls_spec
         .as_ref()
         .map(|spec| spec.client_auth.as_str().to_string())
@@ -329,8 +348,11 @@ async fn main() -> Result<()> {
     );
     if tls_acceptor.is_some() {
         println!(
-            "  TLS:          irc={tls_bind}, https={}, client_auth={tls_client_auth_mode}, tls_only={tls_only}",
-            http_tls_bind.as_deref().unwrap_or("disabled")
+            "  TLS:          irc={tls_bind}, https={}, client_auth={tls_client_auth_mode}, tls_only={tls_only}, hot_reload={} (watch={}ms, debounce={}ms)",
+            http_tls_bind.as_deref().unwrap_or("disabled"),
+            tls_reload_config.enabled,
+            tls_reload_config.watch_interval_ms,
+            tls_reload_config.debounce_ms,
         );
     }
     if !tls_only {
@@ -469,7 +491,7 @@ async fn main() -> Result<()> {
         listeners_handle.abort();
     }
 
-    let workers = vec![
+    let mut workers = vec![
         webhook_worker,
         backup_worker,
         vacuum_worker,
@@ -477,6 +499,9 @@ async fn main() -> Result<()> {
         group_inactivity_worker,
         task_timeout_worker,
     ];
+    if let Some(worker) = tls_reload_worker {
+        workers.push(worker);
+    }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         for handle in workers {
             let _ = handle.await;

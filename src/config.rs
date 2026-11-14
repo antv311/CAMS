@@ -11,7 +11,10 @@ use crate::logging::{
 };
 use crate::rate_limit::RateLimitConfig;
 use crate::shutdown::ShutdownConfig;
-use crate::tls::{ClientAuthMode, TlsServerConfigSpec};
+use crate::tls::{
+    ClientAuthMode, TlsReloadConfig, TlsServerConfigSpec, DEFAULT_TLS_RELOAD_DEBOUNCE_MS,
+    DEFAULT_TLS_RELOAD_ENABLED, DEFAULT_TLS_WATCH_INTERVAL_MS,
+};
 use crate::vacuum::{
     VacuumConfig, DEFAULT_VACUUM_BATCH_PAGES, DEFAULT_VACUUM_ENABLED,
     DEFAULT_VACUUM_INTERVAL_SECS, DEFAULT_VACUUM_MAX_BATCHES_PER_RUN,
@@ -72,6 +75,9 @@ pub struct ServerConfig {
     pub tls_client_auth: Option<String>,
     pub http_tls_bind: Option<String>,
     pub tls_only: bool,
+    pub tls_reload_enabled: bool,
+    pub tls_watch_interval_ms: u64,
+    pub tls_reload_debounce_ms: u64,
     pub register_key: Option<String>,
     pub open_registration: bool,
     pub auth: AuthConfig,
@@ -118,6 +124,9 @@ impl Default for ServerConfig {
             tls_client_auth: None,
             http_tls_bind: None,
             tls_only: false,
+            tls_reload_enabled: DEFAULT_TLS_RELOAD_ENABLED,
+            tls_watch_interval_ms: DEFAULT_TLS_WATCH_INTERVAL_MS,
+            tls_reload_debounce_ms: DEFAULT_TLS_RELOAD_DEBOUNCE_MS,
             register_key: None,
             open_registration: false,
             auth: AuthConfig::default(),
@@ -235,6 +244,16 @@ impl ServerConfig {
         }
     }
 
+    pub fn to_tls_reload_config(&self) -> Result<TlsReloadConfig> {
+        let cfg = TlsReloadConfig {
+            enabled: self.tls_reload_enabled,
+            watch_interval_ms: self.tls_watch_interval_ms,
+            debounce_ms: self.tls_reload_debounce_ms,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     pub fn to_sqlite_config(&self) -> Result<SqlitePoolConfig> {
         let cfg = SqlitePoolConfig {
             read_pool_size: self.db_pool_size,
@@ -285,6 +304,7 @@ impl ServerConfig {
             let value = match arg.as_str() {
                 "--open-registration"
                 | "--tls-only"
+                | "--tls-reload-enabled"
                 | "--windows-event-log"
                 | "--backup-enabled"
                 | "--backup-on-startup"
@@ -298,6 +318,7 @@ impl ServerConfig {
                 | "--alerts-disk-pressure-enabled"
                 | "--shutdown-checkpoint-leases" => "true",
                 "--no-backups"
+                | "--no-tls-reload"
                 | "--no-db-vacuum"
                 | "--no-rate-limit"
                 | "--no-alerts"
@@ -316,6 +337,8 @@ impl ServerConfig {
                 | "--tls-bind"
                 | "--tls-client-ca"
                 | "--tls-client-auth"
+                | "--tls-watch-interval-ms"
+                | "--tls-reload-debounce-ms"
                 | "--register-key"
                 | "--token-ttl-seconds"
                 | "--rate-limit-ip-rps"
@@ -429,6 +452,9 @@ impl ServerConfig {
             ("AIRCD_TLS_CLIENT_CA", "--tls-client-ca"),
             ("AIRCD_TLS_CLIENT_AUTH", "--tls-client-auth"),
             ("AIRCD_TLS_ONLY", "--tls-only"),
+            ("AIRCD_TLS_RELOAD_ENABLED", "--tls-reload-enabled"),
+            ("AIRCD_TLS_WATCH_INTERVAL_MS", "--tls-watch-interval-ms"),
+            ("AIRCD_TLS_RELOAD_DEBOUNCE_MS", "--tls-reload-debounce-ms"),
             ("AIRCD_REGISTER_KEY", "--register-key"),
             ("AIRCD_OPEN_REGISTRATION", "--open-registration"),
             ("AIRCD_TOKEN_TTL_SECONDS", "--token-ttl-seconds"),
@@ -569,6 +595,7 @@ impl ServerConfig {
         let _ = config.to_backup_config()?;
         let _ = config.to_sqlite_config()?;
         let _ = config.to_vacuum_config()?;
+        let _ = config.to_tls_reload_config()?;
         config.alerts.validate()?;
         config.shutdown.validate()?;
         Ok(config)
@@ -588,6 +615,16 @@ impl ServerConfig {
             "--tls-client-auth" => self.tls_client_auth = Some(value.into()),
             "--tls-only" => {
                 self.tls_only = parse_bool_setting("tls_only", value)?;
+            }
+            "--tls-reload-enabled" | "--no-tls-reload" => {
+                self.tls_reload_enabled = parse_bool_setting("tls_reload_enabled", value)?;
+            }
+            "--tls-watch-interval-ms" => {
+                self.tls_watch_interval_ms = parse_u64_setting("tls_watch_interval_ms", value)?;
+            }
+            "--tls-reload-debounce-ms" => {
+                self.tls_reload_debounce_ms =
+                    parse_u64_setting("tls_reload_debounce_ms", value)?;
             }
             "--register-key" => self.register_key = Some(value.into()),
             "--open-registration" => {
@@ -1629,6 +1666,68 @@ mod tests {
             assert!(
                 ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
                 "expected invalid shutdown config for {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tls_reload_settings_load_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let empty = fixture.write("");
+        let defaults = ServerConfig::load_with(&[], |_| None, &empty)?.to_tls_reload_config()?;
+        assert!(defaults.enabled);
+        assert_eq!(defaults.watch_interval_ms, DEFAULT_TLS_WATCH_INTERVAL_MS);
+        assert_eq!(defaults.debounce_ms, DEFAULT_TLS_RELOAD_DEBOUNCE_MS);
+
+        let path = fixture.write(
+            "tls_reload_enabled = false\n\
+             tls_watch_interval_ms = 5000\n\
+             tls_reload_debounce_ms = 500\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?.to_tls_reload_config()?;
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.watch_interval_ms, 5000);
+        assert_eq!(cfg.debounce_ms, 500);
+
+        let env = environment(&[
+            ("AIRCD_TLS_RELOAD_ENABLED", "true"),
+            ("AIRCD_TLS_WATCH_INTERVAL_MS", "1500"),
+            ("AIRCD_TLS_RELOAD_DEBOUNCE_MS", "100"),
+        ]);
+        let cfg = ServerConfig::load_with(&[], &env, &path)?.to_tls_reload_config()?;
+        assert!(cfg.enabled);
+        assert_eq!(cfg.watch_interval_ms, 1500);
+        assert_eq!(cfg.debounce_ms, 100);
+
+        let cfg = ServerConfig::load_with(
+            &[
+                "--no-tls-reload".into(),
+                "--tls-watch-interval-ms".into(),
+                "250".into(),
+                "--tls-reload-debounce-ms".into(),
+                "50".into(),
+            ],
+            &env,
+            &path,
+        )?
+        .to_tls_reload_config()?;
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.watch_interval_ms, 250);
+        assert_eq!(cfg.debounce_ms, 50);
+
+        let cfg = ServerConfig::load_with(&["--tls-reload-enabled".into()], &env, &path)?
+            .to_tls_reload_config()?;
+        assert!(cfg.enabled);
+
+        for bad in [
+            "tls_watch_interval_ms = 90000000",
+            "tls_reload_debounce_ms = 70000",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid tls reload config for {bad}"
             );
         }
         Ok(())

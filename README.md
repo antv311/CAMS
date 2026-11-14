@@ -1158,6 +1158,15 @@ aircd tui --profile worker-1
 
 - Python `AircdClient` and `AircdHttpClient` accept `tls_ca_path`, `tls_cert_path`, `tls_key_path`, and `tls_verify`; `airc-daemon` accepts `--tls-ca`, `--tls-cert`, and `--tls-key`.
 
+### Dynamic TLS Certificate Hot-Reload
+
+Server TLS certificates, private keys, and mTLS CA bundles (`--tls-cert`, `--tls-key`, `--tls-client-ca`) can be rotated without restarting `aircd` or dropping active IRC TLS / HTTP listeners:
+
+- **Automatic file watcher** (enabled by default on Windows and Unix): polls the configured PEM files every `--tls-watch-interval-ms` (default `2000`, `0` disables polling) with `--tls-reload-debounce-ms` (default `250`) so simultaneous cert/key writes settle before atomic swap. Disable background watching with `--no-tls-reload` (`AIRCD_TLS_RELOAD_ENABLED=0`).
+- **Unix `SIGHUP`**: sending `SIGHUP` to `aircd` triggers an immediate reload when `tls_reload_enabled` is enabled.
+- **Owner HTTP API**: `GET /v1/owner/tls` inspects active cert/CA SHA-256 fingerprints, reload generation, and error state; `POST /v1/owner/tls/reload` triggers an immediate synchronous reload (both require `X-AirCD-Invite` / owner key).
+- Invalid or mismatched PEM files fail safely without modifying the active `TlsAcceptor`, emit `tls.reload_failed` error & audit events, and increment `aircd_tls_reloads_total{result="error"}`.
+
 With `AIRCD_SEED_DEMO=1` (or an in-memory database) the prototype seeds demo principals:
 
 | Nick | Token |

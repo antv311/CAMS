@@ -41,6 +41,14 @@ const RATE_LIMIT_SCOPES: &[&str] = &["ip", "principal"];
 pub const ALERT_RULE_KEYS: &[&str] = &["wake_failure_rate", "queue_backlog", "disk_pressure"];
 const ALERT_DELIVERY_STATUSES: &[&str] = &["delivered", "failed"];
 const AUDIT_STREAM_CATEGORIES: &[&str] = &["auth", "security", "task_state", "server_error"];
+const TLS_RELOAD_RESULTS: &[(&str, &str)] = &[
+    ("file_watcher", "ok"),
+    ("file_watcher", "error"),
+    ("sighup", "ok"),
+    ("sighup", "error"),
+    ("owner_api", "ok"),
+    ("owner_api", "error"),
+];
 const MAX_WAKE_COMPLETION_HISTORY: usize = 50_000;
 const MAX_WAKE_COMPLETION_AGE: Duration = Duration::from_secs(86_400);
 
@@ -209,6 +217,9 @@ pub struct MetricsRegistry {
     audit_stream_events_total: BTreeMap<&'static str, AtomicU64>,
     audit_stream_active_subscribers: AtomicI64,
     audit_stream_lagged_total: AtomicU64,
+    tls_reloads_total: BTreeMap<(&'static str, &'static str), AtomicU64>,
+    tls_reload_generation: AtomicU64,
+    tls_last_reload_timestamp_seconds: AtomicU64,
 }
 
 impl Default for MetricsRegistry {
@@ -245,6 +256,12 @@ impl MetricsRegistry {
             audit_stream_events_total: counter_map(AUDIT_STREAM_CATEGORIES),
             audit_stream_active_subscribers: AtomicI64::new(0),
             audit_stream_lagged_total: AtomicU64::new(0),
+            tls_reloads_total: TLS_RELOAD_RESULTS
+                .iter()
+                .map(|&k| (k, AtomicU64::new(0)))
+                .collect(),
+            tls_reload_generation: AtomicU64::new(0),
+            tls_last_reload_timestamp_seconds: AtomicU64::new(0),
         }
     }
 
@@ -474,6 +491,37 @@ impl MetricsRegistry {
             .fetch_add(1, Ordering::Relaxed);
         AuditStreamSubscriberGuard {
             registry: self.clone(),
+        }
+    }
+
+    pub fn set_tls_initial_state(&self, generation: u64, loaded_at_secs: i64) {
+        self.tls_reload_generation
+            .store(generation, Ordering::Relaxed);
+        self.tls_last_reload_timestamp_seconds
+            .store(loaded_at_secs.max(0) as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_tls_reload(
+        &self,
+        trigger: &str,
+        ok: bool,
+        generation: u64,
+        timestamp_secs: i64,
+    ) {
+        let norm_trigger = match trigger {
+            "file_watcher" | "sighup" | "owner_api" => trigger,
+            _ if trigger.starts_with("owner_api") => "owner_api",
+            _ => "owner_api",
+        };
+        let result = if ok { "ok" } else { "error" };
+        if let Some(counter) = self.tls_reloads_total.get(&(norm_trigger, result)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        self.tls_reload_generation
+            .store(generation, Ordering::Relaxed);
+        if ok {
+            self.tls_last_reload_timestamp_seconds
+                .store(timestamp_secs.max(0) as u64, Ordering::Relaxed);
         }
     }
 
@@ -1226,6 +1274,50 @@ impl MetricsRegistry {
             "aircd_audit_stream_lagged_total",
             &[],
             self.audit_stream_lagged_total.load(Ordering::Relaxed),
+        );
+
+        // 8. Dynamic TLS certificate hot-reload
+        write_header(
+            &mut out,
+            "aircd_tls_reloads_total",
+            "counter",
+            "Total TLS certificate and mTLS CA hot-reload attempts by trigger and result.",
+        );
+        for &(trigger, result) in TLS_RELOAD_RESULTS {
+            let val = self.tls_reloads_total[&(trigger, result)].load(Ordering::Relaxed);
+            write_sample(
+                &mut out,
+                "aircd_tls_reloads_total",
+                &[("trigger", trigger), ("result", result)],
+                val,
+            );
+        }
+
+        write_header(
+            &mut out,
+            "aircd_tls_reload_generation",
+            "gauge",
+            "Current active TLS certificate reload generation (0 when TLS is disabled).",
+        );
+        write_sample(
+            &mut out,
+            "aircd_tls_reload_generation",
+            &[],
+            self.tls_reload_generation.load(Ordering::Relaxed),
+        );
+
+        write_header(
+            &mut out,
+            "aircd_tls_last_reload_timestamp_seconds",
+            "gauge",
+            "Unix timestamp in seconds of the most recent TLS certificate load or hot-reload.",
+        );
+        write_sample(
+            &mut out,
+            "aircd_tls_last_reload_timestamp_seconds",
+            &[],
+            self.tls_last_reload_timestamp_seconds
+                .load(Ordering::Relaxed),
         );
 
         out
