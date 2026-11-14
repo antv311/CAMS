@@ -1147,6 +1147,8 @@ def cmd_task(args: argparse.Namespace) -> int:
             )
         print_out(args, data, lines or [f"No tasks in {args.channel}."])
         return 0
+    if args.task_cmd == "export":
+        return _cmd_task_export(args, server, token)
     if args.task_cmd in ("claim", "done", "release"):
         data = http_json(
             server,
@@ -1160,6 +1162,122 @@ def cmd_task(args: argparse.Namespace) -> int:
     if args.task_cmd == "worktree":
         return _cmd_task_worktree(args, server, token, _prof)
     raise CliError("Unsupported task subcommand")
+
+
+TASK_EXPORT_COLUMNS = [
+    "id", "channel", "sprint", "kind", "priority", "title", "status", "assignee", "reviewer", "created_by",
+    "parent_task_id", "blocked_by", "repo", "branch", "issue_url",
+    "created_at", "updated_at", "started_at", "first_review_at", "completed_at",
+    "lead_time_seconds", "cycle_time_seconds", "review_seconds", "review_rounds",
+    "changes_requested", "time_in_status",
+]
+TASK_EVENT_COLUMNS = [
+    "task_id", "channel", "sprint", "title", "at", "actor", "action", "from_status", "to_status", "note",
+]
+_EXPORT_TIME_FIELDS = {"created_at", "updated_at", "started_at", "first_review_at", "completed_at", "at"}
+
+
+def _iso_utc(ts: Any) -> str:
+    if ts is None or ts == "":
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts)))
+
+
+def task_export_rows(data: dict[str, Any], *, events: bool = False) -> tuple[list[str], list[dict[str, Any]]]:
+    """Flatten a /v1/tasks/export response into CSV columns and rows (UTC ISO timestamps)."""
+    rows: list[dict[str, Any]] = []
+    for entry in data.get("tasks") or []:
+        task = entry.get("task") or {}
+        metrics = entry.get("metrics") or {}
+        if events:
+            for ev in entry.get("events") or []:
+                rows.append({
+                    "task_id": task.get("id"), "channel": task.get("channel"),
+                    "sprint": task.get("sprint"), "title": task.get("title"),
+                    "at": ev.get("created_at"), "actor": ev.get("actor_id"),
+                    "action": ev.get("action"), "from_status": ev.get("from_status"),
+                    "to_status": ev.get("to_status"), "note": ev.get("note"),
+                })
+            continue
+        row = {col: task.get(col) for col in TASK_EXPORT_COLUMNS if col in task}
+        row.update({col: metrics.get(col) for col in TASK_EXPORT_COLUMNS if col in metrics})
+        row["blocked_by"] = ";".join(task.get("blocked_by") or [])
+        row["time_in_status"] = ";".join(
+            f"{status}={secs}" for status, secs in (metrics.get("time_in_status") or {}).items()
+        )
+        rows.append(row)
+    columns = TASK_EVENT_COLUMNS if events else TASK_EXPORT_COLUMNS
+    for row in rows:
+        for col in columns:
+            value = row.get(col)
+            row[col] = _iso_utc(value) if col in _EXPORT_TIME_FIELDS else ("" if value is None else value)
+    return columns, rows
+
+
+def render_task_export_csv(data: dict[str, Any], *, events: bool = False) -> str:
+    import csv
+    import io
+
+    columns, rows = task_export_rows(data, events=events)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def _fmt_duration(seconds: Any) -> str:
+    if seconds is None:
+        return "-"
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+
+
+def _cmd_task_export(args: argparse.Namespace, server: str, token: str) -> int:
+    if not args.channel and not args.sprint:
+        raise CliError("task export needs a project channel and/or --sprint")
+    fmt = args.format
+    if fmt is None:
+        fmt = "csv" if args.output and args.output.lower().endswith(".csv") else "json"
+    if args.events and fmt != "csv":
+        raise CliError("--events selects the CSV layout; use --format csv (JSON always includes events)")
+    query = {k: v for k, v in (("channel", args.channel), ("sprint", args.sprint)) if v}
+    data = http_json(server, "GET", f"/v1/tasks/export?{urllib.parse.urlencode(query)}", token=token)
+    if fmt == "csv":
+        text = render_task_export_csv(data, events=args.events)
+    else:
+        text = json.dumps(data, indent=2) + "\n"
+    if not args.output or args.output == "-":
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return 0
+    dest = Path(args.output)
+    if dest.exists() and not args.force:
+        raise CliError(f"{dest} already exists; pass --force to overwrite it")
+    # newline="" keeps the CSV's LF rows from becoming CRLF on Windows.
+    with open(dest, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    summary = data.get("summary") or {}
+    cycle = summary.get("cycle_time_seconds") or {}
+    review = summary.get("review_seconds") or {}
+    what = "events" if args.events else "tasks"
+    count = text.count("\n") - 1 if fmt == "csv" else summary.get("tasks", 0)
+    print_out(
+        args,
+        {"ok": True, "path": str(dest), "format": fmt, "rows": count, "summary": summary},
+        [
+            f"Wrote {count} {what} to {dest} ({fmt})",
+            f"  {summary.get('tasks', 0)} tasks, {summary.get('completed', 0)} completed; "
+            f"median cycle {_fmt_duration(cycle.get('median'))}, "
+            f"median review {_fmt_duration(review.get('median'))}, "
+            f"{summary.get('changes_requested', 0)} change request(s)",
+        ],
+    )
+    return 0
 
 
 def _primary_repo_root(path: Path) -> Path:
@@ -3033,6 +3151,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_tl_blk.add_argument("--blocked", action="store_true", help="Only tasks with unresolved dependencies")
     p_tl_blk.add_argument("--ready", action="store_true", help="Only tasks with no unresolved dependencies")
     p_tl.set_defaults(func=cmd_task)
+
+    p_tx = task_sub.add_parser(
+        "export",
+        help="Export task history with cycle times and review durations as JSON or CSV",
+    )
+    p_tx.add_argument("channel", nargs="?", help="Project channel, e.g. #cams (all of its sprints)")
+    p_tx.add_argument("--sprint", help="Sprint room, e.g. #cams-s3")
+    p_tx.add_argument("--format", choices=["json", "csv"], default=None,
+                      help="Output format (default: from the --output extension, else json)")
+    p_tx.add_argument("--events", action="store_true",
+                      help="CSV: one row per audit-log event instead of one row per task")
+    p_tx.add_argument("-o", "--output", help="File to write (default: stdout)")
+    p_tx.add_argument("--force", action="store_true", help="Overwrite an existing --output file")
+    p_tx.set_defaults(func=cmd_task)
 
     for action in ("claim", "done", "release"):
         p_ta = task_sub.add_parser(action)

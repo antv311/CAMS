@@ -18,6 +18,7 @@ mod reports;
 mod rooms;
 mod server;
 mod store;
+mod task_metrics;
 mod tasks;
 mod tls;
 mod tokens;
