@@ -90,8 +90,8 @@ pub struct TaskQuestion {
     pub channel: String,
     pub asked_by: String,
     pub question: String,
-    /// `open` (waiting for the project manager), `escalated` (waiting for the
-    /// owner) or `answered`.
+    /// `open` (waiting for the reviewer/PM), `escalated_pm` (waiting for the PM),
+    /// `escalated` (waiting for the owner) or `answered`.
     pub status: String,
     /// The task status to return to once the question is answered.
     pub resume_status: String,
@@ -187,6 +187,18 @@ impl TaskStore {
         )
         .optional()
         .context("load task")
+    }
+
+    /// Include completed children so a lead can account for the whole decomposition.
+    pub fn children(&self, parent_id: &str) -> Result<Vec<Task>> {
+        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut statement = db.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at, rowid"
+        ))?;
+        let tasks = statement
+            .query_map([parent_id], Self::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
     }
 
     pub fn claim(&self, task_id: &str, principal_id: &str) -> Result<Task> {
@@ -415,22 +427,50 @@ impl TaskStore {
     }
 
     /// Hand an open question up to the owner.
-    pub fn escalate(&self, task_id: &str, actor_id: &str, note: Option<&str>) -> Result<TaskQuestion> {
+    pub fn escalate(
+        &self,
+        task_id: &str,
+        actor_id: &str,
+        note: Option<&str>,
+    ) -> Result<TaskQuestion> {
+        self.escalate_question(task_id, actor_id, note, "escalated")
+    }
+
+    pub fn escalate_to_pm(
+        &self,
+        task_id: &str,
+        actor_id: &str,
+        note: Option<&str>,
+    ) -> Result<TaskQuestion> {
+        self.escalate_question(task_id, actor_id, note, "escalated_pm")
+    }
+
+    fn escalate_question(
+        &self,
+        task_id: &str,
+        actor_id: &str,
+        note: Option<&str>,
+        to: &str,
+    ) -> Result<TaskQuestion> {
         let now = unix_timestamp();
         let db = self.db.lock().expect("sqlite mutex poisoned");
         let question = Self::pending_question_locked(&db, task_id)?
-            .filter(|q| q.status == "open")
+            .filter(|q| q.status == "open" || (to == "escalated" && q.status == "escalated_pm"))
             .ok_or_else(|| anyhow!("task has no open question to escalate"))?;
         db.execute(
-            "UPDATE task_questions SET status = 'escalated', escalation_note = ?1 WHERE id = ?2",
-            params![note, question.id],
+            "UPDATE task_questions SET status = ?1, escalation_note = ?2 WHERE id = ?3",
+            params![to, note, question.id],
         )
         .context("escalate task question")?;
         Self::log_event_locked(
             &db,
             task_id,
             actor_id,
-            "escalate",
+            if to == "escalated_pm" {
+                "escalate_pm"
+            } else {
+                "escalate"
+            },
             Some("blocked"),
             Some("blocked"),
             note,
@@ -459,7 +499,7 @@ impl TaskStore {
         db.query_row(
             &format!(
                 "SELECT {QUESTION_COLUMNS} FROM task_questions
-                 WHERE task_id = ?1 AND status IN ('open', 'escalated')
+                 WHERE task_id = ?1 AND status IN ('open', 'escalated_pm', 'escalated')
                  ORDER BY created_at DESC, rowid DESC LIMIT 1"
             ),
             params![task_id],

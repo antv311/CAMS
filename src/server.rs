@@ -1085,8 +1085,18 @@ impl Server {
         action: &str,
         status: &str,
         actor: &str,
-        body: String,
+        mut body: String,
     ) -> Result<()> {
+        let recipients = self.task_wake_recipients(task, action)?;
+        let mut cc: Vec<_> = recipients
+            .iter()
+            .filter(|id| !id.eq_ignore_ascii_case(actor))
+            .map(|id| format!("@{id}"))
+            .collect();
+        cc.sort();
+        if !cc.is_empty() {
+            body.push_str(&format!(" | cc {}", cc.join(" ")));
+        }
         let room = task.sprint.clone().unwrap_or_else(|| task.channel.clone());
         let message = self.history.append(&room, SERVER_NAME, &body)?;
         let mut tags = vec![
@@ -1113,21 +1123,62 @@ impl Server {
             message.seq,
         )?;
         let task_json = serde_json::to_value(task).ok();
-        self.emit_webhook(WebhookEvent {
-            event: "task".to_string(),
-            channel: room,
-            seq: Some(message.seq),
-            msg_id: Some(message.msg_id),
-            from: actor.to_string(),
-            to: None,
-            message: body,
-            created_at: message.created_at,
-            report: None,
-            task: task_json,
-            git: None,
-            lock: None,
-        });
+        self.emit_webhook_to(
+            WebhookEvent {
+                event: "task".to_string(),
+                channel: room,
+                seq: Some(message.seq),
+                msg_id: Some(message.msg_id),
+                from: actor.to_string(),
+                to: None,
+                message: body,
+                created_at: message.created_at,
+                report: None,
+                task: task_json,
+                git: None,
+                lock: None,
+            },
+            Some(&recipients),
+        );
         Ok(())
+    }
+
+    /// Task wakes follow workflow ownership, never mentions in a title/report.
+    fn task_wake_recipients(&self, task: &Task, action: &str) -> Result<HashSet<String>> {
+        let reviewer = match task.reviewer.as_ref() {
+            Some(id)
+                if task.assignee.as_ref() != Some(id)
+                    && self.projects.role_of(&task.channel, id)?.is_some() =>
+            {
+                Some(id)
+            }
+            _ => None,
+        };
+        let ids = match (action, task.status.as_str()) {
+            ("create" | "assign" | "answer", _)
+            | ("status", "changes_requested" | "merged" | "cancelled") => {
+                task.assignee.iter().cloned().collect()
+            }
+            ("ask", _) | ("status", "review") => {
+                if task.parent_task_id.is_some() {
+                    match reviewer {
+                        Some(id) => vec![id.clone()],
+                        None => self.project_managers(&task.channel)?,
+                    }
+                } else {
+                    let mut ids = self.project_managers(&task.channel)?;
+                    ids.extend(reviewer.cloned());
+                    ids
+                }
+            }
+            ("escalate_pm", _) => match self.projects.get(&task.channel)?.and_then(|p| p.pm) {
+                Some(pm) => vec![pm],
+                None => self.project_managers(&task.channel)?,
+            },
+            ("escalate", _) => self.owner_ids()?,
+            _ => Vec::new(),
+        };
+        Ok(ids.into_iter().map(|id| id.to_ascii_lowercase()).collect())
     }
 
     fn names(&self, session: &Session, channel: Option<String>) -> Result<()> {
@@ -1933,19 +1984,10 @@ impl Server {
             return Err(anyhow!("only the task's assignee can ask a question on it"));
         }
         let (task, _) = self.tasks.ask(&current.id, &actor.id, question)?;
-        let mut text = format!(
+        let text = format!(
             "TASK {} blocked - @{} asks: {}",
             task.id, actor.nick, question
         );
-        let cc: Vec<String> = self
-            .project_managers(&task.channel)?
-            .into_iter()
-            .filter(|id| id != &actor.id)
-            .map(|id| format!("@{id}"))
-            .collect();
-        if !cc.is_empty() {
-            text.push_str(&format!(" | cc {}", cc.join(" ")));
-        }
         self.broadcast_task_event(&task, "ask", "success", &actor.nick, text)?;
         Ok(task)
     }
@@ -1958,9 +2000,15 @@ impl Server {
             return Err(anyhow!("an answer is required"));
         }
         let current = self.get_task_api(task_id)?;
-        if !self.is_project_manager(actor, &current.channel)? {
+        let is_manager = self.is_project_manager(actor, &current.channel)?;
+        let can_review = self.is_task_reviewer(actor, &current)?;
+        let is_open = self
+            .tasks
+            .pending_question(&current.id)?
+            .is_some_and(|q| q.status == "open");
+        if !(is_manager || can_review && is_open) {
             return Err(anyhow!(
-                "only a leader or coordinator of {} or the owner can answer",
+                "only the subtask reviewer, a leader or coordinator of {} or the owner can answer",
                 current.channel
             ));
         }
@@ -1981,32 +2029,50 @@ impl Server {
         note: Option<&str>,
     ) -> Result<Task> {
         let current = self.get_task_api(task_id)?;
-        if !self.is_project_manager(actor, &current.channel)? {
+        let is_manager = self.is_project_manager(actor, &current.channel)?;
+        if !is_manager && !self.is_task_reviewer(actor, &current)? {
             return Err(anyhow!(
-                "only a leader or coordinator of {} can escalate",
+                "only the subtask reviewer or a leader or coordinator of {} can escalate",
                 current.channel
             ));
         }
         let note = note.map(str::trim).filter(|n| !n.is_empty());
-        let question = self.tasks.escalate(&current.id, &actor.id, note)?;
+        let question = if is_manager {
+            self.tasks.escalate(&current.id, &actor.id, note)?
+        } else {
+            self.tasks.escalate_to_pm(&current.id, &actor.id, note)?
+        };
+        let destination = if is_manager {
+            "the owner"
+        } else {
+            "the project manager"
+        };
         let mut text = format!(
-            "TASK {} needs the owner - @{} escalates @{}'s question: {}",
-            current.id, actor.nick, question.asked_by, question.question
+            "TASK {} needs {} - @{} escalates @{}'s question: {}",
+            current.id, destination, actor.nick, question.asked_by, question.question
         );
         if let Some(note) = note {
             text.push_str(&format!(" ({note})"));
         }
-        let cc: Vec<String> = self
-            .owner_ids()?
-            .into_iter()
-            .filter(|id| id != &actor.id)
-            .map(|id| format!("@{id}"))
-            .collect();
-        if !cc.is_empty() {
-            text.push_str(&format!(" | cc {}", cc.join(" ")));
-        }
-        self.broadcast_task_event(&current, "escalate", "success", &actor.nick, text)?;
+        self.broadcast_task_event(
+            &current,
+            if is_manager {
+                "escalate"
+            } else {
+                "escalate_pm"
+            },
+            "success",
+            &actor.nick,
+            text,
+        )?;
         Ok(current)
+    }
+
+    fn is_task_reviewer(&self, actor: &Principal, task: &Task) -> Result<bool> {
+        Ok(task.parent_task_id.is_some()
+            && task.assignee.as_deref() != Some(&actor.id)
+            && task.reviewer.as_deref() == Some(&actor.id)
+            && self.projects.role_of(&task.channel, &actor.id)?.is_some())
     }
 
     pub fn create_project_api(
@@ -2238,7 +2304,51 @@ impl Server {
     ) -> Result<String> {
         let target_id = self.resolve_task_account(channel, name)?;
         let is_lead = parent.is_some_and(|task| task.assignee.as_deref() == Some(&actor.id));
-        if target_id != actor.id && !is_lead && !self.is_project_manager(actor, channel)? {
+        let is_manager = self.is_project_manager(actor, channel)?;
+        if let Some(parent) = parent.filter(|_| !is_manager) {
+            let parent_lead = parent
+                .assignee
+                .as_deref()
+                .map(|id| self.auth.resolve_by_name(id))
+                .transpose()?
+                .flatten();
+            if let Some(binding) = parent_lead
+                .as_ref()
+                .map(|lead| {
+                    self.groups
+                        .named_role(&self.project_of(channel), &lead.nick)
+                })
+                .transpose()?
+                .flatten()
+            {
+                if !binding.is_lead {
+                    if target_id != actor.id {
+                        return Err(anyhow!(
+                            "only a group lead can delegate to other group members"
+                        ));
+                    }
+                } else if parent.assignee.as_deref() != Some(target_id.as_str()) {
+                    let target = self
+                        .auth
+                        .resolve_by_name(&target_id)?
+                        .ok_or_else(|| anyhow!("unknown account '{name}'"))?;
+                    let target_binding = self
+                        .groups
+                        .named_role(&self.project_of(channel), &target.nick)?;
+                    if !target_binding.is_some_and(|other| {
+                        !other.is_lead
+                            && other.group.definition.name == binding.group.definition.name
+                    }) {
+                        return Err(anyhow!(
+                            "@{} is not a named worker in group '{}'",
+                            target.nick,
+                            binding.group.definition.name
+                        ));
+                    }
+                }
+            }
+        }
+        if target_id != actor.id && !is_lead && !is_manager {
             return Err(anyhow!(
                 "only a parent task's assignee or a leader or coordinator of {channel} can assign work to someone else"
             ));
@@ -2319,7 +2429,7 @@ impl Server {
         let requested = normalize_channel(&new.channel);
         let channel = self.project_of(&requested);
         new.sprint = if requested != channel {
-            Some(requested)
+            Some(requested.clone())
         } else {
             self.rooms.current(&channel)?.map(|room| room.channel)
         };
@@ -2352,6 +2462,12 @@ impl Server {
             }
             if TERMINAL_STATUSES.contains(&parent.status.as_str()) {
                 return Err(anyhow!("cannot add subtasks to a {} parent", parent.status));
+            }
+            if new.repo.is_none() {
+                new.repo = parent.repo.clone();
+            }
+            if requested == channel {
+                new.sprint = parent.sprint.clone();
             }
         }
         let assignee_id = match new
@@ -2541,39 +2657,12 @@ impl Server {
             .tasks
             .set_status(&current.id, &from, &to, &actor.id, note, branch)?;
 
-        let mut cc = String::new();
-        match to.as_str() {
-            "review" => {
-                let mut reviewers = self.project_managers(&task.channel)?;
-                if let Some(reviewer) = &task.reviewer {
-                    if !reviewers.contains(reviewer) {
-                        reviewers.push(reviewer.clone());
-                    }
-                }
-                for manager in reviewers {
-                    if manager != actor.id {
-                        cc.push_str(&format!(" @{manager}"));
-                    }
-                }
-            }
-            "changes_requested" | "merged" | "cancelled" => {
-                if let Some(assignee) = task.assignee.as_deref() {
-                    if assignee != actor.id {
-                        cc.push_str(&format!(" @{assignee}"));
-                    }
-                }
-            }
-            _ => {}
-        }
         let mut text = format!(
             "TASK {} {} -> {} by @{}: {}",
             task.id, from, to, actor.nick, task.title
         );
         if let Some(note) = note {
             text.push_str(&format!(" - {note}"));
-        }
-        if !cc.is_empty() {
-            text.push_str(&format!(" | cc{cc}"));
         }
         self.broadcast_task_event(&task, "status", "success", &actor.nick, text)?;
         Ok(task)
@@ -2613,11 +2702,17 @@ impl Server {
                 })
                 .collect();
             // Questions from blocked workers that this account should answer.
-            let questions = if is_manager {
-                self.tasks.questions(Some(&channel), "open")?
-            } else {
-                Vec::new()
-            };
+            let mut questions = Vec::new();
+            for question in self.tasks.questions(Some(&channel), "open")? {
+                if is_manager
+                    || self.is_task_reviewer(actor, &self.get_task_api(&question.task_id)?)?
+                {
+                    questions.push(question);
+                }
+            }
+            if is_manager {
+                questions.extend(self.tasks.questions(Some(&channel), "escalated_pm")?);
+            }
             if tasks.is_empty() && to_review.is_empty() && questions.is_empty() {
                 continue;
             }
@@ -3068,6 +3163,10 @@ impl Server {
     }
 
     fn emit_webhook(&self, event: WebhookEvent) {
+        self.emit_webhook_to(event, None);
+    }
+
+    fn emit_webhook_to(&self, event: WebhookEvent, task_recipients: Option<&HashSet<String>>) {
         let online = self.online_principal_ids();
         let members = if event.channel.starts_with('#') || event.channel.starts_with('&') {
             self.channel_member_ids(&event.channel).unwrap_or_default()
@@ -3075,10 +3174,10 @@ impl Server {
             Vec::new()
         };
         let role_mentions = self.role_mentions(&event.channel, &event.message);
-        self.request_wakes(&event, &members, &role_mentions);
-        if let Err(err) =
-            self.webhooks
-                .enqueue_for_event(&event, &online, &members, &role_mentions)
+        self.request_wakes(&event, &members, &role_mentions, task_recipients);
+        if let Err(err) = self
+            .webhooks
+            .enqueue_for_event(&event, &online, &members, &role_mentions)
         {
             self.logger.log_error(
                 "webhook.enqueue_error",
@@ -3095,6 +3194,7 @@ impl Server {
         event: &WebhookEvent,
         members: &[String],
         role_mentions: &HashSet<String>,
+        task_recipients: Option<&HashSet<String>>,
     ) {
         let enabled = match self.wakes.enabled_principals() {
             Ok(list) if !list.is_empty() => list,
@@ -3131,10 +3231,17 @@ impl Server {
             if event.event == "dm" && !is_dm {
                 continue;
             }
-            let addressed = is_dm
-                || mentions.contains(&lowered)
-                || role_mentions.contains(&lowered)
-                || (everyone && members.iter().any(|m| m.eq_ignore_ascii_case(&principal_id)));
+            let addressed = if let Some(recipients) = task_recipients {
+                recipients.contains(&lowered)
+            } else {
+                is_dm
+                    || mentions.contains(&lowered)
+                    || role_mentions.contains(&lowered)
+                    || (everyone
+                        && members
+                            .iter()
+                            .any(|m| m.eq_ignore_ascii_case(&principal_id)))
+            };
             if !addressed {
                 continue;
             }

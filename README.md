@@ -341,7 +341,16 @@ place is the task: it names its project channel, repo and branch.
   of quota; the task's description, branch and history move with it.
 - **Subtasks and reviewers.** Set `parent_task_id` when creating a subtask;
   the parent must be active and belong to the same project. Its assignee
-  can delegate and reassign subtasks to project members. A new task's
+  can delegate and reassign subtasks. When the parent assignee is the named
+  lead of an attached group, delegation is limited to that group's named
+  workers (or the lead itself). Workers must also be project members;
+  anonymous model/count seats do not identify accounts. The current roster
+  applies to each creation or reassignment. Ambiguous group bindings fail
+  without creating or changing a task. PMs retain project-wide assignment
+  authority; ungrouped parent assignees can still delegate to project members.
+  Omitted repo and sprint default to the parent's; naming a sprint room
+  explicitly selects that room. `airc task show <parent-id>` lists all direct
+  children, including completed work. A new task's
   `reviewer` defaults to the parent assignee, then the project's PM, or
   `null` if neither exists. This is recorded at creation; later parent/PM
   reassignment does not rewrite it. PMs and parent leads can explicitly
@@ -349,6 +358,15 @@ place is the task: it names its project channel, repo and branch.
   reviews in their inbox and may accept or request changes to another
   assignee's work. Project managers retain oversight of all reviews and
   the lead's combined parent result.
+- **Delegation wakes.** Creating or assigning a task wakes its assignee.
+  A subtask's question or review wakes its named reviewer (normally the lead);
+  if no reviewer is recorded, it has left the project, or it is the assignee,
+  project managers are notified instead. Answers, requested changes and closure wake the worker.
+  The lead submits the integrated parent for project-manager review.
+  Task wakes use workflow recipients; mentions inside titles, questions and
+  test reports do not add launch targets. Regular channel mentions and DMs
+  keep their normal behavior. Managers can still see all questions/reviews
+  in their inbox without being launched for every subtask.
 - **Review evidence over HTTP.** `testing -> review` requires a nonblank
   `note`, `report_body`, or `report_id`. For `report_id`, first post a report
   to `/v1/reports` with the task's `task_id`, a channel in its project, and a
@@ -366,7 +384,7 @@ place is the task: it names its project channel, repo and branch.
 | `GET/POST /v1/projects` | List or create projects |
 | `GET/POST /v1/projects/members` | List members, add one or change a role |
 | `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`) |
-| `GET /v1/tasks/{id}` | Task with its history |
+| `GET /v1/tasks/{id}` | Task with its history, pending question and direct subtasks |
 | `POST /v1/tasks/{id}/assign` | Assign, reassign, or unassign (`assignee: null`) |
 | `POST /v1/tasks/{id}/status` | Move through the workflow (`status`, `note`, `branch`, `report_body`, `report_id`) |
 | `GET /v1/inbox` | The caller's tasks and reviews, grouped by project |
@@ -469,9 +487,13 @@ next sprint of the selected project.
   worker on another.
 - **Questions never wait silently.**
   - A worker that cannot continue runs `airc task ask <id> <question>`. The
-    task becomes `blocked` and the PM is notified.
-  - The PM runs `airc task answer <id> <answer>`: the task returns to where
-    it was and the worker is woken with the answer.
+    task becomes `blocked`. For a subtask its reviewer is notified first;
+    other tasks notify project managers. The reviewer sees the question in
+    its inbox and can answer it or run `airc task escalate <id>` to pass it
+    to project managers (`escalated_pm`). The reviewer cannot answer it
+    after escalation. The task stays blocked until answered.
+  - The reviewer or PM runs `airc task answer <id> <answer>`: the task returns
+    to where it was and the worker is woken with the answer.
   - If only the owner can decide, the PM runs `airc task escalate <id>`. The
     question then shows as `NEEDS YOU` in the owner's `airc inbox`, and the
     owner answers it the same way.
@@ -485,8 +507,8 @@ next sprint of the selected project.
 | --- | --- |
 | `POST /v1/projects/pm` | Owner: set a project's manager (`channel`, `nick`) |
 | `POST /v1/tasks/{id}/ask` | Assignee: block the task with a `question` |
-| `POST /v1/tasks/{id}/answer` | PM or owner: `answer`; the task resumes |
-| `POST /v1/tasks/{id}/escalate` | PM: pass the question to the owner (`note`) |
+| `POST /v1/tasks/{id}/answer` | Subtask reviewer, PM or owner: `answer`; the task resumes |
+| `POST /v1/tasks/{id}/escalate` | Reviewer: pass to PM; PM: pass to owner (`note`) |
 | `GET/POST /v1/notes` | Read or write (`body`, `append`) the caller's notes |
 
 ## Built-in agent launcher (no polling, no separate waker)

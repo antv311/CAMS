@@ -686,7 +686,7 @@ def cmd_task(args: argparse.Namespace) -> int:
             payload={field: text or None},
         )
         t = data["task"]
-        done = {"ask": "asked; task is", "answer": "answered; task is", "escalate": "escalated to the owner; task is"}
+        done = {"ask": "asked; task is", "answer": "answered; task is", "escalate": "escalated; task is"}
         print_out(args, data, [f"Task {t['id']} {done[args.task_cmd]} {t['status']}"])
         return 0
     if args.task_cmd == "show":
@@ -708,7 +708,11 @@ def cmd_task(args: argparse.Namespace) -> int:
             lines.append(t["body"])
         q = data.get("question")
         if q:
-            waiting = "the owner" if q["status"] == "escalated" else "the project manager"
+            waiting = "the owner" if q["status"] == "escalated" else (
+                f"reviewer @{t['reviewer']}" if q["status"] == "open"
+                and t.get("parent_task_id") and t.get("reviewer")
+                else "the project manager"
+            )
             lines.append(f"WAITING on {waiting}: @{q['asked_by']} asks: {q['question']}")
         for ev in data.get("events", []):
             note = f" - {ev['note']}" if ev.get("note") else ""
@@ -2138,9 +2142,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_tst.set_defaults(func=cmd_task)
 
     for name, text in (
-        ("ask", "Assignee: park the task and ask the project manager a question"),
-        ("answer", "PM or owner: answer the pending question; the task resumes"),
-        ("escalate", "PM: pass the pending question up to the owner"),
+        ("ask", "Assignee: park the task and ask its reviewer or project manager"),
+        ("answer", "Subtask reviewer, PM or owner: answer the pending question"),
+        ("escalate", "Reviewer: pass a question to the PM; PM: pass it to the owner"),
     ):
         p_tq = task_sub.add_parser(name, help=text)
         p_tq.add_argument("id")
