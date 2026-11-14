@@ -503,6 +503,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/dashboard", get(get_dashboard))
         .route("/healthz", get(healthz))
         .route("/metrics", get(prometheus_metrics))
+        .route("/metrics/alerts/rules", get(prometheus_alert_rules))
+        .route("/v1/alerts", get(get_alerts_status))
         .route("/v1/agents", get(public_agents))
         .route("/v1/channels", get(public_channels))
         .route("/v1/gits", get(public_gits).post(register_git_repo))
@@ -522,6 +524,9 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
             "/v1/owner/db/vacuum",
             get(owner_db_vacuum_status).post(owner_db_vacuum),
         )
+        .route("/v1/owner/alerts", get(owner_alerts_status))
+        .route("/v1/owner/alerts/evaluate", post(owner_alerts_evaluate))
+        .route("/v1/owner/alerts/test", post(owner_alerts_test))
         .route("/v1/login", post(login_agent))
         .route("/v1/tokens", get(list_tokens_api).post(issue_token_api))
         .route("/v1/tokens/refresh", post(refresh_token_api))
@@ -707,6 +712,75 @@ async fn prometheus_metrics(State(state): State<AppState>) -> Result<impl IntoRe
         with_cors_headers(),
         [(header::CONTENT_TYPE, crate::metrics::PROMETHEUS_CONTENT_TYPE)],
         body,
+    ))
+}
+
+#[derive(Deserialize, Default)]
+struct AlertRulesQuery {
+    format: Option<String>,
+    include_disabled: Option<bool>,
+}
+
+async fn prometheus_alert_rules(
+    State(state): State<AppState>,
+    Query(query): Query<AlertRulesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let include_disabled = query.include_disabled.unwrap_or(false);
+    let format = query
+        .format
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("yaml")
+        .to_ascii_lowercase();
+    match format.as_str() {
+        "yaml" | "yml" => {
+            let yaml = state
+                .server
+                .alerts()
+                .export_prometheus_rules_yaml(include_disabled);
+            Ok((
+                StatusCode::OK,
+                with_cors_headers(),
+                [(header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
+                yaml,
+            )
+                .into_response())
+        }
+        "json" => {
+            let groups = state
+                .server
+                .alerts()
+                .export_prometheus_rules(include_disabled);
+            Ok((
+                StatusCode::OK,
+                with_cors_headers(),
+                Json(json!({ "ok": true, "groups": groups })),
+            )
+                .into_response())
+        }
+        other => Err(ApiError::bad_request(format!(
+            "unsupported format '{other}': expected yaml or json"
+        ))),
+    }
+}
+
+async fn get_alerts_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/alerts")?;
+    let server = state.server.clone();
+    let snap = tokio::task::spawn_blocking(move || server.alert_eval_snapshot())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    let mut status = state.server.alerts().status(&snap);
+    // Do not expose raw alert webhook URLs (which may hold embedded tokens) to non-owner readers.
+    status.webhook_url = None;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "alerts": status })),
     ))
 }
 
@@ -2013,6 +2087,99 @@ async fn owner_db_checkpoint(
             "ok": true,
             "checkpoint": checkpoint,
             "diagnostics": diagnostics,
+        })),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+struct OwnerAlertsEvaluateReq {
+    invite: Option<String>,
+    notify: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct OwnerAlertsTestReq {
+    invite: Option<String>,
+}
+
+async fn owner_alerts_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, None)?;
+    let server = state.server.clone();
+    let snap = tokio::task::spawn_blocking(move || server.alert_eval_snapshot())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    let status = state.server.alerts().status(&snap);
+    let config = state.server.alerts().config();
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "alerts": status,
+            "config": config,
+        })),
+    ))
+}
+
+async fn owner_alerts_evaluate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OwnerAlertsEvaluateReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let deliveries = state
+        .server
+        .evaluate_alerts(req.notify.unwrap_or(true))
+        .await
+        .map_err(ApiError::internal)?;
+    let server = state.server.clone();
+    let snap = tokio::task::spawn_blocking(move || server.alert_eval_snapshot())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    let status = state.server.alerts().status(&snap);
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "deliveries": deliveries,
+            "alerts": status,
+        })),
+    ))
+}
+
+async fn owner_alerts_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OwnerAlertsTestReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let deliveries = state
+        .server
+        .alerts()
+        .send_test_alert("owner")
+        .await
+        .map_err(|err| {
+            let msg = err.to_string();
+            if msg.starts_with("No alert webhook configured") {
+                ApiError::bad_request(msg)
+            } else {
+                ApiError::new(StatusCode::BAD_GATEWAY, msg)
+            }
+        })?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "deliveries": deliveries,
         })),
     ))
 }
@@ -4683,7 +4850,7 @@ fn build_welcome_payload(state: &AppState, base_host: &str) -> Result<Value, Api
         "webhook_signing": {
             "headers": ["X-AirCD-Signature-256", "X-Agent-Ping-Signature-256", "X-AirCD-Event", "X-AirCD-Delivery"],
             "algorithm": "HMAC-SHA256 hex with 'sha256=' prefix over raw JSON request body",
-            "events": ["message", "mention", "dm", "report", "task", "git", "role", "lock", "connection_test"],
+            "events": ["message", "mention", "dm", "report", "task", "git", "role", "lock", "alert", "connection_test"],
             "notify_when_modes": ["always", "offline", "mentions"]
         },
         "directory": snapshot,
@@ -4864,7 +5031,7 @@ fn build_welcome_html(state: &AppState, base_host: &str) -> Result<String, ApiEr
     <h1>aircd — IRC + Webhook + Roles + Git Coordinator</h1>
     <p class="muted">Lightweight agent &amp; developer coordination bus. Connect via raw IRC (<code>{irc}</code>), the <code>airc</code> CLI, or HTTP REST API (<code>{http}</code>).</p>
     <ul>{reachable_urls}</ul>
-    <p class="muted">Web &amp; machine-readable endpoints: <a style="color:var(--accent)" href="/dashboard">Sprint Dashboard</a> &middot; <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a> &middot; <a style="color:var(--accent)" href="/metrics">/metrics</a> (Prometheus)</p>
+    <p class="muted">Web &amp; machine-readable endpoints: <a style="color:var(--accent)" href="/dashboard">Sprint Dashboard</a> &middot; <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a> &middot; <a style="color:var(--accent)" href="/metrics">/metrics</a> (Prometheus) &middot; <a style="color:var(--accent)" href="/metrics/alerts/rules">/metrics/alerts/rules</a> (Alert Rules)</p>
   </div>
 
   <div class="grid">
@@ -5096,6 +5263,7 @@ mod tests {
     include!("http_task_batch_tests.rs");
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
+    include!("http_alerts_tests.rs");
     include!("http_dashboard_tests.rs");
 
     struct TemplateApi {

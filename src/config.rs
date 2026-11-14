@@ -1,5 +1,6 @@
 //! Editable server settings and shared per-user configuration discovery.
 
+use crate::alerts::AlertConfig;
 use crate::backup::{default_owner_key_path, BackupConfig};
 use crate::db::{
     SqlitePoolConfig, SqliteSynchronous, DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_CACHE_SIZE_KIB,
@@ -98,6 +99,7 @@ pub struct ServerConfig {
     pub db_vacuum_batch_pages: u32,
     pub db_vacuum_step_delay_ms: u64,
     pub db_vacuum_max_batches_per_run: usize,
+    pub alerts: AlertConfig,
 }
 
 impl Default for ServerConfig {
@@ -142,6 +144,7 @@ impl Default for ServerConfig {
             db_vacuum_batch_pages: DEFAULT_VACUUM_BATCH_PAGES,
             db_vacuum_step_delay_ms: DEFAULT_VACUUM_STEP_DELAY_MS,
             db_vacuum_max_batches_per_run: DEFAULT_VACUUM_MAX_BATCHES_PER_RUN,
+            alerts: AlertConfig::default(),
         }
     }
 }
@@ -256,6 +259,12 @@ impl ServerConfig {
         Ok(cfg)
     }
 
+    pub fn to_alert_config(&self) -> Result<AlertConfig> {
+        let mut cfg = self.alerts.clone();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     fn load_with(
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
@@ -272,8 +281,20 @@ impl ServerConfig {
                 | "--backup-on-startup"
                 | "--db-vacuum-enabled"
                 | "--rate-limit-enabled"
-                | "--rate-limit-trust-proxy-headers" => "true",
-                "--no-backups" | "--no-db-vacuum" | "--no-rate-limit" => "false",
+                | "--rate-limit-trust-proxy-headers"
+                | "--alerts-enabled"
+                | "--alerts-send-resolved"
+                | "--alerts-wake-failure-enabled"
+                | "--alerts-queue-backlog-enabled"
+                | "--alerts-disk-pressure-enabled" => "true",
+                "--no-backups"
+                | "--no-db-vacuum"
+                | "--no-rate-limit"
+                | "--no-alerts"
+                | "--no-alerts-send-resolved"
+                | "--no-alerts-wake-failure"
+                | "--no-alerts-queue-backlog"
+                | "--no-alerts-disk-pressure" => "false",
                 "--config"
                 | "--bind"
                 | "--http-bind"
@@ -309,7 +330,25 @@ impl ServerConfig {
                 | "--db-vacuum-min-freelist-ratio"
                 | "--db-vacuum-batch-pages"
                 | "--db-vacuum-step-delay-ms"
-                | "--db-vacuum-max-batches" => iter
+                | "--db-vacuum-max-batches"
+                | "--alerts-eval-interval-secs"
+                | "--alerts-webhook-url"
+                | "--alerts-webhook-secret"
+                | "--alerts-repeat-interval-secs"
+                | "--alerts-group-name"
+                | "--alerts-wake-failure-rate-threshold"
+                | "--alerts-wake-failure-window-secs"
+                | "--alerts-wake-failure-min-samples"
+                | "--alerts-wake-failure-for-secs"
+                | "--alerts-wake-failure-severity"
+                | "--alerts-queue-backlog-threshold"
+                | "--alerts-queue-backlog-for-secs"
+                | "--alerts-queue-backlog-severity"
+                | "--alerts-disk-used-ratio-threshold"
+                | "--alerts-disk-min-free-bytes"
+                | "--alerts-disk-pressure-for-secs"
+                | "--alerts-disk-pressure-severity"
+                | "--alerts-disk-path" => iter
                     .next()
                     .filter(|value| !value.starts_with("--"))
                     .with_context(|| format!("{arg} requires a value"))?,
@@ -349,6 +388,7 @@ impl ServerConfig {
                     &mut config.tls_key,
                     &mut config.tls_client_ca,
                     &mut config.backup_dir,
+                    &mut config.alerts.disk_path,
                 ]
                 .into_iter()
                 .flatten()
@@ -411,6 +451,29 @@ impl ServerConfig {
             ("AIRCD_DB_VACUUM_BATCH_PAGES", "--db-vacuum-batch-pages"),
             ("AIRCD_DB_VACUUM_STEP_DELAY_MS", "--db-vacuum-step-delay-ms"),
             ("AIRCD_DB_VACUUM_MAX_BATCHES", "--db-vacuum-max-batches"),
+            ("AIRCD_ALERTS_ENABLED", "--alerts-enabled"),
+            ("AIRCD_ALERTS_EVAL_INTERVAL_SECS", "--alerts-eval-interval-secs"),
+            ("AIRCD_ALERTS_WEBHOOK_URL", "--alerts-webhook-url"),
+            ("AIRCD_ALERTS_WEBHOOK_SECRET", "--alerts-webhook-secret"),
+            ("AIRCD_ALERTS_REPEAT_INTERVAL_SECS", "--alerts-repeat-interval-secs"),
+            ("AIRCD_ALERTS_SEND_RESOLVED", "--alerts-send-resolved"),
+            ("AIRCD_ALERTS_GROUP_NAME", "--alerts-group-name"),
+            ("AIRCD_ALERTS_WAKE_FAILURE_ENABLED", "--alerts-wake-failure-enabled"),
+            ("AIRCD_ALERTS_WAKE_FAILURE_RATE_THRESHOLD", "--alerts-wake-failure-rate-threshold"),
+            ("AIRCD_ALERTS_WAKE_FAILURE_WINDOW_SECS", "--alerts-wake-failure-window-secs"),
+            ("AIRCD_ALERTS_WAKE_FAILURE_MIN_SAMPLES", "--alerts-wake-failure-min-samples"),
+            ("AIRCD_ALERTS_WAKE_FAILURE_FOR_SECS", "--alerts-wake-failure-for-secs"),
+            ("AIRCD_ALERTS_WAKE_FAILURE_SEVERITY", "--alerts-wake-failure-severity"),
+            ("AIRCD_ALERTS_QUEUE_BACKLOG_ENABLED", "--alerts-queue-backlog-enabled"),
+            ("AIRCD_ALERTS_QUEUE_BACKLOG_THRESHOLD", "--alerts-queue-backlog-threshold"),
+            ("AIRCD_ALERTS_QUEUE_BACKLOG_FOR_SECS", "--alerts-queue-backlog-for-secs"),
+            ("AIRCD_ALERTS_QUEUE_BACKLOG_SEVERITY", "--alerts-queue-backlog-severity"),
+            ("AIRCD_ALERTS_DISK_PRESSURE_ENABLED", "--alerts-disk-pressure-enabled"),
+            ("AIRCD_ALERTS_DISK_USED_RATIO_THRESHOLD", "--alerts-disk-used-ratio-threshold"),
+            ("AIRCD_ALERTS_DISK_MIN_FREE_BYTES", "--alerts-disk-min-free-bytes"),
+            ("AIRCD_ALERTS_DISK_PRESSURE_FOR_SECS", "--alerts-disk-pressure-for-secs"),
+            ("AIRCD_ALERTS_DISK_PRESSURE_SEVERITY", "--alerts-disk-pressure-severity"),
+            ("AIRCD_ALERTS_DISK_PATH", "--alerts-disk-path"),
         ] {
             if let Some(value) = env(name) {
                 // Preserve the existing empty invite-key environment fallback.
@@ -482,6 +545,7 @@ impl ServerConfig {
         let _ = config.to_backup_config()?;
         let _ = config.to_sqlite_config()?;
         let _ = config.to_vacuum_config()?;
+        config.alerts.validate()?;
         Ok(config)
     }
 
@@ -647,10 +711,99 @@ impl ServerConfig {
                     .parse::<usize>()
                     .with_context(|| format!("db_vacuum_max_batches_per_run must be a non-negative integer, got '{value}'"))?;
             }
+            "--alerts-enabled" | "--no-alerts" => {
+                self.alerts.enabled = parse_bool_setting("alerts.enabled", value)?;
+            }
+            "--alerts-eval-interval-secs" => {
+                self.alerts.eval_interval_secs =
+                    parse_u64_setting("alerts.eval_interval_secs", value)?;
+            }
+            "--alerts-webhook-url" => self.alerts.webhook_url = Some(value.into()),
+            "--alerts-webhook-secret" => self.alerts.webhook_secret = Some(value.into()),
+            "--alerts-repeat-interval-secs" => {
+                self.alerts.repeat_interval_secs =
+                    parse_u64_setting("alerts.repeat_interval_secs", value)?;
+            }
+            "--alerts-send-resolved" | "--no-alerts-send-resolved" => {
+                self.alerts.send_resolved = parse_bool_setting("alerts.send_resolved", value)?;
+            }
+            "--alerts-group-name" => self.alerts.group_name = value.into(),
+            "--alerts-wake-failure-enabled" | "--no-alerts-wake-failure" => {
+                self.alerts.wake_failure_enabled =
+                    parse_bool_setting("alerts.wake_failure_enabled", value)?;
+            }
+            "--alerts-wake-failure-rate-threshold" => {
+                self.alerts.wake_failure_rate_threshold =
+                    parse_f64_setting("alerts.wake_failure_rate_threshold", value)?;
+            }
+            "--alerts-wake-failure-window-secs" => {
+                self.alerts.wake_failure_window_secs =
+                    parse_u64_setting("alerts.wake_failure_window_secs", value)?;
+            }
+            "--alerts-wake-failure-min-samples" => {
+                self.alerts.wake_failure_min_samples =
+                    parse_u64_setting("alerts.wake_failure_min_samples", value)?;
+            }
+            "--alerts-wake-failure-for-secs" => {
+                self.alerts.wake_failure_for_secs =
+                    parse_u64_setting("alerts.wake_failure_for_secs", value)?;
+            }
+            "--alerts-wake-failure-severity" => {
+                self.alerts.wake_failure_severity = value.into();
+            }
+            "--alerts-queue-backlog-enabled" | "--no-alerts-queue-backlog" => {
+                self.alerts.queue_backlog_enabled =
+                    parse_bool_setting("alerts.queue_backlog_enabled", value)?;
+            }
+            "--alerts-queue-backlog-threshold" => {
+                self.alerts.queue_backlog_threshold =
+                    parse_u64_setting("alerts.queue_backlog_threshold", value)?;
+            }
+            "--alerts-queue-backlog-for-secs" => {
+                self.alerts.queue_backlog_for_secs =
+                    parse_u64_setting("alerts.queue_backlog_for_secs", value)?;
+            }
+            "--alerts-queue-backlog-severity" => {
+                self.alerts.queue_backlog_severity = value.into();
+            }
+            "--alerts-disk-pressure-enabled" | "--no-alerts-disk-pressure" => {
+                self.alerts.disk_pressure_enabled =
+                    parse_bool_setting("alerts.disk_pressure_enabled", value)?;
+            }
+            "--alerts-disk-used-ratio-threshold" => {
+                self.alerts.disk_used_ratio_threshold =
+                    parse_f64_setting("alerts.disk_used_ratio_threshold", value)?;
+            }
+            "--alerts-disk-min-free-bytes" => {
+                self.alerts.disk_min_free_bytes =
+                    parse_u64_setting("alerts.disk_min_free_bytes", value)?;
+            }
+            "--alerts-disk-pressure-for-secs" => {
+                self.alerts.disk_pressure_for_secs =
+                    parse_u64_setting("alerts.disk_pressure_for_secs", value)?;
+            }
+            "--alerts-disk-pressure-severity" => {
+                self.alerts.disk_pressure_severity = value.into();
+            }
+            "--alerts-disk-path" => self.alerts.disk_path = Some(value.into()),
             _ => unreachable!(),
         }
         Ok(())
     }
+}
+
+fn parse_u64_setting(name: &str, value: &str) -> Result<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a non-negative integer, got '{value}'"))
+}
+
+fn parse_f64_setting(name: &str, value: &str) -> Result<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .with_context(|| format!("{name} must be a number, got '{value}'"))
 }
 
 fn parse_bool_setting(name: &str, value: &str) -> Result<bool> {
@@ -1249,6 +1402,107 @@ mod tests {
             assert!(
                 ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
                 "expected invalid vacuum config for {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alerts_settings_respect_precedence_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "[alerts]\n\
+             enabled = false\n\
+             eval_interval_secs = 45\n\
+             webhook_url = 'http://127.0.0.1:9095/alerts'\n\
+             webhook_secret = 'file-secret'\n\
+             repeat_interval_secs = 600\n\
+             send_resolved = false\n\
+             group_name = 'cams_file'\n\
+             wake_failure_rate_threshold = 0.35\n\
+             wake_failure_window_secs = 600\n\
+             wake_failure_min_samples = 8\n\
+             wake_failure_for_secs = 90\n\
+             wake_failure_severity = 'warning'\n\
+             queue_backlog_threshold = 25\n\
+             queue_backlog_for_secs = 30\n\
+             disk_used_ratio_threshold = 0.85\n\
+             disk_min_free_bytes = 2147483648\n\
+             disk_path = 'storage'\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        let alerts = cfg.to_alert_config()?;
+        assert!(!alerts.enabled);
+        assert_eq!(alerts.eval_interval_secs, 45);
+        assert_eq!(
+            alerts.webhook_url.as_deref(),
+            Some("http://127.0.0.1:9095/alerts")
+        );
+        assert_eq!(alerts.webhook_secret.as_deref(), Some("file-secret"));
+        assert_eq!(alerts.repeat_interval_secs, 600);
+        assert!(!alerts.send_resolved);
+        assert_eq!(alerts.group_name, "cams_file");
+        assert_eq!(alerts.wake_failure_rate_threshold, 0.35);
+        assert_eq!(alerts.wake_failure_window_secs, 600);
+        assert_eq!(alerts.wake_failure_min_samples, 8);
+        assert_eq!(alerts.wake_failure_for_secs, 90);
+        assert_eq!(alerts.wake_failure_severity, "warning");
+        assert_eq!(alerts.queue_backlog_threshold, 25);
+        assert_eq!(alerts.queue_backlog_for_secs, 30);
+        assert_eq!(alerts.disk_used_ratio_threshold, 0.85);
+        assert_eq!(alerts.disk_min_free_bytes, 2_147_483_648);
+        assert_eq!(
+            Path::new(alerts.disk_path.as_deref().unwrap()),
+            fixture.0.join("storage")
+        );
+
+        let env = environment(&[
+            ("AIRCD_ALERTS_ENABLED", "true"),
+            ("AIRCD_ALERTS_EVAL_INTERVAL_SECS", "20"),
+            ("AIRCD_ALERTS_SEND_RESOLVED", "true"),
+            ("AIRCD_ALERTS_QUEUE_BACKLOG_THRESHOLD", "40"),
+            ("AIRCD_ALERTS_DISK_PRESSURE_SEVERITY", "warning"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--alerts-eval-interval-secs".into(),
+                "10".into(),
+                "--alerts-wake-failure-rate-threshold".into(),
+                "0.5".into(),
+                "--alerts-wake-failure-severity".into(),
+                "critical".into(),
+                "--no-alerts-queue-backlog".into(),
+            ],
+            &env,
+            &path,
+        )?;
+        let alerts = cfg.to_alert_config()?;
+        assert!(alerts.enabled);
+        assert_eq!(alerts.eval_interval_secs, 10);
+        assert!(alerts.send_resolved);
+        assert_eq!(alerts.wake_failure_rate_threshold, 0.5);
+        assert_eq!(alerts.wake_failure_severity, "critical");
+        assert!(!alerts.queue_backlog_enabled);
+        assert_eq!(alerts.queue_backlog_threshold, 40);
+        assert_eq!(alerts.disk_pressure_severity, "warning");
+
+        let cfg = ServerConfig::load_with(&["--no-alerts".into()], &env, &path)?;
+        assert!(!cfg.to_alert_config()?.enabled);
+
+        for bad in [
+            "[alerts]\nwebhook_url = 'http://example.com/public-http'",
+            "[alerts]\nwebhook_secret = '   '",
+            "[alerts]\ngroup_name = 'has space'",
+            "[alerts]\nwake_failure_rate_threshold = 1.5",
+            "[alerts]\nwake_failure_window_secs = 0",
+            "[alerts]\ndisk_used_ratio_threshold = -0.1",
+            "[alerts]\nwake_failure_severity = 'urgent'",
+            "[alerts]\nunknown_key = 1",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid alerts config for {bad}"
             );
         }
         Ok(())

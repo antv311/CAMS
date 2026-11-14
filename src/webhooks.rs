@@ -194,6 +194,66 @@ impl WebhookStore {
         Ok(rows)
     }
 
+    pub fn pending_delivery_count(&self) -> Result<u64> {
+        let db = self.db.read()?;
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Enqueue a system alert webhook for principals subscribed to `"alert"`
+    /// (or `"all"` / `"*"` with `notify_when = "always"`).
+    pub fn enqueue_alert(&self, payload: &serde_json::Value) -> Result<usize> {
+        let configs = {
+            let db = self.db.read()?;
+            Self::list_enabled_locked(&db)?
+        };
+        let now = unix_timestamp();
+        let mut pending = Vec::new();
+        for cfg in configs {
+            let explicit_alert = cfg.events.iter().any(|e| e == "alert");
+            let all_always = cfg.notify_when == "always"
+                && cfg.events.iter().any(|e| e == "all" || e == "*");
+            if !explicit_alert && !all_always {
+                continue;
+            }
+            let delivery_id = format!("del_{}", Uuid::new_v4().simple());
+            let mut per_recipient = payload.clone();
+            if let Some(obj) = per_recipient.as_object_mut() {
+                obj.insert(
+                    "delivery_id".to_string(),
+                    serde_json::Value::String(delivery_id.clone()),
+                );
+                obj.insert(
+                    "to".to_string(),
+                    serde_json::Value::String(cfg.principal_id.clone()),
+                );
+            }
+            let payload_json = serde_json::to_string(&per_recipient)?;
+            pending.push((delivery_id, cfg.principal_id, payload_json));
+        }
+        let queued = pending.len();
+        if queued > 0 {
+            let mut db = self.db.write()?;
+            let tx = db.transaction().context("begin alert webhook enqueue tx")?;
+            for (delivery_id, principal_id, payload_json) in pending {
+                tx.execute(
+                    "INSERT INTO webhook_deliveries
+                     (id, principal_id, event_type, channel, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+                     VALUES (?1, ?2, 'alert', '#alerts', ?3, 'pending', 0, ?4, ?4, ?4)",
+                    params![delivery_id, principal_id, payload_json, now],
+                )
+                .context("enqueue alert webhook delivery")?;
+            }
+            tx.commit().context("commit alert webhook enqueue tx")?;
+            self.notify.notify_waiters();
+        }
+        Ok(queued)
+    }
+
     /// Match enabled webhook subscribers and enqueue durable deliveries for async push.
     pub fn enqueue_for_event(
         &self,
@@ -754,6 +814,7 @@ fn normalize_events(events: Option<Vec<String>>) -> Vec<String> {
                 | "git"
                 | "role"
                 | "lock"
+                | "alert"
                 | "all"
                 | "*"
         ) && !out.contains(&clean)
