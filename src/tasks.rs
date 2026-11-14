@@ -55,7 +55,7 @@ const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expire
      body, kind, priority, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
      reviewer, parent_task_id, review_round_json, timeout_seconds, execution_heartbeat_at";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Task {
     pub id: String,
     pub channel: String,
@@ -103,7 +103,7 @@ pub struct TaskDependency {
 
 /// A submission snapshot. A fresh revision is issued on every handoff, even
 /// when the submitted commit or evidence happens to be identical.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewRound {
     pub revision: String,
     pub group: String,
@@ -116,7 +116,7 @@ pub struct ReviewRound {
     pub votes: Vec<PeerVote>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerVote {
     pub reviewer: String,
     pub decision: String,
@@ -177,6 +177,15 @@ pub struct TaskCascade {
 pub struct TaskUpdate {
     pub task: Task,
     pub cascaded: Vec<TaskCascade>,
+}
+
+/// A validated workflow mutation, prepared without side effects by the server.
+pub(crate) struct PreparedTaskStatus {
+    pub current: Task,
+    pub to: String,
+    pub note: Option<String>,
+    pub branch: Option<String>,
+    pub round: Option<ReviewRound>,
 }
 
 /// A question that stops a task until someone answers it.
@@ -317,11 +326,43 @@ impl TaskStore {
     }
 
     pub fn create_full(&self, new: NewTask) -> Result<Task> {
+        let id = format!("task_{}", Uuid::new_v4().simple());
+        Ok(self
+            .create_batch_full(vec![(id, new)])
+            .map_err(|error| anyhow!("{error:#}"))?
+            .remove(0))
+    }
+
+    /// Insert every row and dependency edge under one writer transaction.
+    /// New IDs are allocated by the server, never accepted from HTTP clients.
+    pub(crate) fn create_batch_full(&self, entries: Vec<(String, NewTask)>) -> Result<Vec<Task>> {
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (index, (id, new)) in entries.iter().enumerate() {
+            Self::insert_new_task_locked(&tx, id, new.clone(), now)
+                .with_context(|| format!("tasks[{index}]"))?;
+        }
+        // All rows now exist, so forward dependencies can be validated.
+        for (index, (id, new)) in entries.iter().enumerate() {
+            Self::link_new_task_locked(&tx, id, new, now)
+                .with_context(|| format!("tasks[{index}]"))?;
+        }
+        let tasks = entries
+            .iter()
+            .map(|(id, _)| Self::get_locked(&tx, id))
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit()?;
+        for task in &tasks {
+            self.metrics.record_task_created(&task.kind);
+        }
+        Ok(tasks)
+    }
+
+    fn insert_new_task_locked(db: &Connection, id: &str, new: NewTask, now: i64) -> Result<()> {
         if new.timeout_seconds == Some(0) {
             return Err(anyhow!("task timeout must be positive seconds"));
         }
-        let now = unix_timestamp();
-        let id = format!("task_{}", Uuid::new_v4().simple());
         let kind = normalize_kind(new.kind.as_deref())?;
         let priority = normalize_priority(new.priority.as_deref())?;
         let assignee = clean_opt(new.assignee);
@@ -331,23 +372,7 @@ impl TaskStore {
         } else {
             "open"
         };
-
-        let blocked_by = normalize_dep_ids(&new.blocked_by);
-
-        let mut db = self.db.write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::validate_dependencies_locked(&tx, &id, &blocked_by, false)?;
-        if let Some(parent_id) = clean_opt(new.parent_task_id.clone()) {
-            let parent = Self::get_locked(&tx, &parent_id)?;
-            if parent.channel != new.channel || TERMINAL_STATUSES.contains(&parent.status.as_str())
-            {
-                return Err(anyhow!(
-                    "parent must be active and belong to the same project"
-                ));
-            }
-            Self::require_unblocked_locked(&tx, &parent_id, true)?;
-        }
-        tx.execute(
+        db.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, priority, assignee, created_by, repo, branch, issue_url,
                                 created_at, updated_at, sprint, reviewer, parent_task_id, timeout_seconds)
@@ -374,8 +399,30 @@ impl TaskStore {
         )
         .context("insert task")?;
 
+        Ok(())
+    }
+
+    fn link_new_task_locked(db: &Connection, id: &str, new: &NewTask, now: i64) -> Result<()> {
+        let blocked_by = normalize_dep_ids(&new.blocked_by);
+        let created_by = clean_opt(new.created_by.clone());
+        let status = if clean_opt(new.assignee.clone()).is_some() {
+            "assigned"
+        } else {
+            "open"
+        };
+        Self::validate_dependencies_locked(db, id, &blocked_by, false)?;
+        if let Some(parent_id) = clean_opt(new.parent_task_id.clone()) {
+            let parent = Self::get_locked(db, &parent_id)?;
+            if parent.channel != new.channel || TERMINAL_STATUSES.contains(&parent.status.as_str())
+            {
+                return Err(anyhow!(
+                    "parent must be active and belong to the same project"
+                ));
+            }
+            Self::require_unblocked_locked(db, &parent_id, true)?;
+        }
         for dep_id in &blocked_by {
-            tx.execute(
+            db.execute(
                 "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![id, dep_id, created_by, now],
@@ -386,8 +433,8 @@ impl TaskStore {
             let actor = created_by.as_deref().unwrap_or("system");
             let note = format!("blocked_by={}", blocked_by.join(","));
             Self::log_event_locked(
-                &tx,
-                &id,
+                db,
+                id,
                 actor,
                 "dependencies",
                 Some(status),
@@ -397,10 +444,7 @@ impl TaskStore {
             )?;
         }
 
-        let task = Self::get_locked(&tx, &id)?;
-        tx.commit()?;
-        self.metrics.record_task_created(&kind);
-        Ok(task)
+        Ok(())
     }
 
     pub fn get(&self, task_id: &str) -> Result<Option<Task>> {
@@ -667,6 +711,7 @@ impl TaskStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn set_status_with_round(
         &self,
         task_id: &str,
@@ -677,13 +722,112 @@ impl TaskStore {
         branch: Option<&str>,
         round: Option<&ReviewRound>,
     ) -> Result<TaskUpdate> {
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let update = self.set_status_locked(
+            &tx,
+            task_id,
+            expected_from,
+            to,
+            actor_id,
+            note,
+            branch,
+            round,
+            now,
+        )?;
+        tx.commit()?;
+        self.record_status_metrics(expected_from, &update);
+        Ok(update)
+    }
+
+    pub(crate) fn set_status_batch(
+        &self,
+        changes: &[PreparedTaskStatus],
+        actor_id: &str,
+    ) -> Result<Vec<TaskUpdate>> {
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut updates = Vec::with_capacity(changes.len());
+        if changes.len() > 1 {
+            let explicit: HashSet<&str> = changes.iter().map(|c| c.current.id.as_str()).collect();
+            for (index, change) in changes.iter().enumerate().filter(|(_, c)| c.to == "cancelled") {
+                let mut statement = tx.prepare(
+                    "WITH RECURSIVE descendants(id) AS (
+                        SELECT id FROM tasks WHERE parent_task_id = ?1
+                        UNION SELECT t.id FROM tasks t JOIN descendants d ON t.parent_task_id = d.id
+                     ) SELECT id FROM descendants",
+                )?;
+                let descendants = statement.query_map([&change.current.id], |row| row.get::<_, String>(0))?;
+                for id in descendants {
+                    if explicit.contains(id?.as_str()) {
+                        return Err(anyhow!("updates[{index}]: cancellation overlaps an explicit descendant in this batch; submit the ancestor alone"));
+                    }
+                }
+            }
+        }
+        for (index, change) in changes.iter().enumerate() {
+            let current = Self::get_locked(&tx, &change.current.id)?;
+            // A cascade or concurrent mutation must never apply a stale authorization.
+            if current != change.current {
+                return Err(anyhow!("updates[{index}]: task changed concurrently or by an earlier cascade; reload and retry"));
+            }
+            let update = self
+                .set_status_locked(
+                    &tx,
+                    &current.id,
+                    &current.status,
+                    &change.to,
+                    actor_id,
+                    change.note.as_deref(),
+                    change.branch.as_deref(),
+                    change.round.as_ref(),
+                    now,
+                )
+                .with_context(|| format!("updates[{index}]"))?;
+            if update
+                .cascaded
+                .iter()
+                .any(|cascade| changes.iter().any(|c| c.current.id == cascade.task.id))
+            {
+                return Err(anyhow!("updates[{index}]: cascade overlaps an explicit task in this batch; submit the ancestor alone"));
+            }
+            updates.push(update);
+        }
+        tx.commit()?;
+        for (change, update) in changes.iter().zip(&updates) {
+            self.record_status_metrics(&change.current.status, update);
+        }
+        Ok(updates)
+    }
+
+    fn record_status_metrics(&self, from: &str, update: &TaskUpdate) {
+        self.metrics
+            .record_task_transition(from, &update.task.status);
+        if TERMINAL_STATUSES.contains(&update.task.status.as_str()) {
+            self.metrics.record_task_completed(&update.task.status);
+        }
+        self.record_cascade_metrics(&update.cascaded);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_status_locked(
+        &self,
+        db: &Connection,
+        task_id: &str,
+        expected_from: &str,
+        to: &str,
+        actor_id: &str,
+        note: Option<&str>,
+        branch: Option<&str>,
+        round: Option<&ReviewRound>,
+        now: i64,
+    ) -> Result<TaskUpdate> {
         if !ALL_STATUSES.contains(&to) {
             return Err(anyhow!("unknown task status '{to}'"));
         }
-        let now = unix_timestamp();
-        let mut db = self.db.write()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current = Self::get_locked(&tx, task_id)?;
+        let current = Self::get_locked(db, task_id)?;
         if self.execution_expired(&current, now)
             && matches!(to, "in_progress" | "testing" | "review" | "done")
         {
@@ -692,7 +836,7 @@ impl TaskStore {
             ));
         }
         if to != "cancelled" {
-            Self::require_unblocked_locked(&tx, task_id, false)?;
+            Self::require_unblocked_locked(db, task_id, false)?;
         }
         if current.status != expected_from {
             return Err(anyhow!(
@@ -703,7 +847,7 @@ impl TaskStore {
             to,
             "in_progress" | "testing" | "review" | "super_review" | "merged" | "done"
         ) {
-            let blockers = Self::unresolved_blockers_locked(&tx, &current)?;
+            let blockers = Self::unresolved_blockers_locked(db, &current)?;
             if !blockers.is_empty() {
                 return Err(anyhow!("{}", format_blocked_error(task_id, &blockers)));
             }
@@ -727,7 +871,7 @@ impl TaskStore {
                 .map(serde_json::to_string)
                 .transpose()?
         };
-        let changed = tx
+        let changed = db
             .execute(
                 "UPDATE tasks
                  SET status = ?1, branch = COALESCE(?2, branch), updated_at = ?3,
@@ -744,7 +888,7 @@ impl TaskStore {
             ));
         }
         Self::log_event_locked(
-            &tx,
+            db,
             task_id,
             actor_id,
             "status",
@@ -755,7 +899,7 @@ impl TaskStore {
         )?;
         if let Some(round) = round {
             Self::log_event_locked(
-                &tx,
+                db,
                 task_id,
                 actor_id,
                 "review_submission",
@@ -766,24 +910,18 @@ impl TaskStore {
             )?;
         }
         if to == "cancelled" {
-            Self::cancel_questions_locked(&tx, task_id)?;
-            tx.execute(
+            Self::cancel_questions_locked(db, task_id)?;
+            db.execute(
                 "DELETE FROM task_parent_blocks WHERE task_id = ?1",
                 [task_id],
             )?;
         }
         let cascaded = if matches!(to, "blocked" | "cancelled") || current.status == "blocked" {
-            Self::cascade_locked(&tx, task_id, to, actor_id, now)?
+            Self::cascade_locked(db, task_id, to, actor_id, now)?
         } else {
             Vec::new()
         };
-        let task = Self::get_locked(&tx, task_id)?;
-        tx.commit()?;
-        self.metrics.record_task_transition(expected_from, to);
-        if TERMINAL_STATUSES.contains(&to) {
-            self.metrics.record_task_completed(to);
-        }
-        self.record_cascade_metrics(&cascaded);
+        let task = Self::get_locked(db, task_id)?;
         Ok(TaskUpdate { task, cascaded })
     }
 

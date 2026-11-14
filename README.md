@@ -472,6 +472,8 @@ place is the task: it names its project channel, repo and branch.
 | `GET/POST /v1/projects` | List or create projects |
 | `GET/POST /v1/projects/members` | List members, add one or change a role |
 | `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `priority`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`, `blocked_by`) |
+| `POST /v1/tasks/batch` | Atomically create 1..100 tasks, including references between new tasks ([batch API](docs/task-batches.md)) |
+| `POST /v1/tasks/bulk-status` | Atomically apply 1..100 workflow updates in request order ([batch API](docs/task-batches.md)) |
 | `GET /v1/tasks/{id}` | Task with its history, pending question, direct subtasks, dependencies and dependents |
 | `POST /v1/tasks/{id}/assign` | Assign, reassign, or unassign (`assignee: null`) |
 | `POST /v1/tasks/{id}/priority` | Update priority (`urgent`, `high`, `normal`, `low`) on an active task |

@@ -22,10 +22,17 @@ use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
 use crate::rooms::{Room, RoomStore};
 use crate::store::{ClientTemplate, ClientTemplateStore, GroupStore, SharedConnection};
-use crate::tasks::{NewTask, ReviewRound, Task, TaskStore, TERMINAL_STATUSES};
+use crate::tasks::{
+    NewTask, PreparedTaskStatus, ReviewRound, Task, TaskStore, TaskUpdate, TERMINAL_STATUSES,
+};
+
 use crate::vacuum::{VacuumConfig, VacuumManager};
 use crate::wake::{WakeConfig, WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
+
+#[path = "task_batch.rs"]
+mod task_batch;
+pub use task_batch::{BatchNewTask, TaskStatusChange};
 
 /// An account made from a client template. `token` is shown once.
 #[derive(Debug, Serialize)]
@@ -2835,8 +2842,28 @@ impl Server {
         ))
     }
 
-    pub fn create_task_full_api(&self, actor: &Principal, mut new: NewTask) -> Result<Task> {
+    pub fn create_task_full_api(&self, actor: &Principal, new: NewTask) -> Result<Task> {
         let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let parent = new
+            .parent_task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        let new = self.prepare_task_creation(actor, new, parent.as_ref())?;
+        self.join_channels(actor, std::slice::from_ref(&new.channel))?;
+        let task = self.tasks.create_full(new)?;
+        self.announce_task_creation(actor, &task)?;
+        Ok(task)
+    }
+
+    fn prepare_task_creation(
+        &self,
+        actor: &Principal,
+        mut new: NewTask,
+        parent: Option<&Task>,
+    ) -> Result<NewTask> {
         let title = new.title.trim().to_string();
         if title.is_empty() {
             return Err(anyhow!("task title is required"));
@@ -2868,12 +2895,7 @@ impl Server {
             .parent_task_id
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty());
-        let parent = new
-            .parent_task_id
-            .as_deref()
-            .map(|id| self.get_task_api(id))
-            .transpose()?;
-        if let Some(parent) = &parent {
+        if let Some(parent) = parent {
             if parent.channel != channel {
                 return Err(anyhow!("parent task must belong to the same project"));
             }
@@ -2893,7 +2915,7 @@ impl Server {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            Some(name) => Some(self.resolve_assignee(actor, &channel, name, parent.as_ref())?),
+            Some(name) => Some(self.resolve_assignee(actor, &channel, name, parent)?),
             None => None,
         };
         let reviewer = match new
@@ -2922,9 +2944,11 @@ impl Server {
         new.reviewer = reviewer;
         new.created_by = Some(actor.id.clone());
 
-        self.join_channels(actor, std::slice::from_ref(&channel))?;
-        let task = self.tasks.create_full(new)?;
-        let mut text = match &assignee_id {
+        Ok(new)
+    }
+
+    fn announce_task_creation(&self, actor: &Principal, task: &Task) -> Result<()> {
+        let mut text = match &task.assignee {
             Some(assignee) => format!(
                 "TASK {} created by @{} and assigned to @{}: {}",
                 task.id, actor.nick, assignee, task.title
@@ -2937,8 +2961,8 @@ impl Server {
         if !task.blocked_by.is_empty() {
             text.push_str(&format!(" (blocked_by: {})", task.blocked_by.join(", ")));
         }
-        self.broadcast_task_event(&task, "create", "success", &actor.nick, text)?;
-        Ok(task)
+        self.broadcast_task_event(task, "create", "success", &actor.nick, text)?;
+        Ok(())
     }
 
     pub fn get_task_api(&self, task_id: &str) -> Result<Task> {
@@ -3233,6 +3257,36 @@ impl Server {
     ) -> Result<Task> {
         let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let current = self.get_task_api(task_id)?;
+        let change = self.prepare_task_status_revision(
+            actor,
+            current,
+            raw_to,
+            note,
+            branch,
+            report_body,
+            report_id,
+            commit,
+        )?;
+        let update = self
+            .tasks
+            .set_status_batch(std::slice::from_ref(&change), &actor.id)
+            .map_err(|error| anyhow!("{error:#}"))?
+            .remove(0);
+        self.announce_task_status(actor, &change, update)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_task_status_revision(
+        &self,
+        actor: &Principal,
+        current: Task,
+        raw_to: &str,
+        note: Option<&str>,
+        branch: Option<&str>,
+        report_body: Option<&str>,
+        report_id: Option<&str>,
+        commit: Option<&str>,
+    ) -> Result<PreparedTaskStatus> {
         let to = raw_to.trim().to_ascii_lowercase().replace('-', "_");
         let from = current.status.clone();
         let is_assignee = current.assignee.as_deref() == Some(actor.id.as_str());
@@ -3342,18 +3396,26 @@ impl Server {
                 evidence = format!("PM/owner consensus bypass: {evidence}");
             }
         }
-        let note = (!evidence.is_empty()).then_some(evidence.as_str());
-        let update = self.tasks.set_status_with_round(
-            &current.id,
-            &from,
-            &to,
-            &actor.id,
-            note,
-            branch,
-            round.as_ref(),
-        )?;
-        let task = update.task;
+        Ok(PreparedTaskStatus {
+            current,
+            to,
+            note: (!evidence.is_empty()).then_some(evidence),
+            branch: branch.map(str::to_string),
+            round,
+        })
+    }
 
+    fn announce_task_status(
+        &self,
+        actor: &Principal,
+        change: &PreparedTaskStatus,
+        update: TaskUpdate,
+    ) -> Result<Task> {
+        let task = update.task;
+        let current = &change.current;
+        let from = &current.status;
+        let to = &change.to;
+        let note = change.note.as_deref();
         let mut text = format!(
             "TASK {} {} -> {} by @{}: {}",
             task.id, from, to, actor.nick, task.title
