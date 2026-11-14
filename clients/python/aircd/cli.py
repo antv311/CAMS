@@ -973,6 +973,8 @@ def cmd_task(args: argparse.Namespace) -> int:
                 timeout_seconds=getattr(args, "timeout_seconds", None),
                 condition=_task_json_object(getattr(args, "condition", None), "--condition"),
                 optional=getattr(args, "optional", False),
+                tags=getattr(args, "tag", None),
+                metadata=_task_json_object(getattr(args, "metadata", None), "--metadata"),
             ),
         )
         t = data["task"]
@@ -995,6 +997,19 @@ def cmd_task(args: argparse.Namespace) -> int:
             if budget is not None:
                 lines.append(f"  token budget {budget:,}")
         print_out(args, data, lines)
+        return 0
+    if args.task_cmd in ("tags", "metadata"):
+        payload: dict[str, Any] = {}
+        if args.task_cmd == "tags":
+            if args.clear:
+                payload["tags"] = []
+            elif args.set is not None:
+                payload["tags"] = args.set
+        elif args.value is not None:
+            payload["metadata"] = _task_json_object(args.value, "metadata")
+        path = f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}"
+        data = http_json(server, "PATCH", path + "/attributes", token=token, payload=payload) if payload else http_json(server, "GET", path, token=token)
+        print_out(args, data, [json.dumps(data["task"].get(args.task_cmd, [] if args.task_cmd == "tags" else {}), ensure_ascii=False)])
         return 0
     if args.task_cmd == "usage":
         path = f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}/usage"
@@ -1176,6 +1191,7 @@ def cmd_task(args: argparse.Namespace) -> int:
             lines.append(f"parent={t.get('parent_task_id') or '-'} reviewer={t.get('reviewer') or '-'}")
         if t.get("condition") is not None or t.get("optional"):
             lines.append(f"condition={json.dumps(t.get('condition'))} optional={bool(t.get('optional'))} enabled={bool(t.get('optional_enabled'))}")
+        lines.append(f"tags={json.dumps(t.get('tags', []), ensure_ascii=False)} metadata={json.dumps(t.get('metadata', {}), ensure_ascii=False)}")
         if t.get("output") is not None:
             lines.append(f"output={json.dumps(t['output'], ensure_ascii=False)}")
         if data.get("dependencies"):
@@ -1273,6 +1289,8 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 0
     if args.task_cmd == "list":
         params = {"channel": args.channel}
+        if getattr(args, "tag", None) is not None:
+            params["tag"] = args.tag
         if getattr(args, "priority", None):
             params["priority"] = args.priority
         if getattr(args, "repo", None):
@@ -3231,7 +3249,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--condition", help="Branch predicate as a JSON object, or @path to a UTF-8 JSON file")
     p_tc.add_argument("--optional", action="store_true", help="Keep this child dormant until the parent lead or PM enables it")
     p_tc.add_argument("--token-budget", metavar="TOKENS", help="Cap the model tokens this task and its subtasks may spend")
+    p_tc.add_argument("--tag", action="append", help="Exact case-sensitive tag; repeat to add more")
+    p_tc.add_argument("--metadata", help="JSON object, or @path to a UTF-8 JSON file")
     p_tc.set_defaults(func=cmd_task)
+
+    p_tags = task_sub.add_parser("tags", help="Show or replace task tags")
+    p_tags.add_argument("id")
+    p_tags_edit = p_tags.add_mutually_exclusive_group()
+    p_tags_edit.add_argument("--set", action="append", metavar="TAG", help="Replace all tags; repeat for multiple tags")
+    p_tags_edit.add_argument("--clear", action="store_true", help="Remove all tags")
+    p_tags.set_defaults(func=cmd_task)
+    p_meta = task_sub.add_parser("metadata", help="Show or replace the task metadata object")
+    p_meta.add_argument("id")
+    p_meta.add_argument("value", nargs="?", help="JSON object or @path; {} clears metadata")
+    p_meta.set_defaults(func=cmd_task)
 
     p_tus = task_sub.add_parser(
         "usage",
@@ -3334,6 +3365,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tl = task_sub.add_parser("list")
     p_tl.add_argument("channel", nargs="?", default="#general")
     p_tl.add_argument("--priority", choices=["urgent", "high", "normal", "low"], help="Filter by priority")
+    p_tl.add_argument("--tag", help="Filter by exact case-sensitive tag")
     p_tl.add_argument("--repo", help="Filter by repository name")
     p_tl_blk = p_tl.add_mutually_exclusive_group()
     p_tl_blk.add_argument("--blocked", action="store_true", help="Only tasks with unresolved dependencies")

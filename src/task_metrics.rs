@@ -244,6 +244,8 @@ mod tests {
             optional: false,
             optional_enabled: false,
             output: None,
+            tags: Vec::new(),
+            metadata: Default::default(),
         }
     }
 
