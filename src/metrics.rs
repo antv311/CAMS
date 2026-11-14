@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::db::PoolStats;
+use crate::db::{DbPageStats, PoolStats};
 use crate::tasks::{ALL_STATUSES, TERMINAL_STATUSES};
 
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -135,6 +135,7 @@ pub struct MetricsSnapshot {
     pub task_events_by_action: BTreeMap<String, u64>,
     pub webhook_deliveries_by_status: BTreeMap<String, u64>,
     pub db_pool: Option<PoolStats>,
+    pub db_pages: Option<DbPageStats>,
 }
 
 /// Central thread-safe Prometheus metrics store shared across server subsystems.
@@ -729,6 +730,79 @@ impl MetricsRegistry {
                 &[],
                 pool.checkpoints,
             );
+
+            write_header(
+                &mut out,
+                "aircd_db_vacuum_steps_total",
+                "counter",
+                "Total SQLite incremental vacuum steps executed.",
+            );
+            write_sample(
+                &mut out,
+                "aircd_db_vacuum_steps_total",
+                &[],
+                pool.vacuum_steps,
+            );
+
+            write_header(
+                &mut out,
+                "aircd_db_vacuum_pages_freed_total",
+                "counter",
+                "Total SQLite freelist pages reclaimed via incremental vacuum.",
+            );
+            write_sample(
+                &mut out,
+                "aircd_db_vacuum_pages_freed_total",
+                &[],
+                pool.vacuum_pages_freed,
+            );
+
+            write_header(
+                &mut out,
+                "aircd_db_vacuum_skipped_busy_total",
+                "counter",
+                "Total incremental vacuum attempts skipped because a writer held the lock.",
+            );
+            write_sample(
+                &mut out,
+                "aircd_db_vacuum_skipped_busy_total",
+                &[],
+                pool.vacuum_skipped_busy,
+            );
+        }
+
+        if let Some(pages) = &snap.db_pages {
+            write_header(
+                &mut out,
+                "aircd_db_page_size_bytes",
+                "gauge",
+                "Configured SQLite database page size in bytes.",
+            );
+            write_sample(&mut out, "aircd_db_page_size_bytes", &[], pages.page_size);
+
+            write_header(
+                &mut out,
+                "aircd_db_pages_total",
+                "gauge",
+                "Total SQLite database pages.",
+            );
+            write_sample(&mut out, "aircd_db_pages_total", &[], pages.page_count);
+
+            write_header(
+                &mut out,
+                "aircd_db_freelist_pages",
+                "gauge",
+                "Current SQLite freelist pages available for incremental vacuum.",
+            );
+            write_sample(&mut out, "aircd_db_freelist_pages", &[], pages.freelist_count);
+
+            write_header(
+                &mut out,
+                "aircd_db_freelist_bytes",
+                "gauge",
+                "Current SQLite freelist size in bytes.",
+            );
+            write_sample(&mut out, "aircd_db_freelist_bytes", &[], pages.freelist_bytes);
         }
 
         out

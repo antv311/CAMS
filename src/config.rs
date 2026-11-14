@@ -10,6 +10,12 @@ use crate::logging::{
 };
 use crate::rate_limit::RateLimitConfig;
 use crate::tls::{ClientAuthMode, TlsServerConfigSpec};
+use crate::vacuum::{
+    VacuumConfig, DEFAULT_VACUUM_BATCH_PAGES, DEFAULT_VACUUM_ENABLED,
+    DEFAULT_VACUUM_INTERVAL_SECS, DEFAULT_VACUUM_MAX_BATCHES_PER_RUN,
+    DEFAULT_VACUUM_MIN_FREELIST_PAGES, DEFAULT_VACUUM_MIN_FREELIST_RATIO,
+    DEFAULT_VACUUM_STEP_DELAY_MS,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -84,6 +90,13 @@ pub struct ServerConfig {
     pub db_wal_autocheckpoint: u32,
     pub db_cache_size_kib: i64,
     pub db_journal_size_limit_bytes: i64,
+    pub db_vacuum_enabled: bool,
+    pub db_vacuum_interval_secs: u64,
+    pub db_vacuum_min_freelist_pages: u64,
+    pub db_vacuum_min_freelist_ratio: f64,
+    pub db_vacuum_batch_pages: u32,
+    pub db_vacuum_step_delay_ms: u64,
+    pub db_vacuum_max_batches_per_run: usize,
 }
 
 impl Default for ServerConfig {
@@ -120,6 +133,13 @@ impl Default for ServerConfig {
             db_wal_autocheckpoint: DEFAULT_WAL_AUTOCHECKPOINT,
             db_cache_size_kib: DEFAULT_CACHE_SIZE_KIB,
             db_journal_size_limit_bytes: DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+            db_vacuum_enabled: DEFAULT_VACUUM_ENABLED,
+            db_vacuum_interval_secs: DEFAULT_VACUUM_INTERVAL_SECS,
+            db_vacuum_min_freelist_pages: DEFAULT_VACUUM_MIN_FREELIST_PAGES,
+            db_vacuum_min_freelist_ratio: DEFAULT_VACUUM_MIN_FREELIST_RATIO,
+            db_vacuum_batch_pages: DEFAULT_VACUUM_BATCH_PAGES,
+            db_vacuum_step_delay_ms: DEFAULT_VACUUM_STEP_DELAY_MS,
+            db_vacuum_max_batches_per_run: DEFAULT_VACUUM_MAX_BATCHES_PER_RUN,
         }
     }
 }
@@ -220,6 +240,20 @@ impl ServerConfig {
         Ok(cfg)
     }
 
+    pub fn to_vacuum_config(&self) -> Result<VacuumConfig> {
+        let cfg = VacuumConfig {
+            enabled: self.db_vacuum_enabled,
+            interval_secs: self.db_vacuum_interval_secs,
+            min_freelist_pages: self.db_vacuum_min_freelist_pages,
+            min_freelist_ratio: self.db_vacuum_min_freelist_ratio,
+            batch_pages: self.db_vacuum_batch_pages,
+            step_delay_ms: self.db_vacuum_step_delay_ms,
+            max_batches_per_run: self.db_vacuum_max_batches_per_run,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     fn load_with(
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
@@ -234,9 +268,10 @@ impl ServerConfig {
                 | "--windows-event-log"
                 | "--backup-enabled"
                 | "--backup-on-startup"
+                | "--db-vacuum-enabled"
                 | "--rate-limit-enabled"
                 | "--rate-limit-trust-proxy-headers" => "true",
-                "--no-backups" | "--no-rate-limit" => "false",
+                "--no-backups" | "--no-db-vacuum" | "--no-rate-limit" => "false",
                 "--config"
                 | "--bind"
                 | "--http-bind"
@@ -266,7 +301,13 @@ impl ServerConfig {
                 | "--db-synchronous"
                 | "--db-wal-autocheckpoint"
                 | "--db-cache-size-kib"
-                | "--db-journal-size-limit" => iter
+                | "--db-journal-size-limit"
+                | "--db-vacuum-interval-secs"
+                | "--db-vacuum-min-freelist-pages"
+                | "--db-vacuum-min-freelist-ratio"
+                | "--db-vacuum-batch-pages"
+                | "--db-vacuum-step-delay-ms"
+                | "--db-vacuum-max-batches" => iter
                     .next()
                     .filter(|value| !value.starts_with("--"))
                     .with_context(|| format!("{arg} requires a value"))?,
@@ -361,6 +402,13 @@ impl ServerConfig {
             ("AIRCD_DB_WAL_AUTOCHECKPOINT", "--db-wal-autocheckpoint"),
             ("AIRCD_DB_CACHE_SIZE_KIB", "--db-cache-size-kib"),
             ("AIRCD_DB_JOURNAL_SIZE_LIMIT", "--db-journal-size-limit"),
+            ("AIRCD_DB_VACUUM_ENABLED", "--db-vacuum-enabled"),
+            ("AIRCD_DB_VACUUM_INTERVAL_SECS", "--db-vacuum-interval-secs"),
+            ("AIRCD_DB_VACUUM_MIN_FREELIST_PAGES", "--db-vacuum-min-freelist-pages"),
+            ("AIRCD_DB_VACUUM_MIN_FREELIST_RATIO", "--db-vacuum-min-freelist-ratio"),
+            ("AIRCD_DB_VACUUM_BATCH_PAGES", "--db-vacuum-batch-pages"),
+            ("AIRCD_DB_VACUUM_STEP_DELAY_MS", "--db-vacuum-step-delay-ms"),
+            ("AIRCD_DB_VACUUM_MAX_BATCHES", "--db-vacuum-max-batches"),
         ] {
             if let Some(value) = env(name) {
                 // Preserve the existing empty invite-key environment fallback.
@@ -431,6 +479,7 @@ impl ServerConfig {
         let _ = config.to_log_config()?;
         let _ = config.to_backup_config()?;
         let _ = config.to_sqlite_config()?;
+        let _ = config.to_vacuum_config()?;
         Ok(config)
     }
 
@@ -556,6 +605,45 @@ impl ServerConfig {
                     .trim()
                     .parse::<i64>()
                     .with_context(|| format!("db_journal_size_limit_bytes must be an integer >= -1, got '{value}'"))?;
+            }
+            "--db-vacuum-enabled" | "--no-db-vacuum" => {
+                self.db_vacuum_enabled = parse_bool_setting("db_vacuum_enabled", value)?;
+            }
+            "--db-vacuum-interval-secs" => {
+                self.db_vacuum_interval_secs = value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("db_vacuum_interval_secs must be a non-negative integer, got '{value}'"))?;
+            }
+            "--db-vacuum-min-freelist-pages" => {
+                self.db_vacuum_min_freelist_pages = value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("db_vacuum_min_freelist_pages must be a non-negative integer, got '{value}'"))?;
+            }
+            "--db-vacuum-min-freelist-ratio" => {
+                self.db_vacuum_min_freelist_ratio = value
+                    .trim()
+                    .parse::<f64>()
+                    .with_context(|| format!("db_vacuum_min_freelist_ratio must be a number in 0.0..=1.0, got '{value}'"))?;
+            }
+            "--db-vacuum-batch-pages" => {
+                self.db_vacuum_batch_pages = value
+                    .trim()
+                    .parse::<u32>()
+                    .with_context(|| format!("db_vacuum_batch_pages must be a positive integer, got '{value}'"))?;
+            }
+            "--db-vacuum-step-delay-ms" => {
+                self.db_vacuum_step_delay_ms = value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("db_vacuum_step_delay_ms must be a non-negative integer, got '{value}'"))?;
+            }
+            "--db-vacuum-max-batches" => {
+                self.db_vacuum_max_batches_per_run = value
+                    .trim()
+                    .parse::<usize>()
+                    .with_context(|| format!("db_vacuum_max_batches_per_run must be a non-negative integer, got '{value}'"))?;
             }
             _ => unreachable!(),
         }
@@ -1092,6 +1180,73 @@ mod tests {
             assert!(
                 ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
                 "expected invalid mTLS config for {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_settings_respect_precedence_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "db_vacuum_enabled = false\n\
+             db_vacuum_interval_secs = 600\n\
+             db_vacuum_min_freelist_pages = 128\n\
+             db_vacuum_min_freelist_ratio = 0.25\n\
+             db_vacuum_batch_pages = 32\n\
+             db_vacuum_step_delay_ms = 10\n\
+             db_vacuum_max_batches_per_run = 16\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        let vac = cfg.to_vacuum_config()?;
+        assert!(!vac.enabled);
+        assert_eq!(vac.interval_secs, 600);
+        assert_eq!(vac.min_freelist_pages, 128);
+        assert_eq!(vac.min_freelist_ratio, 0.25);
+        assert_eq!(vac.batch_pages, 32);
+        assert_eq!(vac.step_delay_ms, 10);
+        assert_eq!(vac.max_batches_per_run, 16);
+
+        let env = environment(&[
+            ("AIRCD_DB_VACUUM_ENABLED", "true"),
+            ("AIRCD_DB_VACUUM_INTERVAL_SECS", "120"),
+            ("AIRCD_DB_VACUUM_BATCH_PAGES", "48"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--db-vacuum-min-freelist-pages".into(),
+                "256".into(),
+                "--db-vacuum-min-freelist-ratio".into(),
+                "0.15".into(),
+                "--db-vacuum-step-delay-ms".into(),
+                "5".into(),
+                "--db-vacuum-max-batches".into(),
+                "8".into(),
+            ],
+            &env,
+            &path,
+        )?;
+        let vac = cfg.to_vacuum_config()?;
+        assert!(vac.enabled);
+        assert_eq!(vac.interval_secs, 120);
+        assert_eq!(vac.min_freelist_pages, 256);
+        assert_eq!(vac.min_freelist_ratio, 0.15);
+        assert_eq!(vac.batch_pages, 48);
+        assert_eq!(vac.step_delay_ms, 5);
+        assert_eq!(vac.max_batches_per_run, 8);
+
+        let cfg = ServerConfig::load_with(&["--no-db-vacuum".into()], &env, &path)?;
+        assert!(!cfg.to_vacuum_config()?.enabled);
+
+        for bad in [
+            "db_vacuum_batch_pages = 0",
+            "db_vacuum_min_freelist_ratio = -0.1",
+            "db_vacuum_min_freelist_ratio = 1.5",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid vacuum config for {bad}"
             );
         }
         Ok(())

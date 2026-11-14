@@ -159,6 +159,67 @@ impl SqlitePoolConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AutoVacuumMode {
+    #[default]
+    None,
+    Full,
+    Incremental,
+}
+
+impl AutoVacuumMode {
+    pub fn from_pragma_code(code: i64) -> Self {
+        match code {
+            1 => Self::Full,
+            2 => Self::Incremental,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
+impl fmt::Display for AutoVacuumMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for AutoVacuumMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DbPageStats {
+    pub auto_vacuum: AutoVacuumMode,
+    pub page_size: u64,
+    pub page_count: u64,
+    pub freelist_count: u64,
+    pub total_bytes: u64,
+    pub freelist_bytes: u64,
+    pub freelist_ratio: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IncrementalVacuumStep {
+    pub acquired_writer: bool,
+    pub skipped_busy: bool,
+    pub auto_vacuum: AutoVacuumMode,
+    pub requested_pages: u32,
+    pub freelist_before: u64,
+    pub freelist_after: u64,
+    pub pages_freed: u64,
+    pub bytes_freed: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WalCheckpointResult {
     pub mode: String,
@@ -180,11 +241,15 @@ pub struct PoolStats {
     pub read_wait_ms: u64,
     pub write_wait_ms: u64,
     pub checkpoints: u64,
+    pub vacuum_steps: u64,
+    pub vacuum_pages_freed: u64,
+    pub vacuum_skipped_busy: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LivePragmas {
     pub journal_mode: String,
+    pub auto_vacuum: String,
     pub synchronous: String,
     pub busy_timeout_ms: i64,
     pub wal_autocheckpoint: i64,
@@ -207,6 +272,7 @@ pub struct SqliteDiagnostics {
     pub config: SqlitePoolConfig,
     pub pool: PoolStats,
     pub pragmas: LivePragmas,
+    pub pages: DbPageStats,
     pub files: Option<WalFileStats>,
 }
 
@@ -218,6 +284,9 @@ struct PoolMetrics {
     read_wait_ns: AtomicU64,
     write_wait_ns: AtomicU64,
     checkpoints: AtomicU64,
+    vacuum_steps: AtomicU64,
+    vacuum_pages_freed: AtomicU64,
+    vacuum_skipped_busy: AtomicU64,
 }
 
 struct ReaderPoolState {
@@ -504,6 +573,21 @@ impl SharedConnection {
         Ok(PooledConnection(PooledConnectionInner::Writer { guard }))
     }
 
+    /// Attempt to acquire the serialized writer connection without blocking.
+    /// Returns `Ok(None)` immediately when another writer currently holds the lock.
+    pub fn try_write(&self) -> Result<Option<PooledConnection<'_>>> {
+        let guard = match self.inner.writer.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("sqlite mutex poisoned"),
+        };
+        self.inner
+            .metrics
+            .write_acquires
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(PooledConnection(PooledConnectionInner::Writer { guard })))
+    }
+
     /// Compatibility alias for acquiring the serialized writer connection.
     #[allow(dead_code)]
     pub fn lock(
@@ -559,6 +643,147 @@ impl SharedConnection {
         })
     }
 
+    pub fn page_stats(&self) -> Result<DbPageStats> {
+        let conn = self.read()?;
+        query_page_stats(&conn)
+    }
+
+    /// Sample SQLite page and freelist statistics without blocking active writers.
+    /// File-backed databases always read through the concurrent WAL reader pool;
+    /// `:memory:` databases return `Ok(None)` if the writer mutex is busy.
+    pub fn try_page_stats(&self) -> Result<Option<DbPageStats>> {
+        if self.inner.readers.is_some() {
+            let conn = self.read()?;
+            return Ok(Some(query_page_stats(&conn)?));
+        }
+        let Some(conn) = self.try_write()? else {
+            return Ok(None);
+        };
+        Ok(Some(query_page_stats(&conn)?))
+    }
+
+    /// Run a bounded `PRAGMA incremental_vacuum(pages)` step.
+    ///
+    /// When `non_blocking` is `true`, this uses `try_write()` and temporarily sets
+    /// `PRAGMA busy_timeout = 0` so active writers (internal or external) are never
+    /// stalled or blocked; if the writer lock is busy, it returns immediately with
+    /// `skipped_busy = true`.
+    pub fn incremental_vacuum_step(
+        &self,
+        pages: u32,
+        non_blocking: bool,
+    ) -> Result<IncrementalVacuumStep> {
+        let requested_pages = if non_blocking { pages.max(1) } else { pages };
+        let db = if non_blocking {
+            match self.try_write()? {
+                Some(guard) => guard,
+                None => {
+                    self.inner
+                        .metrics
+                        .vacuum_skipped_busy
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(IncrementalVacuumStep {
+                        acquired_writer: false,
+                        skipped_busy: true,
+                        auto_vacuum: AutoVacuumMode::Incremental,
+                        requested_pages,
+                        freelist_before: 0,
+                        freelist_after: 0,
+                        pages_freed: 0,
+                        bytes_freed: 0,
+                    });
+                }
+            }
+        } else {
+            self.write()?
+        };
+
+        let before = query_page_stats(&db)?;
+        if before.auto_vacuum != AutoVacuumMode::Incremental || before.freelist_count == 0 {
+            return Ok(IncrementalVacuumStep {
+                acquired_writer: true,
+                skipped_busy: false,
+                auto_vacuum: before.auto_vacuum,
+                requested_pages,
+                freelist_before: before.freelist_count,
+                freelist_after: before.freelist_count,
+                pages_freed: 0,
+                bytes_freed: 0,
+            });
+        }
+
+        let _timeout_guard = if non_blocking {
+            Some(BusyTimeoutGuard::enter(
+                &db,
+                self.inner.config.busy_timeout_ms,
+            )?)
+        } else {
+            None
+        };
+
+        let pragma_sql = if requested_pages == 0 {
+            "PRAGMA incremental_vacuum;".to_string()
+        } else {
+            format!("PRAGMA incremental_vacuum({requested_pages});")
+        };
+
+        // SQLite yields one row per page reclaimed by `PRAGMA incremental_vacuum(N)`,
+        // so we must step the prepared query to completion rather than using execute_batch
+        // (which stops after the first step).
+        let run_result: rusqlite::Result<()> = (|| {
+            let mut stmt = db.prepare(&pragma_sql)?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        })();
+        if let Err(err) = run_result {
+            if is_sqlite_busy_error(&err) {
+                self.inner
+                    .metrics
+                    .vacuum_skipped_busy
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(IncrementalVacuumStep {
+                    acquired_writer: true,
+                    skipped_busy: true,
+                    auto_vacuum: before.auto_vacuum,
+                    requested_pages,
+                    freelist_before: before.freelist_count,
+                    freelist_after: before.freelist_count,
+                    pages_freed: 0,
+                    bytes_freed: 0,
+                });
+            }
+            return Err(err).with_context(|| format!("run {pragma_sql}"));
+        }
+
+        let freelist_after: i64 = db
+            .pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .context("query PRAGMA freelist_count after incremental_vacuum")?;
+        let freelist_after = freelist_after.max(0) as u64;
+        let pages_freed = before.freelist_count.saturating_sub(freelist_after);
+        let bytes_freed = pages_freed.saturating_mul(before.page_size);
+
+        self.inner
+            .metrics
+            .vacuum_steps
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .vacuum_pages_freed
+            .fetch_add(pages_freed, Ordering::Relaxed);
+
+        Ok(IncrementalVacuumStep {
+            acquired_writer: true,
+            skipped_busy: false,
+            auto_vacuum: before.auto_vacuum,
+            requested_pages,
+            freelist_before: before.freelist_count,
+            freelist_after,
+            pages_freed,
+            bytes_freed,
+        })
+    }
+
     pub fn pool_stats(&self) -> PoolStats {
         let (read_pool_max, read_pool_created, read_pool_idle, read_pool_in_use) =
             match &self.inner.readers {
@@ -577,13 +802,24 @@ impl SharedConnection {
             read_wait_ms: self.inner.metrics.read_wait_ns.load(Ordering::Relaxed) / 1_000_000,
             write_wait_ms: self.inner.metrics.write_wait_ns.load(Ordering::Relaxed) / 1_000_000,
             checkpoints: self.inner.metrics.checkpoints.load(Ordering::Relaxed),
+            vacuum_steps: self.inner.metrics.vacuum_steps.load(Ordering::Relaxed),
+            vacuum_pages_freed: self
+                .inner
+                .metrics
+                .vacuum_pages_freed
+                .load(Ordering::Relaxed),
+            vacuum_skipped_busy: self
+                .inner
+                .metrics
+                .vacuum_skipped_busy
+                .load(Ordering::Relaxed),
         }
     }
 
     pub fn diagnostics(&self) -> Result<SqliteDiagnostics> {
-        let pragmas = {
+        let (pragmas, pages) = {
             let db = self.write()?;
-            query_live_pragmas(&db)?
+            (query_live_pragmas(&db)?, query_page_stats(&db)?)
         };
         let reader_query_only = if self.inner.readers.is_some() {
             let reader = self.read()?;
@@ -602,9 +838,42 @@ impl SharedConnection {
                 reader_query_only,
                 ..pragmas
             },
+            pages,
             files,
         })
     }
+}
+
+struct BusyTimeoutGuard<'a> {
+    conn: &'a Connection,
+    restore_ms: u64,
+}
+
+impl<'a> BusyTimeoutGuard<'a> {
+    fn enter(conn: &'a Connection, restore_ms: u64) -> Result<Self> {
+        conn.busy_timeout(Duration::ZERO)
+            .context("set non-blocking busy_timeout=0 for incremental vacuum")?;
+        Ok(Self { conn, restore_ms })
+    }
+}
+
+impl Drop for BusyTimeoutGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .conn
+            .busy_timeout(Duration::from_millis(self.restore_ms));
+    }
+}
+
+fn is_sqlite_busy_error(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(ffi_err, _)
+            if matches!(
+                ffi_err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn open_reader_connection(path: &Path, config: &SqlitePoolConfig) -> Result<Connection> {
@@ -637,6 +906,22 @@ fn apply_writer_pragmas(
     file_backed: bool,
 ) -> Result<()> {
     apply_common_pragmas(conn, config)?;
+    let av_code: i64 = conn
+        .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+        .unwrap_or(0);
+    if av_code != 2 {
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
+            .context("enable SQLite PRAGMA auto_vacuum = INCREMENTAL")?;
+        let actual_av: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .unwrap_or(0);
+        if actual_av != 2 && file_backed {
+            // Existing databases created under auto_vacuum=NONE require a one-time
+            // VACUUM to allocate pointer-map pages before incremental_vacuum works.
+            conn.execute_batch("VACUUM;")
+                .context("migrate existing database to PRAGMA auto_vacuum = INCREMENTAL")?;
+        }
+    }
     if file_backed {
         let mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -662,10 +947,48 @@ fn apply_writer_pragmas(
     Ok(())
 }
 
+fn query_page_stats(conn: &Connection) -> Result<DbPageStats> {
+    let av_code: i64 = conn
+        .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+        .context("query PRAGMA auto_vacuum")?;
+    let page_size: i64 = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .context("query PRAGMA page_size")?;
+    let page_count: i64 = conn
+        .pragma_query_value(None, "page_count", |row| row.get(0))
+        .context("query PRAGMA page_count")?;
+    let freelist_count: i64 = conn
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .context("query PRAGMA freelist_count")?;
+    let page_size = page_size.max(0) as u64;
+    let page_count = page_count.max(0) as u64;
+    let freelist_count = freelist_count.max(0) as u64;
+    let total_bytes = page_count.saturating_mul(page_size);
+    let freelist_bytes = freelist_count.saturating_mul(page_size);
+    let freelist_ratio = if page_count > 0 {
+        freelist_count as f64 / page_count as f64
+    } else {
+        0.0
+    };
+    Ok(DbPageStats {
+        auto_vacuum: AutoVacuumMode::from_pragma_code(av_code),
+        page_size,
+        page_count,
+        freelist_count,
+        total_bytes,
+        freelist_bytes,
+        freelist_ratio,
+    })
+}
+
 fn query_live_pragmas(conn: &Connection) -> Result<LivePragmas> {
     let journal_mode: String = conn
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .context("query PRAGMA journal_mode")?;
+    let av_code: i64 = conn
+        .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+        .context("query PRAGMA auto_vacuum")?;
+    let auto_vacuum = AutoVacuumMode::from_pragma_code(av_code).as_str().to_string();
     let sync_code: i64 = conn
         .pragma_query_value(None, "synchronous", |row| row.get(0))
         .context("query PRAGMA synchronous")?;
@@ -699,6 +1022,7 @@ fn query_live_pragmas(conn: &Connection) -> Result<LivePragmas> {
     };
     Ok(LivePragmas {
         journal_mode,
+        auto_vacuum,
         synchronous,
         busy_timeout_ms,
         wal_autocheckpoint,
@@ -942,6 +1266,70 @@ mod tests {
         assert!(bad3.validate().is_err());
         assert!(SqliteSynchronous::parse("bogus").is_err());
         assert!(WalCheckpointMode::parse("bogus").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_auto_vacuum_migrates_legacy_db_and_steps_without_blocking() -> Result<()> {
+        let tmp = TempDb::new("vacuum-migrate");
+        // Create a pre-existing database with auto_vacuum = NONE and persisted data.
+        {
+            let raw = Connection::open(&tmp.path)?;
+            raw.execute_batch(
+                "PRAGMA auto_vacuum = NONE;
+                 CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT NOT NULL);",
+            )?;
+            let payload = "y".repeat(2048);
+            for i in 0..120 {
+                raw.execute("INSERT INTO items (id, body) VALUES (?1, ?2)", rusqlite::params![i, &payload])?;
+            }
+        }
+
+        let pool = SharedConnection::open_pool(&tmp.path, SqlitePoolConfig::default(), |_| Ok(()))?;
+        let diag = pool.diagnostics()?;
+        assert_eq!(diag.pragmas.auto_vacuum, "incremental");
+        assert_eq!(diag.pages.auto_vacuum, AutoVacuumMode::Incremental);
+        let kept: i64 = pool
+            .read()?
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
+        assert_eq!(kept, 120);
+
+        // Fragment the DB by deleting rows.
+        {
+            let writer = pool.write()?;
+            writer.execute("DELETE FROM items WHERE id >= 10", [])?;
+        }
+        let before = pool.page_stats()?;
+        assert!(before.freelist_count > 10);
+
+        // Non-blocking step yields immediately when an internal writer holds the lock.
+        {
+            let _writer = pool.write()?;
+            let busy_step = pool.incremental_vacuum_step(16, true)?;
+            assert!(!busy_step.acquired_writer);
+            assert!(busy_step.skipped_busy);
+            assert_eq!(busy_step.pages_freed, 0);
+        }
+
+        // Non-blocking step yields immediately if an external connection holds a write lock.
+        {
+            let external = Connection::open(&tmp.path)?;
+            external.execute_batch("BEGIN IMMEDIATE; INSERT INTO items (id, body) VALUES (9999, 'ext');")?;
+            let ext_busy = pool.incremental_vacuum_step(16, true)?;
+            assert!(ext_busy.skipped_busy);
+            assert_eq!(ext_busy.pages_freed, 0);
+            external.execute_batch("ROLLBACK;")?;
+        }
+
+        // Once uncontended, bounded incremental vacuum frees pages while readers stay active.
+        let reader = pool.read()?;
+        let step = pool.incremental_vacuum_step(8, true)?;
+        assert!(step.acquired_writer);
+        assert!(!step.skipped_busy);
+        assert_eq!(step.pages_freed, 8);
+        assert_eq!(step.freelist_after, step.freelist_before - 8);
+        let cnt: i64 = reader.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
+        assert_eq!(cnt, 10);
         Ok(())
     }
 }

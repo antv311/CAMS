@@ -23,6 +23,7 @@ use crate::reports::{NewReport, Report, ReportStore};
 use crate::rooms::{Room, RoomStore};
 use crate::store::{ClientTemplate, ClientTemplateStore, GroupStore, SharedConnection};
 use crate::tasks::{NewTask, ReviewRound, Task, TaskStore, TERMINAL_STATUSES};
+use crate::vacuum::{VacuumConfig, VacuumManager};
 use crate::wake::{WakeConfig, WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
 
@@ -76,6 +77,7 @@ pub struct Server {
     templates: ClientTemplateStore,
     groups: GroupStore,
     backups: BackupManager,
+    vacuum: VacuumManager,
     logger: EventForwarder,
     metrics: Arc<MetricsRegistry>,
     // Lock before db/inner: registration, command effects, reissue and cleanup
@@ -200,6 +202,7 @@ impl Server {
             templates: ClientTemplateStore::new(db.clone()),
             groups: GroupStore::new(db.clone()),
             backups: BackupManager::new(db.clone(), backup_config, logger.clone()),
+            vacuum: VacuumManager::new(db.clone(), VacuumConfig::default(), logger.clone()),
             logger: logger.clone(),
             metrics,
             db,
@@ -283,6 +286,10 @@ impl Server {
 
     pub fn backups(&self) -> &BackupManager {
         &self.backups
+    }
+
+    pub fn vacuum(&self) -> &VacuumManager {
+        &self.vacuum
     }
 
     pub fn db(&self) -> &SharedConnection {
@@ -435,6 +442,7 @@ impl Server {
             }
         }
         drop(db);
+        let db_pages = self.db.try_page_stats().ok().flatten();
 
         Ok(MetricsSnapshot {
             irc_sessions,
@@ -448,6 +456,7 @@ impl Server {
             task_events_by_action,
             webhook_deliveries_by_status,
             db_pool: Some(self.db.pool_stats()),
+            db_pages,
         })
     }
 

@@ -57,3 +57,12 @@ open_registration = false
 # db_wal_autocheckpoint = 1000            # WAL pages before auto-checkpoint (0 disables)
 # db_cache_size_kib = 16384               # per-connection page cache in KiB
 # db_journal_size_limit_bytes = 67108864  # WAL file size limit after checkpoint (-1 unlimited)
+
+# Automated online SQLite defragmentation & non-blocking incremental vacuum.
+# db_vacuum_enabled = true                # enable periodic freelist check & incremental vacuum
+# db_vacuum_interval_secs = 300           # seconds between freelist checks (0 disables timer)
+# db_vacuum_min_freelist_pages = 64       # minimum freelist pages to trigger scheduled vacuum
+# db_vacuum_min_freelist_ratio = 0.0      # optional freelist fraction 0.0..=1.0 (0 disables ratio gate)
+# db_vacuum_batch_pages = 64              # max pages reclaimed per non-blocking vacuum step
+# db_vacuum_step_delay_ms = 25            # pause between batches so active writers never starve
+# db_vacuum_max_batches_per_run = 32      # max batches per scheduled pass (0 unlimited)
