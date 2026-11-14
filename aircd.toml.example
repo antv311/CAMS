@@ -15,6 +15,10 @@ db = "aircd.sqlite3"
 # register_key = "replace-with-your-private-invite-key"
 open_registration = false
 
+# Bearer token lifetime (default: unset = non-expiring).
+# [auth]
+# token_ttl_seconds = 86400
+
 # Forward server errors and security audit logs to Windows Application Event Log
 # (Windows only) and/or a syslog daemon.
 # windows_event_log = false

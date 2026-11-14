@@ -42,6 +42,12 @@ fn resolve_config_dir(windows: bool, env: impl Fn(&str) -> Option<String>) -> Pa
     .join("aircd")
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    pub token_ttl_seconds: Option<u64>,
+}
+
 // Deliberately no Debug: this contains the optional owner invite credential.
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -54,6 +60,7 @@ pub struct ServerConfig {
     pub tls_bind: String,
     pub register_key: Option<String>,
     pub open_registration: bool,
+    pub auth: AuthConfig,
     pub windows_event_log: bool,
     pub windows_event_log_source: String,
     pub syslog_target: Option<String>,
@@ -84,6 +91,7 @@ impl Default for ServerConfig {
             tls_bind: "127.0.0.1:6697".into(),
             register_key: None,
             open_registration: false,
+            auth: AuthConfig::default(),
             windows_event_log: false,
             windows_event_log_source: "aircd".into(),
             syslog_target: None,
@@ -189,6 +197,7 @@ impl ServerConfig {
                 | "--tls-key"
                 | "--tls-bind"
                 | "--register-key"
+                | "--token-ttl-seconds"
                 | "--windows-event-log-source"
                 | "--syslog-target"
                 | "--syslog-format"
@@ -264,6 +273,7 @@ impl ServerConfig {
             ("AIRCD_TLS_BIND", "--tls-bind"),
             ("AIRCD_REGISTER_KEY", "--register-key"),
             ("AIRCD_OPEN_REGISTRATION", "--open-registration"),
+            ("AIRCD_TOKEN_TTL_SECONDS", "--token-ttl-seconds"),
             ("AIRCD_WINDOWS_EVENT_LOG", "--windows-event-log"),
             ("AIRCD_WINDOWS_EVENT_LOG_SOURCE", "--windows-event-log-source"),
             ("AIRCD_SYSLOG_TARGET", "--syslog-target"),
@@ -321,6 +331,9 @@ impl ServerConfig {
                 bail!("server setting {name} must not be empty");
             }
         }
+        if config.auth.token_ttl_seconds == Some(0) {
+            bail!("server setting auth.token_ttl_seconds must be at least 1");
+        }
         let _ = config.to_log_config()?;
         let _ = config.to_backup_config()?;
         let _ = config.to_sqlite_config()?;
@@ -339,6 +352,16 @@ impl ServerConfig {
             "--register-key" => self.register_key = Some(value.into()),
             "--open-registration" => {
                 self.open_registration = parse_bool_setting("open_registration", value)?;
+            }
+            "--token-ttl-seconds" => {
+                let ttl = value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("token_ttl_seconds must be a positive integer, got '{value}'"))?;
+                if ttl == 0 {
+                    bail!("server setting auth.token_ttl_seconds must be at least 1");
+                }
+                self.auth.token_ttl_seconds = Some(ttl);
             }
             "--windows-event-log" => {
                 self.windows_event_log = parse_bool_setting("windows_event_log", value)?;
@@ -780,6 +803,7 @@ mod tests {
             "db_synchronous = 'bogus'",
             "db_cache_size_kib = -1",
             "db_journal_size_limit_bytes = -2",
+            "[auth]\ntoken_ttl_seconds = 0",
         ] {
             let bad_path = fixture.write(bad);
             assert!(
@@ -787,6 +811,26 @@ mod tests {
                 "expected invalid config for {bad}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn auth_token_ttl_settings_respect_precedence() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write("[auth]\ntoken_ttl_seconds = 3600\n");
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        assert_eq!(cfg.auth.token_ttl_seconds, Some(3600));
+
+        let env = environment(&[("AIRCD_TOKEN_TTL_SECONDS", "7200")]);
+        let cfg = ServerConfig::load_with(&[], &env, &path)?;
+        assert_eq!(cfg.auth.token_ttl_seconds, Some(7200));
+
+        let cfg = ServerConfig::load_with(
+            &["--token-ttl-seconds".into(), "900".into()],
+            &env,
+            &path,
+        )?;
+        assert_eq!(cfg.auth.token_ttl_seconds, Some(900));
         Ok(())
     }
 }

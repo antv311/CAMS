@@ -9,11 +9,11 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_rustls::TlsAcceptor;
 
 use crate::attachments::{AttachmentStore, NewAttachment, TaskAttachment};
-use crate::auth::{AuthStore, Principal};
+use crate::auth::{AuthStore, AuthTokenInfo, IssuedToken, Principal, Scope};
 use crate::backup::{BackupConfig, BackupManager};
 use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
-use crate::locks::{LockStore, ResourceLock};
+use crate::locks::{LockConflictError, LockStore, ResourceLock};
 use crate::logging::{EventForwarder, LogEvent, Severity};
 use crate::notes::NoteStore;
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
@@ -130,12 +130,21 @@ struct Membership {
 struct Session {
     session_id: String,
     principal: Option<Principal>,
+    token_info: Option<AuthTokenInfo>,
     nick: Option<String>,
     pass_token: Option<String>,
     registered: bool,
     capabilities: HashSet<String>,
     tx: UnboundedSender<String>,
     shutdown_tx: UnboundedSender<String>,
+}
+
+impl Session {
+    fn has_scope(&self, required: Scope) -> bool {
+        self.token_info
+            .as_ref()
+            .is_some_and(|info| info.has_scope(required))
+    }
 }
 
 impl Server {
@@ -153,6 +162,15 @@ impl Server {
         logger: EventForwarder,
         backup_config: BackupConfig,
     ) -> Self {
+        Self::with_logger_backup_and_ttl(db, logger, backup_config, None)
+    }
+
+    pub fn with_logger_backup_and_ttl(
+        db: SharedConnection,
+        logger: EventForwarder,
+        backup_config: BackupConfig,
+        token_ttl_seconds: Option<u64>,
+    ) -> Self {
         let lease_seconds = std::env::var("AIRCD_TASK_LEASE_SECONDS")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -160,7 +178,7 @@ impl Server {
             .unwrap_or(300);
 
         let server = Self {
-            auth: AuthStore::with_logger(db.clone(), logger.clone()),
+            auth: AuthStore::with_config(db.clone(), logger.clone(), token_ttl_seconds),
             history: HistoryStore::new(db.clone()),
             tasks: TaskStore::new(db.clone(), lease_seconds),
             webhooks: WebhookStore::with_logger(db.clone(), logger.clone()),
@@ -265,9 +283,21 @@ impl Server {
 
     /// Commit the credential reset before invalidating the active IRC session.
     /// Registration and IRC command effects cannot straddle this operation.
+    #[cfg(test)]
     pub fn reissue_token(&self, principal_id: &str) -> Result<String> {
+        Ok(self.reissue_token_with_options(principal_id, None, None)?.token)
+    }
+
+    pub fn reissue_token_with_options(
+        &self,
+        principal_id: &str,
+        scopes: Option<&[String]>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<IssuedToken> {
         let _guard = self.session_gate.lock().expect("session mutex poisoned");
-        let token = self.auth.reissue_all(principal_id)?;
+        let issued = self
+            .auth
+            .reissue_all_with_options(principal_id, scopes, ttl_seconds)?;
         let client = self
             .inner
             .lock()
@@ -288,7 +318,7 @@ impl Server {
             None,
             format!("Owner reissued token and revoked prior credentials for @{principal_id}"),
         );
-        Ok(token)
+        Ok(issued)
     }
 
     pub fn history(&self) -> &HistoryStore {
@@ -464,6 +494,7 @@ impl Server {
         let mut session = Session {
             session_id: format!("sess_{}", uuid::Uuid::new_v4().simple()),
             principal: None,
+            token_info: None,
             nick: None,
             pass_token: None,
             registered: false,
@@ -539,7 +570,7 @@ impl Server {
                 self.cap(session, subcommand, capabilities)?;
             }
             Command::Join(channels) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "JOIN")? {
                     return Ok(false);
                 }
                 for ch in channels.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -547,7 +578,7 @@ impl Server {
                 }
             }
             Command::Part(channels) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "PART")? {
                     return Ok(false);
                 }
                 for ch in channels.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -555,7 +586,7 @@ impl Server {
                 }
             }
             Command::Privmsg { target, body } => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "PRIVMSG")? {
                     return Ok(false);
                 }
                 self.privmsg(session, target, body)?;
@@ -565,7 +596,7 @@ impl Server {
                 after_seq,
                 limit,
             } => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "HISTORY")? {
                     return Ok(false);
                 }
                 let channels = match channel {
@@ -579,55 +610,55 @@ impl Server {
                 self.replay_history(session, &channels, after_seq, limit)?;
             }
             Command::TaskCreate { channel, title } => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Pm, "TASK CREATE")? {
                     return Ok(false);
                 }
                 self.task_create(session, normalize_channel(&channel), title)?;
             }
             Command::TaskClaim(task_id) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "TASK CLAIM")? {
                     return Ok(false);
                 }
                 self.task_claim(session, task_id)?;
             }
             Command::TaskDone(task_id) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "TASK DONE")? {
                     return Ok(false);
                 }
                 self.task_done(session, task_id)?;
             }
             Command::TaskRelease(task_id) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "TASK RELEASE")? {
                     return Ok(false);
                 }
                 self.task_release(session, task_id)?;
             }
             Command::TaskList(channel) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "TASK LIST")? {
                     return Ok(false);
                 }
                 self.task_list(session, normalize_channel(&channel))?;
             }
             Command::Names(channel) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "NAMES")? {
                     return Ok(false);
                 }
                 self.names(session, channel)?;
             }
             Command::Who(target) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "WHO")? {
                     return Ok(false);
                 }
                 self.who(session, target)?;
             }
             Command::RoleList => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "ROLES")? {
                     return Ok(false);
                 }
                 self.role_list(session)?;
             }
             Command::RoleSet { nick, role } => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Admin, "ROLE")? {
                     return Ok(false);
                 }
                 self.role_set(session, nick, role)?;
@@ -638,67 +669,76 @@ impl Server {
                 ttl_seconds,
                 note,
             } => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "LOCK")? {
                     return Ok(false);
                 }
                 self.lock_acquire(session, resource, channel, ttl_seconds, note)?;
             }
             Command::LockRelease(resource) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "UNLOCK")? {
                     return Ok(false);
                 }
                 self.lock_release(session, resource)?;
             }
             Command::LockList(channel) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "LOCKS")? {
                     return Ok(false);
                 }
                 self.lock_list(session, channel)?;
             }
             Command::Notice { target, body } => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "NOTICE")? {
                     return Ok(false);
                 }
                 self.privmsg(session, target, body)?;
             }
             Command::Mode { target, flags, arg } => {
-                if !self.ensure_registered(session)? {
+                let is_role_mutation = flags
+                    .as_deref()
+                    .is_some_and(|f| matches!(f, "+o" | "-o" | "+v" | "-v"))
+                    && arg.is_some();
+                let required = if is_role_mutation {
+                    Scope::Admin
+                } else {
+                    Scope::Read
+                };
+                if !self.require_irc_scope(session, required, "MODE")? {
                     return Ok(false);
                 }
                 self.mode(session, target, flags, arg)?;
             }
             Command::Topic { channel, topic: _ } => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "TOPIC")? {
                     return Ok(false);
                 }
                 self.send_topic(session, &normalize_channel(&channel))?;
             }
-            Command::List(channel) => {
-                if !self.ensure_registered(session)? {
+            Command::List(channel) | Command::Channels(channel) => {
+                if !self.require_irc_scope(session, Scope::Read, "LIST")? {
                     return Ok(false);
                 }
                 self.list_channels(session, channel)?;
             }
             Command::Whois(nick) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "WHOIS")? {
                     return Ok(false);
                 }
                 self.whois(session, nick)?;
             }
             Command::Ison(nicks) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "ISON")? {
                     return Ok(false);
                 }
                 self.ison(session, nicks)?;
             }
             Command::Userhost(nicks) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Read, "USERHOST")? {
                     return Ok(false);
                 }
                 self.userhost(session, nicks)?;
             }
             Command::Away(reason) => {
-                if !self.ensure_registered(session)? {
+                if !self.require_irc_scope(session, Scope::Write, "AWAY")? {
                     return Ok(false);
                 }
                 let nick = session.principal()?.nick.clone();
@@ -782,8 +822,8 @@ impl Server {
             return Ok(());
         }
 
-        let principal = match self.auth.authenticate(token) {
-            Ok(principal) => principal,
+        let ctx = match self.auth.authenticate_context(token) {
+            Ok(ctx) => ctx,
             Err(_) => {
                 self.logger.log_security(
                     Severity::Warning,
@@ -792,15 +832,17 @@ impl Server {
                     session.nick.as_deref(),
                     None,
                     Some("irc"),
-                    "IRC authentication failed: invalid token",
+                    "IRC authentication failed: invalid or expired token",
                 );
                 session.send(format!(":{SERVER_NAME} 464 * :Password incorrect"));
                 return Ok(());
             }
         };
+        let principal = ctx.principal;
 
         session.nick = Some(principal.nick.clone());
         session.principal = Some(principal.clone());
+        session.token_info = Some(ctx.token);
         session.registered = true;
 
         let memberships = self.mark_connected_and_memberships(&principal.id)?;
@@ -1672,11 +1714,34 @@ impl Server {
 
     fn lock_release(&self, session: &Session, resource: String) -> Result<()> {
         let principal = session.principal()?.clone();
-        let can_force = matches!(
+        let is_privileged_role = matches!(
             principal.role.as_str(),
             "leader" | "coordinator" | "op" | "admin"
         );
+        let can_force = is_privileged_role && session.has_scope(Scope::Admin);
         if let Err(err) = self.release_lock_api(&principal, &resource, can_force) {
+            if err.downcast_ref::<LockConflictError>().is_some()
+                && is_privileged_role
+                && !session.has_scope(Scope::Admin)
+            {
+                self.logger.log_security(
+                    Severity::Warning,
+                    "auth.scope_denied",
+                    "failure",
+                    Some(&principal.id),
+                    None,
+                    Some("irc"),
+                    format!(
+                        "IRC UNLOCK force-unlock denied for @{}: token lacks required scope 'admin'",
+                        principal.nick
+                    ),
+                );
+                session.send(format!(
+                    ":{SERVER_NAME} 481 {} :Permission denied - UNLOCK (force) requires token scope 'admin'",
+                    principal.nick
+                ));
+                return Ok(());
+            }
             session.send(format!(
                 ":{SERVER_NAME} NOTICE {} :UNLOCK {} failed: {}",
                 principal.nick, resource, err
@@ -2352,7 +2417,15 @@ impl Server {
         // only token was never returned to the caller. Nothing launches here.
         let mut db = self.db.write()?;
         let tx = db.transaction().context("start worker provisioning")?;
-        let (principal, token) = AuthStore::register_principal_on(&tx, nick, None, None)?;
+        let (principal, issued) = AuthStore::register_principal_on_with_options(
+            &tx,
+            nick,
+            None,
+            None,
+            None,
+            self.auth.default_ttl_seconds(),
+        )?;
+        let token = issued.token;
         let wake = WakeManager::upsert_on(&tx, &principal.id, template.launcher_for(model))?;
         for project in projects {
             tx.execute(
@@ -3843,7 +3916,61 @@ impl Server {
             return Err(anyhow!("session replaced"));
         }
 
+        if let Some(info) = session.token_info.as_ref() {
+            let expired_or_revoked = match info.token_id.as_deref() {
+                Some(token_id) => self.auth.is_token_active(token_id)?.is_none(),
+                None => info.is_expired_at(unix_timestamp()),
+            };
+            if expired_or_revoked {
+                self.logger.log_security(
+                    Severity::Warning,
+                    "auth.irc_expired",
+                    "failure",
+                    Some(&principal.id),
+                    None,
+                    Some("irc"),
+                    format!("Active IRC session token expired for @{}", principal.nick),
+                );
+                session.send(format!(":{SERVER_NAME} ERROR :Bearer token has expired"));
+                return Err(anyhow!("token expired"));
+            }
+        }
+
         Ok(true)
+    }
+
+    fn require_irc_scope(
+        &self,
+        session: &Session,
+        required: Scope,
+        command_name: &str,
+    ) -> Result<bool> {
+        if !self.ensure_registered(session)? {
+            return Ok(false);
+        }
+        if session.has_scope(required) {
+            return Ok(true);
+        }
+        let principal = session.principal()?;
+        self.logger.log_security(
+            Severity::Warning,
+            "auth.scope_denied",
+            "failure",
+            Some(&principal.id),
+            None,
+            Some("irc"),
+            format!(
+                "IRC {command_name} denied for @{}: token lacks required scope '{}'",
+                principal.nick,
+                required.as_str()
+            ),
+        );
+        session.send(format!(
+            ":{SERVER_NAME} 481 {} :Permission denied - {command_name} requires token scope '{}'",
+            principal.nick,
+            required.as_str()
+        ));
+        Ok(false)
     }
 
     fn mark_connected_and_memberships(&self, principal_id: &str) -> Result<Vec<Membership>> {
@@ -4034,6 +4161,7 @@ mod tests {
         Session {
             session_id: format!("sess_{}", uuid::Uuid::new_v4().simple()),
             principal: None,
+            token_info: None,
             nick: Some(nick.to_string()),
             pass_token: Some(token.to_string()),
             registered: false,
@@ -4053,6 +4181,7 @@ mod tests {
             Session {
                 session_id: format!("sess_{}", uuid::Uuid::new_v4().simple()),
                 principal: None,
+                token_info: None,
                 nick: nick.map(str::to_string),
                 pass_token: token.map(str::to_string),
                 registered: false,
@@ -4882,6 +5011,207 @@ mod tests {
             Some("/repos/one"),
             "repo_path_for should not resolve a repo attached to another project"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn irc_commands_enforce_token_scopes_and_expiry() -> Result<()> {
+        let server = test_server()?;
+        let (leader, _) = server
+            .auth()
+            .register_principal("irc-leader", Some("leader"), None)?;
+        let (peer, _) = server
+            .auth()
+            .register_principal("irc-peer", Some("builder"), None)?;
+        server.create_project_api(&leader, "#ircops", "IRC Ops", None)?;
+
+        let read_tok = server.auth().issue_token_with_options(
+            &leader.id,
+            Some("ro"),
+            false,
+            Some(&["read-only".to_string()]),
+            Some(3600),
+        )?;
+        let write_tok = server.auth().issue_token_with_options(
+            &leader.id,
+            Some("rw"),
+            false,
+            Some(&["builder".to_string()]),
+            Some(3600),
+        )?;
+        let pm_tok = server.auth().issue_token_with_options(
+            &leader.id,
+            Some("pm"),
+            false,
+            Some(&["pm".to_string()]),
+            Some(3600),
+        )?;
+        let admin_tok = server.auth().issue_token_with_options(
+            &leader.id,
+            Some("adm"),
+            false,
+            Some(&["admin".to_string()]),
+            Some(3600),
+        )?;
+
+        let drain = |rx: &mut mpsc::UnboundedReceiver<String>| -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(line) = rx.try_recv() {
+                out.push(line);
+            }
+            out
+        };
+
+        // 1. read-only token: allows LIST, WHO, CHANNELS; denies JOIN, PRIVMSG, TASK CREATE, ROLE.
+        let (mut ro_session, mut ro_rx) =
+            test_session_with_rx(Some(&read_tok.token), Some("irc-leader"));
+        server.try_register(&mut ro_session)?;
+        assert!(ro_session.registered);
+        let _ = drain(&mut ro_rx);
+
+        server.handle_command(&mut ro_session, Command::List(None)).await?;
+        assert!(drain(&mut ro_rx).iter().any(|l| l.contains(" 323 ")));
+        server.handle_command(&mut ro_session, Command::Who(None)).await?;
+        assert!(drain(&mut ro_rx).iter().any(|l| l.contains(" 315 ")));
+        server.handle_command(&mut ro_session, Command::Channels(None)).await?;
+        assert!(drain(&mut ro_rx).iter().any(|l| l.contains(" 323 ")));
+
+        server
+            .handle_command(&mut ro_session, Command::Join("#ircops".into()))
+            .await?;
+        assert!(drain(&mut ro_rx).iter().any(|l| l.contains(" 481 ") && l.contains("write")));
+        server
+            .handle_command(
+                &mut ro_session,
+                Command::Privmsg {
+                    target: "#ircops".into(),
+                    body: "denied".into(),
+                },
+            )
+            .await?;
+        assert!(drain(&mut ro_rx).iter().any(|l| l.contains(" 481 ")));
+        server
+            .handle_command(
+                &mut ro_session,
+                Command::TaskCreate {
+                    channel: "#ircops".into(),
+                    title: "Denied".into(),
+                },
+            )
+            .await?;
+        assert!(drain(&mut ro_rx).iter().any(|l| l.contains(" 481 ") && l.contains("pm")));
+        server.disconnect(&ro_session)?;
+
+        // 2. builder (write) token: allows JOIN, PRIVMSG, TASK CLAIM; denies TASK CREATE, ROLE, force-UNLOCK.
+        let pm_task = server.create_task_full_api(
+            &leader,
+            crate::tasks::NewTask {
+                channel: "#ircops".to_string(),
+                title: "Claimable".to_string(),
+                ..Default::default()
+            },
+        )?;
+        server
+            .locks()
+            .acquire("db-migration", &peer.id, "#ircops", None, Some(300))?;
+
+        let (mut rw_session, mut rw_rx) =
+            test_session_with_rx(Some(&write_tok.token), Some("irc-leader"));
+        server.try_register(&mut rw_session)?;
+        let _ = drain(&mut rw_rx);
+        server
+            .handle_command(&mut rw_session, Command::Join("#ircops-rw".into()))
+            .await?;
+        assert!(drain(&mut rw_rx).iter().any(|l| l.contains(" JOIN #ircops-rw")));
+        server
+            .handle_command(&mut rw_session, Command::TaskClaim(pm_task.id.clone()))
+            .await?;
+        assert!(drain(&mut rw_rx).iter().all(|l| !l.contains(" 481 ")));
+        assert_eq!(
+            server.tasks().get(&pm_task.id)?.unwrap().claimed_by.as_deref(),
+            Some("irc-leader")
+        );
+        server
+            .handle_command(
+                &mut rw_session,
+                Command::TaskCreate {
+                    channel: "#ircops".into(),
+                    title: "Need PM".into(),
+                },
+            )
+            .await?;
+        assert!(drain(&mut rw_rx).iter().any(|l| l.contains(" 481 ") && l.contains("pm")));
+        server
+            .handle_command(
+                &mut rw_session,
+                Command::LockRelease("db-migration".into()),
+            )
+            .await?;
+        assert!(drain(&mut rw_rx).iter().any(|l| l.contains(" 481 ") && l.contains("admin")));
+        server.disconnect(&rw_session)?;
+
+        // 3. pm token: allows TASK CREATE; denies ROLE and force-UNLOCK.
+        let (mut pm_session, mut pm_rx) =
+            test_session_with_rx(Some(&pm_tok.token), Some("irc-leader"));
+        server.try_register(&mut pm_session)?;
+        let _ = drain(&mut pm_rx);
+        server
+            .handle_command(
+                &mut pm_session,
+                Command::TaskCreate {
+                    channel: "#ircops".into(),
+                    title: "Created by PM".into(),
+                },
+            )
+            .await?;
+        assert!(drain(&mut pm_rx).iter().all(|l| !l.contains(" 481 ")));
+        server
+            .handle_command(
+                &mut pm_session,
+                Command::RoleSet {
+                    nick: "irc-peer".into(),
+                    role: "reviewer".into(),
+                },
+            )
+            .await?;
+        assert!(drain(&mut pm_rx).iter().any(|l| l.contains(" 481 ") && l.contains("admin")));
+        server.disconnect(&pm_session)?;
+
+        // 4. admin token: allows ROLE and force-UNLOCK.
+        let (mut adm_session, mut adm_rx) =
+            test_session_with_rx(Some(&admin_tok.token), Some("irc-leader"));
+        server.try_register(&mut adm_session)?;
+        let _ = drain(&mut adm_rx);
+        server
+            .handle_command(
+                &mut adm_session,
+                Command::RoleSet {
+                    nick: "irc-peer".into(),
+                    role: "reviewer".into(),
+                },
+            )
+            .await?;
+        assert!(drain(&mut adm_rx).iter().all(|l| !l.contains(" 481 ")));
+        server
+            .handle_command(
+                &mut adm_session,
+                Command::LockRelease("db-migration".into()),
+            )
+            .await?;
+        assert!(drain(&mut adm_rx).iter().all(|l| !l.contains(" 481 ")));
+        assert!(server.locks().list(Some("#ircops"))?.is_empty());
+
+        // 5. Expired token fails mid-session and on fresh registration.
+        server.db.lock().expect("sqlite mutex poisoned").execute(
+            "UPDATE principal_tokens SET expires_at = 1 WHERE token_id = ?1",
+            rusqlite::params![admin_tok.token_id],
+        )?;
+        assert!(server.ensure_registered(&adm_session).is_err());
+
+        let (mut exp_session, _exp_rx) =
+            test_session_with_rx(Some(&admin_tok.token), Some("irc-leader"));
+        server.try_register(&mut exp_session)?;
+        assert!(!exp_session.registered);
         Ok(())
     }
 }
