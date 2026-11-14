@@ -102,19 +102,16 @@ class LiveShellTest(unittest.TestCase):
         bash = _bash()
         if not bash:
             self.skipTest("bash not available")
-        script = self.dir / "airc.bash"
-        script.write_bytes(render("bash", cli.build_parser()).encode())
-        lines = [f"source '{script.as_posix()}'"]
+        lines = [render("bash", cli.build_parser())]
         for words, _ in self.CASES:
             quoted = " ".join(f"'{w}'" for w in words)
             lines.append(
                 f"COMP_WORDS=({quoted}); COMP_CWORD={len(words) - 1}; _airc; echo \"${{COMPREPLY[*]}}\""
             )
-        runner = self.dir / "run.sh"
-        runner.write_bytes(("\n".join(lines) + "\n").encode())
-        out = subprocess.run([bash, runner.as_posix()], capture_output=True, text=True, timeout=60)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout.splitlines(), [want for _, want in self.CASES])
+        script = ("\n".join(lines) + "\n").replace("\r\n", "\n").replace("\r", "")
+        out = subprocess.run([bash], input=script.encode("utf-8"), capture_output=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr.decode("utf-8", "replace"))
+        self.assertEqual(out.stdout.decode("utf-8", "replace").splitlines(), [want for _, want in self.CASES])
 
     def test_powershell(self) -> None:
         ps = shutil.which("pwsh") or (shutil.which("powershell") if os.name == "nt" else None)
