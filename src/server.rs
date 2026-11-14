@@ -26,7 +26,7 @@ use crate::store::{ClientTemplate, ClientTemplateStore, GroupStore, SharedConnec
 use crate::tasks::{
     NewTask, PreparedTaskStatus, ReviewRound, Task, TaskStore, TaskUpdate, TERMINAL_STATUSES,
 };
-
+use crate::token_usage::{NewUsage, TokenCounts, TokenReport, TokenUsageStore};
 use crate::vacuum::{VacuumConfig, VacuumManager};
 use crate::wake::{WakeConfig, WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
@@ -81,6 +81,7 @@ pub struct Server {
     wakes: WakeManager,
     notes: NoteStore,
     attachments: AttachmentStore,
+    token_usage: TokenUsageStore,
     rooms: RoomStore,
     templates: ClientTemplateStore,
     groups: GroupStore,
@@ -215,6 +216,7 @@ impl Server {
             ),
             notes: NoteStore::new(db.clone()),
             attachments: AttachmentStore::new(db.clone()),
+            token_usage: TokenUsageStore::new(db.clone()),
             rooms: RoomStore::new(db.clone()),
             templates: ClientTemplateStore::new(db.clone()),
             groups: GroupStore::new(db.clone()),
@@ -466,6 +468,10 @@ impl Server {
 
     pub fn attachments(&self) -> &AttachmentStore {
         &self.attachments
+    }
+
+    pub fn token_usage(&self) -> &TokenUsageStore {
+        &self.token_usage
     }
 
     pub fn metrics(&self) -> &Arc<MetricsRegistry> {
@@ -3099,6 +3105,62 @@ impl Server {
             uploaded_by: &actor.id,
             data,
         })
+    }
+
+    /// Record model tokens a worker spent on a task. The assignee, the
+    /// reviewer, any member of the task's project and the owner may report.
+    pub fn record_task_usage_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        session_id: Option<&str>,
+        model: Option<&str>,
+        tokens: TokenCounts,
+    ) -> Result<TokenReport> {
+        let task = self.get_task_api(task_id)?;
+        let project = self.project_of(&task.channel);
+        let allowed = Self::is_owner(actor)
+            || task.assignee.as_deref() == Some(actor.id.as_str())
+            || task.claimed_by.as_deref() == Some(actor.id.as_str())
+            || task.reviewer.as_deref() == Some(actor.id.as_str())
+            || self.projects.role_of(&project, &actor.id)?.is_some();
+        if !allowed {
+            return Err(anyhow!(
+                "only members of {project}, the task's assignee or reviewer, or the owner can report token usage on {}",
+                task.id
+            ));
+        }
+        self.token_usage.record(NewUsage {
+            task_id: &task.id,
+            recorded_by: &actor.id,
+            session_id,
+            model,
+            tokens,
+        })
+    }
+
+    /// Set or clear a task's token budget. Like dependencies, this is for a
+    /// project manager or the lead who owns the parent task.
+    pub fn set_task_token_budget_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        budget: Option<i64>,
+    ) -> Result<TokenReport> {
+        let task = self.get_task_api(task_id)?;
+        let is_lead = task
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?
+            .is_some_and(|parent| parent.assignee.as_deref() == Some(actor.id.as_str()));
+        if !is_lead && !self.is_project_manager(actor, &task.channel)? {
+            return Err(anyhow!(
+                "only the parent task's assignee or a project manager can set a token budget"
+            ));
+        }
+        self.token_usage.set_budget(&task.id, budget, &actor.id)?;
+        self.token_usage.report(&task.id)
     }
 
     /// Assign, reassign or (with `None`) return a task to the pool.

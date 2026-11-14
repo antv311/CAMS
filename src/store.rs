@@ -1104,6 +1104,7 @@ fn init_with(connection: &Connection, seed_demo: bool) -> Result<()> {
     migrate_client_templates(connection)?;
     migrate_groups(connection)?;
     crate::attachments::migrate(connection)?;
+    crate::token_usage::migrate(connection)?;
 
     if seed_demo {
         for (id, token, team) in DEMO_PRINCIPALS {

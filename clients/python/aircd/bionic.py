@@ -197,6 +197,18 @@ class MaxTurnsError(BionicError):
         self.turn_usage = list(turn_usage or [])
 
 
+class TokenBudgetError(MaxTurnsError):
+    """A token budget (``--token-budget`` or the hub task's) ran out before a final answer.
+
+    Subclasses :class:`MaxTurnsError` so callers that already handle "stopped
+    without an answer" keep working; ``budget`` holds the ledger snapshot.
+    """
+
+    def __init__(self, message: str, *, budget: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
+        super().__init__(message, **kwargs)
+        self.budget = dict(budget or {})
+
+
 @dataclass
 class BionicConfig:
     """Runtime settings for the Bionic agent runner."""
@@ -228,6 +240,15 @@ class BionicConfig:
     tools_dirs: list[str] = field(default_factory=list)
     #: Load user-defined plugin tools at all (``--no-plugins`` turns this off).
     plugins: bool = True
+    #: Most total tokens (prompt + completion, summed over turns) this run may
+    #: spend before it stops with :class:`TokenBudgetError`.
+    token_budget: Optional[int] = None
+    #: Hub task to bill each turn's tokens to (``--task``; defaults to the
+    #: ``AIRCD_WAKE_TASK`` the hub sets when it wakes a worker for a task). The
+    #: task's own and ancestors' budgets are enforced as well.
+    task_id: Optional[str] = None
+    #: Send per-turn usage to the hub when ``task_id`` is set.
+    report_usage: bool = True
 
 
 @dataclass
@@ -245,6 +266,9 @@ class RunResult:
     usage: dict[str, int] = field(default_factory=dict)
     #: Per-turn ``usage`` objects in turn order (``None`` for a turn without one).
     turn_usage: list[Optional[dict[str, int]]] = field(default_factory=list)
+    #: Budget/accounting snapshot (:meth:`TokenLedger.snapshot`) when a token
+    #: budget or hub task was in play, else ``None``.
+    budget: Optional[dict[str, Any]] = None
 
 
 def _env_first(*names: str) -> str:
@@ -422,6 +446,21 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
     if plugins is None:
         plugins = not (getattr(args, "no_plugins", False) or _parse_bool_env("BIONIC_NO_PLUGINS"))
 
+    token_budget = getattr(args, "token_budget", None)
+    if token_budget is None:
+        env_budget = os.environ.get("BIONIC_TOKEN_BUDGET", "").strip()
+        if env_budget:
+            token_budget = _parse_int(env_budget, "BIONIC_TOKEN_BUDGET", minimum=1)
+    elif int(token_budget) < 1:
+        raise BionicError(f"--token-budget must be >= 1, got {token_budget}")
+    task_id = getattr(args, "task_id", None)
+    if task_id is None:
+        task_id = _env_first("BIONIC_TASK_ID", "AIRCD_WAKE_TASK")
+    task_id = str(task_id).strip() or None
+    report_usage = getattr(args, "report_usage", None)
+    if report_usage is None:
+        report_usage = not (getattr(args, "no_report_usage", False) or _parse_bool_env("BIONIC_NO_USAGE_REPORT"))
+
     return BionicConfig(
         base_url=base_url,
         api_key=api_key,
@@ -447,6 +486,9 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
         pull_timeout=float(pull_timeout),
         tools_dirs=tools_dirs,
         plugins=bool(plugins),
+        token_budget=int(token_budget) if token_budget is not None else None,
+        task_id=task_id,
+        report_usage=bool(report_usage),
     )
 
 
@@ -1976,6 +2018,224 @@ class ToolStep:
 
 ToolHook = Callable[[ToolStep], Optional[str]]
 
+#: Sends one turn's usage to the hub and returns the hub's report
+#: (``GET /v1/tasks/{id}/usage`` shape: ``remaining``, ``limited_by``,
+#: ``exceeded``...). Called with ``None`` once before the first turn to read the
+#: current state without recording anything.
+UsageReporter = Callable[[Optional[dict[str, Any]]], Optional[dict[str, Any]]]
+
+
+def estimate_tokens(value: Any) -> int:
+    """Rough token count (~4 characters per token) for servers that send no ``usage``."""
+    if value is None:
+        return 0
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return (len(text) + 3) // 4
+
+
+def hub_usage_reporter(
+    task_id: str,
+    *,
+    model: str = "",
+    session_id: Optional[str] = None,
+    timeout: float = 10.0,
+) -> UsageReporter:
+    """A :data:`UsageReporter` that bills ``task_id`` on the aircd hub.
+
+    The hub URL and token come from the same places as ``airc``: ``AIRCD_PROFILE``
+    (or the profile named after ``AIRC_NICK``, which the hub sets when it wakes
+    a worker), ``AIRCD_TOKEN`` and ``AIRCD_HTTP_URL`` / ``AIRC_SERVER``.
+    """
+    from aircd import cli as airc_cli
+    from aircd.client import AircdHttpClient
+
+    profiles = airc_cli.load_profiles().get("profiles", {})
+    nick = os.environ.get("AIRC_NICK", "").strip()
+    profile = os.environ.get("AIRCD_PROFILE", "").strip() or (nick if nick in profiles else None)
+    server_env = os.environ.get("AIRC_SERVER", "").strip()
+    args = argparse.Namespace(profile=profile, server=None)
+    if server_env.startswith(("http://", "https://")) and not os.environ.get("AIRCD_HTTP_URL", "").strip():
+        args.server = server_env
+    try:
+        server, token, prof = airc_cli.resolve_connection(args)
+    except Exception as err:  # CliError and TLS problems
+        raise BionicError(f"cannot resolve the aircd hub for task {task_id}: {err}") from None
+    if not token:
+        raise BionicError(
+            f"no aircd token to bill task {task_id}; set AIRCD_PROFILE or AIRCD_TOKEN, or pass --no-report-usage"
+        )
+    tls = prof.get("_tls") or {}
+    client = AircdHttpClient(
+        server,
+        token=token,
+        timeout=timeout,
+        tls_verify=not bool(tls.get("tls_insecure", False)),
+        tls_ca_path=tls.get("tls_ca"),
+        tls_cert_path=tls.get("tls_cert"),
+        tls_key_path=tls.get("tls_key"),
+    )
+
+    def report(usage: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if usage is None:
+            return client.task_usage(task_id)
+        return client.record_task_usage(
+            task_id,
+            prompt_tokens=int(usage.get("prompt_tokens", 0)),
+            completion_tokens=int(usage.get("completion_tokens", 0)),
+            total_tokens=usage.get("total_tokens"),
+            session_id=session_id,
+            model=model or None,
+        )
+
+    return report
+
+
+class TokenLedger:
+    """Counts a run's tokens and enforces the local and hub token budgets.
+
+    ``budget`` is the run's own ceiling. With a ``reporter`` every turn is
+    billed to the hub task, whose reply carries the tightest remaining
+    allowance over the task's and its ancestors' budgets (so sibling
+    subtasks share a parent's budget). A hub that cannot be reached never
+    fails the run; the error is logged and the local budget still applies.
+    """
+
+    def __init__(
+        self,
+        budget: Optional[int] = None,
+        *,
+        reporter: Optional[UsageReporter] = None,
+        task_id: Optional[str] = None,
+        log: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.budget = budget
+        self.reporter = reporter
+        self.task_id = task_id
+        self.log = log
+        self.usage: dict[str, int] = {}
+        self.estimated_turns = 0
+        self.reported_turns = 0
+        self.report_errors: list[str] = []
+        self.hub: Optional[dict[str, Any]] = None
+
+    @property
+    def active(self) -> bool:
+        return self.budget is not None or self.reporter is not None
+
+    @property
+    def spent(self) -> int:
+        return int(self.usage.get("total_tokens", 0))
+
+    def _call_reporter(self, usage: Optional[dict[str, Any]]) -> None:
+        if self.reporter is None:
+            return
+        try:
+            report = self.reporter(usage)
+        except Exception as err:
+            message = str(err)
+            self.report_errors.append(message)
+            if self.log:
+                self.log(f"[budget] could not reach the hub for task {self.task_id}: {message}")
+            return
+        if usage is not None:
+            self.reported_turns += 1
+        if isinstance(report, dict):
+            self.hub = report
+
+    def start(self) -> None:
+        """Read the hub task's budget before the first turn."""
+        self._call_reporter(None)
+
+    def add(self, usage: Optional[dict[str, int]], *, estimated: bool = False) -> None:
+        """Count one turn and bill it to the hub task."""
+        if not usage:
+            return
+        for key, value in usage.items():
+            self.usage[key] = self.usage.get(key, 0) + int(value)
+        if estimated:
+            self.estimated_turns += 1
+        self._call_reporter(usage)
+
+    def _limits(self) -> list[tuple[int, str]]:
+        limits: list[tuple[int, str]] = []
+        if self.budget is not None:
+            limits.append((self.budget - self.spent, "run"))
+        if self.hub is not None and self.hub.get("remaining") is not None:
+            limits.append((int(self.hub["remaining"]), f"task {self.hub.get('limited_by') or self.task_id}"))
+        return limits
+
+    def remaining(self) -> Optional[int]:
+        """Tightest allowance left (may be negative), or ``None`` without any budget."""
+        limits = self._limits()
+        return min(limits)[0] if limits else None
+
+    def limited_by(self) -> Optional[str]:
+        limits = self._limits()
+        return min(limits)[1] if limits else None
+
+    def exhausted(self) -> bool:
+        remaining = self.remaining()
+        return remaining is not None and remaining <= 0
+
+    def cap_max_tokens(self, max_tokens: Optional[int]) -> Optional[int]:
+        """Never ask for more completion tokens than the budget has left."""
+        remaining = self.remaining()
+        if remaining is None or remaining <= 0:
+            return max_tokens
+        return remaining if max_tokens is None else min(max_tokens, remaining)
+
+    def snapshot(self) -> dict[str, Any]:
+        snap: dict[str, Any] = {
+            "token_budget": self.budget,
+            "spent": self.spent,
+            "remaining": self.remaining(),
+            "limited_by": self.limited_by(),
+            "exhausted": self.exhausted(),
+            "estimated_turns": self.estimated_turns,
+        }
+        if self.task_id:
+            snap["task_id"] = self.task_id
+            snap["reported_turns"] = self.reported_turns
+            if self.hub is not None:
+                snap["task_total_tokens"] = (self.hub.get("total") or {}).get("total_tokens")
+                snap["task_token_budget"] = self.hub.get("token_budget")
+            if self.report_errors:
+                snap["report_errors"] = self.report_errors[-3:]
+        return snap
+
+    def exhausted_message(self) -> str:
+        where = self.limited_by() or "run"
+        if where == "run":
+            return f"token budget exhausted: spent {self.spent} of {self.budget} tokens"
+        return (
+            f"token budget exhausted on {where}: {self.remaining()} tokens remaining "
+            f"(this run spent {self.spent})"
+        )
+
+
+def ledger_for(
+    config: BionicConfig,
+    *,
+    model: str = "",
+    session_id: Optional[str] = None,
+    reporter: Optional[UsageReporter] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> TokenLedger:
+    """The ledger ``run_agent`` uses for ``config``; ``reporter`` overrides the hub client."""
+    setup_error = ""
+    if reporter is None and config.task_id and config.report_usage:
+        try:
+            reporter = hub_usage_reporter(config.task_id, model=model, session_id=session_id)
+        except BionicError as err:
+            # A worker woken for a task without hub credentials still runs;
+            # it just cannot bill the task.
+            setup_error = str(err)
+            (log or (lambda msg: print(msg, file=sys.stderr)))(f"[budget] warning: {setup_error}")
+    ledger = TokenLedger(config.token_budget, reporter=reporter, task_id=config.task_id, log=log)
+    if setup_error:
+        ledger.report_errors.append(setup_error)
+    return ledger
+
 
 def system_prompt_for(config: BionicConfig, tool_schemas: list[dict[str, Any]]) -> str:
     """System prompt ``run_agent`` sends for ``config`` with these tool schemas."""
@@ -1998,12 +2258,22 @@ def run_agent(
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     messages: Optional[list[dict[str, Any]]] = None,
     before_tool: Optional["ToolHook"] = None,
+    usage_reporter: Optional[UsageReporter] = None,
+    ledger: Optional[TokenLedger] = None,
 ) -> RunResult:
     """Run the OpenAI tool-calling loop until a final response or ``max_turns``.
 
     ``on_event`` receives progress events as dicts with a ``type`` key:
     ``turn``, ``token`` / ``reasoning`` (only when ``config.stream``),
-    ``tool_call``, ``tool_result`` and ``done``.
+    ``tool_call``, ``tool_result``, ``budget`` (after each turn when a token
+    budget or hub task is in play) and ``done``.
+
+    Token accounting: with ``config.token_budget`` or ``config.task_id`` set,
+    each turn's tokens go into a :class:`TokenLedger` (estimated from message
+    sizes when the server sends no ``usage``), are billed to the hub task, and
+    the run stops with :class:`TokenBudgetError` instead of starting a turn
+    once a budget is spent. ``usage_reporter`` replaces the hub client;
+    ``ledger`` shares one budget across several runs (the REPL does).
 
     ``messages`` lets the caller own the conversation (the interactive REPL
     does): the list is extended in place with the prompt, assistant turns and
@@ -2058,7 +2328,31 @@ def run_agent(
     total_tool_calls = 0
     usage_totals: dict[str, int] = {}
     turn_usage: list[Optional[dict[str, int]]] = []
+    if ledger is None:
+        ledger = ledger_for(
+            config,
+            model=model,
+            session_id=active_session_id or f"run-{uuid.uuid4().hex[:12]}",
+            reporter=usage_reporter,
+            log=log,
+        )
+    ledger.start()
+
+    def budget_stop(turns: int) -> TokenBudgetError:
+        if session_file is not None:
+            _save_session_messages(session_file, messages)
+        return TokenBudgetError(
+            ledger.exhausted_message(),
+            budget=ledger.snapshot(),
+            turns=turns,
+            tool_calls=total_tool_calls,
+            usage=usage_totals,
+            turn_usage=turn_usage,
+        )
+
     for turn in range(1, config.max_turns + 1):
+        if ledger.exhausted():
+            raise budget_stop(turn - 1)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -2067,8 +2361,11 @@ def run_agent(
         }
         if config.temperature is not None:
             payload["temperature"] = config.temperature
-        if config.max_tokens is not None:
-            payload["max_tokens"] = config.max_tokens
+        max_tokens = ledger.cap_max_tokens(config.max_tokens)
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        # Size of what this turn sends, for servers that report no usage.
+        prompt_estimate = estimate_tokens(messages) + estimate_tokens(tool_schemas) if ledger.active else 0
 
         notify({"type": "turn", "turn": turn, "model": model})
         if config.stream:
@@ -2104,6 +2401,23 @@ def run_agent(
         cleaned = _normalize_assistant_message(msg)
         messages.append(cleaned)
 
+        if ledger.active:
+            if usage:
+                ledger.add(usage)
+            else:
+                completion = estimate_tokens(
+                    [msg.get("content"), msg.get("reasoning_content"), cleaned.get("tool_calls")]
+                )
+                ledger.add(
+                    {
+                        "prompt_tokens": prompt_estimate,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt_estimate + completion,
+                    },
+                    estimated=True,
+                )
+            notify({"type": "budget", "turn": turn, **ledger.snapshot()})
+
         tool_calls = cleaned.get("tool_calls") or []
         if not tool_calls:
             final_text = str(cleaned.get("content") or "").strip()
@@ -2120,6 +2434,7 @@ def run_agent(
                 session_id=active_session_id,
                 usage=usage_totals,
                 turn_usage=turn_usage,
+                budget=ledger.snapshot() if ledger.active else None,
             )
 
         for idx, tc in enumerate(tool_calls):
@@ -2506,6 +2821,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--temperature", type=float, help="Sampling temperature (env: BIONIC_TEMPERATURE)")
     parser.add_argument("--max-tokens", type=int, help="Max completion tokens per turn (env: BIONIC_MAX_TOKENS)")
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        help=(
+            "Stop before a new turn once this run has spent this many total tokens "
+            "(prompt + completion over all turns; env: BIONIC_TOKEN_BUDGET)"
+        ),
+    )
+    parser.add_argument(
+        "--task",
+        dest="task_id",
+        metavar="TASK_ID",
+        help=(
+            "Bill each turn's tokens to this hub task and obey its (and its parents') token budget "
+            "(env: BIONIC_TASK_ID; defaults to AIRCD_WAKE_TASK when woken by the hub)"
+        ),
+    )
+    parser.add_argument(
+        "--no-report-usage",
+        action="store_true",
+        help="Do not send token usage to the hub task (env: BIONIC_NO_USAGE_REPORT=1)",
+    )
     parser.add_argument("--system-prompt", help="Override default system prompt (env: BIONIC_SYSTEM_PROMPT)")
     parser.add_argument("--system-prompt-file", help="Read system prompt override from a UTF-8 file")
     parser.add_argument("--session-id", help="Resume or create a saved local session by ID")
@@ -2659,23 +2996,40 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         log = (lambda msg: print(msg, file=sys.stderr)) if config.verbose else None
         on_event = StreamRenderer(config.stream_format) if config.stream else None
-        result = run_agent(prompt, config, log=log, on_event=on_event)
+        try:
+            result = run_agent(prompt, config, log=log, on_event=on_event)
+        except TokenBudgetError as err:
+            print(f"error: {err}", file=sys.stderr)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": str(err),
+                            "reason": "token_budget",
+                            "turns": err.turns,
+                            "tool_calls": err.tool_calls,
+                            "usage": err.usage,
+                            "budget": err.budget,
+                        }
+                    )
+                )
+            return 3
         if config.emit_session_id and result.session_id:
             print(f"session_id: {result.session_id}", file=sys.stderr)
         if args.json:
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "model": result.model,
-                        "turns": result.turns,
-                        "tool_calls": result.tool_calls,
-                        "session_id": result.session_id,
-                        "usage": result.usage,
-                        "content": result.content,
-                    }
-                )
-            )
+            out = {
+                "ok": True,
+                "model": result.model,
+                "turns": result.turns,
+                "tool_calls": result.tool_calls,
+                "session_id": result.session_id,
+                "usage": result.usage,
+                "content": result.content,
+            }
+            if result.budget is not None:
+                out["budget"] = result.budget
+            print(json.dumps(out))
         else:
             print(result.content)
         return 0

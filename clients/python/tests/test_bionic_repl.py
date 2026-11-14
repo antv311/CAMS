@@ -73,6 +73,17 @@ class BionicReplTests(unittest.TestCase):
     def chat_bodies(self) -> list[dict[str, Any]]:
         return [r["body"] for r in self.server.requests if r["path"] == "/v1/chat/completions"]
 
+    def test_token_budget_spans_the_whole_repl_session(self) -> None:
+        self.server.chat_replies = [_reply("one", usage=60), _reply("two", usage=60), _reply("never")]
+        repl, out = self.run_repl(["first", "second", "third", "/usage"], token_budget=100)
+        self.assertIn("one", out)
+        self.assertIn("two", out)
+        self.assertIn("token budget exhausted: spent 122 of 100 tokens", out)
+        self.assertEqual(len(self.chat_bodies()), 2, "the third prompt never reaches the model")
+        self.assertEqual(self.chat_bodies()[1]["max_tokens"], 39)
+        self.assertIn('budget: {"token_budget": 100, "spent": 122', out)
+        self.assertIsNotNone(repl.ledger)
+
     def test_multi_turn_conversation_carries_context(self) -> None:
         self.server.chat_replies = [_reply("Noted: alpha.", usage=10), _reply("You said alpha.", usage=20)]
         repl, out = self.run_repl(["remember alpha", "what did I say?", "/usage", "/context"])

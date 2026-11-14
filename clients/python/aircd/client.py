@@ -866,6 +866,42 @@ class AircdHttpClient:
         raw, _ = self._raw("POST", path, data=data, content_type=content_type)
         return json.loads(raw.decode("utf-8"))["attachment"]
 
+    def task_usage(self, task_id: str) -> dict[str, Any]:
+        """Token report: ``own``, ``subtasks``, ``total``, ``token_budget``,
+        ``remaining`` (tightest over the task and its ancestors), ``limited_by``,
+        ``exceeded``, ``by_session`` and ``by_subtask``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/usage"
+        return self._request("GET", path)["usage"]
+
+    def record_task_usage(
+        self,
+        task_id: str,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: Optional[int] = None,
+        session_id: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Bill model tokens to a task; returns the task's token report afterwards."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/usage"
+        payload: dict[str, Any] = {
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+        }
+        if total_tokens is not None:
+            payload["total_tokens"] = int(total_tokens)
+        if session_id:
+            payload["session_id"] = session_id
+        if model:
+            payload["model"] = model
+        return self._request("POST", path, payload=payload)["usage"]
+
+    def set_task_budget(self, task_id: str, token_budget: Optional[int]) -> dict[str, Any]:
+        """Set a task's token ceiling (covers its subtasks), or clear it with ``None``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/budget"
+        return self._request("POST", path, payload={"token_budget": token_budget})["usage"]
+
     def list_task_attachments(self, task_id: str) -> list[dict[str, Any]]:
         path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/attachments"
         return self._request("GET", path).get("attachments") or []

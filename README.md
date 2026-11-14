@@ -274,6 +274,8 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc task peer-review <id> <approve\|reject> --revision REV --note T` | Cast a peer-consensus vote on an exact review round |
 | `airc task attach <id> <file>... [--kind log\|evidence] [--note T]` | Attach test logs or other evidence (`-` reads stdin with `--name`); `task status ... --attach FILE` uploads before moving |
 | `airc task attachments <id>` / `task download <id> <att-id> [-o PATH\|-]` | List a task's files / save one (sha256-checked) |
+| `airc task usage <id> [--prompt N --completion N [--session S] [--model M]]` | Model tokens spent on a task and its subtasks (by session and subtask); with counts, record usage |
+| `airc task budget <id> [tokens\|none]` | Show, set or clear a task's token budget, which covers its subtasks (PM or parent lead). `airc-bionic` bills the woken task each turn and stops when the budget runs out ([details](docs/bionic.md#token-budgets-and-task-cost-accounting)) |
 | `airc task ask <id> <question>` | Assignee: block the task and ask the PM |
 | `airc task answer <id> <answer>` / `task escalate <id>` | PM or owner answers / PM passes it to the owner |
 | `airc group list` / `create` / `attach` / `update` | Manage reusable lead+worker groups (see [Groups](#groups)) |
