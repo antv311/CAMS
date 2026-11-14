@@ -74,6 +74,11 @@ class _HubCase(unittest.TestCase):
 
 
 class GroupModelTest(unittest.TestCase):
+    def test_consensus_policy_survives_group_round_trip(self) -> None:
+        policy = {"peer_reviewers": ["lead", "peer"], "quorum": 1}
+        group = Group.from_dict({**GROUP_REPLY, "review_policy": policy})
+        self.assertEqual(group.to_dict()["review_policy"], policy)
+
     def test_parse_member_specs(self) -> None:
         self.assertEqual(GroupMember.parse("claude:opus"), GroupMember("claude", "opus", 1))
         self.assertEqual(GroupMember.parse(" ollama:gemma3*3 "), GroupMember("ollama", "gemma3", 3))
@@ -209,6 +214,16 @@ class GroupHttpClientTest(_HubCase):
         self.assertEqual(status["path"], "/v1/tasks/task_2/status")
         self.assertEqual(status["body"], {"status": "review", "note": "pytest: 9 passed", "branch": None})
 
+    def test_library_submits_commit_and_votes_on_exact_revision(self) -> None:
+        self.reply((200, {"task": {"id": "task/1"}}), (200, {"task": {"status": "super_review"}}))
+        hub = AircdHttpClient(self.url, token="tok")
+        hub.set_task_status("task/1", "review", note="tests pass", branch="feature", commit="a" * 40)
+        hub.peer_review_task("task/1", "review_123", "approve", note="Inspected aaaaa")
+        submit, vote = self.hub.requests
+        self.assertEqual(submit["body"]["commit"], "a" * 40)
+        self.assertEqual(vote["path"], "/v1/tasks/task%2F1/peer-review")
+        self.assertEqual(vote["body"], {"revision": "review_123", "decision": "approve", "note": "Inspected aaaaa"})
+
 
 class GroupCliTest(_HubCase):
     """`airc group` and the task flags, run in-process against the fake hub."""
@@ -229,6 +244,34 @@ class GroupCliTest(_HubCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(argv)
         return code, out.getvalue(), err.getvalue()
+
+    def test_consensus_policy_file_is_preserved_and_listed(self) -> None:
+        policy = {"peer_reviewers": ["lead", "peer"], "quorum": 1}
+        group = {**GROUP_REPLY, "review_policy": policy}
+        self.reply((200, {"group": group}))
+        path = Path(self.cfg.name) / "group.json"
+        path.write_text(json.dumps(group), encoding="utf-8")
+        code, out, err = self.run_cli("group", "create", "dev", "--file", str(path), "--invite", "owner")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.hub.requests[0]["body"]["review_policy"], policy)
+        self.assertIn("peer review: lead, peer; quorum=1", out)
+
+    def test_consensus_submission_vote_and_task_display(self) -> None:
+        task = {"id": "task_1", "status": "review", "kind": "feature", "channel": "#cams", "title": "Work",
+                "review_round": {"revision": "review_123", "commit": "a" * 40, "quorum": 1, "peer_reviewers": ["peer"],
+                                 "votes": [{"reviewer": "peer", "decision": "approve", "note": "Reviewed source"}]}}
+        self.reply((200, {"task": task}), (200, {"task": {**task, "status": "super_review"}}), (200, {"task": task}))
+        code, _, err = self.run_cli("task", "status", "task_1", "review", "--note", "Tests passed", "--commit", "a" * 40)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.hub.requests[0]["body"]["commit"], "a" * 40)
+        code, out, err = self.run_cli("task", "peer-review", "task_1", "approve", "--revision", "review_123", "--note", "Reviewed source")
+        self.assertEqual(code, 0, err)
+        self.assertIn("super_review", out)
+        self.assertEqual(self.hub.requests[1]["body"], {"revision": "review_123", "decision": "approve", "note": "Reviewed source"})
+        code, out, err = self.run_cli("task", "show", "task_1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("peer revision=review_123", out)
+        self.assertIn("@peer: approve - Reviewed source", out)
 
     def test_group_update_flags(self) -> None:
         self.reply((200, {"group": GROUP_REPLY}))
@@ -524,6 +567,45 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         shown = json.loads(self.cli("--json", "task", "show", tid).stdout)
         notes = [ev.get("note") or "" for ev in shown["events"]]
         self.assertTrue(any(f"report {rep['id']}" in n and "12 passed" in n for n in notes), notes)
+
+    def test_consensus_cli_against_real_hub(self) -> None:
+        self.cli("project", "create", "#consensus")
+        for nick in ("consensus-lead", "consensus-worker", "consensus-peer"):
+            self.cli("--profile", nick, "register", "--nick", nick, "--invite", OWNER_KEY, "--no-default")
+            self.cli("project", "add", "#consensus", nick, "--role", "builder")
+        definition = {
+            "name": "consensus", "lead": {"template": "example", "model": "lead", "nick": "consensus-lead"},
+            "workers": [{"template": "example", "model": "worker", "nick": nick}
+                        for nick in ("consensus-worker", "consensus-peer")],
+            "review_policy": {"peer_reviewers": ["consensus-lead", "consensus-peer", "consensus-worker"]},
+        }
+        group_file = Path(self.tmp.name) / "consensus.json"
+        group_file.write_text(json.dumps(definition), encoding="utf-8")
+        self.cli("group", "create", "consensus", "--file", str(group_file), "--invite", OWNER_KEY)
+        self.cli("group", "attach", "consensus", "#consensus", "--invite", OWNER_KEY)
+        task = json.loads(self.cli("--json", "task", "create", "#consensus", "Reviewed work",
+                                   "--assign", "consensus-worker", "--reviewer", "consensus-lead").stdout)["task"]
+        tid = task["id"]
+        self.cli("--profile", "consensus-worker", "task", "status", tid, "testing")
+        task = json.loads(self.cli("--profile", "consensus-worker", "--json", "task", "status", tid, "review",
+                                   "--branch", "feat/review", "--commit", "a" * 40, "--note", "Integration tests passed").stdout)["task"]
+        revision = task["review_round"]["revision"]
+        self.assertEqual(task["review_round"]["quorum"], 2)
+        self.assertEqual(task["review_round"]["commit"], "a" * 40)
+        self.assertIn(tid, self.cli("--profile", "consensus-peer", "inbox").stdout)
+        denied = self.cli("--profile", "consensus-peer", "task", "peer-review", tid, "approve",
+                          "--revision", "old", "--note", "stale", check=False)
+        self.assertEqual(denied.returncode, 1)
+        self.assertIn("stale review revision", denied.stderr)
+        for nick, decision in [("consensus-lead", "approve"), ("consensus-peer", "reject"), ("consensus-peer", "approve")]:
+            reviewed = json.loads(self.cli("--profile", nick, "--json", "task", "peer-review", tid, decision,
+                                           "--revision", revision, "--note", "Inspected exact submitted source").stdout)["task"]
+            expected = "super_review" if nick == "consensus-peer" and decision == "approve" else "review"
+            self.assertEqual(reviewed["status"], expected)
+        denied = self.cli("--profile", "consensus-lead", "task", "status", tid, "merged", check=False)
+        self.assertEqual(denied.returncode, 1)
+        merged = json.loads(self.cli("--json", "task", "status", tid, "merged", "--note", "PM accepted peer consensus").stdout)["task"]
+        self.assertEqual(merged["status"], "merged")
 
     def test_group_lead_question_delegation_against_real_hub(self) -> None:
         self.cli("project", "create", "#delegate")

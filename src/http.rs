@@ -257,6 +257,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/status", post(set_task_status))
+        .route("/v1/tasks/{id}/peer-review", post(peer_review_task))
         .route("/v1/tasks/{id}/ask", post(ask_task))
         .route("/v1/tasks/{id}/answer", post(answer_task))
         .route("/v1/tasks/{id}/escalate", post(escalate_task))
@@ -1869,6 +1870,7 @@ struct TaskStatusReq {
     branch: Option<String>,
     report_body: Option<String>,
     report_id: Option<String>,
+    commit: Option<String>,
 }
 
 async fn set_task_status(
@@ -1880,7 +1882,7 @@ async fn set_task_status(
     let actor = authenticate_request(&state, &headers)?;
     let task = state
         .server
-        .set_task_status_api(
+        .set_task_status_revision_api(
             &actor,
             &id,
             &req.status,
@@ -1888,12 +1890,39 @@ async fn set_task_status(
             req.branch.as_deref(),
             req.report_body.as_deref(),
             req.report_id.as_deref(),
+            req.commit.as_deref(),
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerReviewTaskReq {
+    revision: String,
+    decision: String,
+    note: String,
+}
+
+async fn peer_review_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PeerReviewTaskReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let task = state
+        .server
+        .peer_review_task_api(&actor, &id, &req.revision, &req.decision, &req.note)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "task": task})),
     ))
 }
 
@@ -3201,6 +3230,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     include!("http_delegation_tests.rs");
+    include!("http_consensus_tests.rs");
 
     struct TemplateApi {
         server: Server,

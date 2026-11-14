@@ -34,6 +34,46 @@ pub struct GroupInput {
     pub workers: Vec<GroupMember>,
     pub lead_prompt: Option<String>,
     pub worker_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<GroupReviewPolicy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupReviewPolicy {
+    pub peer_reviewers: Vec<String>,
+    /// Omitted means every configured peer other than the task assignee.
+    pub quorum: Option<u32>,
+}
+
+fn validate_review_policy(input: &mut GroupInput) -> Result<()> {
+    let Some(policy) = &mut input.review_policy else {
+        return Ok(());
+    };
+    let roster: std::collections::HashSet<String> = std::iter::once(&input.lead)
+        .chain(&input.workers)
+        .filter_map(|member| member.nick.as_deref())
+        .map(|nick| nick.trim_start_matches('@').to_ascii_lowercase())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for nick in &mut policy.peer_reviewers {
+        *nick = nick.trim().trim_start_matches('@').to_ascii_lowercase();
+        if !roster.contains(nick) || !seen.insert(nick.clone()) {
+            return Err(anyhow!(
+                "peer reviewers must be distinct named members of the group roster"
+            ));
+        }
+    }
+    if seen.is_empty()
+        || policy
+            .quorum
+            .is_some_and(|q| q == 0 || q as usize > seen.len())
+    {
+        return Err(anyhow!(
+            "review quorum must be between one and the number of configured peers"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -101,6 +141,7 @@ impl GroupStore {
         for worker in &mut input.workers {
             validate_group_member(worker)?;
         }
+        validate_review_policy(&mut input)?;
         for text in [&input.description, &input.lead_prompt, &input.worker_prompt]
             .into_iter()
             .flatten()
@@ -115,12 +156,13 @@ impl GroupStore {
         db.execute(
             "INSERT INTO groups
                (name, description, lead_json, workers_json, lead_prompt, worker_prompt,
-                created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                created_at, updated_at, review_policy_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
              ON CONFLICT(name) DO UPDATE SET
                description = excluded.description, lead_json = excluded.lead_json,
                workers_json = excluded.workers_json, lead_prompt = excluded.lead_prompt,
-               worker_prompt = excluded.worker_prompt, updated_at = excluded.updated_at",
+               worker_prompt = excluded.worker_prompt, updated_at = excluded.updated_at,
+               review_policy_json = excluded.review_policy_json",
             params![
                 input.name,
                 input.description,
@@ -129,6 +171,11 @@ impl GroupStore {
                 input.lead_prompt,
                 input.worker_prompt,
                 unix_timestamp(),
+                input
+                    .review_policy
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
             ],
         )
         .context("save group")?;
@@ -242,6 +289,7 @@ impl GroupStore {
         if workers.is_empty() {
             return Err(anyhow!("a group needs at least one worker"));
         }
+        validate_review_policy(&mut group.definition)?;
         if group.definition != before {
             tx.execute(
                 "UPDATE groups SET lead_json = ?2, workers_json = ?3, updated_at = ?4 WHERE name = ?1",
@@ -321,7 +369,7 @@ impl GroupStore {
         let group = db
             .query_row(
                 "SELECT name, description, lead_json, workers_json, lead_prompt,
-                        worker_prompt, created_at, updated_at FROM groups WHERE name = ?1",
+                        worker_prompt, created_at, updated_at, review_policy_json FROM groups WHERE name = ?1",
                 [name],
                 |row| {
                     let lead: String = row.get(2)?;
@@ -342,6 +390,9 @@ impl GroupStore {
                                 .map_err(|e| decode_error(3, e))?,
                             lead_prompt: row.get(4)?,
                             worker_prompt: row.get(5)?,
+                            review_policy: row.get::<_, Option<String>>(8)?
+                                .map(|raw| serde_json::from_str(&raw).map_err(|e| decode_error(8, e)))
+                                .transpose()?,
                         },
                         projects: Vec::new(),
                         created_at: row.get(6)?,
@@ -1086,6 +1137,13 @@ fn migrate_groups(connection: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_group_projects_channel ON group_projects(channel);",
         )
         .context("migrate groups")?;
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('groups') WHERE name = 'review_policy_json')",
+        [], |row| row.get(0),
+    )?;
+    if !exists {
+        connection.execute("ALTER TABLE groups ADD COLUMN review_policy_json TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -1139,6 +1197,7 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         ("sprint", "TEXT"),
         ("reviewer", "TEXT"),
         ("parent_task_id", "TEXT"),
+        ("review_round_json", "TEXT"),
     ];
 
     for (column, definition) in columns {
@@ -1306,6 +1365,112 @@ mod tests {
             "worker_prompt": "Write only the assigned code.\n"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn consensus_migration_reopen_and_vote_rollback_preserve_snapshots() -> Result<()> {
+        use crate::tasks::{NewTask, ReviewRound, TaskStore};
+        let path =
+            std::env::temp_dir().join(format!("aircd-consensus-{}.sqlite3", uuid::Uuid::new_v4()));
+        let saved;
+        let id;
+        {
+            let db = open(&path)?;
+            let groups = GroupStore::new(db.clone());
+            let tasks = TaskStore::new(db.clone(), 60);
+            groups.upsert(group_input("dev"))?;
+            let task = tasks.create_full(NewTask {
+                channel: "#one".into(),
+                title: "Keep legacy work".into(),
+                assignee: Some("worker".into()),
+                ..NewTask::default()
+            })?;
+            id = task.id;
+            {
+                let connection = db.lock().unwrap();
+                // Simulate the pre-consensus schema with real persisted rows.
+                connection.execute("ALTER TABLE groups DROP COLUMN review_policy_json", [])?;
+                connection.execute("ALTER TABLE tasks DROP COLUMN review_round_json", [])?;
+                init_with(&connection, false)?;
+                init_with(&connection, false)?;
+            }
+            assert!(groups
+                .get("dev")?
+                .unwrap()
+                .definition
+                .review_policy
+                .is_none());
+            assert!(tasks.get(&id)?.unwrap().review_round.is_none());
+            let mut group = group_input("dev");
+            group.review_policy = Some(GroupReviewPolicy {
+                peer_reviewers: vec!["dev-lead".into()],
+                quorum: None,
+            });
+            groups.upsert(group)?;
+            let round = ReviewRound {
+                revision: "round-1".into(),
+                group: "dev".into(),
+                assignee: "worker".into(),
+                commit: "1".repeat(40),
+                branch: "feat/consensus".into(),
+                evidence: "Tests passed".into(),
+                peer_reviewers: vec!["dev-lead".into()],
+                quorum: 1,
+                votes: Vec::new(),
+            };
+            tasks.set_status_with_round(
+                &id,
+                "assigned",
+                "review",
+                "worker",
+                Some("Tests passed"),
+                Some("feat/consensus"),
+                Some(&round),
+            )?;
+            let before = serde_json::to_value(tasks.get(&id)?)?;
+            let events = tasks.events(&id)?.len();
+            db.lock().unwrap().execute_batch("CREATE TRIGGER reject_peer_event BEFORE INSERT ON task_events
+                WHEN NEW.action = 'peer_review' BEGIN SELECT RAISE(ABORT, 'forced event failure'); END;")?;
+            assert!(tasks
+                .peer_vote(
+                    &id,
+                    "round-1",
+                    "dev-lead",
+                    "approve",
+                    "Reviewed",
+                    &["dev-lead".into()]
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(tasks.get(&id)?)?, before);
+            assert_eq!(tasks.events(&id)?.len(), events);
+            db.lock()
+                .unwrap()
+                .execute("DROP TRIGGER reject_peer_event", [])?;
+            saved = serde_json::to_value(tasks.peer_vote(
+                &id,
+                "round-1",
+                "dev-lead",
+                "approve",
+                "Reviewed",
+                &["dev-lead".into()],
+            )?)?;
+            assert_eq!(saved["status"], "super_review");
+        }
+        {
+            let db = open(&path)?;
+            assert!(GroupStore::new(db.clone())
+                .get("dev")?
+                .unwrap()
+                .definition
+                .review_policy
+                .is_some());
+            assert_eq!(
+                serde_json::to_value(TaskStore::new(db, 60).get(&id)?.unwrap())?,
+                saved
+            );
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     fn group_project(db: &SharedConnection, channel: &str) -> Result<()> {

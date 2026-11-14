@@ -122,6 +122,7 @@ class Group:
     lead_prompt: Optional[str] = None
     worker_prompt: Optional[str] = None
     projects: list[str] = field(default_factory=list)
+    review_policy: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Group":
@@ -136,6 +137,7 @@ class Group:
             lead_prompt=data.get("lead_prompt") or None,
             worker_prompt=data.get("worker_prompt") or None,
             projects=list(data.get("projects") or data.get("channels") or []),
+            review_policy=data.get("review_policy"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -151,6 +153,8 @@ class Group:
             out["lead_prompt"] = self.lead_prompt
         if self.worker_prompt:
             out["worker_prompt"] = self.worker_prompt
+        if self.review_policy is not None:
+            out["review_policy"] = self.review_policy
         return out
 
     @property
@@ -666,12 +670,25 @@ class AircdHttpClient:
         *,
         note: Optional[str] = None,
         branch: Optional[str] = None,
+        commit: Optional[str] = None,
     ) -> dict[str, Any]:
         """Move a task and return it. Moving to ``review`` needs a test report as ``note``."""
         if status == "review" and not (note or "").strip():
             raise AircdHttpError(REVIEW_NEEDS_REPORT)
         path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/status"
-        return self._request("POST", path, payload={"status": status, "note": note, "branch": branch})["task"]
+        payload = {"status": status, "note": note, "branch": branch}
+        if commit is not None:
+            payload["commit"] = commit
+        return self._request("POST", path, payload=payload)["task"]
+
+    def peer_review_task(
+        self, task_id: str, revision: str, decision: str, *, note: str,
+    ) -> dict[str, Any]:
+        """Approve or reject the exact review revision shown by task show/inbox."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/peer-review"
+        return self._request("POST", path, payload={
+            "revision": revision, "decision": decision, "note": note,
+        })["task"]
 
     # Internal
 

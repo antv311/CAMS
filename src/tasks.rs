@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -19,6 +19,7 @@ pub const ALL_STATUSES: &[&str] = &[
     "testing",
     "blocked",
     "review",
+    "super_review",
     "changes_requested",
     "merged",
     "done",
@@ -27,7 +28,7 @@ pub const ALL_STATUSES: &[&str] = &[
 
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
      body, kind, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
-     reviewer, parent_task_id";
+     reviewer, parent_task_id, review_round_json";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Task {
@@ -53,6 +54,42 @@ pub struct Task {
     /// Account ID of the lead or PM who reviews this work.
     pub reviewer: Option<String>,
     pub parent_task_id: Option<String>,
+    pub review_round: Option<ReviewRound>,
+}
+
+/// A submission snapshot. A fresh revision is issued on every handoff, even
+/// when the submitted commit or evidence happens to be identical.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReviewRound {
+    pub revision: String,
+    pub group: String,
+    pub assignee: String,
+    pub commit: String,
+    pub branch: String,
+    pub evidence: String,
+    pub peer_reviewers: Vec<String>,
+    pub quorum: usize,
+    pub votes: Vec<PeerVote>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerVote {
+    pub reviewer: String,
+    pub decision: String,
+    pub note: String,
+    pub created_at: i64,
+}
+
+impl ReviewRound {
+    pub fn consensus(&self, eligible: &[String]) -> bool {
+        !self.votes.iter().any(|vote| vote.decision == "reject")
+            && self
+                .votes
+                .iter()
+                .filter(|vote| vote.decision == "approve" && eligible.contains(&vote.reviewer))
+                .count()
+                >= self.quorum
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -281,6 +318,8 @@ impl TaskStore {
         }
         let next_status = match (assignee, current.status.as_str()) {
             (None, _) => "open",
+            // Reassignment invalidates both the evidence and peer votes.
+            (Some(_), "review" | "super_review") if current.review_round.is_some() => "assigned",
             (Some(_), "review") => "review",
             (Some(_), "changes_requested") => "changes_requested",
             (Some(_), _) => "assigned",
@@ -288,7 +327,7 @@ impl TaskStore {
         db.execute(
             "UPDATE tasks
              SET assignee = ?1, status = ?2, claimed_by = NULL, lease_expires_at = NULL,
-                 updated_at = ?3
+                 updated_at = ?3, review_round_json = NULL
              WHERE id = ?4",
             params![assignee, next_status, now, task_id],
         )
@@ -308,6 +347,7 @@ impl TaskStore {
 
     /// Write a status change. Permission and transition rules live in the
     /// server; this only refuses unknown statuses and no-op races.
+    #[cfg(test)]
     pub fn set_status(
         &self,
         task_id: &str,
@@ -317,24 +357,60 @@ impl TaskStore {
         note: Option<&str>,
         branch: Option<&str>,
     ) -> Result<Task> {
+        self.set_status_with_round(task_id, expected_from, to, actor_id, note, branch, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_status_with_round(
+        &self,
+        task_id: &str,
+        expected_from: &str,
+        to: &str,
+        actor_id: &str,
+        note: Option<&str>,
+        branch: Option<&str>,
+        round: Option<&ReviewRound>,
+    ) -> Result<Task> {
         if !ALL_STATUSES.contains(&to) {
             return Err(anyhow!("unknown task status '{to}'"));
         }
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
-        let changed = db
+        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if round.is_some_and(|r| current.assignee.as_deref() != Some(r.assignee.as_str())) {
+            return Err(anyhow!(
+                "task assignee changed concurrently; reload and retry"
+            ));
+        }
+        let saved_round = if to == "review" {
+            round.map(serde_json::to_string).transpose()?
+        } else if matches!(
+            to,
+            "changes_requested" | "in_progress" | "testing" | "cancelled"
+        ) {
+            None
+        } else {
+            current
+                .review_round
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+        };
+        let changed = tx
             .execute(
                 "UPDATE tasks
-                 SET status = ?1, branch = COALESCE(?2, branch), updated_at = ?3
+                 SET status = ?1, branch = COALESCE(?2, branch), updated_at = ?3,
+                     review_round_json = ?6
                  WHERE id = ?4 AND status = ?5",
-                params![to, branch, now, task_id, expected_from],
+                params![to, branch, now, task_id, expected_from, saved_round],
             )
             .context("update task status")?;
         if changed != 1 {
             return Err(anyhow!("task status changed concurrently; reload and retry"));
         }
         Self::log_event_locked(
-            &db,
+            &tx,
             task_id,
             actor_id,
             "status",
@@ -343,7 +419,93 @@ impl TaskStore {
             note,
             now,
         )?;
-        Self::get_locked(&db, task_id)
+        if let Some(round) = round {
+            Self::log_event_locked(
+                &tx,
+                task_id,
+                actor_id,
+                "review_submission",
+                Some(expected_from),
+                Some(to),
+                Some(&serde_json::to_string(round)?),
+                now,
+            )?;
+        }
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    /// Validate and replace a peer's vote atomically with phase advancement.
+    pub fn peer_vote(
+        &self,
+        task_id: &str,
+        revision: &str,
+        actor_id: &str,
+        decision: &str,
+        note: &str,
+        eligible: &[String],
+    ) -> Result<Task> {
+        if !matches!(decision, "approve" | "reject") || note.trim().is_empty() {
+            return Err(anyhow!(
+                "peer decision must be approve or reject with a nonblank review note"
+            ));
+        }
+        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if !matches!(current.status.as_str(), "review" | "super_review") {
+            return Err(anyhow!("task is not awaiting review"));
+        }
+        let mut round = current
+            .review_round
+            .ok_or_else(|| anyhow!("task has no peer review round"))?;
+        if round.revision != revision
+            || current.assignee.as_deref() != Some(round.assignee.as_str())
+        {
+            return Err(anyhow!("stale review revision; reload the submitted task"));
+        }
+        if actor_id == round.assignee
+            || !round.peer_reviewers.iter().any(|id| id == actor_id)
+            || !eligible.iter().any(|id| id == actor_id)
+        {
+            return Err(anyhow!(
+                "only a configured peer currently in the group and project may vote"
+            ));
+        }
+        let now = unix_timestamp();
+        round.votes.retain(|vote| vote.reviewer != actor_id);
+        round.votes.push(PeerVote {
+            reviewer: actor_id.to_string(),
+            decision: decision.to_string(),
+            note: note.trim().to_string(),
+            created_at: now,
+        });
+        let to = if round.consensus(eligible) {
+            "super_review"
+        } else {
+            "review"
+        };
+        tx.execute(
+            "UPDATE tasks SET status = ?2, review_round_json = ?3, updated_at = ?4 WHERE id = ?1",
+            params![task_id, to, serde_json::to_string(&round)?, now],
+        )?;
+        let evidence = serde_json::json!({"revision": revision, "commit": round.commit,
+            "decision": decision, "note": note.trim()})
+        .to_string();
+        Self::log_event_locked(
+            &tx,
+            task_id,
+            actor_id,
+            "peer_review",
+            Some(&current.status),
+            Some(to),
+            Some(&evidence),
+            now,
+        )?;
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        Ok(task)
     }
 
     /// The assignee is stuck: record the question and park the task.
@@ -578,7 +740,7 @@ impl TaskStore {
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
-                 WHERE channel = ?1 AND status = 'review'
+                 WHERE channel = ?1 AND status IN ('review', 'super_review')
                  ORDER BY updated_at ASC"
             ))
             .context("prepare review queue")?;
@@ -663,6 +825,18 @@ impl TaskStore {
             sprint: row.get(15)?,
             reviewer: row.get(16)?,
             parent_task_id: row.get(17)?,
+            review_round: row
+                .get::<_, Option<String>>(18)?
+                .map(|raw| {
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            18,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?,
         })
     }
 }
