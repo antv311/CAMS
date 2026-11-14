@@ -888,6 +888,7 @@ def cmd_task(args: argparse.Namespace) -> int:
                 parent=args.parent,
                 reviewer=args.reviewer,
                 blocked_by=getattr(args, "blocked_by", None),
+                timeout_seconds=getattr(args, "timeout_seconds", None),
             ),
         )
         t = data["task"]
@@ -912,6 +913,14 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (assignee={t.get('assignee') or '-'})"])
+        return 0
+    if args.task_cmd in ("timeout", "heartbeat"):
+        payload = {"timeout_seconds": args.seconds} if args.task_cmd == "timeout" else {}
+        data = http_json(server, "POST",
+                         f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}/{args.task_cmd}",
+                         token=token, payload=payload)
+        task = data["task"]
+        print_out(args, data, [f"Task {task['id']} {args.task_cmd}: {task['status']} (timeout_seconds={task.get('timeout_seconds') or 'inherit'})"])
         return 0
     if args.task_cmd == "priority":
         data = http_json(
@@ -3072,12 +3081,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--parent", metavar="TASK_ID", help="Make this a subtask of TASK_ID (a group lead splitting work)")
     p_tc.add_argument("--reviewer", metavar="NICK", help="Who reviews it (default: the parent's assignee, else the PM)")
     p_tc.add_argument("--blocked-by", action="append", metavar="TASK_ID", help="Dependency task ID (cross-repo supported; repeatable or comma-separated)")
+    p_tc.add_argument("--timeout-seconds", type=int, help="Positive execution timeout in seconds (default: inherit hub policy)")
     p_tc.set_defaults(func=cmd_task)
 
     p_tas = task_sub.add_parser("assign", help="Assign or reassign a task; omit NICK to return it to the pool")
     p_tas.add_argument("id")
     p_tas.add_argument("nick", nargs="?")
     p_tas.set_defaults(func=cmd_task)
+
+    p_tto = task_sub.add_parser("timeout", help="Set execution timeout or inherit hub policy")
+    p_tto.add_argument("id")
+    p_tto.add_argument("seconds", type=int, nargs="?", help="Positive seconds; omit to inherit")
+    p_tto.set_defaults(func=cmd_task)
+    p_thb = task_sub.add_parser("heartbeat", help="Renew your currently executing task")
+    p_thb.add_argument("id")
+    p_thb.set_defaults(func=cmd_task)
 
     p_tpr_set = task_sub.add_parser("priority", help="Set a task's dispatch priority")
     p_tpr_set.add_argument("id")

@@ -22,6 +22,7 @@ const TRANSITION_ACTIONS: &[&str] = &[
     "peer_review",
     "ask",
     "answer",
+    "timeout",
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -194,6 +195,8 @@ mod tests {
             status: status.into(),
             claimed_by: None,
             lease_expires_at: None,
+            timeout_seconds: None,
+            execution_heartbeat_at: None,
             body: None,
             kind: "task".into(),
             priority: "normal".into(),

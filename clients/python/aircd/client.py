@@ -735,6 +735,7 @@ class AircdHttpClient:
         parent: Optional[str] = None,
         reviewer: Optional[str] = None,
         blocked_by: Optional[list[str]] = None,
+        timeout_seconds: Optional[int] = None,
     ) -> dict[str, Any]:
         """Create a task and return it. ``parent`` makes it a subtask of that task
         id; ``reviewer`` names who reviews it (the hub defaults to the parent's
@@ -742,9 +743,19 @@ class AircdHttpClient:
         payload = task_create_payload(
             channel, title, body=body, kind=kind, priority=priority, assignee=assignee,
             repo=repo, branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
-            blocked_by=blocked_by,
+            blocked_by=blocked_by, timeout_seconds=timeout_seconds,
         )
         return self._request("POST", "/v1/tasks", payload=payload)["task"]
+
+    def task_heartbeat(self, task_id: str) -> dict[str, Any]:
+        """Renew this task's execution interval as its current executing holder."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/heartbeat"
+        return self._request("POST", path, payload={})["task"]
+
+    def set_task_timeout(self, task_id: str, seconds: Optional[int]) -> dict[str, Any]:
+        """Set positive timeout seconds, or None to inherit hub/priority policy."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/timeout"
+        return self._request("POST", path, payload={"timeout_seconds": seconds})["task"]
 
     def set_task_priority(self, task_id: str, priority: str) -> dict[str, Any]:
         """Set the priority (``urgent``, ``high``, ``normal``, or ``low``) of a task."""
@@ -973,6 +984,7 @@ def task_create_payload(
     parent: Optional[str] = None,
     reviewer: Optional[str] = None,
     blocked_by: Optional[list[str]] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> dict[str, Any]:
     """The POST /v1/tasks body. ``parent_task_id``, ``reviewer``, ``priority``,
     and ``blocked_by`` are only sent when set, so a hub without those features
@@ -987,6 +999,8 @@ def task_create_payload(
         "branch": branch,
         "issue_url": issue_url,
     }
+    if timeout_seconds is not None:
+        payload["timeout_seconds"] = timeout_seconds
     priority = (priority or "").strip().lower()
     if priority:
         payload["priority"] = priority

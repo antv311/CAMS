@@ -1366,3 +1366,47 @@ This starts the server, launches a Claude agent via `airc-daemon`, sends a
 message as a human principal, and verifies the agent receives it and replies.
 
 Prerequisites: Rust, Python 3.10+, and `claude` CLI in PATH.
+
+
+### Task execution timeouts
+
+The hub sweeps expired tasks every second, including after a restart. Expired
+`claimed` tasks return to `open`; expired `in_progress` or `testing` tasks return
+to `assigned` when they have an assignee, otherwise `open`. Recovery clears the
+claim, lease, heartbeat and review votes, keeps branch/worktree information, and
+records a `timeout` task event plus a sprint-room notice to the PM and former
+worker. It does not terminate worker processes. Queue, blocked, review and
+terminal tasks are exempt. Recovered assigned tasks wait for their assignee or PM
+to restart/reassign them; they do not repeatedly expire while queued.
+
+Assigned execution has no timeout by default. Configure `[task_timeout]` with
+`default_seconds` and/or `[task_timeout.priority_seconds]` (`urgent`, `high`,
+`normal`, `low`) in `aircd.toml`; all values must be positive integer seconds.
+Per-task `timeout_seconds` overrides priority policy, which overrides the default.
+Claimed tasks fall back to `AIRCD_TASK_LEASE_SECONDS` (300 seconds) when no policy
+applies. Existing execution uses its last durable heartbeat, or `updated_at` for
+legacy tasks. Changing priority retains that heartbeat, so a shorter policy can
+expire work immediately. Setting a task timeout grants a fresh interval.
+
+```sh
+airc task create '#project' 'Run analysis' --assign worker --timeout-seconds 600
+airc task timeout TASK_ID 900   # PM or parent lead sets an override
+airc task timeout TASK_ID       # inherit hub/priority policy
+airc task heartbeat TASK_ID     # executing assignee or claim holder renews
+```
+
+Workers doing long operations must heartbeat more frequently than the configured
+interval. Only a task heartbeat or entry into `in_progress`/`testing` reports
+execution progress; chat, metadata edits and group heartbeats do not renew it.
+Expired workers cannot renew, complete a claim, or hand execution in for review
+before recovery. Starting again after recovery opens a fresh execution interval.
+Pausing for a decision clears execution timing; resuming grants a fresh interval.
+
+HTTP clients can set `timeout_seconds` during task creation, or POST
+`{"timeout_seconds": 600}` (or `null` to inherit) to `/v1/tasks/{id}/timeout` with
+PM scope and project management/parent lead authority. POST
+`/v1/tasks/{id}/heartbeat` with write scope as the executing holder. Time comes
+from the hub. Responses include `timeout_seconds`, `execution_heartbeat_at` and
+`lease_expires_at`. The Python SDK provides `set_task_timeout` and
+`task_heartbeat`. Timeout transitions also appear in task exports and Prometheus
+`task_events` counts.

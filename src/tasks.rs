@@ -13,6 +13,14 @@ use crate::store::SharedConnection;
 #[path = "task_cascade_tests.rs"]
 mod cascade_tests;
 
+#[path = "task_timeout.rs"]
+mod timeout;
+pub use timeout::TaskTimeoutConfig;
+
+#[cfg(test)]
+#[path = "task_timeout_tests.rs"]
+mod timeout_tests;
+
 /// Statuses after which a task no longer appears in lists or inboxes.
 pub const TERMINAL_STATUSES: &[&str] = &["done", "merged", "cancelled"];
 
@@ -45,7 +53,7 @@ const PRIORITY_ORDER_SQL: &str = "CASE priority \
 
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
      body, kind, priority, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
-     reviewer, parent_task_id, review_round_json";
+     reviewer, parent_task_id, review_round_json, timeout_seconds, execution_heartbeat_at";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Task {
@@ -55,6 +63,8 @@ pub struct Task {
     pub status: String,
     pub claimed_by: Option<String>,
     pub lease_expires_at: Option<i64>,
+    pub timeout_seconds: Option<u32>,
+    pub execution_heartbeat_at: Option<i64>,
     /// Full description: everything a new assignee needs without reading chat.
     pub body: Option<String>,
     /// `task`, `bug` or `feature`.
@@ -142,6 +152,7 @@ pub struct NewTask {
     pub reviewer: Option<String>,
     pub parent_task_id: Option<String>,
     pub blocked_by: Vec<String>,
+    pub timeout_seconds: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -195,6 +206,7 @@ const QUESTION_COLUMNS: &str = "id, task_id, channel, asked_by, question, status
 pub struct TaskStore {
     db: SharedConnection,
     lease_seconds: i64,
+    timeouts: TaskTimeoutConfig,
     metrics: Arc<MetricsRegistry>,
 }
 
@@ -291,6 +303,7 @@ impl TaskStore {
         Self {
             db,
             lease_seconds,
+            timeouts: TaskTimeoutConfig::default(),
             metrics,
         }
     }
@@ -304,6 +317,9 @@ impl TaskStore {
     }
 
     pub fn create_full(&self, new: NewTask) -> Result<Task> {
+        if new.timeout_seconds == Some(0) {
+            return Err(anyhow!("task timeout must be positive seconds"));
+        }
         let now = unix_timestamp();
         let id = format!("task_{}", Uuid::new_v4().simple());
         let kind = normalize_kind(new.kind.as_deref())?;
@@ -334,8 +350,8 @@ impl TaskStore {
         tx.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, priority, assignee, created_by, repo, branch, issue_url,
-                                created_at, updated_at, sprint, reviewer, parent_task_id)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16)",
+                                created_at, updated_at, sprint, reviewer, parent_task_id, timeout_seconds)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16, ?17)",
             params![
                 id,
                 new.channel,
@@ -352,7 +368,8 @@ impl TaskStore {
                 now,
                 clean_opt(new.sprint),
                 clean_opt(new.reviewer),
-                clean_opt(new.parent_task_id)
+                clean_opt(new.parent_task_id),
+                new.timeout_seconds
             ],
         )
         .context("insert task")?;
@@ -406,13 +423,12 @@ impl TaskStore {
 
     pub fn claim(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
-        let lease_expires_at = now + self.lease_seconds;
         let mut db = self.db.write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = Self::get_locked_opt(&tx, task_id)?;
         if let Some(ref task) = current {
             let claimable = task.status == "open"
-                || (task.status == "claimed" && task.lease_expires_at.is_none_or(|exp| exp < now));
+                || (task.status == "claimed" && task.lease_expires_at.is_none_or(|exp| exp <= now));
             if claimable {
                 let blockers = Self::unresolved_blockers_locked(&tx, task)?;
                 if !blockers.is_empty() {
@@ -420,6 +436,12 @@ impl TaskStore {
                 }
             }
         }
+        let lease_expires_at = now.saturating_add(
+            current
+                .as_ref()
+                .and_then(|t| self.timeout_seconds(t))
+                .unwrap_or(self.lease_seconds),
+        );
         let prev_status = current.as_ref().map(|t| t.status.clone());
 
         Self::require_unblocked_locked(&tx, task_id, true)?;
@@ -434,7 +456,7 @@ impl TaskStore {
                    AND (
                      status = 'open'
                      OR lease_expires_at IS NULL
-                     OR lease_expires_at < ?3
+                     OR lease_expires_at <= ?3
                    )",
                 params![principal_id, lease_expires_at, now, task_id],
             )
@@ -444,6 +466,21 @@ impl TaskStore {
             return Err(anyhow!("task is already claimed or done"));
         }
 
+        if let Some(old) = current.as_ref().filter(|t| t.status == "claimed") {
+            Self::log_event_locked(
+                &tx,
+                task_id,
+                "aircd",
+                "timeout",
+                Some("claimed"),
+                Some("claimed"),
+                Some(&format!(
+                    "expired lease reclaimed; previous_holder={}",
+                    old.claimed_by.as_deref().unwrap_or("-")
+                )),
+                now,
+            )?;
+        }
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
         self.metrics
@@ -457,6 +494,11 @@ impl TaskStore {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::require_unblocked_locked(&tx, task_id, true)?;
         if let Some(current) = Self::get_locked_opt(&tx, task_id)? {
+            if self.execution_expired(&current, now) {
+                return Err(anyhow!(
+                    "task execution timed out; wait for recovery and start again"
+                ));
+            }
             if current.claimed_by.as_deref() == Some(principal_id) && current.status == "claimed" {
                 let blockers = Self::unresolved_blockers_locked(&tx, &current)?;
                 if !blockers.is_empty() {
@@ -642,6 +684,13 @@ impl TaskStore {
         let mut db = self.db.write()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = Self::get_locked(&tx, task_id)?;
+        if self.execution_expired(&current, now)
+            && matches!(to, "in_progress" | "testing" | "review" | "done")
+        {
+            return Err(anyhow!(
+                "task execution timed out; wait for recovery and start again"
+            ));
+        }
         if to != "cancelled" {
             Self::require_unblocked_locked(&tx, task_id, false)?;
         }
@@ -826,6 +875,11 @@ impl TaskStore {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = Self::get_locked(&tx, task_id)?;
         Self::require_unblocked_locked(&tx, task_id, true)?;
+        if self.execution_expired(&current, now) {
+            return Err(anyhow!(
+                "task execution timed out; wait for recovery and start again"
+            ));
+        }
         if !matches!(
             current.status.as_str(),
             "assigned" | "in_progress" | "changes_requested"
@@ -1860,6 +1914,8 @@ impl TaskStore {
             status: row.get(3)?,
             claimed_by: row.get(4)?,
             lease_expires_at: row.get(5)?,
+            timeout_seconds: row.get(20)?,
+            execution_heartbeat_at: row.get(21)?,
             body: row.get(6)?,
             kind: row
                 .get::<_, Option<String>>(7)?

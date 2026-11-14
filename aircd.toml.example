@@ -57,3 +57,14 @@ open_registration = false
 # db_wal_autocheckpoint = 1000            # WAL pages before auto-checkpoint (0 disables)
 # db_cache_size_kib = 16384               # per-connection page cache in KiB
 # db_journal_size_limit_bytes = 67108864  # WAL file size limit after checkpoint (-1 unlimited)
+
+# Execution timeouts are opt-in for assigned work; claimed tasks retain the
+# AIRCD_TASK_LEASE_SECONDS default (300 seconds). Positive per-task overrides
+# take precedence over priority, then default. Chat does not renew execution.
+# [task_timeout]
+# default_seconds = 3600
+# [task_timeout.priority_seconds]
+# urgent = 900
+# high = 1800
+# normal = 3600
+# low = 7200

@@ -562,6 +562,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/priority", post(set_task_priority))
+        .route("/v1/tasks/{id}/timeout", post(set_task_timeout))
+        .route("/v1/tasks/{id}/heartbeat", post(task_heartbeat))
         .route(
             "/v1/tasks/{id}/dependencies",
             get(get_task_dependencies)
@@ -2917,6 +2919,7 @@ async fn export_tasks(
 
 #[derive(Deserialize)]
 struct CreateTaskReq {
+    timeout_seconds: Option<u32>,
     channel: Option<String>,
     title: String,
     body: Option<String>,
@@ -2960,6 +2963,7 @@ async fn create_task(
                 reviewer: req.reviewer,
                 parent_task_id: req.parent_task_id,
                 blocked_by: req.blocked_by.unwrap_or_default(),
+                timeout_seconds: req.timeout_seconds,
             },
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -2998,6 +3002,50 @@ async fn assign_task(
 #[derive(Deserialize)]
 struct SetTaskPriorityReq {
     priority: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTaskTimeoutReq {
+    timeout_seconds: Option<u32>,
+}
+
+async fn set_task_timeout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTaskTimeoutReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/timeout")?
+        .principal;
+    let task = state
+        .server
+        .set_task_timeout_api(&actor, &id, req.timeout_seconds)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "task": task})),
+    ))
+}
+
+async fn task_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/heartbeat")?
+            .principal;
+    let task = state
+        .server
+        .task_heartbeat_api(&actor, &id)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "task": task})),
+    ))
 }
 
 async fn set_task_priority(
@@ -4875,6 +4923,7 @@ mod tests {
     include!("http_attachment_tests.rs");
     include!("http_group_activity_tests.rs");
     include!("http_task_cascade_tests.rs");
+    include!("http_task_timeout_tests.rs");
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
     include!("http_dashboard_tests.rs");
