@@ -527,6 +527,10 @@ impl SharedConnection {
         }
     }
 
+    pub fn db_path(&self) -> Option<&Path> {
+        self.inner.path.as_deref()
+    }
+
     /// Acquire a connection for read-only queries. Uses the concurrent WAL
     /// reader pool for file-backed databases and falls back to the single
     /// connection for `:memory:` databases.

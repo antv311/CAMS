@@ -1,10 +1,12 @@
 //! In-memory Prometheus metrics registry and text exposition (format 0.0.4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
 
 use crate::db::{DbPageStats, PoolStats};
 use crate::tasks::{ALL_STATUSES, TERMINAL_STATUSES};
@@ -36,6 +38,10 @@ const IRC_SESSION_EVENTS: &[&str] = &[
 ];
 const QUESTION_ACTIONS: &[&str] = &["asked", "answered", "escalated", "escalated_pm"];
 const RATE_LIMIT_SCOPES: &[&str] = &["ip", "principal"];
+pub const ALERT_RULE_KEYS: &[&str] = &["wake_failure_rate", "queue_backlog", "disk_pressure"];
+const ALERT_DELIVERY_STATUSES: &[&str] = &["delivered", "failed"];
+const MAX_WAKE_COMPLETION_HISTORY: usize = 50_000;
+const MAX_WAKE_COMPLETION_AGE: Duration = Duration::from_secs(86_400);
 
 #[derive(Debug)]
 struct HistogramState {
@@ -121,6 +127,39 @@ impl Histogram {
     }
 }
 
+/// Rolling-window wake outcome summary used by Prometheus alerting rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct WakeFailureWindowStats {
+    pub window_secs: u64,
+    pub total_completed: u64,
+    pub ok: u64,
+    pub failed: u64,
+    pub timeout: u64,
+    pub failures: u64,
+    pub failure_rate: f64,
+}
+
+/// Filesystem capacity and pressure telemetry for the database volume.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DiskStats {
+    pub path: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub free_bytes: u64,
+    pub used_bytes: u64,
+    pub used_ratio: f64,
+}
+
+/// Per-rule alert state sample exported on `/metrics`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlertMetricSample {
+    pub rule: String,
+    pub alertname: String,
+    pub severity: String,
+    pub state_code: u8,
+    pub active: bool,
+}
+
 /// Live database and runtime gauges sampled on `/metrics` scrape.
 #[derive(Clone, Debug, Default)]
 pub struct MetricsSnapshot {
@@ -136,6 +175,8 @@ pub struct MetricsSnapshot {
     pub webhook_deliveries_by_status: BTreeMap<String, u64>,
     pub db_pool: Option<PoolStats>,
     pub db_pages: Option<DbPageStats>,
+    pub disk: Option<DiskStats>,
+    pub alert_states: Vec<AlertMetricSample>,
 }
 
 /// Central thread-safe Prometheus metrics store shared across server subsystems.
@@ -153,9 +194,13 @@ pub struct MetricsRegistry {
     task_questions_total: BTreeMap<&'static str, AtomicU64>,
     wake_requests_total: BTreeMap<&'static str, AtomicU64>,
     wake_runs_total: BTreeMap<&'static str, AtomicU64>,
+    wake_completion_history: Mutex<VecDeque<(Instant, &'static str)>>,
     wake_dispatch_duration: Histogram,
     wake_duration: BTreeMap<&'static str, Histogram>,
     wake_end_to_end_duration: BTreeMap<&'static str, Histogram>,
+    alerts_fired_total: BTreeMap<&'static str, AtomicU64>,
+    alerts_resolved_total: BTreeMap<&'static str, AtomicU64>,
+    alert_webhook_deliveries_total: BTreeMap<&'static str, AtomicU64>,
 }
 
 impl Default for MetricsRegistry {
@@ -179,9 +224,13 @@ impl MetricsRegistry {
             task_questions_total: counter_map(QUESTION_ACTIONS),
             wake_requests_total: counter_map(WAKE_REQUEST_RESULTS),
             wake_runs_total: counter_map(WAKE_RUN_STATUSES),
+            wake_completion_history: Mutex::new(VecDeque::new()),
             wake_dispatch_duration: Histogram::new(WAKE_DISPATCH_BUCKETS),
             wake_duration: histogram_map(WAKE_OUTCOMES, WAKE_EXECUTION_BUCKETS),
             wake_end_to_end_duration: histogram_map(WAKE_OUTCOMES, WAKE_EXECUTION_BUCKETS),
+            alerts_fired_total: counter_map(ALERT_RULE_KEYS),
+            alerts_resolved_total: counter_map(ALERT_RULE_KEYS),
+            alert_webhook_deliveries_total: counter_map(ALERT_DELIVERY_STATUSES),
         }
     }
 
@@ -284,6 +333,94 @@ impl MetricsRegistry {
         }
         if let Some(hist) = self.wake_end_to_end_duration.get(outcome) {
             hist.observe(e2e_secs);
+        }
+        if let Some(&static_outcome) = WAKE_OUTCOMES.iter().find(|&&o| o == outcome) {
+            self.record_wake_outcome_at(Instant::now(), static_outcome);
+        }
+    }
+
+    pub(crate) fn record_wake_outcome_at(&self, at: Instant, outcome: &'static str) {
+        let mut history = self
+            .wake_completion_history
+            .lock()
+            .expect("metrics wake history mutex poisoned");
+        history.push_back((at, outcome));
+        while history.len() > MAX_WAKE_COMPLETION_HISTORY {
+            history.pop_front();
+        }
+        while let Some(&(ts, _)) = history.front() {
+            if at.saturating_duration_since(ts) > MAX_WAKE_COMPLETION_AGE {
+                history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn wake_failure_stats(&self, window: Duration) -> WakeFailureWindowStats {
+        self.wake_failure_stats_at(Instant::now(), window)
+    }
+
+    pub(crate) fn wake_failure_stats_at(
+        &self,
+        now: Instant,
+        window: Duration,
+    ) -> WakeFailureWindowStats {
+        let history = self
+            .wake_completion_history
+            .lock()
+            .expect("metrics wake history mutex poisoned");
+        let mut ok = 0u64;
+        let mut failed = 0u64;
+        let mut timeout = 0u64;
+        for &(ts, outcome) in history.iter().rev() {
+            if now.saturating_duration_since(ts) > window {
+                if ts <= now {
+                    break;
+                }
+                continue;
+            }
+            match outcome {
+                "ok" => ok += 1,
+                "failed" => failed += 1,
+                "timeout" => timeout += 1,
+                _ => {}
+            }
+        }
+        let failures = failed + timeout;
+        let total_completed = ok + failures;
+        let failure_rate = if total_completed > 0 {
+            failures as f64 / total_completed as f64
+        } else {
+            0.0
+        };
+        WakeFailureWindowStats {
+            window_secs: window.as_secs(),
+            total_completed,
+            ok,
+            failed,
+            timeout,
+            failures,
+            failure_rate,
+        }
+    }
+
+    pub fn record_alert_fired(&self, rule: &str) {
+        if let Some(counter) = self.alerts_fired_total.get(rule) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_alert_resolved(&self, rule: &str) {
+        if let Some(counter) = self.alerts_resolved_total.get(rule) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_alert_webhook_delivery(&self, delivered: bool) {
+        let key = if delivered { "delivered" } else { "failed" };
+        if let Some(counter) = self.alert_webhook_deliveries_total.get(key) {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -803,6 +940,147 @@ impl MetricsRegistry {
                 "Current SQLite freelist size in bytes.",
             );
             write_sample(&mut out, "aircd_db_freelist_bytes", &[], pages.freelist_bytes);
+        }
+
+        // 6. Queue backlog, disk pressure & Prometheus alerting
+        let webhook_pending = snap
+            .webhook_deliveries_by_status
+            .get("pending")
+            .copied()
+            .unwrap_or(0);
+        write_header(
+            &mut out,
+            "aircd_queue_backlog_total",
+            "gauge",
+            "Total pending items across wake queue and webhook delivery queue.",
+        );
+        write_sample(
+            &mut out,
+            "aircd_queue_backlog_total",
+            &[],
+            snap.wake_pending_sessions as u64 + webhook_pending,
+        );
+
+        if let Some(disk) = &snap.disk {
+            write_header(
+                &mut out,
+                "aircd_disk_total_bytes",
+                "gauge",
+                "Total filesystem capacity in bytes on the database volume.",
+            );
+            write_sample(&mut out, "aircd_disk_total_bytes", &[], disk.total_bytes);
+
+            write_header(
+                &mut out,
+                "aircd_disk_available_bytes",
+                "gauge",
+                "Available filesystem bytes on the database volume.",
+            );
+            write_sample(
+                &mut out,
+                "aircd_disk_available_bytes",
+                &[],
+                disk.available_bytes,
+            );
+
+            write_header(
+                &mut out,
+                "aircd_disk_used_bytes",
+                "gauge",
+                "Used filesystem bytes on the database volume.",
+            );
+            write_sample(&mut out, "aircd_disk_used_bytes", &[], disk.used_bytes);
+
+            write_header(
+                &mut out,
+                "aircd_disk_used_ratio",
+                "gauge",
+                "Filesystem used fraction (0.0..=1.0) on the database volume.",
+            );
+            write_sample_f64(&mut out, "aircd_disk_used_ratio", &[], disk.used_ratio);
+        }
+
+        if !snap.alert_states.is_empty() {
+            write_header(
+                &mut out,
+                "aircd_alerts_active",
+                "gauge",
+                "Whether each configured Prometheus alert rule is currently firing (1) or not (0).",
+            );
+            for sample in &snap.alert_states {
+                write_sample(
+                    &mut out,
+                    "aircd_alerts_active",
+                    &[
+                        ("rule", &sample.rule),
+                        ("alertname", &sample.alertname),
+                        ("severity", &sample.severity),
+                    ],
+                    u64::from(sample.active),
+                );
+            }
+
+            write_header(
+                &mut out,
+                "aircd_alerts_state",
+                "gauge",
+                "Current alert rule state (0=inactive, 1=pending, 2=firing).",
+            );
+            for sample in &snap.alert_states {
+                write_sample(
+                    &mut out,
+                    "aircd_alerts_state",
+                    &[
+                        ("rule", &sample.rule),
+                        ("alertname", &sample.alertname),
+                        ("severity", &sample.severity),
+                    ],
+                    u64::from(sample.state_code),
+                );
+            }
+        }
+
+        write_header(
+            &mut out,
+            "aircd_alerts_fired_total",
+            "counter",
+            "Total alert firing transitions since server start by rule.",
+        );
+        for rule in ALERT_RULE_KEYS {
+            let val = self.alerts_fired_total[rule].load(Ordering::Relaxed);
+            write_sample(&mut out, "aircd_alerts_fired_total", &[("rule", rule)], val);
+        }
+
+        write_header(
+            &mut out,
+            "aircd_alerts_resolved_total",
+            "counter",
+            "Total alert resolution transitions since server start by rule.",
+        );
+        for rule in ALERT_RULE_KEYS {
+            let val = self.alerts_resolved_total[rule].load(Ordering::Relaxed);
+            write_sample(
+                &mut out,
+                "aircd_alerts_resolved_total",
+                &[("rule", rule)],
+                val,
+            );
+        }
+
+        write_header(
+            &mut out,
+            "aircd_alert_webhook_deliveries_total",
+            "counter",
+            "Total direct alert webhook deliveries attempted since server start by status.",
+        );
+        for status in ALERT_DELIVERY_STATUSES {
+            let val = self.alert_webhook_deliveries_total[status].load(Ordering::Relaxed);
+            write_sample(
+                &mut out,
+                "aircd_alert_webhook_deliveries_total",
+                &[("status", status)],
+                val,
+            );
         }
 
         out
