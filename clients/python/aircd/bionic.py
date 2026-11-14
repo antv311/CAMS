@@ -18,10 +18,12 @@ import os
 import platform
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -35,6 +37,7 @@ DEFAULT_MAX_TURNS = 30
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_OUTPUT_CHARS = 16000
+DEFAULT_PULL_TIMEOUT_SECONDS = 1800.0
 STREAM_FORMATS = ("text", "jsonl")
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -198,6 +201,9 @@ class BionicConfig:
     approval: str = "auto"
     stream: bool = False
     stream_format: str = "text"
+    auto_pull: bool = False
+    lms_path: str = ""
+    pull_timeout: float = DEFAULT_PULL_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -358,6 +364,17 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
     # --stream-format on the command line implies --stream; the env var alone does not.
     stream = bool(getattr(args, "stream", False) or cli_stream_format or _parse_bool_env("BIONIC_STREAM"))
 
+    auto_pull = bool(getattr(args, "auto_pull", False) or _parse_bool_env("BIONIC_AUTO_PULL"))
+    lms_path = (getattr(args, "lms_path", None) or os.environ.get("BIONIC_LMS", "")).strip()
+    pull_timeout = getattr(args, "pull_timeout", None)
+    if pull_timeout is None:
+        env_pull = os.environ.get("BIONIC_PULL_TIMEOUT", "").strip()
+        pull_timeout = (
+            _parse_float(env_pull, "BIONIC_PULL_TIMEOUT", minimum=0.0) if env_pull else DEFAULT_PULL_TIMEOUT_SECONDS
+        )
+    elif pull_timeout <= 0:
+        raise BionicError(f"--pull-timeout must be > 0, got {pull_timeout}")
+
     return BionicConfig(
         base_url=base_url,
         api_key=api_key,
@@ -378,6 +395,9 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
         approval=approval,
         stream=stream,
         stream_format=stream_format,
+        auto_pull=auto_pull,
+        lms_path=lms_path,
+        pull_timeout=float(pull_timeout),
     )
 
 
@@ -1356,6 +1376,234 @@ def resolve_model(config: BionicConfig) -> str:
     return model
 
 
+# --- Model readiness and auto-pull --------------------------------------------------------------
+
+READY_STATES = ("loaded",)
+
+
+def server_root(base_url: str) -> str:
+    """Strip an OpenAI-style ``/v1`` suffix to get the server root (for LM Studio's ``/api/v0``)."""
+    root = normalize_base_url(base_url)
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return root
+
+
+def model_states(base_url: str, *, api_key: str = "", timeout: float = 30.0) -> Optional[dict[str, str]]:
+    """Return ``{model_id: state}`` from LM Studio's ``GET /api/v0/models``.
+
+    ``state`` is typically ``loaded`` or ``not-loaded``. Returns ``None`` when the
+    server does not offer that endpoint (plain OpenAI-compatible servers), so
+    callers fall back to ``/v1/models`` presence plus a completion probe.
+    """
+    url = server_root(base_url) + "/api/v0/models"
+    try:
+        body = _http_json(url, method="GET", api_key=api_key, timeout=timeout)
+    except BionicError:
+        return None
+    raw_list = body.get("data")
+    if not isinstance(raw_list, list):
+        return None
+    states: dict[str, str] = {}
+    for entry in raw_list:
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id") or "").strip()
+        if model_id:
+            states[model_id] = str(entry.get("state") or "unknown").strip().lower() or "unknown"
+    return states
+
+
+def find_lms(lms_path: str = "") -> Optional[str]:
+    """Locate the LM Studio ``lms`` CLI: explicit path, then ``BIONIC_LMS``, then ``PATH``."""
+    candidate = (lms_path or os.environ.get("BIONIC_LMS", "")).strip()
+    if candidate:
+        found = shutil.which(candidate)
+        if found:
+            return found
+        return candidate if Path(candidate).is_file() else None
+    return shutil.which("lms")
+
+
+def _run_lms(lms: str, args: list[str], timeout: float) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            [lms, *args],
+            capture_output=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout:g}s"
+    except OSError as err:
+        return False, str(err)
+    out = (_decode_output(proc.stdout) + _decode_output(proc.stderr)).strip()
+    if len(out) > 2000:
+        out = "..." + out[-2000:]
+    return proc.returncode == 0, out
+
+
+def probe_model(config: BionicConfig, model: str) -> dict[str, Any]:
+    """Send a one-token chat completion to confirm ``model`` actually answers.
+
+    LM Studio loads a not-yet-loaded model on demand (JIT) for this request, so
+    a successful probe also means the model is now resident.
+    """
+    url = normalize_base_url(config.base_url) + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": False,
+    }
+    started = time.monotonic()
+    try:
+        resp = _http_json(url, method="POST", payload=payload, api_key=config.api_key, timeout=config.timeout)
+    except BionicError as err:
+        return {"ok": False, "latency_ms": int((time.monotonic() - started) * 1000), "error": str(err)}
+    latency_ms = int((time.monotonic() - started) * 1000)
+    choices = resp.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {"ok": False, "latency_ms": latency_ms, "error": f"no choices in reply: {json.dumps(resp)[:200]}"}
+    return {"ok": True, "latency_ms": latency_ms, "error": None}
+
+
+def check_health(
+    config: BionicConfig,
+    *,
+    probe: Optional[bool] = True,
+    auto_pull: Optional[bool] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Check that the Bionic server is up and the configured model is loaded and answering.
+
+    Steps: list ``/models`` (server reachable), resolve the model (``auto`` prefers
+    an already-loaded chat model), look up its load state via LM Studio's
+    ``/api/v0/models`` when available, optionally download (``lms get``) and load
+    (``lms load``) it when ``auto_pull`` is set, then optionally probe it with a
+    one-token completion. ``probe=None`` probes only when the load state is not
+    already known to be ``loaded``. ``auto_pull=None`` uses ``config.auto_pull``.
+
+    Returns a JSON-serializable report whose ``ok`` key is true when the model is
+    ready for a task. Never raises for an unhealthy server; the reason is in
+    ``error``.
+    """
+    say = log or (lambda _msg: None)
+    pull = config.auto_pull if auto_pull is None else bool(auto_pull)
+    list_timeout = min(config.timeout, 30.0)
+    report: dict[str, Any] = {
+        "ok": False,
+        "base_url": normalize_base_url(config.base_url),
+        "server": {"reachable": False},
+        "model": None,
+        "available": False,
+        "state": None,
+        "actions": [],
+        "probe": None,
+        "error": None,
+    }
+
+    def fail(msg: str) -> dict[str, Any]:
+        report["error"] = msg
+        return report
+
+    try:
+        listed = list_models(config.base_url, api_key=config.api_key, timeout=list_timeout)
+    except BionicError as err:
+        report["server"]["error"] = str(err)
+        return fail(str(err))
+    report["server"] = {"reachable": True, "models": len(listed)}
+    states = model_states(config.base_url, api_key=config.api_key, timeout=list_timeout)
+
+    requested = config.model.strip()
+    if not requested:
+        report["ok"] = bool(listed)
+        report["available_models"] = [m["id"] for m in listed]
+        if not listed:
+            return fail(f"No usable chat models returned by {report['base_url']}/models")
+        return report
+
+    if requested.lower() == "auto":
+        if not listed:
+            return fail(f"No usable chat models returned by {report['base_url']}/models")
+        loaded = [m["id"] for m in listed if states and states.get(m["id"]) in READY_STATES]
+        model = loaded[0] if loaded else listed[0]["id"]
+    else:
+        model = requested
+    report["model"] = model
+
+    def refresh_state() -> None:
+        nonlocal states, listed
+        ids = {m["id"] for m in listed}
+        report["available"] = model in ids or bool(states and model in states)
+        if states is not None and model in states:
+            report["state"] = states[model]
+        else:
+            report["state"] = "unknown" if report["available"] else "missing"
+
+    refresh_state()
+
+    if pull and (not report["available"] or report["state"] not in READY_STATES):
+        lms = find_lms(config.lms_path)
+        if lms is None:
+            report["actions"].append(
+                {"action": "lms", "ok": False, "detail": "lms CLI not found (set --lms or BIONIC_LMS)"}
+            )
+        else:
+            if not report["available"]:
+                say(f"[health] downloading {model} with lms get")
+                ok, detail = _run_lms(lms, ["get", model, "--yes"], config.pull_timeout)
+                report["actions"].append({"action": "get", "ok": ok, "detail": detail})
+                if not ok:
+                    return fail(f"lms get {model} failed: {detail or 'no output'}")
+            say(f"[health] loading {model} with lms load")
+            ok, detail = _run_lms(lms, ["load", model, "--yes"], config.pull_timeout)
+            report["actions"].append({"action": "load", "ok": ok, "detail": detail})
+            if not ok:
+                return fail(f"lms load {model} failed: {detail or 'no output'}")
+            try:
+                listed = list_models(config.base_url, api_key=config.api_key, timeout=list_timeout)
+            except BionicError as err:
+                return fail(str(err))
+            states = model_states(config.base_url, api_key=config.api_key, timeout=list_timeout)
+            refresh_state()
+            if report["state"] == "missing":
+                # Some servers only list loaded models after a refresh; lms said it loaded.
+                report["available"] = True
+                report["state"] = "unknown"
+
+    if not report["available"]:
+        hint = " (use --auto-pull to download it)" if not pull else ""
+        return fail(f"Model {model!r} is not available on {report['base_url']}{hint}")
+
+    should_probe = probe if probe is not None else report["state"] not in READY_STATES
+    if should_probe:
+        say(f"[health] probing {model}")
+        report["probe"] = probe_model(config, model)
+        if not report["probe"]["ok"]:
+            return fail(f"Model {model!r} did not answer: {report['probe']['error']}")
+        if states is not None:
+            refreshed = model_states(config.base_url, api_key=config.api_key, timeout=list_timeout)
+            if refreshed is not None and refreshed.get(model):
+                report["state"] = refreshed[model]
+        report["ok"] = True
+        return report
+
+    if report["state"] not in READY_STATES and report["state"] != "unknown":
+        return fail(f"Model {model!r} is {report['state']}, not loaded (use --auto-pull to load it)")
+    report["ok"] = True
+    return report
+
+
+def ensure_model_ready(config: BionicConfig, *, log: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
+    """Pre-task readiness check: run :func:`check_health` with auto-pull, raise if not ready."""
+    report = check_health(config, probe=None, auto_pull=True, log=log)
+    if not report["ok"]:
+        raise BionicError(f"Bionic model not ready: {report['error']}")
+    return report
+
+
 def build_system_prompt(
     cwd: str,
     custom_prompt: Optional[str] = None,
@@ -1531,7 +1779,12 @@ def run_agent(
         if on_event is not None:
             on_event(event)
 
-    model = resolve_model(config)
+    if config.auto_pull:
+        report = ensure_model_ready(config, log=log)
+        notify({"type": "health", "report": report})
+        model = str(report["model"])
+    else:
+        model = resolve_model(config)
     system_prompt = build_system_prompt(
         config.cwd,
         config.system_prompt,
@@ -1796,6 +2049,13 @@ class BionicAgent:
             include_all=include_all,
         )
 
+    def health(self, *, probe: Optional[bool] = True, auto_pull: Optional[bool] = None) -> dict[str, Any]:
+        """Check server and model readiness; see :func:`check_health`. Caches a resolved ``auto`` model."""
+        report = check_health(self._config, probe=probe, auto_pull=auto_pull, log=self._log)
+        if report["ok"] and report.get("model") and self._resolved_model is None:
+            self._resolved_model = str(report["model"])
+        return report
+
     def new_session(self) -> None:
         """Forget the current conversation; the next ``keep_session`` run starts fresh."""
         self.session_id = None
@@ -1998,6 +2258,36 @@ def build_parser() -> argparse.ArgumentParser:
             "implies --stream (env: BIONIC_STREAM_FORMAT, default: text)"
         ),
     )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help=(
+            "Check that the server is reachable and --model is available, loaded and answering; "
+            "print a JSON report and exit 0 when ready, 2 when not"
+        ),
+    )
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="With --health, skip the one-token completion probe (report load state only)",
+    )
+    parser.add_argument(
+        "--auto-pull",
+        action="store_true",
+        help=(
+            "Before running (or with --health), download the model with `lms get` and load it with "
+            "`lms load` when it is missing or not loaded, then confirm it answers (env: BIONIC_AUTO_PULL)"
+        ),
+    )
+    parser.add_argument("--lms", dest="lms_path", help="Path to the LM Studio `lms` CLI (env: BIONIC_LMS)")
+    parser.add_argument(
+        "--pull-timeout",
+        type=float,
+        help=(
+            "Timeout in seconds for each `lms get`/`lms load` "
+            f"(env: BIONIC_PULL_TIMEOUT, default: {int(DEFAULT_PULL_TIMEOUT_SECONDS)})"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON result to stdout")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log tool calls to stderr")
     return parser
@@ -2020,8 +2310,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps({"data": models}))
             return 0
 
+        if args.health:
+            log = (lambda msg: print(msg, file=sys.stderr)) if config.verbose else None
+            report = check_health(config, probe=not args.no_probe, auto_pull=config.auto_pull, log=log)
+            print(json.dumps(report))
+            if not report["ok"]:
+                print(f"error: {report['error']}", file=sys.stderr)
+                return 2
+            return 0
+
         if not args.prompt:
-            parser.error("-p/--prompt is required unless --list-models is specified")
+            parser.error("-p/--prompt is required unless --list-models or --health is specified")
 
         prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
         if not prompt.strip():
