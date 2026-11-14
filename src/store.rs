@@ -45,6 +45,11 @@ pub struct Group {
     pub updated_at: i64,
 }
 
+pub struct NamedGroupRole {
+    pub group: Group,
+    pub is_lead: bool,
+}
+
 /// Atomic changes to an existing group's seats; other definition fields are preserved.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct GroupMembershipUpdate {
@@ -134,6 +139,34 @@ impl GroupStore {
         let name = group_name(name)?;
         let db = self.db.lock().expect("sqlite mutex poisoned");
         Self::get_locked(&db, name)
+    }
+
+    /// Only explicit nick bindings identify accounts; model/count seats do not.
+    pub fn named_role(&self, project: &str, nick: &str) -> Result<Option<NamedGroupRole>> {
+        let mut selected = None;
+        for group in self.list()? {
+            if !group.projects.iter().any(|channel| channel == project) {
+                continue;
+            }
+            let matches = |member: &GroupMember| {
+                member.nick.as_deref().is_some_and(|name| {
+                    name.trim_start_matches('@')
+                        .eq_ignore_ascii_case(nick.trim_start_matches('@'))
+                })
+            };
+            let is_lead = matches(&group.definition.lead);
+            let is_worker = group.definition.workers.iter().any(matches);
+            if !is_lead && !is_worker {
+                continue;
+            }
+            if selected.is_some() || (is_lead && is_worker) {
+                return Err(anyhow!(
+                    "ambiguous group role for @{nick} in {project}; bind this nick to one group role per project"
+                ));
+            }
+            selected = Some(NamedGroupRole { group, is_lead });
+        }
+        Ok(selected)
     }
 
     pub fn update_membership(

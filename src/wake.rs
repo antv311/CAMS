@@ -926,39 +926,24 @@ impl WakeManager {
     /// Resolve named seats only, within the event's project. Client/model/count
     /// describe desired seats, not the identity of an existing account.
     fn group_prompt(&self, ctx: &WakeContext, project: &str) -> Result<Option<GroupPrompt>> {
-        let mut selected = None;
-        for group in crate::store::GroupStore::new(self.db.clone()).list()? {
-            if !group.projects.iter().any(|channel| channel == project) {
-                continue;
-            }
-            let definition = group.definition;
-            let matches = |member: &crate::store::GroupMember| {
-                member.nick.as_deref().is_some_and(|nick| {
-                    nick.trim_start_matches('@').eq_ignore_ascii_case(&ctx.nick)
-                })
-            };
-            let lead = matches(&definition.lead);
-            let worker = definition.workers.iter().any(matches);
-            if !lead && !worker {
-                continue;
-            }
-            if selected.is_some() || (lead && worker) {
-                return Err(anyhow!(
-                    "ambiguous group role for @{} in {project}; bind this nick to one group role per project",
-                    ctx.nick
-                ));
-            }
-            selected = Some(GroupPrompt {
-                name: definition.name,
-                role: if lead { "group lead" } else { "group worker" },
-                template: if lead {
-                    definition.lead_prompt
-                } else {
-                    definition.worker_prompt
-                },
-            });
-        }
-        Ok(selected)
+        Ok(crate::store::GroupStore::new(self.db.clone())
+            .named_role(project, &ctx.nick)?
+            .map(|binding| {
+                let definition = binding.group.definition;
+                GroupPrompt {
+                    name: definition.name,
+                    role: if binding.is_lead {
+                        "group lead"
+                    } else {
+                        "group worker"
+                    },
+                    template: if binding.is_lead {
+                        definition.lead_prompt
+                    } else {
+                        definition.worker_prompt
+                    },
+                }
+            }))
     }
 
     fn launch_vars(

@@ -390,6 +390,24 @@ class GroupCliTest(_HubCase):
         self.assertIn("parent=- reviewer=pm", out)
         self.assertIn("subtask task_2 [review] @w1: part one", out)
 
+    def test_task_show_question_waits_for_reviewer_pm_or_owner(self) -> None:
+        for status, waiting in (("open", "reviewer @lead"), ("escalated_pm", "the project manager"), ("escalated", "the owner")):
+            with self.subTest(status=status):
+                self.reply((200, {
+                    "task": {"id": "task_2", "kind": "task", "status": "blocked", "channel": "#cams",
+                             "title": "child", "parent_task_id": "task_1", "reviewer": "lead"},
+                    "question": {"status": status, "asked_by": "worker", "question": "Scope?"},
+                }))
+                code, out, err = self.run_cli("task", "show", "task_2")
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"WAITING on {waiting}", out)
+
+    def test_escalation_output_does_not_assume_owner_destination(self) -> None:
+        self.reply((200, {"task": {"id": "task_2", "status": "blocked"}}))
+        code, out, err = self.run_cli("task", "escalate", "task_2", "PM decision")
+        self.assertEqual(code, 0, err)
+        self.assertIn("escalated; task is blocked", out)
+
     def test_review_without_report_is_refused_before_the_hub(self) -> None:
         for note in ([], ["--note", "  "]):
             code, _, err = self.run_cli("task", "status", "task_2", "review", *note)
@@ -506,6 +524,32 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         shown = json.loads(self.cli("--json", "task", "show", tid).stdout)
         notes = [ev.get("note") or "" for ev in shown["events"]]
         self.assertTrue(any(f"report {rep['id']}" in n and "12 passed" in n for n in notes), notes)
+
+    def test_group_lead_question_delegation_against_real_hub(self) -> None:
+        self.cli("project", "create", "#delegate")
+        for nick in ("delegate-lead", "delegate-worker"):
+            self.cli("--profile", nick, "register", "--nick", nick, "--invite", OWNER_KEY, "--no-default")
+            self.cli("project", "add", "#delegate", nick, "--role", "builder")
+        definition = {
+            "name": "delegation", "lead": {"template": "example", "model": "lead", "nick": "delegate-lead"},
+            "workers": [{"template": "example", "model": "worker", "nick": "delegate-worker"}],
+        }
+        group_file = Path(self.tmp.name) / "delegation.json"
+        group_file.write_text(json.dumps(definition), encoding="utf-8")
+        self.cli("group", "create", "delegation", "--file", str(group_file), "--invite", OWNER_KEY)
+        self.cli("group", "attach", "delegation", "#delegate", "--invite", OWNER_KEY)
+        parent = json.loads(self.cli("--json", "task", "create", "#delegate", "parent", "--assign", "delegate-lead").stdout)["task"]
+        child = json.loads(self.cli("--profile", "delegate-lead", "--json", "task", "create", "#delegate", "child",
+                                   "--parent", parent["id"], "--assign", "delegate-worker").stdout)["task"]
+        self.assertEqual(child["reviewer"], "delegate-lead")
+        self.cli("--profile", "delegate-worker", "task", "ask", child["id"], "Scope?")
+        shown = self.cli("--profile", "delegate-lead", "task", "show", child["id"]).stdout
+        self.assertIn("WAITING on reviewer @delegate-lead", shown)
+        self.cli("--profile", "delegate-lead", "task", "escalate", child["id"], "PM decision")
+        self.assertIn("WAITING on the project manager", self.cli("task", "show", child["id"]).stdout)
+        self.cli("task", "answer", child["id"], "Approved")
+        parent_shown = self.cli("--profile", "delegate-lead", "task", "show", parent["id"]).stdout
+        self.assertIn(f"subtask {child['id']} [assigned] @delegate-worker", parent_shown)
 
     def test_real_hub_groups(self) -> None:
         listed = self.cli("--json", "group", "list", check=False)

@@ -1600,10 +1600,17 @@ async fn get_task(
         .tasks()
         .pending_question(&task.id)
         .map_err(ApiError::internal)?;
+    let subtasks = state
+        .server
+        .tasks()
+        .children(&task.id)
+        .map_err(ApiError::internal)?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
-        Json(json!({ "ok": true, "task": task, "events": events, "question": question })),
+        Json(
+            json!({ "ok": true, "task": task, "events": events, "question": question, "subtasks": subtasks }),
+        ),
     ))
 }
 
@@ -2823,6 +2830,8 @@ mod tests {
     use crate::store;
     use crate::webhooks::sign_payload;
     use tokio::sync::mpsc;
+
+    include!("http_delegation_tests.rs");
 
     struct TemplateApi {
         server: Server,
@@ -4602,10 +4611,15 @@ mod tests {
         .await?;
         assert_eq!(body["inbox"]["review_count"], 0);
         let messages = api.server.history().tail("#one", 0, 20)?;
-        assert!(messages.iter().any(|message| message.body.contains(id)
-            && message.body.contains("testing -> review")
-            && message.body.contains("@pm")
-            && message.body.contains("@lead")));
+        let notice = messages
+            .iter()
+            .find(|message| message.body.contains(id) && message.body.contains("testing -> review"))
+            .unwrap();
+        assert!(notice.body.contains("@lead"));
+        assert!(
+            !notice.body.contains("@pm"),
+            "PM oversight stays in the inbox without a subtask wake"
+        );
         for nick in ["worker", "peer"] {
             let (status, _) = call(
                 &api.client,
