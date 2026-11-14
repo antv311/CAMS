@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
 import os
 import sqlite3
 import subprocess
@@ -21,7 +22,7 @@ class TaskAttributesE2ETest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = f"http://127.0.0.1:{_free_port()}"
             db = Path(tmp) / "attributes.sqlite3"
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 conn.executescript("""
                     CREATE TABLE tasks (id TEXT PRIMARY KEY, channel TEXT NOT NULL,
                     title TEXT NOT NULL, status TEXT NOT NULL, claimed_by TEXT,
