@@ -47,6 +47,8 @@ No paths, model IDs, or hostnames outside `localhost` are hardcoded.
 | `--api-key` | `BIONIC_API_KEY`, `OPENAI_API_KEY` | `lm-studio` | Bearer token (`""` omits header) |
 | `--model` | `BIONIC_MODEL` | *(required, or `auto`)* | Model ID, or `auto` to pick the first chat model |
 | `--cwd` | `BIONIC_CWD` | current directory | Working directory for file and shell tools |
+| `--workspace-root` | `BIONIC_WORKSPACE_ROOT` | the working directory | Directory every tool call is jailed to (must contain `--cwd`) |
+| `--approval` | `BIONIC_APPROVAL` | `auto` | Tool approval mode: `auto`, `prompt`, or `read-only` (see below) |
 | `--max-turns` | `BIONIC_MAX_TURNS` | `30` | Maximum LLM/tool turns before failing |
 | `--timeout` | `BIONIC_TIMEOUT` | `300` | HTTP request timeout in seconds |
 | `--command-timeout` | `BIONIC_COMMAND_TIMEOUT` | `120` | Per-`run_command` timeout in seconds |
@@ -143,7 +145,42 @@ store and pass back on subsequent wakes.
 
 ## Security considerations
 
-`airc-bionic` executes tool calls (`run_command`, `write_file`, `edit_file`)
-unattended with the OS permissions of the hub/runner process. Only attach it to
-trusted projects, use dedicated worker profiles, and adjust `--max-turns` and
-`--command-timeout` as needed for your workload.
+`airc-bionic` runs tool calls with the OS permissions of the hub/runner
+process. Only attach it to trusted projects, use dedicated worker profiles, and
+adjust `--max-turns` and `--command-timeout` as needed for your workload.
+
+### Workspace root jail
+
+Every tool call is confined to the workspace root (`--workspace-root`, default
+the working directory, which `aircd` sets to the task's `{repo_path}`):
+
+- `read_file`, `write_file` and `edit_file` resolve the requested path fully,
+  collapsing `..` and following symlinks and Windows junctions, then refuse it
+  unless the result is inside the root. Absolute paths, `~`, drive-relative
+  (`D:x`) and rooted (`\x`) Windows paths, and links that point out of the
+  repository are all denied.
+- `run_command` is checked before it runs. The executable in each pipeline
+  segment may be anywhere (`python`, `git`, `airc`, an absolute interpreter
+  path), but every argument, redirect target and `--flag=value` that looks like
+  a path must resolve inside the root. Commands that use `..` to leave the root,
+  absolute or `~` paths outside it, `$VAR`/`%VAR%` paths that expand outside it,
+  or command substitution (`$(...)`, backticks) are refused. URLs and device
+  paths such as `/dev/null` and `nul` are allowed, as are `cmd.exe` switches
+  such as `/b`.
+
+A denied call returns `{"error": "Denied: ...", "denied": true}` to the model so
+it can correct itself; nothing runs or is written. The command check reads the
+command text without running it, so code an interpreter runs (for example
+`python -c "..."`) can still reach outside the root. For untrusted models, also
+run the worker as a restricted OS user or inside a container.
+
+### Tool approval modes
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` (default) | Calls that pass the jail check run without asking. Use for unattended `aircd` wakes. |
+| `prompt` | Before each `run_command`, `write_file` or `edit_file`, asks `Allow ...? [y/N]` on the controlling terminal (`/dev/tty` or `CONIN$`). If no terminal is attached, the call is denied. Reads never prompt. |
+| `read-only` | Only `read_file` is offered to the model; mutating tools are refused. Use for review or analysis seats. |
+
+Set the mode per template with `"env": {"BIONIC_APPROVAL": "read-only"}` or by
+adding `--approval <mode>` to `args`.
