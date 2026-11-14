@@ -16,6 +16,7 @@ use crate::auth::{
     AuthContext, DuplicatePrincipalError, DuplicateTokenLabelError, Scope, TokenExpiredError,
 };
 use crate::gits::{sanitize_repo_name, verify_github_signature};
+use crate::history::{canonical_dm_channel, HistorySearchScope};
 use crate::locks::LockConflictError;
 use crate::logging::{LogEvent, Severity};
 use crate::rate_limit::{
@@ -543,6 +544,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         )
         .route("/v1/channels/join", post(join_channels))
         .route("/v1/messages", get(list_messages).post(post_message))
+        .route("/v1/messages/search", get(search_messages))
         .route("/v1/roles", get(list_roles).post(set_role))
         .route(
             "/v1/webhooks",
@@ -2360,6 +2362,7 @@ struct MessagesQuery {
     dm: Option<String>,
     peer: Option<String>,
     after_seq: Option<i64>,
+    from_seq: Option<i64>,
     limit: Option<i64>,
 }
 
@@ -2392,12 +2395,96 @@ async fn list_messages(
             .map_err(ApiError::internal)?
     } else {
         let chan = normalize_http_channel(q.channel.as_deref().unwrap_or("#general"));
-        state
-            .server
-            .history()
-            .tail(&chan, after_seq, limit)
-            .map_err(ApiError::internal)?
+        if let Some(from_seq) = q.from_seq {
+            state
+                .server
+                .history()
+                .after(&chan, from_seq.saturating_sub(1).max(0), limit)
+                .map_err(ApiError::internal)?
+        } else {
+            state
+                .server
+                .history()
+                .tail(&chan, after_seq, limit)
+                .map_err(ApiError::internal)?
+        }
     };
+
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "messages": messages })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SearchMessagesQuery {
+    q: Option<String>,
+    scope: Option<String>,
+    channel: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn search_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SearchMessagesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let principal = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/messages/search",
+    )?
+    .principal;
+
+    let query_text = q.q.unwrap_or_default();
+    let scope_str = q.scope.as_deref().unwrap_or("all").trim().to_ascii_lowercase();
+    let scope = match scope_str.as_str() {
+        "" | "all" => HistorySearchScope::All,
+        "sprints" | "sprint" => HistorySearchScope::Sprints,
+        "dms" | "dm" => HistorySearchScope::Dms,
+        "channel" | "room" => HistorySearchScope::Channel,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "Invalid search scope '{other}' (expected all, sprints, dms, or channel)"
+            )));
+        }
+    };
+
+    let resolved_channel = if let Some(raw_chan) = q.channel.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(peer) = raw_chan.strip_prefix('@') {
+            let resolved = state
+                .server
+                .auth()
+                .resolve_by_name(peer)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found(format!("Unknown agent '{peer}'")))?;
+            Some(canonical_dm_channel(&principal.id, &resolved.id))
+        } else {
+            Some(normalize_http_channel(raw_chan))
+        }
+    } else {
+        None
+    };
+
+    let effective_scope = if resolved_channel.is_some() && scope == HistorySearchScope::All {
+        HistorySearchScope::Channel
+    } else {
+        scope
+    };
+    let limit = q.limit.unwrap_or(100);
+    let messages = state
+        .server
+        .history()
+        .search(
+            &principal.id,
+            &query_text,
+            effective_scope,
+            resolved_channel.as_deref(),
+            limit,
+        )
+        .map_err(ApiError::internal)?;
 
     Ok((
         StatusCode::OK,
@@ -9125,6 +9212,133 @@ mod tests {
         )
         .await?;
         assert_eq!(status, 404);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_messages_endpoint_supports_scopes_dm_privacy_and_from_seq() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let base = &api.base;
+        let owner_tok = "human-token";
+        let pm_tok = tokens["pm"].as_str();
+        let worker_tok = tokens["worker"].as_str();
+
+        // Open a sprint room under #one (#one-s1).
+        let (status, room_body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/rooms"),
+            pm_tok,
+            json!({ "project": "#one", "title": "Sprint One" }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let sprint_chan = room_body["room"]["channel"].as_str().unwrap().to_string();
+
+        // Post messages to #general, sprint room, and private DMs.
+        for (tok, target, body) in [
+            (owner_tok, "#general", "hub deploy checklist"),
+            (pm_tok, sprint_chan.as_str(), "sprint deploy ready"),
+            (worker_tok, "@pm", "dm deploy question"),
+            (owner_tok, "@lead", "secret owner-lead deploy note"),
+        ] {
+            let (st, _) = call(
+                &api.client,
+                "POST",
+                format!("{base}/v1/messages"),
+                tok,
+                json!({ "target": target, "body": body }),
+            )
+            .await?;
+            assert_eq!(st, 201);
+        }
+
+        // Unauthenticated search is rejected.
+        let res = api
+            .client
+            .get(format!("{base}/v1/messages/search?q=deploy"))
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // PM sees #general, #one-s1, and worker<->pm DM, but NOT owner<->lead DM.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=all"),
+            pm_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs.iter().all(|m| !m["body"].as_str().unwrap().contains("secret owner-lead")));
+
+        // Sprint scope returns only #one-s1.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=sprints"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let sprint_msgs = body["messages"].as_array().unwrap();
+        assert_eq!(sprint_msgs.len(), 1);
+        assert_eq!(sprint_msgs[0]["channel"], sprint_chan);
+
+        // DMs scope for worker returns only worker<->pm DM.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=dms"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let dm_msgs = body["messages"].as_array().unwrap();
+        assert_eq!(dm_msgs.len(), 1);
+        assert_eq!(dm_msgs[0]["body"], "dm deploy question");
+
+        // Channel scope with @peer resolves the DM conversation.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=channel&channel=@pm"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+
+        // Invalid scope returns 400.
+        let (status, _) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=invalid"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // from_seq loads inclusively starting at seq=1.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages?channel=%23general&from_seq=1&limit=10"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let loaded = body["messages"].as_array().unwrap();
+        assert!(loaded.iter().any(|m| m["body"] == "hub deploy checklist"));
 
         Ok(())
     }

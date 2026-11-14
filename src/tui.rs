@@ -5,6 +5,7 @@
 //! stops the hub or the agents it has launched.
 
 use crate::config::config_dir;
+use crate::history::ParsedSearchQuery;
 use anyhow::{anyhow, Context, Result};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -65,6 +66,7 @@ const HELP: &[&str] = &[
     "  w           answer a question that is waiting on you",
     "  l           switch an account's launcher on or off (owner)",
     "  g           groups    c  chat      r  refresh      q  quit",
+    "  / / Ctrl+F  search chat history across sprint channels and DMs",
     "  S           start the hub on this machine when it is not running",
     "              (Ctrl+S in chat)",
     "",
@@ -81,6 +83,7 @@ const HELP: &[&str] = &[
     "  PageUp/PageDown scroll history · Home oldest · End latest",
     "  Mouse wheel scrolls history over the message pane",
     "  Ctrl+D or click a name in People: direct message someone",
+    "  Ctrl+F: search conversation history (sprint channels & DMs)",
     "",
     "In a pop-up: up/down choose, Enter confirm, Esc cancel.",
 ];
@@ -220,6 +223,76 @@ pub struct GroupView {
 /// A model a client can run: its id and, when the client gave one, a label.
 pub type ModelItem = (String, Option<String>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchScope {
+    #[default]
+    All,
+    Sprints,
+    DirectMessages,
+    CurrentRoom,
+}
+
+impl SearchScope {
+    fn api_param(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Sprints => "sprints",
+            Self::DirectMessages => "dms",
+            Self::CurrentRoom => "channel",
+        }
+    }
+
+    fn next(self, has_room: bool) -> Self {
+        match self {
+            Self::All => Self::Sprints,
+            Self::Sprints => Self::DirectMessages,
+            Self::DirectMessages => {
+                if has_room {
+                    Self::CurrentRoom
+                } else {
+                    Self::All
+                }
+            }
+            Self::CurrentRoom => Self::All,
+        }
+    }
+
+    fn prev(self, has_room: bool) -> Self {
+        match self {
+            Self::All => {
+                if has_room {
+                    Self::CurrentRoom
+                } else {
+                    Self::DirectMessages
+                }
+            }
+            Self::Sprints => Self::All,
+            Self::DirectMessages => Self::Sprints,
+            Self::CurrentRoom => Self::DirectMessages,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub room: String,
+    pub seq: i64,
+    pub sender: String,
+    pub body: String,
+    pub time: i64,
+    pub is_sprint: bool,
+    pub is_dm: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchResponse {
+    pub query: String,
+    pub scope: SearchScope,
+    pub channel: Option<String>,
+    pub hits: Vec<SearchHit>,
+    pub error: Option<String>,
+}
+
 /// Everything the screens show, refreshed from the server in the background.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -242,6 +315,8 @@ pub struct Snapshot {
     pub templates: Vec<TemplateView>,
     /// The models last listed for a template, or why they could not be.
     pub models: Option<(String, Result<Vec<ModelItem>, String>)>,
+    /// Results from the hub's `/v1/messages/search` endpoint for the active search.
+    pub search_results: Option<SearchResponse>,
     /// The result of the last action: (succeeded, text, when).
     pub notice: Option<(bool, String, Instant)>,
     /// The hub could not be reached or refused the refresh.
@@ -284,6 +359,17 @@ pub enum Action {
     CreateAccount { body: Value },
     /// Several requests in order; stops at the first that fails.
     Many(Vec<Action>),
+    /// Query `/v1/messages/search` for older or full-database chat matches.
+    SearchHistory {
+        query: String,
+        scope: SearchScope,
+        channel: Option<String>,
+    },
+    /// Load a historical message window around `around_seq` for jumping to old hits.
+    LoadMessageWindow {
+        room: String,
+        around_seq: i64,
+    },
     /// Start the hub on this machine because nothing answers at its address.
     StartHub,
 }
@@ -411,6 +497,14 @@ pub struct GroupEditorState {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchState {
+    pub query: String,
+    pub scope: SearchScope,
+    pub current_room: Option<String>,
+    pub idx: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Modal {
     /// Choose one of `items` (label, value).
@@ -428,6 +522,8 @@ pub enum Modal {
         selected: Vec<String>,
         idx: usize,
     },
+    /// Full-text search across sprint channels and direct messages.
+    Search(Box<SearchState>),
     Detail { task_id: String },
     Help,
 }
@@ -467,6 +563,10 @@ pub struct App {
     chat_content_height: usize,
     chat_area: Rect,
     chat_channel: Option<String>,
+    /// Target `(room, seq)` to scroll into view on the next chat render.
+    pub jump_to_seq: Option<(String, i64)>,
+    /// Currently highlighted `(room, seq)` jumped to from search.
+    pub chat_highlight: Option<(String, i64)>,
     channel_rows: Vec<(u16, usize)>,
     task_rows: Vec<(u16, usize)>,
     home_rows: Vec<(u16, usize)>,
@@ -501,6 +601,8 @@ impl Default for App {
             chat_content_height: 0,
             chat_area: Rect::default(),
             chat_channel: None,
+            jump_to_seq: None,
+            chat_highlight: None,
             channel_rows: Vec::new(),
             task_rows: Vec::new(),
             home_rows: Vec::new(),
@@ -536,6 +638,8 @@ pub fn open_dm(app: &mut App, nick: &str) {
     // Drawing moves the selection to this room once it is listed.
     app.chat_channel = Some(room);
     app.chat_scroll = 0;
+    app.jump_to_seq = None;
+    app.chat_highlight = None;
     app.input.clear();
     app.view = View::Chat;
 }
@@ -1412,6 +1516,7 @@ async fn refresh(
     snap.notice = guard.notice.clone();
     snap.detail = guard.detail.clone();
     snap.models = guard.models.clone();
+    snap.search_results = guard.search_results.clone();
     snap.error = None;
     snap.hub_down = false;
     *guard = snap;
@@ -1777,6 +1882,137 @@ async fn start_hub(server: &str) -> (bool, String) {
     }
 }
 
+async fn search_history_api(
+    client: &reqwest::Client,
+    cfg: &TuiConfig,
+    snap: &Snapshot,
+    query: &str,
+    scope: SearchScope,
+    channel: Option<&str>,
+) -> SearchResponse {
+    let mut path = format!(
+        "/v1/messages/search?q={}&scope={}&limit=100",
+        encode_path_segment(query),
+        scope.api_param()
+    );
+    if scope == SearchScope::CurrentRoom {
+        if let Some(ch) = channel {
+            path.push_str("&channel=");
+            path.push_str(&encode_path_segment(ch));
+        }
+    }
+    let url = format!("{}{path}", cfg.server);
+    let response = match client.get(url).bearer_auth(&cfg.token).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            return SearchResponse {
+                query: query.to_string(),
+                scope,
+                channel: channel.map(str::to_owned),
+                hits: Vec::new(),
+                error: Some(format!("{err}")),
+            };
+        }
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        // Older hubs do not expose /v1/messages/search; client-side search stays active.
+        return SearchResponse {
+            query: query.to_string(),
+            scope,
+            channel: channel.map(str::to_owned),
+            hits: Vec::new(),
+            error: None,
+        };
+    }
+    let parsed: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg = parsed["error"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return SearchResponse {
+            query: query.to_string(),
+            scope,
+            channel: channel.map(str::to_owned),
+            hits: Vec::new(),
+            error: Some(msg),
+        };
+    }
+    let my_id = snap
+        .accounts
+        .iter()
+        .find(|a| a.nick.eq_ignore_ascii_case(&cfg.nick))
+        .map(|a| a.id.clone())
+        .unwrap_or_else(|| cfg.nick.clone());
+    let mut hits = Vec::new();
+    for msg in parsed["messages"].as_array().into_iter().flatten() {
+        let raw_chan = text(&msg["channel"]);
+        let (room, is_dm, is_sprint) = if let Some(peer) = dm_peer(&raw_chan, &my_id) {
+            let nick = snap
+                .accounts
+                .iter()
+                .find(|a| a.id.eq_ignore_ascii_case(&peer))
+                .map(|a| a.nick.clone())
+                .unwrap_or(peer);
+            (format!("@{nick}"), true, false)
+        } else {
+            let sprint = project_for(snap, &raw_chan).is_some_and(|p| p.channel != raw_chan);
+            (raw_chan, false, sprint)
+        };
+        hits.push(SearchHit {
+            room,
+            seq: msg["seq"].as_i64().unwrap_or(0),
+            sender: text(&msg["sender_id"]),
+            body: text(&msg["body"]),
+            time: msg["created_at"].as_i64().unwrap_or(0),
+            is_sprint,
+            is_dm,
+        });
+    }
+    SearchResponse {
+        query: query.to_string(),
+        scope,
+        channel: channel.map(str::to_owned),
+        hits,
+        error: None,
+    }
+}
+
+async fn load_message_window(
+    client: &reqwest::Client,
+    cfg: &TuiConfig,
+    shared: &Arc<Mutex<Snapshot>>,
+    room: &str,
+    around_seq: i64,
+) {
+    if room.starts_with('@') {
+        return;
+    }
+    let from_seq = around_seq.saturating_sub(200).max(1);
+    let path = format!(
+        "/v1/messages?channel={}&from_seq={from_seq}&limit=500",
+        encode_channel(room)
+    );
+    if let Ok(fetched) = get(client, cfg, &path).await {
+        let mut guard = shared.lock().expect("snapshot mutex poisoned");
+        let lines = guard.messages.entry(room.to_string()).or_default();
+        let mut seen: HashSet<i64> = lines.iter().map(|l| l.seq).collect();
+        for message in fetched["messages"].as_array().into_iter().flatten() {
+            let seq = message["seq"].as_i64().unwrap_or(0);
+            if seen.insert(seq) {
+                lines.push(ChatLine {
+                    seq,
+                    sender: text(&message["sender_id"]),
+                    body: text(&message["body"]),
+                    time: message["created_at"].as_i64().unwrap_or(0),
+                });
+            }
+        }
+        lines.sort_by_key(|l| l.seq);
+    }
+}
+
 async fn fetch_loop(
     client: reqwest::Client,
     cfg: TuiConfig,
@@ -1837,6 +2073,25 @@ async fn fetch_loop(
                             .await
                             .unwrap_or_else(|err| vec![format!("Could not load the task: {err}")]);
                         shared.lock().expect("snapshot mutex poisoned").detail = Some((id, lines));
+                    }
+                    Some(Action::SearchHistory { query, scope, channel }) => {
+                        let snap = shared.lock().expect("snapshot mutex poisoned").clone();
+                        let result = search_history_api(
+                            &client,
+                            &cfg,
+                            &snap,
+                            &query,
+                            scope,
+                            channel.as_deref(),
+                        )
+                        .await;
+                        shared.lock().expect("snapshot mutex poisoned").search_results =
+                            Some(result);
+                        continue;
+                    }
+                    Some(Action::LoadMessageWindow { room, around_seq }) => {
+                        load_message_window(&client, &cfg, &shared, &room, around_seq).await;
+                        continue;
                     }
                     Some(Action::StartHub) => {
                         // Someone may have started it since the last refresh.
@@ -3263,6 +3518,233 @@ fn handle_group_attach_key(
     }
 }
 
+fn search_room_matches_scope(
+    scope: SearchScope,
+    current_room: Option<&str>,
+    room: &str,
+    is_sprint: bool,
+    is_dm: bool,
+) -> bool {
+    match scope {
+        SearchScope::All => true,
+        SearchScope::Sprints => is_sprint,
+        SearchScope::DirectMessages => is_dm,
+        SearchScope::CurrentRoom => current_room == Some(room),
+    }
+}
+
+fn search_query_matches(parsed: &ParsedSearchQuery, room: &str, sender: &str, body: &str) -> bool {
+    let room_l = room.to_ascii_lowercase();
+    let sender_l = sender.to_ascii_lowercase();
+    let body_l = body.to_ascii_lowercase();
+    parsed.from_filters.iter().all(|f| sender_l.contains(f))
+        && parsed.in_filters.iter().all(|r| room_l.contains(r))
+        && parsed
+            .terms
+            .iter()
+            .all(|t| body_l.contains(t) || sender_l.contains(t))
+}
+
+/// Search loaded chat history (and any matching server search response) for `state`.
+pub fn search_hits(state: &SearchState, snap: &Snapshot) -> Vec<SearchHit> {
+    let parsed = ParsedSearchQuery::parse(&state.query);
+    if parsed.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
+
+    for (room, lines) in &snap.messages {
+        let is_dm = room.starts_with('@');
+        let is_sprint = !is_dm && project_for(snap, room).is_some_and(|p| p.channel != *room);
+        if !search_room_matches_scope(
+            state.scope,
+            state.current_room.as_deref(),
+            room,
+            is_sprint,
+            is_dm,
+        ) {
+            continue;
+        }
+        for line in lines {
+            if search_query_matches(&parsed, room, &line.sender, &line.body)
+                && seen.insert((room.clone(), line.seq))
+            {
+                hits.push(SearchHit {
+                    room: room.clone(),
+                    seq: line.seq,
+                    sender: line.sender.clone(),
+                    body: line.body.clone(),
+                    time: line.time,
+                    is_sprint,
+                    is_dm,
+                });
+            }
+        }
+    }
+
+    if let Some(resp) = &snap.search_results {
+        let scoped_channel = if state.scope == SearchScope::CurrentRoom {
+            state.current_room.as_deref()
+        } else {
+            None
+        };
+        if resp.query.trim() == state.query.trim()
+            && resp.scope == state.scope
+            && resp.channel.as_deref() == scoped_channel
+        {
+            for hit in &resp.hits {
+                if search_room_matches_scope(
+                    state.scope,
+                    state.current_room.as_deref(),
+                    &hit.room,
+                    hit.is_sprint,
+                    hit.is_dm,
+                ) && search_query_matches(&parsed, &hit.room, &hit.sender, &hit.body)
+                    && seen.insert((hit.room.clone(), hit.seq))
+                {
+                    hits.push(hit.clone());
+                }
+            }
+        }
+    }
+
+    hits.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| a.room.cmp(&b.room)));
+    hits
+}
+
+fn search_action_for(state: &SearchState) -> Option<Action> {
+    let parsed = ParsedSearchQuery::parse(&state.query);
+    if parsed.is_empty() {
+        return None;
+    }
+    Some(Action::SearchHistory {
+        query: state.query.trim().to_string(),
+        scope: state.scope,
+        channel: if state.scope == SearchScope::CurrentRoom {
+            state.current_room.clone()
+        } else {
+            None
+        },
+    })
+}
+
+fn open_search_modal(app: &mut App, snap: &Snapshot) {
+    let current_room = if app.view == View::Chat {
+        chat_rooms(app, snap).get(app.channel_idx).cloned()
+    } else {
+        app.project.clone()
+    };
+    app.modal = Some(Modal::Search(Box::new(SearchState {
+        query: String::new(),
+        scope: SearchScope::All,
+        current_room,
+        idx: 0,
+    })));
+}
+
+fn handle_search_key(
+    app: &mut App,
+    mut state: Box<SearchState>,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    snap: &Snapshot,
+) -> Option<Action> {
+    let has_room = state.current_room.is_some();
+    match code {
+        KeyCode::Esc => None,
+        KeyCode::Tab => {
+            state.scope = state.scope.next(has_room);
+            state.idx = 0;
+            let action = search_action_for(&state);
+            app.modal = Some(Modal::Search(state));
+            action
+        }
+        KeyCode::BackTab => {
+            state.scope = state.scope.prev(has_room);
+            state.idx = 0;
+            let action = search_action_for(&state);
+            app.modal = Some(Modal::Search(state));
+            action
+        }
+        KeyCode::Up => {
+            state.idx = state.idx.saturating_sub(1);
+            app.modal = Some(Modal::Search(state));
+            None
+        }
+        KeyCode::Down => {
+            let len = search_hits(&state, snap).len();
+            state.idx = (state.idx + 1).min(len.saturating_sub(1));
+            app.modal = Some(Modal::Search(state));
+            None
+        }
+        KeyCode::PageUp => {
+            state.idx = state.idx.saturating_sub(10);
+            app.modal = Some(Modal::Search(state));
+            None
+        }
+        KeyCode::PageDown => {
+            let len = search_hits(&state, snap).len();
+            state.idx = (state.idx + 10).min(len.saturating_sub(1));
+            app.modal = Some(Modal::Search(state));
+            None
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            state.query.clear();
+            state.idx = 0;
+            app.modal = Some(Modal::Search(state));
+            None
+        }
+        KeyCode::Backspace => {
+            state.query.pop();
+            state.idx = 0;
+            let action = search_action_for(&state);
+            app.modal = Some(Modal::Search(state));
+            action
+        }
+        KeyCode::Char(c)
+            if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
+        {
+            state.query.push(c);
+            state.idx = 0;
+            let action = search_action_for(&state);
+            app.modal = Some(Modal::Search(state));
+            action
+        }
+        KeyCode::Enter => {
+            let hits = search_hits(&state, snap);
+            if let Some(hit) = hits.get(state.idx.min(hits.len().saturating_sub(1))) {
+                if hit.is_dm && !app.dm_open.contains(&hit.room) {
+                    app.dm_open.push(hit.room.clone());
+                }
+                app.chat_channel = Some(hit.room.clone());
+                app.chat_scroll = 0;
+                app.jump_to_seq = Some((hit.room.clone(), hit.seq));
+                app.chat_highlight = Some((hit.room.clone(), hit.seq));
+                app.view = View::Chat;
+                let has_local = snap
+                    .messages
+                    .get(&hit.room)
+                    .is_some_and(|lines| lines.iter().any(|l| l.seq == hit.seq));
+                if !has_local {
+                    return Some(Action::LoadMessageWindow {
+                        room: hit.room.clone(),
+                        around_seq: hit.seq,
+                    });
+                }
+                return None;
+            }
+            let action = search_action_for(&state);
+            app.modal = Some(Modal::Search(state));
+            action
+        }
+        _ => {
+            app.modal = Some(Modal::Search(state));
+            None
+        }
+    }
+}
+
 fn handle_modal(
     app: &mut App,
     code: KeyCode,
@@ -3347,6 +3829,7 @@ fn handle_modal(
             selected,
             idx,
         } => handle_group_attach_key(app, group_name, attached, selected, idx, code, snap),
+        Modal::Search(state) => handle_search_key(app, state, code, modifiers, snap),
         Modal::Detail { .. } | Modal::Help => None,
     }
 }
@@ -3373,6 +3856,10 @@ pub fn handle_key(
     };
     if start_key && snap.hub_down && hub_bind_for(&snap.server).is_some() {
         return Some(Action::StartHub);
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('f')) {
+        open_search_modal(app, snap);
+        return None;
     }
     if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('d')) {
         let people: Vec<(String, String)> = snap
@@ -3453,6 +3940,7 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option
             app.view = View::Chat;
         }
         KeyCode::Char('r') | KeyCode::Char('R') => return Some(Action::Refresh),
+        KeyCode::Char('/') => open_search_modal(app, snap),
         KeyCode::Char('?') | KeyCode::Char('h') => app.modal = Some(Modal::Help),
         KeyCode::Down | KeyCode::Char('j') => app.cursor = (app.cursor + 1).min(last),
         KeyCode::Up | KeyCode::Char('k') => app.cursor = app.cursor.saturating_sub(1),
@@ -3634,6 +4122,7 @@ fn handle_groups_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Ac
             app.view = View::Chat;
         }
         KeyCode::Char('r') | KeyCode::Char('R') => return Some(Action::Refresh),
+        KeyCode::Char('/') => open_search_modal(app, snap),
         KeyCode::Char('?') | KeyCode::Char('h') => app.modal = Some(Modal::Help),
         KeyCode::Char('n') | KeyCode::Char('N') => {
             app.modal = Some(Modal::GroupEditor(Box::new(GroupEditorState::new_group())));
@@ -3746,6 +4235,8 @@ fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
             app.channel_idx = app.channel_idx.saturating_sub(1);
             app.chat_channel = None;
             app.chat_scroll = 0;
+            app.jump_to_seq = None;
+            app.chat_highlight = None;
         }
         KeyCode::Down => {
             if app.channel_idx + 1 < chat_rooms(app, snap).len() {
@@ -3753,6 +4244,8 @@ fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
             }
             app.chat_channel = None;
             app.chat_scroll = 0;
+            app.jump_to_seq = None;
+            app.chat_highlight = None;
         }
         KeyCode::PageUp => {
             app.chat_scroll = app
@@ -3766,7 +4259,11 @@ fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
                 .saturating_sub(usize::from(app.chat_area.height).max(1));
         }
         KeyCode::Home => app.chat_scroll = app.chat_max_scroll,
-        KeyCode::End => app.chat_scroll = 0,
+        KeyCode::End => {
+            app.chat_scroll = 0;
+            app.jump_to_seq = None;
+            app.chat_highlight = None;
+        }
         KeyCode::Backspace => {
             app.input.pop();
             app.chat_scroll = 0;
@@ -3781,6 +4278,8 @@ fn handle_chat_key(app: &mut App, code: KeyCode, snap: &Snapshot) -> Option<Acti
             let body = app.input.trim().to_string();
             app.input.clear();
             app.chat_scroll = 0;
+            app.jump_to_seq = None;
+            app.chat_highlight = None;
             let rooms = chat_rooms(app, snap);
             if let (false, Some(target)) = (body.is_empty(), rooms.get(app.channel_idx)) {
                 return Some(Action::Send {
@@ -3826,6 +4325,8 @@ pub fn handle_click(app: &mut App, column: u16, row: u16) -> Option<Action> {
                 app.channel_idx = *index;
                 app.chat_channel = None;
                 app.chat_scroll = 0;
+                app.jump_to_seq = None;
+                app.chat_highlight = None;
             }
         }
         View::Chat if app.people_area.contains((column, row).into()) => {
@@ -4005,6 +4506,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, snap: &Snapshot) {
             ("Tab", "complete @name"),
             ("Up/Down", "room"),
             ("^D", "direct message"),
+            ("^F", "search"),
             ("PgUp/PgDn", "history"),
             ("End", "latest"),
             ("Esc", "dashboard"),
@@ -4200,7 +4702,9 @@ pub fn hint_color(key: &str, label: &str) -> Color {
         ("q", _) | ("Q", _) => Color::Red,
         ("?", _) => Color::Gray,
         ("t", _) => Color::Magenta,
-        (_, "answer" | "chat" | "send" | "complete @name" | "direct message") => Color::Yellow,
+        (_, "answer" | "chat" | "send" | "complete @name" | "direct message" | "search") => {
+            Color::Yellow
+        }
         ("Enter" | "Esc" | "Up/Down" | "PgUp/PgDn" | "End", _) => Color::Blue,
         _ => Color::Green,
     }
@@ -5040,7 +5544,7 @@ fn draw_groups(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
     );
 }
 
-fn chat_message<'a>(message: &'a ChatLine, me: &str) -> Text<'a> {
+fn chat_message<'a>(message: &'a ChatLine, me: &str, highlighted: bool) -> Text<'a> {
     let name_color = if message.sender == "aircd" {
         Color::DarkGray
     } else if message.sender.eq_ignore_ascii_case(me) {
@@ -5049,10 +5553,18 @@ fn chat_message<'a>(message: &'a ChatLine, me: &str) -> Text<'a> {
         Color::Cyan
     };
     let mut body = Text::from(message.body.as_str()).lines.into_iter();
-    let mut first = Line::from(vec![
-        Span::styled(clock(message.time), dim()),
-        Span::styled(format!(" {}: ", message.sender), bold().fg(name_color)),
-    ]);
+    let mut spans = Vec::new();
+    if highlighted {
+        spans.push(Span::styled("» ", bold().fg(Color::Yellow)));
+        spans.push(Span::styled(clock(message.time), bold().fg(Color::Yellow)));
+    } else {
+        spans.push(Span::styled(clock(message.time), dim()));
+    }
+    spans.push(Span::styled(
+        format!(" {}: ", message.sender),
+        bold().fg(name_color),
+    ));
+    let mut first = Line::from(spans);
     first.spans.extend(body.next().unwrap_or_default().spans);
     let lines: Vec<Line> = std::iter::once(first).chain(body).collect();
     Text::from(lines)
@@ -5175,27 +5687,42 @@ fn draw_chat(frame: &mut Frame, app: &mut App, snap: &Snapshot, area: Rect) {
 
     let block = Block::bordered();
     let inner = block.inner(messages_area);
-    let messages: Vec<_> = snap
-        .messages
-        .get(&current)
-        .into_iter()
-        .flatten()
-        .flat_map(|message| chat_message(message, &snap.me).lines)
-        .map(|line| {
+    let mut messages: Vec<(Paragraph, usize)> = Vec::new();
+    let mut jump_target_row: Option<usize> = None;
+    let mut running_rows = 0usize;
+    let jump_seq = app
+        .jump_to_seq
+        .as_ref()
+        .filter(|(room, _)| room == &current)
+        .map(|(_, seq)| *seq);
+    for message in snap.messages.get(&current).into_iter().flatten() {
+        let highlighted = app
+            .chat_highlight
+            .as_ref()
+            .is_some_and(|(room, seq)| room == &current && *seq == message.seq);
+        if jump_seq == Some(message.seq) {
+            jump_target_row = Some(running_rows);
+        }
+        for line in chat_message(message, &snap.me, highlighted).lines {
             let paragraph = Paragraph::new(line).wrap(Wrap { trim: false });
             let rows = paragraph.line_count(inner.width);
-            (paragraph, rows)
-        })
-        .collect();
-    let total_rows: usize = messages.iter().map(|(_, rows)| rows).sum();
-    // Keep the same history in view when refresh appends messages.
-    if app.chat_scroll > 0 && inner.width == app.chat_area.width {
+            running_rows += rows;
+            messages.push((paragraph, rows));
+        }
+    }
+    let total_rows = running_rows;
+    app.chat_max_scroll = total_rows.saturating_sub(usize::from(inner.height));
+    if let Some(start_row) = jump_target_row {
+        let desired_skipped = start_row.saturating_sub(usize::from(inner.height) / 3);
+        app.chat_scroll = app.chat_max_scroll.saturating_sub(desired_skipped);
+        app.jump_to_seq = None;
+    } else if app.chat_scroll > 0 && inner.width == app.chat_area.width {
+        // Keep the same history in view when refresh appends messages.
         app.chat_scroll = app
             .chat_scroll
             .saturating_add(total_rows.saturating_sub(app.chat_content_height));
     }
     app.chat_content_height = total_rows;
-    app.chat_max_scroll = total_rows.saturating_sub(usize::from(inner.height));
     app.chat_scroll = app.chat_scroll.min(app.chat_max_scroll);
     app.chat_area = inner;
     app.chat_channel = Some(current.clone());
@@ -5710,6 +6237,268 @@ fn draw_group_attach(
     );
 }
 
+fn highlight_spans(
+    text: &str,
+    terms: &[String],
+    base_style: Style,
+    hit_style: Style,
+) -> Vec<Span<'static>> {
+    if terms.is_empty() || text.is_empty() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for term in terms {
+        if term.is_empty() {
+            continue;
+        }
+        let mut offset = 0;
+        while let Some(pos) = lower[offset..].find(term.as_str()) {
+            let start = offset + pos;
+            let end = start + term.len();
+            ranges.push((start, end));
+            offset = end;
+        }
+    }
+    if ranges.is_empty() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if let Some(prefix) = text.get(cursor..start).filter(|s| !s.is_empty()) {
+            spans.push(Span::styled(prefix.to_string(), base_style));
+        }
+        if let Some(matched) = text.get(start..end).filter(|s| !s.is_empty()) {
+            spans.push(Span::styled(matched.to_string(), hit_style));
+        }
+        cursor = end;
+    }
+    if let Some(tail) = text.get(cursor..).filter(|s| !s.is_empty()) {
+        spans.push(Span::styled(tail.to_string(), base_style));
+    }
+    spans
+}
+
+fn draw_search_modal(frame: &mut Frame, area: Rect, state: &SearchState, snap: &Snapshot) {
+    let rect = centered(area, 96, 26);
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Search Chat History  (Tab scope · Up/Down select · Enter jump · Esc close) ");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let parsed = ParsedSearchQuery::parse(&state.query);
+    let hits = search_hits(state, snap);
+    let idx = state.idx.min(hits.len().saturating_sub(1));
+    let selected_hit = hits.get(idx);
+
+    let show_preview = inner.height >= 10 && selected_hit.is_some();
+    let preview_height = if show_preview { 4 } else { 0 };
+    let [query_area, scope_area, sep_area, results_area, preview_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(preview_height),
+    ])
+    .areas(inner);
+
+    // Query line.
+    let query_line = Line::from(vec![
+        Span::styled("Query: ", bold().fg(Color::Cyan)),
+        Span::raw(state.query.clone()),
+    ]);
+    frame.render_widget(Paragraph::new(query_line), query_area);
+    if query_area.width > 7 {
+        let cursor_x = query_area.x
+            + 7
+            + (state.query.chars().count() as u16).min(query_area.width.saturating_sub(8));
+        frame.set_cursor_position((cursor_x, query_area.y));
+    }
+
+    // Scope bar + match count.
+    let mut scopes = vec![
+        (SearchScope::All, "All".to_string()),
+        (SearchScope::Sprints, "Sprints".to_string()),
+        (SearchScope::DirectMessages, "DMs".to_string()),
+    ];
+    if let Some(room) = &state.current_room {
+        scopes.push((SearchScope::CurrentRoom, format!("Room: {room}")));
+    }
+    let mut scope_spans = vec![Span::styled("Scope: ", dim())];
+    for (scope, label) in scopes {
+        let active = scope == state.scope;
+        scope_spans.push(Span::styled(
+            format!(" {label} "),
+            if active {
+                bold().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                dim()
+            },
+        ));
+        scope_spans.push(Span::raw(" "));
+    }
+    let count_text = if parsed.is_empty() {
+        String::new()
+    } else if hits.is_empty() {
+        "  0 matches".to_string()
+    } else {
+        format!("  {} match(es) [{}/{}]", hits.len(), idx + 1, hits.len())
+    };
+    scope_spans.push(Span::styled(count_text, Style::default().fg(Color::Yellow)));
+    frame.render_widget(Paragraph::new(Line::from(scope_spans)), scope_area);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(usize::from(sep_area.width)),
+            dim(),
+        )),
+        sep_area,
+    );
+
+    // Results list or empty/prompt state.
+    if parsed.is_empty() {
+        let sprint_count = snap
+            .messages
+            .keys()
+            .filter(|r| !r.starts_with('@') && project_for(snap, r).is_some_and(|p| p.channel != **r))
+            .count();
+        let dm_count = snap.messages.keys().filter(|r| r.starts_with('@')).count();
+        let msg_total: usize = snap.messages.values().map(Vec::len).sum();
+        let help_lines = vec![
+            Line::from("Type keywords to search conversation history across sprint channels and DMs."),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Syntax: ", bold().fg(Color::Cyan)),
+                Span::raw("term1 term2 (AND)   from:<nick>   in:<room>"),
+            ]),
+            Line::from(vec![
+                Span::styled("  Keys:   ", bold().fg(Color::Cyan)),
+                Span::raw("Tab cycle scope · Up/Down pick · Ctrl+U clear · Enter jump · Esc close"),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(
+                    "  Indexed locally: {msg_total} messages ({sprint_count} sprint channel(s), {dm_count} DM thread(s))"
+                ),
+                dim(),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(help_lines).wrap(Wrap { trim: false }), results_area);
+    } else if hits.is_empty() {
+        let mut msg_lines = vec![Line::from(Span::styled(
+            format!("No messages matched \"{}\".", state.query.trim()),
+            dim(),
+        ))];
+        if let Some(err) = snap
+            .search_results
+            .as_ref()
+            .and_then(|r| r.error.as_deref())
+        {
+            msg_lines.push(Line::from(Span::styled(
+                format!("Server search note: {err}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        frame.render_widget(Paragraph::new(msg_lines).wrap(Wrap { trim: false }), results_area);
+    } else {
+        let visible = usize::from(results_area.height);
+        let first = idx.saturating_sub(visible.saturating_sub(1));
+        let mut rows: Vec<Line> = Vec::new();
+        for (i, hit) in hits.iter().enumerate().skip(first).take(visible) {
+            let selected = i == idx;
+            let row_bg = if selected {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            let room_color = if hit.is_dm {
+                Color::Magenta
+            } else if hit.is_sprint {
+                Color::Cyan
+            } else {
+                Color::Blue
+            };
+            let collapsed = hit.body.replace('\n', " ");
+            let mut spans = vec![
+                Span::styled(if selected { "> " } else { "  " }, row_bg.add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{} ", clock(hit.time)), dim().patch(row_bg)),
+                Span::styled(
+                    format!("{:<16} ", hit.room),
+                    row_bg.fg(room_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("@{:<12} ", hit.sender),
+                    row_bg.fg(Color::Green),
+                ),
+            ];
+            spans.extend(highlight_spans(
+                &collapsed,
+                &parsed.terms,
+                row_bg,
+                row_bg.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+            rows.push(Line::from(spans).style(row_bg));
+        }
+        frame.render_widget(Paragraph::new(rows), results_area);
+    }
+
+    // Bottom preview pane for the currently selected search hit.
+    if show_preview {
+        if let Some(hit) = selected_hit {
+            let [p_sep, p_body] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(preview_area);
+            let header = format!(
+                "── Preview: {} · @{} · {} (seq #{}) ",
+                hit.room,
+                hit.sender,
+                clock(hit.time),
+                hit.seq
+            );
+            let fill = usize::from(p_sep.width).saturating_sub(header.chars().count());
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("{header}{}", "─".repeat(fill)),
+                    dim(),
+                )),
+                p_sep,
+            );
+            let preview_lines: Vec<Line> = hit
+                .body
+                .lines()
+                .map(|line| {
+                    Line::from(highlight_spans(
+                        line,
+                        &parsed.terms,
+                        Style::default(),
+                        bold().fg(Color::Yellow),
+                    ))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(preview_lines).wrap(Wrap { trim: false }),
+                p_body,
+            );
+        }
+    }
+}
+
 fn draw_modal(frame: &mut Frame, modal: &Modal, snap: &Snapshot, area: Rect) {
     let frame_style = Style::default().fg(Color::Cyan);
     match modal {
@@ -5772,6 +6561,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, snap: &Snapshot, area: Rect) {
             selected,
             idx,
         } => draw_group_attach(frame, area, group_name, attached, selected, *idx, snap),
+        Modal::Search(state) => draw_search_modal(frame, area, state, snap),
         Modal::Detail { task_id } => {
             let lines: Vec<Line> = match &snap.detail {
                 Some((id, lines)) if id == task_id => {
@@ -6045,6 +6835,7 @@ mod tests {
             detail: None,
             templates: Vec::new(),
             models: None,
+            search_results: None,
             notice: None,
             error: None,
             hub_down: false,
@@ -8292,5 +9083,244 @@ mod tests {
         assert!(screen.contains("No projects exist on the hub yet."), "{screen}");
         press(&mut app, &snap, &[KeyCode::Esc]);
         assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn search_modal_searches_sprint_channels_and_dms_and_cycles_scopes() {
+        let mut snap = fixture();
+        snap.channels.push("@agent3.8".into());
+        snap.messages.insert(
+            "#general".into(),
+            vec![ChatLine {
+                seq: 10,
+                sender: "user".into(),
+                body: "Hub deployment notes".into(),
+                time: 3600 * 9,
+            }],
+        );
+        snap.messages.insert(
+            "#sample-app-s1".into(),
+            vec![
+                ChatLine {
+                    seq: 20,
+                    sender: "codex".into(),
+                    body: "Sprint deploy script updated".into(),
+                    time: 3600 * 10,
+                },
+                ChatLine {
+                    seq: 21,
+                    sender: "agent3.8".into(),
+                    body: "Sprint review passed".into(),
+                    time: 3600 * 11,
+                },
+            ],
+        );
+        snap.messages.insert(
+            "@agent3.8".into(),
+            vec![ChatLine {
+                seq: 30,
+                sender: "agent3.8".into(),
+                body: "DM: ready to deploy seek bar".into(),
+                time: 3600 * 12,
+            }],
+        );
+
+        let mut app = App {
+            view: View::Chat,
+            channel_idx: 2, // #sample-app-s1
+            ..App::default()
+        };
+
+        // Ctrl+F opens Search modal from Chat (preserving current_room).
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL, &snap),
+            None
+        );
+        let empty_screen = render(&mut app, &snap);
+        assert!(empty_screen.contains("Search Chat History"), "{empty_screen}");
+        assert!(empty_screen.contains("1 sprint channel(s), 1 DM thread(s)"), "{empty_screen}");
+
+        // Typing "deploy" searches All rooms (DM, sprint, and #general) newest first,
+        // and emits Action::SearchHistory.
+        let action = press(
+            &mut app,
+            &snap,
+            &[
+                KeyCode::Char('d'),
+                KeyCode::Char('e'),
+                KeyCode::Char('p'),
+                KeyCode::Char('l'),
+                KeyCode::Char('o'),
+                KeyCode::Char('y'),
+            ],
+        );
+        assert_eq!(
+            action,
+            Some(Action::SearchHistory {
+                query: "deploy".into(),
+                scope: SearchScope::All,
+                channel: None,
+            })
+        );
+        let all_screen = render(&mut app, &snap);
+        assert!(all_screen.contains("3 match(es) [1/3]"), "{all_screen}");
+        assert!(all_screen.contains("@agent3.8"), "{all_screen}");
+        assert!(all_screen.contains("#sample-app-s1"), "{all_screen}");
+        assert!(all_screen.contains("#general"), "{all_screen}");
+
+        // Tab -> Sprints scope: only #sample-app-s1 matches.
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Tab]),
+            Some(Action::SearchHistory {
+                query: "deploy".into(),
+                scope: SearchScope::Sprints,
+                channel: None,
+            })
+        );
+        let sprint_screen = render(&mut app, &snap);
+        assert!(sprint_screen.contains("1 match(es) [1/1]"), "{sprint_screen}");
+        assert!(sprint_screen.contains("Sprint deploy script updated"), "{sprint_screen}");
+
+        // Tab -> DMs scope: only @agent3.8 DM matches.
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Tab]),
+            Some(Action::SearchHistory {
+                query: "deploy".into(),
+                scope: SearchScope::DirectMessages,
+                channel: None,
+            })
+        );
+        let dm_screen = render(&mut app, &snap);
+        assert!(dm_screen.contains("1 match(es) [1/1]"), "{dm_screen}");
+        assert!(dm_screen.contains("DM: ready to deploy seek bar"), "{dm_screen}");
+
+        // Tab -> Room scope (#sample-app-s1).
+        assert_eq!(
+            press(&mut app, &snap, &[KeyCode::Tab]),
+            Some(Action::SearchHistory {
+                query: "deploy".into(),
+                scope: SearchScope::CurrentRoom,
+                channel: Some("#sample-app-s1".into()),
+            })
+        );
+        let room_screen = render(&mut app, &snap);
+        assert!(room_screen.contains("Room: #sample-app-s1"), "{room_screen}");
+        assert!(room_screen.contains("1 match(es) [1/1]"), "{room_screen}");
+
+        // BackTab returns to DMs, Ctrl+U clears the query, Esc closes the modal.
+        press(&mut app, &snap, &[KeyCode::BackTab]);
+        handle_key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL, &snap);
+        assert!(render(&mut app, &snap).contains("Type keywords to search"));
+
+        // Qualifiers from: and in: work in All scope.
+        press(&mut app, &snap, &[KeyCode::BackTab, KeyCode::BackTab]); // Back to All
+        type_text(&mut app, &snap, "from:codex in:s1 script");
+        let qual_screen = render(&mut app, &snap);
+        assert!(qual_screen.contains("1 match(es) [1/1]"), "{qual_screen}");
+        assert!(qual_screen.contains("Sprint deploy script updated"), "{qual_screen}");
+
+        press(&mut app, &snap, &[KeyCode::Esc]);
+        assert!(app.modal.is_none());
+
+        // '/' opens search modal from Dashboard as well.
+        app.view = View::Dashboard;
+        press(&mut app, &snap, &[KeyCode::Char('/')]);
+        assert!(matches!(app.modal, Some(Modal::Search(_))));
+    }
+
+    #[test]
+    fn search_modal_jumps_to_matched_message_in_chat_and_loads_older_window() {
+        let (mut app, mut snap) = chat_with_history(60);
+        // Add a sprint room with an older matched message and many newer messages.
+        let sprint_msgs: Vec<ChatLine> = (1..=80)
+            .map(|seq| ChatLine {
+                seq,
+                sender: if seq == 15 { "agent3.8" } else { "codex" }.into(),
+                body: if seq == 15 {
+                    "Found the critical seekbar regression here".into()
+                } else {
+                    format!("sprint-chatter-{seq:03}")
+                },
+                time: 3600 + seq * 60,
+            })
+            .collect();
+        snap.messages.insert("#sample-app-s1".into(), sprint_msgs);
+        // Start in #general (index 0) and open search via Ctrl+F.
+        app.channel_idx = 0;
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL, &snap);
+        type_text(&mut app, &snap, "seekbar regression");
+        assert_eq!(press(&mut app, &snap, &[KeyCode::Enter]), None);
+        assert!(app.modal.is_none());
+        assert_eq!(app.view, View::Chat);
+
+        // Rendering Chat jumps directly to #sample-app-s1 and scrolls to seq #15 with highlight.
+        let chat_screen = render(&mut app, &snap);
+        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "#sample-app-s1");
+        assert!(chat_screen.contains("Found the critical seekbar regression"), "{chat_screen}");
+        assert!(chat_screen.contains("» "), "{chat_screen}");
+        assert!(app.chat_scroll > 0);
+
+        // Pressing End jumps to latest and clears the search highlight.
+        press(&mut app, &snap, &[KeyCode::End]);
+        assert_eq!(app.chat_scroll, 0);
+        assert_eq!(app.chat_highlight, None);
+
+        // Server search result not in snap.messages yet merges cleanly and requests LoadMessageWindow on Enter.
+        snap.search_results = Some(SearchResponse {
+            query: "ancient".into(),
+            scope: SearchScope::All,
+            channel: None,
+            hits: vec![
+                SearchHit {
+                    room: "#sample-app-s1".into(),
+                    seq: 2,
+                    sender: "codex".into(),
+                    body: "sprint-chatter-002".into(), // already in snap.messages (dedup test)
+                    time: 0,
+                    is_sprint: true,
+                    is_dm: false,
+                },
+                SearchHit {
+                    room: "#sample-app".into(),
+                    seq: 1,
+                    sender: "agent3.8".into(),
+                    body: "An ancient archived decision".into(),
+                    time: 3600,
+                    is_sprint: false,
+                    is_dm: false,
+                },
+            ],
+            error: None,
+        });
+        // Wait: #sample-app in chat_with_history has seq 1..=60; use seq 9999 not in snap.messages!
+        snap.search_results.as_mut().unwrap().hits[1].seq = 9999;
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL, &snap);
+        type_text(&mut app, &snap, "ancient");
+        let jump_action = press(&mut app, &snap, &[KeyCode::Enter]);
+        assert_eq!(
+            jump_action,
+            Some(Action::LoadMessageWindow {
+                room: "#sample-app".into(),
+                around_seq: 9999,
+            })
+        );
+    }
+
+    #[test]
+    fn search_modal_renders_safely_at_small_terminal_sizes() {
+        let snap = fixture();
+        let mut app = App {
+            view: View::Chat,
+            modal: Some(Modal::Search(Box::new(SearchState {
+                query: "Stepping".into(),
+                scope: SearchScope::All,
+                current_room: Some("#sample-app".into()),
+                idx: 0,
+            }))),
+            ..App::default()
+        };
+        for (width, height) in [(110, 32), (60, 10), (20, 6), (1, 1)] {
+            render_to_text(&mut app, &snap, width, height).unwrap();
+        }
     }
 }
