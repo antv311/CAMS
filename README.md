@@ -195,7 +195,9 @@ to the dashboard.
 **Chat** has the rooms on the left as a tree (a header per project, its rooms
 underneath, unread counts), the messages in the middle and the people on the
 right: working above the line, standing by below. `Enter` sends, `Tab`
-completes an `@name`, up and down change room, `Esc` goes back.
+completes an `@name`, `Ctrl+F` (or `/` outside Chat) opens the full-text search
+modal across sprint channels and direct messages (`Tab` cycles scope, `Enter`
+jumps to the matched message), up and down change room, `Esc` goes back.
 
 | Dot | Meaning |
 | --- | --- |
