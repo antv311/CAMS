@@ -27,6 +27,7 @@ use crate::store::{
     ClientTemplate, ClientTemplateInput, GroupInput, GroupMember, GroupMembershipUpdate,
     GroupMemoryError, GroupStoreError, WalCheckpointMode,
 };
+use crate::vacuum::VacuumRunOptions;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HttpRuntimeInfo {
@@ -517,6 +518,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/owner/backup", post(owner_backup_action))
         .route("/v1/owner/db", get(owner_db_status))
         .route("/v1/owner/db/checkpoint", post(owner_db_checkpoint))
+        .route(
+            "/v1/owner/db/vacuum",
+            get(owner_db_vacuum_status).post(owner_db_vacuum),
+        )
         .route("/v1/login", post(login_agent))
         .route("/v1/tokens", get(list_tokens_api).post(issue_token_api))
         .route("/v1/tokens/refresh", post(refresh_token_api))
@@ -1887,6 +1892,14 @@ struct OwnerDbCheckpointReq {
     mode: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+struct OwnerDbVacuumReq {
+    invite: Option<String>,
+    batch_pages: Option<u32>,
+    max_pages: Option<u64>,
+    blocking: Option<bool>,
+}
+
 async fn owner_db_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1897,11 +1910,75 @@ async fn owner_db_status(
         .await
         .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
         .map_err(ApiError::internal)?;
+    let vacuum = state.server.vacuum().status();
     Ok((
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({
             "ok": true,
+            "diagnostics": diagnostics,
+            "vacuum": vacuum,
+        })),
+    ))
+}
+
+async fn owner_db_vacuum_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, None)?;
+    let db = state.server.db().clone();
+    let pages = tokio::task::spawn_blocking(move || db.page_stats())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    let status = state.server.vacuum().status();
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "status": status,
+            "pages": pages,
+        })),
+    ))
+}
+
+async fn owner_db_vacuum(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OwnerDbVacuumReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    if req.batch_pages == Some(0) {
+        return Err(ApiError::bad_request("batch_pages must be at least 1"));
+    }
+    let opts = VacuumRunOptions {
+        batch_pages: req.batch_pages,
+        max_pages: req.max_pages,
+        blocking: req.blocking.unwrap_or(false),
+        ignore_threshold: true,
+    };
+    let result = state
+        .server
+        .vacuum()
+        .run_with_options("manual", opts)
+        .await
+        .map_err(ApiError::internal)?;
+    let status = state.server.vacuum().status();
+    let db = state.server.db().clone();
+    let diagnostics = tokio::task::spawn_blocking(move || db.diagnostics())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "result": result,
+            "status": status,
             "diagnostics": diagnostics,
         })),
     ))
@@ -8463,6 +8540,62 @@ mod tests {
         assert_eq!(cp_json["ok"], true);
         assert_eq!(cp_json["checkpoint"]["mode"], "truncate");
         assert_eq!(cp_json["checkpoint"]["busy"], 0);
+
+        // Fragment the DB by inserting and deleting messages, then inspect & run incremental vacuum.
+        {
+            let db_conn = server.db().write()?;
+            db_conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let big = "z".repeat(4096);
+            for i in 0..80 {
+                db_conn.execute(
+                    "INSERT INTO messages (msg_id, channel, sender_id, body, created_at) VALUES (?1, '#general', 'burst-0', ?2, 1)",
+                    rusqlite::params![format!("frag-msg-{i}"), &big],
+                )?;
+            }
+            db_conn.execute_batch("COMMIT;")?;
+            db_conn.execute("DELETE FROM messages WHERE msg_id LIKE 'frag-msg-%'", [])?;
+        }
+
+        let vac_status_json: serde_json::Value = client
+            .get(format!("{base}/v1/owner/db/vacuum"))
+            .header("X-AirCD-Invite", owner_secret)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(vac_status_json["ok"], true);
+        assert_eq!(vac_status_json["pages"]["auto_vacuum"], "incremental");
+        assert!(
+            vac_status_json["pages"]["freelist_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        let vac_run_json: serde_json::Value = client
+            .post(format!("{base}/v1/owner/db/vacuum"))
+            .header("X-AirCD-Invite", owner_secret)
+            .json(&json!({ "batch_pages": 16 }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(vac_run_json["ok"], true);
+        assert_eq!(vac_run_json["result"]["outcome"], "completed");
+        assert!(
+            vac_run_json["result"]["pages_freed"].as_u64().unwrap() > 0
+        );
+        assert_eq!(vac_run_json["result"]["freelist_after"], 0);
+
+        let metrics_text = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(metrics_text.contains("aircd_db_freelist_pages 0\n"));
+        assert!(metrics_text.contains("aircd_db_vacuum_pages_freed_total "));
+        assert!(metrics_text.contains("aircd_db_vacuum_steps_total "));
 
         handle.abort();
         drop(server);

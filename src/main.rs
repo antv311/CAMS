@@ -23,6 +23,7 @@ mod tasks;
 mod tls;
 mod tokens;
 mod tui;
+mod vacuum;
 mod wake;
 mod webhooks;
 
@@ -137,7 +138,14 @@ async fn main() -> Result<()> {
                        --db-synchronous <mode>  SQLite WAL synchronous mode: off, normal, full, extra (env AIRCD_DB_SYNCHRONOUS, default normal)\n  \
                        --db-wal-autocheckpoint <pages>  WAL auto-checkpoint threshold in pages (env AIRCD_DB_WAL_AUTOCHECKPOINT, default 1000)\n  \
                        --db-cache-size-kib <n>  Per-connection SQLite cache size in KiB (env AIRCD_DB_CACHE_SIZE_KIB, default 16384)\n  \
-                       --db-journal-size-limit <bytes>  WAL journal size limit in bytes (env AIRCD_DB_JOURNAL_SIZE_LIMIT, default 67108864)"
+                       --db-journal-size-limit <bytes>  WAL journal size limit in bytes (env AIRCD_DB_JOURNAL_SIZE_LIMIT, default 67108864)\n  \
+                       --no-db-vacuum           Disable automated incremental vacuum worker (env AIRCD_DB_VACUUM_ENABLED=0)\n  \
+                       --db-vacuum-interval-secs <n>  Seconds between freelist checks (env AIRCD_DB_VACUUM_INTERVAL_SECS, default 300; 0 disables timer)\n  \
+                       --db-vacuum-min-freelist-pages <n>  Minimum freelist pages to trigger vacuum (env AIRCD_DB_VACUUM_MIN_FREELIST_PAGES, default 64)\n  \
+                       --db-vacuum-min-freelist-ratio <f>  Minimum freelist ratio 0.0..=1.0 (env AIRCD_DB_VACUUM_MIN_FREELIST_RATIO, default 0.0)\n  \
+                       --db-vacuum-batch-pages <n>  Max pages reclaimed per non-blocking vacuum step (env AIRCD_DB_VACUUM_BATCH_PAGES, default 64)\n  \
+                       --db-vacuum-step-delay-ms <n>  Delay between vacuum steps in milliseconds (env AIRCD_DB_VACUUM_STEP_DELAY_MS, default 25)\n  \
+                       --db-vacuum-max-batches <n>  Max vacuum batches per scheduled pass (env AIRCD_DB_VACUUM_MAX_BATCHES, default 32; 0 unlimited)"
                 );
         return Ok(());
     }
@@ -145,6 +153,7 @@ async fn main() -> Result<()> {
     let log_config = server_config.to_log_config()?;
     let backup_config = server_config.to_backup_config()?;
     let sqlite_config = server_config.to_sqlite_config()?;
+    let vacuum_config = server_config.to_vacuum_config()?;
     let tls_spec = server_config.to_tls_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
     let config::ServerConfig {
@@ -170,8 +179,10 @@ async fn main() -> Result<()> {
         backup_config.clone(),
         auth_config.token_ttl_seconds,
     );
+    server.vacuum().update_config(vacuum_config.clone());
     let _webhook_worker = server.webhooks().spawn_worker();
     let _backup_worker = server.backups().spawn_worker();
+    let _vacuum_worker = server.vacuum().spawn_worker();
 
     let tls_acceptor = tls_spec
         .as_ref()
@@ -240,6 +251,17 @@ async fn main() -> Result<()> {
                 backup_config.retention
             );
         }
+    }
+    if vacuum_config.enabled {
+        println!(
+            "  db vacuum:    incremental (interval={}s, min_pages={}, batch={}, delay={}ms)",
+            vacuum_config.interval_secs,
+            vacuum_config.min_freelist_pages,
+            vacuum_config.batch_pages,
+            vacuum_config.step_delay_ms,
+        );
+    } else {
+        println!("  db vacuum:    disabled");
     }
     if rate_limit_config.enabled {
         println!(

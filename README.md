@@ -954,7 +954,19 @@ For file-backed databases, `aircd` runs a scheduled snapshot backup worker that 
 - `--db-wal-autocheckpoint <pages>` / `AIRCD_DB_WAL_AUTOCHECKPOINT` / `db_wal_autocheckpoint` (default: `1000`; `0` disables)
 - `--db-cache-size-kib <n>` / `AIRCD_DB_CACHE_SIZE_KIB` / `db_cache_size_kib` (default: `16384`)
 - `--db-journal-size-limit <bytes>` / `AIRCD_DB_JOURNAL_SIZE_LIMIT` / `db_journal_size_limit_bytes` (default: `67108864`; `-1` unlimited)
-- Owner HTTP endpoints (require the owner key): `GET /v1/owner/db` returns pool, WAL, and pragma diagnostics; `POST /v1/owner/db/checkpoint` triggers a manual WAL checkpoint (`mode`: `passive` default, `full`, `restart`, `truncate`).
+- Owner HTTP endpoints (require the owner key): `GET /v1/owner/db` returns pool, WAL, pragma, page/freelist, and incremental-vacuum diagnostics; `POST /v1/owner/db/checkpoint` triggers a manual WAL checkpoint (`mode`: `passive` default, `full`, `restart`, `truncate`); `GET /v1/owner/db/vacuum` returns vacuum status and freelist page stats; `POST /v1/owner/db/vacuum` triggers an incremental vacuum pass (`batch_pages`, `max_pages`, `blocking`).
+
+### Automated online database defragmentation and incremental vacuum
+
+`aircd` configures SQLite with `PRAGMA auto_vacuum = INCREMENTAL` (migrating existing `NONE` databases via a one-time startup `VACUUM`) and runs a background worker that samples `PRAGMA freelist_count` through the concurrent WAL reader pool without locking active readers or writers. When the freelist exceeds the configured threshold, it runs bounded `PRAGMA incremental_vacuum(batch_pages)` steps using non-blocking `try_write` and `busy_timeout = 0`, yielding immediately whenever an active writer holds the lock:
+
+- `--no-db-vacuum` / `AIRCD_DB_VACUUM_ENABLED=0` / `db_vacuum_enabled = false` (default: enabled)
+- `--db-vacuum-interval-secs <n>` / `AIRCD_DB_VACUUM_INTERVAL_SECS` / `db_vacuum_interval_secs` (default: `300`; `0` disables the periodic timer)
+- `--db-vacuum-min-freelist-pages <n>` / `AIRCD_DB_VACUUM_MIN_FREELIST_PAGES` / `db_vacuum_min_freelist_pages` (default: `64`)
+- `--db-vacuum-min-freelist-ratio <f>` / `AIRCD_DB_VACUUM_MIN_FREELIST_RATIO` / `db_vacuum_min_freelist_ratio` (default: `0.0`, range `0.0..=1.0`)
+- `--db-vacuum-batch-pages <n>` / `AIRCD_DB_VACUUM_BATCH_PAGES` / `db_vacuum_batch_pages` (default: `64`, minimum `1`)
+- `--db-vacuum-step-delay-ms <n>` / `AIRCD_DB_VACUUM_STEP_DELAY_MS` / `db_vacuum_step_delay_ms` (default: `25`)
+- `--db-vacuum-max-batches <n>` / `AIRCD_DB_VACUUM_MAX_BATCHES` / `db_vacuum_max_batches_per_run` (default: `32`; `0` unlimited)
 
 ### HTTP token-bucket rate limiting
 
