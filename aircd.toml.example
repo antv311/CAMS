@@ -1,0 +1,16 @@
+# Copy to aircd.toml inside AIRCD_CONFIG_DIR, or pass --config <path>.
+# Precedence: command-line flags > environment variables > file > defaults.
+# Restart the server after editing. No values are expanded as shell expressions.
+bind = "127.0.0.1:6667"
+http_bind = "127.0.0.1:6680"
+tls_bind = "127.0.0.1:6697"
+
+# File-relative DB and TLS paths resolve beside this config file.
+db = "aircd.sqlite3"
+# tls_cert = "cert.pem"
+# tls_key = "key.pem"
+
+# By default a random owner key is generated once beside the database.
+# Prefer AIRCD_REGISTER_KEY to storing a credential in this file.
+# register_key = "replace-with-your-private-invite-key"
+open_registration = false

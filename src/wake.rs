@@ -1619,10 +1619,10 @@ mod tests {
         assert!(wakes.is_automated_account("agent-a")?);
         assert!(wakes.is_automated_account("AGENT-B")?);
         assert!(!wakes.is_automated_account("agent-off")?);
-        assert!(!wakes.is_automated_account("tony")?);
+        assert!(!wakes.is_automated_account("user")?);
 
         assert!(wakes.is_automated_dm(&dm_ctx("agent-a", "agent-b"))?);
-        assert!(!wakes.is_automated_dm(&dm_ctx("tony", "agent-a"))?);
+        assert!(!wakes.is_automated_dm(&dm_ctx("user", "agent-a"))?);
         assert!(!wakes.is_automated_dm(&dm_ctx("agent-off", "agent-a"))?);
         assert!(!wakes.is_automated_dm(&channel_ctx("agent-a", "agent-b", "#cams"))?);
         Ok(())
@@ -1667,7 +1667,7 @@ mod tests {
         assert!(!wakes.request(dm_ctx("agent-b", "agent-a"))?);
 
         // Intervening human DM resets B's DM wake state.
-        assert!(wakes.request(dm_ctx("tony", "agent-b"))?);
+        assert!(wakes.request(dm_ctx("user", "agent-b"))?);
         wait_until_idle(&wakes, "agent-b").await;
 
         // Now B -> A wakes A, and A -> B is suppressed.
@@ -1811,7 +1811,7 @@ mod tests {
             },
         )?;
 
-        assert!(wakes.request(channel_ctx("tony", "agent-a", "#quest"))?);
+        assert!(wakes.request(channel_ctx("user", "agent-a", "#quest"))?);
         wait_until_idle(&wakes, "agent-a").await;
 
         let seen = failures.lock().unwrap().clone();
@@ -1837,7 +1837,7 @@ mod tests {
             "agent-a",
             shell_launcher("echo fixing RESOURCE_EXHAUSTED handling"),
         )?;
-        assert!(wakes.request(channel_ctx("tony", "agent-a", "#cams"))?);
+        assert!(wakes.request(channel_ctx("user", "agent-a", "#cams"))?);
         wait_until_idle(&wakes, "agent-a").await;
         assert!(failures.lock().unwrap().is_empty());
         assert_eq!(wakes.quota_cooldown_until("agent-a"), None);
@@ -1876,8 +1876,8 @@ mod tests {
         );
 
         // Mentions, DMs and tasks during the cooldown neither launch nor post.
-        assert!(!wakes.request(channel_ctx("tony", "agent-a", "#cams"))?);
-        assert!(!wakes.request(dm_ctx("tony", "agent-a"))?);
+        assert!(!wakes.request(channel_ctx("user", "agent-a", "#cams"))?);
+        assert!(!wakes.request(dm_ctx("user", "agent-a"))?);
         assert!(!wakes.request(task_ctx("pm", "agent-a", "task_2"))?);
         assert_eq!(failures.lock().unwrap().len(), 1);
         let runs = wakes.runs(Some("agent-a"), 10)?;
@@ -1906,12 +1906,12 @@ mod tests {
             .insert("agent-a".into(), unix_timestamp() + 60);
         let owner = WakeContext {
             event: Some("owner".into()),
-            ..channel_ctx("tony", "agent-a", "#cams")
+            ..channel_ctx("user", "agent-a", "#cams")
         };
         assert!(wakes.request(owner)?);
         wait_until_idle(&wakes, "agent-a").await;
         assert_eq!(wakes.quota_cooldown_until("agent-a"), None);
-        assert!(wakes.request(channel_ctx("tony", "agent-a", "#cams"))?);
+        assert!(wakes.request(channel_ctx("user", "agent-a", "#cams"))?);
         wait_until_idle(&wakes, "agent-a").await;
         Ok(())
     }
@@ -1950,7 +1950,7 @@ mod tests {
 
         // Repeated human DMs always wake the agent.
         for _ in 0..3 {
-            assert!(wakes.request(dm_ctx("tony", "agent-a"))?);
+            assert!(wakes.request(dm_ctx("user", "agent-a"))?);
             wait_until_idle(&wakes, "agent-a").await;
         }
 

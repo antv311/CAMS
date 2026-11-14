@@ -4,6 +4,7 @@
 //! local HTTP API using a saved `airc` profile. Closing the interface never
 //! stops the hub or the agents it has launched.
 
+use crate::config::config_dir;
 use anyhow::{anyhow, Context, Result};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -17,7 +18,6 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -461,25 +461,6 @@ fn selected_task<'a>(app: &App, snap: &'a Snapshot) -> Option<&'a TaskView> {
 }
 
 // ---------------------------------------------------------------- config
-
-fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("AIRCD_CONFIG_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    if cfg!(windows) {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            if !local.trim().is_empty() {
-                return PathBuf::from(local).join("aircd");
-            }
-        }
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("aircd")
-}
 
 fn load_config(server: Option<String>, profile: Option<String>) -> Result<TuiConfig> {
     let dir = config_dir();
@@ -3305,10 +3286,10 @@ mod tests {
     fn fixture() -> Snapshot {
         let mut messages = BTreeMap::new();
         messages.insert(
-            "#quest-video".to_string(),
+            "#sample-app".to_string(),
             vec![ChatLine {
                 seq: 1,
-                sender: "flash3.8".to_string(),
+                sender: "agent3.8".to_string(),
                 body: "Stepping in as PM".to_string(),
                 time: 3_600 * 14 + 60 * 5,
             }],
@@ -3322,38 +3303,38 @@ mod tests {
         };
         Snapshot {
             server: "http://127.0.0.1:6680".to_string(),
-            me: "tony".to_string(),
+            me: "user".to_string(),
             my_role: "leader".to_string(),
             accounts: vec![
-                account("tony", "leader", true, false),
+                account("user", "leader", true, false),
                 Account {
                     launcher: Some(true),
                     command_found: true,
                     last_run: Some("ok".into()),
-                    ..account("flash3.8", "builder", false, true)
+                    ..account("agent3.8", "builder", false, true)
                 },
                 Account {
                     launcher: Some(false),
                     command_found: true,
-                    ..account("flash-lite", "builder", false, false)
+                    ..account("agent-lite", "builder", false, false)
                 },
             ],
             projects: vec![ProjectView {
-                channel: "#quest-video".into(),
-                name: "Quest player".into(),
-                pm: Some("flash3.8".into()),
+                channel: "#sample-app".into(),
+                name: "Demo project".into(),
+                pm: Some("agent3.8".into()),
                 tasks: vec![TaskView {
                     id: "task_abc123".into(),
                     kind: "bug".into(),
                     status: "blocked".into(),
                     assignee: "codex".into(),
                     title: "Fix seek bar".into(),
-                    sprint: Some("#quest-video-s1".into()),
+                    sprint: Some("#sample-app-s1".into()),
                     ..TaskView::default()
                 }],
                 members: vec![
                     Member {
-                        nick: "flash3.8".into(),
+                        nick: "agent3.8".into(),
                         role: "coordinator".into(),
                     },
                     Member {
@@ -3362,35 +3343,35 @@ mod tests {
                     },
                 ],
                 repos: vec![RepoView {
-                    name: "quest-player".into(),
+                    name: "demo-project".into(),
                     folder_found: false,
                     local_ok: false,
                     branch: None,
-                    remote: Some("https://github.com/antv311/quest-video-workspace.git".into()),
+                    remote: Some("https://github.com/example-org/sample-workspace.git".into()),
                 }],
                 rooms: vec![RoomView {
-                    channel: "#quest-video-s1".into(),
+                    channel: "#sample-app-s1".into(),
                     label: "s1".into(),
                     title: Some("Local playback".into()),
                 }],
             }],
             waiting: vec![Waiting {
                 task_id: "task_abc123".into(),
-                channel: "#quest-video".into(),
+                channel: "#sample-app".into(),
                 asked_by: "codex".into(),
                 question: "May I buy a licence?".into(),
                 escalated: true,
             }],
             launchers: vec![Launcher {
-                nick: "flash-lite".into(),
+                nick: "agent-lite".into(),
                 enabled: false,
                 mode: "fresh".into(),
             }],
-            runs: vec!["ok       @flash3.8  role in #quest-video".into()],
+            runs: vec!["ok       @agent3.8  role in #sample-app".into()],
             channels: vec![
                 "#general".into(),
-                "#quest-video".into(),
-                "#quest-video-s1".into(),
+                "#sample-app".into(),
+                "#sample-app-s1".into(),
             ],
             messages,
             dm_seq: 0,
@@ -3435,15 +3416,15 @@ mod tests {
         let screen = render(&mut App::default(), &fixture());
         for expected in [
             "[D]ashboard",
-            "you: @tony (leader)",
-            "flash3.8",
+            "you: @user (leader)",
+            "agent3.8",
             "working",
             "no launcher",
             "launcher off",
             "NEEDS YOU",
             "May I buy a licence?",
-            "#quest-video",
-            "PM @flash3.8",
+            "#sample-app",
+            "PM @agent3.8",
             "blocked 1",
             "Fix seek bar",
             "Recent launches",
@@ -3463,12 +3444,12 @@ mod tests {
         app.input = "hello team".to_string();
         let screen = render(&mut app, &snap);
         for expected in [
-            "[-] Quest player",
-            "#quest-video",
+            "[-] Demo project",
+            "#sample-app",
             "codex needs you",
-            "flash3.8 working",
+            "agent3.8 working",
             "14:05",
-            "flash3.8: ",
+            "agent3.8: ",
             "Stepping in as PM",
             "hello team",
         ] {
@@ -3521,7 +3502,7 @@ mod tests {
             .collect();
         if let Some(top) = lines
             .iter()
-            .position(|line| line.contains(" Message #quest-video "))
+            .position(|line| line.contains(" Message #sample-app "))
         {
             let left = lines[top].chars().take_while(|c| *c != '┌').count() as u16;
             input_area = Rect::new(left, top as u16, 0, CHAT_INPUT_HEIGHT);
@@ -3581,7 +3562,7 @@ mod tests {
     fn chat_with_history(count: usize) -> (App, Snapshot) {
         let mut snap = fixture();
         snap.messages.insert(
-            "#quest-video".into(),
+            "#sample-app".into(),
             (0..count)
                 .map(|index| ChatLine {
                     seq: index as i64 + 1,
@@ -3633,7 +3614,7 @@ mod tests {
         let before = render(&mut app, &snap);
         let offset = app.chat_scroll;
         snap.messages
-            .get_mut("#quest-video")
+            .get_mut("#sample-app")
             .unwrap()
             .push(ChatLine {
                 seq: 81,
@@ -3663,7 +3644,7 @@ mod tests {
         press(&mut app, &snap, &[KeyCode::End]);
         assert!(render(&mut app, &snap).contains("newest arrival"));
         snap.messages
-            .get_mut("#quest-video")
+            .get_mut("#sample-app")
             .unwrap()
             .push(ChatLine {
                 seq: 82,
@@ -3680,7 +3661,7 @@ mod tests {
         let (mut app, snap) = chat_with_history(80);
         render(&mut app, &snap);
         for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Tab] {
-            app.input = "hi @fl".into();
+            app.input = "hi @ag".into();
             app.chat_scroll = 5;
             press(&mut app, &snap, &[key]);
             assert_eq!(app.chat_scroll, 0, "input key {key:?}");
@@ -3690,7 +3671,7 @@ mod tests {
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Enter]),
             Some(Action::Send {
-                target: "#quest-video".into(),
+                target: "#sample-app".into(),
                 body: "hello".into()
             })
         );
@@ -3765,7 +3746,7 @@ mod tests {
     #[test]
     fn chat_scrolls_within_wrapped_unicode_and_multiline_messages() {
         let (mut app, mut snap) = chat_with_history(1);
-        snap.messages.get_mut("#quest-video").unwrap()[0].body = format!(
+        snap.messages.get_mut("#sample-app").unwrap()[0].body = format!(
             "FIRST\n{}\nLAST",
             "界界界 alpha beta gamma delta epsilon ".repeat(100)
         );
@@ -3788,7 +3769,7 @@ mod tests {
     #[test]
     fn chat_history_can_exceed_the_paragraph_scroll_range() {
         let (mut app, mut snap) = chat_with_history(1);
-        snap.messages.get_mut("#quest-video").unwrap()[0].body = (0..66_000)
+        snap.messages.get_mut("#sample-app").unwrap()[0].body = (0..66_000)
             .map(|index| format!("row-{index:05}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -3815,7 +3796,7 @@ mod tests {
         }
         render(&mut app, &snap);
         press(&mut app, &snap, &[KeyCode::Home]);
-        snap.messages.get_mut("#quest-video").unwrap().truncate(1);
+        snap.messages.get_mut("#sample-app").unwrap().truncate(1);
         assert!(render(&mut app, &snap).contains("message-000"));
         assert_eq!(app.chat_scroll, 0);
     }
@@ -3833,14 +3814,14 @@ mod tests {
         app.input.clear();
 
         press(&mut app, &snap, &[KeyCode::Down]);
-        type_text(&mut app, &snap, "ping @flash3");
+        type_text(&mut app, &snap, "ping @agent3");
         press(&mut app, &snap, &[KeyCode::Tab]);
-        assert_eq!(app.input, "ping @flash3.8 ");
+        assert_eq!(app.input, "ping @agent3.8 ");
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Enter]),
             Some(Action::Send {
-                target: "#quest-video".into(),
-                body: "ping @flash3.8".into()
+                target: "#sample-app".into(),
+                body: "ping @agent3.8".into()
             })
         );
         assert!(app.input.is_empty());
@@ -3861,12 +3842,12 @@ mod tests {
     fn completion_extends_to_the_shared_prefix_when_several_names_match() {
         let accounts = fixture().accounts;
         assert_eq!(
-            complete_mention("hi @fl", &accounts).as_deref(),
-            Some("hi @flash")
+            complete_mention("hi @ag", &accounts).as_deref(),
+            Some("hi @agent")
         );
         assert_eq!(
-            complete_mention("hi @to", &accounts).as_deref(),
-            Some("hi @tony ")
+            complete_mention("hi @us", &accounts).as_deref(),
+            Some("hi @user ")
         );
         assert_eq!(complete_mention("hi @zz", &accounts), None);
         assert_eq!(complete_mention("no mention", &accounts), None);
@@ -3897,7 +3878,7 @@ mod tests {
         let snap = fixture();
         let mut app = App::default();
         press(&mut app, &snap, &[KeyCode::Char('n')]);
-        assert!(render(&mut app, &snap).contains("New task in #quest-video: title"));
+        assert!(render(&mut app, &snap).contains("New task in #sample-app: title"));
         type_text(&mut app, &snap, "Add subtitles");
         press(&mut app, &snap, &[KeyCode::Enter]);
         assert!(render(&mut app, &snap).contains("@codex  (builder)"));
@@ -3913,7 +3894,7 @@ mod tests {
             sent(
                 "/v1/tasks",
                 json!({
-                    "channel": "#quest-video", "title": "Add subtitles", "kind": "bug",
+                    "channel": "#sample-app", "title": "Add subtitles", "kind": "bug",
                     "assignee": "codex", "body": "SRT files only",
                 }),
                 "Task created"
@@ -3941,7 +3922,7 @@ mod tests {
             press(&mut app, &snap, &[KeyCode::Char('a'), KeyCode::Enter]),
             sent(
                 "/v1/tasks/task_abc123/assign",
-                json!({"assignee": "flash3.8"}),
+                json!({"assignee": "agent3.8"}),
                 "Task reassigned"
             )
         );
@@ -4002,7 +3983,7 @@ mod tests {
             ),
             sent(
                 "/v1/projects/pm",
-                json!({"channel": "#quest-video", "nick": "flash3.8"}),
+                json!({"channel": "#sample-app", "nick": "agent3.8"}),
                 "Project manager set"
             )
         );
@@ -4010,13 +3991,13 @@ mod tests {
         // others, then a new account.
         press(&mut app, &snap, &[KeyCode::Char('m')]);
         let screen = render(&mut app, &snap);
-        assert!(screen.contains("Members of #quest-video"), "{screen}");
-        assert!(screen.contains("@flash3.8  (coordinator, change role)"), "{screen}");
-        assert!(screen.contains("@flash-lite  (add)"), "{screen}");
+        assert!(screen.contains("Members of #sample-app"), "{screen}");
+        assert!(screen.contains("@agent3.8  (coordinator, change role)"), "{screen}");
+        assert!(screen.contains("@agent-lite  (add)"), "{screen}");
         assert!(screen.contains("+ new account (client and model)"), "{screen}");
         assert!(
-            screen.find("@flash3.8  (coordinator").unwrap() < screen.find("@tony  (add)").unwrap()
-                && screen.find("@flash-lite  (add)").unwrap() < screen.find("+ new account").unwrap(),
+            screen.find("@agent3.8  (coordinator").unwrap() < screen.find("@user  (add)").unwrap()
+                && screen.find("@agent-lite  (add)").unwrap() < screen.find("+ new account").unwrap(),
             "{screen}"
         );
         assert_eq!(
@@ -4027,8 +4008,8 @@ mod tests {
             ),
             sent(
                 "/v1/projects/members",
-                json!({"channel": "#quest-video", "nick": "flash-lite", "role": "builder"}),
-                "@flash-lite is now builder in #quest-video"
+                json!({"channel": "#sample-app", "nick": "agent-lite", "role": "builder"}),
+                "@agent-lite is now builder in #sample-app"
             )
         );
         // Answer the waiting question.
@@ -4048,9 +4029,9 @@ mod tests {
             press(&mut app, &snap, &[KeyCode::Char('l'), KeyCode::Enter]),
             Some(Action::Api {
                 path: "/v1/owner/wake".into(),
-                body: json!({"action": "enable", "nick": "flash-lite"}),
+                body: json!({"action": "enable", "nick": "agent-lite"}),
                 owner: true,
-                done: "Launcher for @flash-lite: enabled".into(),
+                done: "Launcher for @agent-lite: enabled".into(),
             })
         );
         // Help opens and closes.
@@ -4083,12 +4064,12 @@ mod tests {
         let screen = render(&mut app, &snap);
         for expected in [
             "[H]ome",
-            "#quest-video",
-            "PM @flash3.8",
-            "repo quest-player",
+            "#sample-app",
+            "PM @agent3.8",
+            "repo demo-project",
             "folder missing",
             "on hub",
-            "remote antv311/quest-video-workspace",
+            "remote example-org/sample-workspace",
             "working",
             "launcher off",
             "no launcher",
@@ -4099,7 +4080,7 @@ mod tests {
 
         assert_eq!(press(&mut app, &snap, &[KeyCode::Enter]), None);
         assert_eq!(app.view, View::Dashboard);
-        assert_eq!(app.project.as_deref(), Some("#quest-video"));
+        assert_eq!(app.project.as_deref(), Some("#sample-app"));
         // Chat opened from a project starts in that project's room.
         press(&mut app, &snap, &[KeyCode::Char('c')]);
         assert_eq!(app.channel_idx, 1);
@@ -4117,7 +4098,7 @@ mod tests {
         });
         let mut app = App::default();
         assert!(render(&mut app, &snap).contains("#wardrobe"));
-        app.project = Some("#quest-video".into());
+        app.project = Some("#sample-app".into());
         let screen = render(&mut app, &snap);
         assert!(screen.contains("Fix seek bar") && !screen.contains("#wardrobe"));
     }
@@ -4183,7 +4164,7 @@ mod tests {
     #[test]
     fn people_dots_follow_each_accounts_tasks_in_the_room() {
         let mut snap = fixture();
-        let state = |snap: &Snapshot, nick: &str| member_state(snap, "#quest-video", nick);
+        let state = |snap: &Snapshot, nick: &str| member_state(snap, "#sample-app", nick);
         // codex's task is blocked on a question escalated to the owner.
         assert_eq!(state(&snap, "codex"), Some((Color::Red, "needs you")));
         snap.waiting[0].escalated = false;
@@ -4200,8 +4181,8 @@ mod tests {
             assert_eq!(state(&snap, "codex"), Some(expected));
         }
         // No task, but its agent is running right now.
-        assert_eq!(state(&snap, "flash3.8"), Some((Color::Green, "working")));
-        assert_eq!(state(&snap, "tony"), None);
+        assert_eq!(state(&snap, "agent3.8"), Some((Color::Green, "working")));
+        assert_eq!(state(&snap, "user"), None);
 
         // An open question wins over the status the task shows.
         snap.waiting.push(question);
@@ -4270,7 +4251,7 @@ mod tests {
             ..App::default()
         };
         render(&mut app, &snap); // first sight: everything counts as read
-        snap.messages.get_mut("#quest-video").unwrap().push(ChatLine {
+        snap.messages.get_mut("#sample-app").unwrap().push(ChatLine {
             seq: 2,
             sender: "codex".into(),
             body: "done".into(),
@@ -4279,14 +4260,14 @@ mod tests {
         let screen = render(&mut app, &snap);
         let row = screen
             .lines()
-            .find(|line| line.contains("#quest-video") && !line.contains("Message"))
+            .find(|line| line.contains("#sample-app") && !line.contains("Message"))
             .unwrap()
             .to_string();
         assert!(row.contains(" 1"), "unread count missing in {row:?}");
         // Opening the room marks it read.
         press(&mut app, &snap, &[KeyCode::Down]);
         render(&mut app, &snap);
-        assert_eq!(app.seen["#quest-video"], 2);
+        assert_eq!(app.seen["#sample-app"], 2);
     }
 
     fn dm(seq: i64, sender: &str, body: &str) -> ChatLine {
@@ -4301,21 +4282,21 @@ mod tests {
     #[test]
     fn dm_peer_is_the_other_side_of_the_stored_channel() {
         assert_eq!(
-            dm_peer("@dm:flash3.8:tony", "tony").as_deref(),
-            Some("flash3.8")
+            dm_peer("@dm:agent3.8:user", "user").as_deref(),
+            Some("agent3.8")
         );
-        assert_eq!(dm_peer("@dm:codex:tony", "Tony").as_deref(), Some("codex"));
-        assert_eq!(dm_peer("@dm:tony:tony", "tony").as_deref(), Some("tony"));
-        assert_eq!(dm_peer("#general", "tony"), None);
+        assert_eq!(dm_peer("@dm:codex:user", "UsEr").as_deref(), Some("codex"));
+        assert_eq!(dm_peer("@dm:user:user", "user").as_deref(), Some("user"));
+        assert_eq!(dm_peer("#general", "user"), None);
     }
 
     #[test]
     fn direct_messages_list_after_the_rooms_and_reply_privately() {
         let mut snap = fixture();
-        snap.channels.push("@flash3.8".into());
+        snap.channels.push("@agent3.8".into());
         snap.messages.insert(
-            "@flash3.8".into(),
-            vec![dm(5, "flash3.8", "can you look at #19?")],
+            "@agent3.8".into(),
+            vec![dm(5, "agent3.8", "can you look at #19?")],
         );
         let mut app = App {
             view: View::Chat,
@@ -4325,12 +4306,12 @@ mod tests {
         let screen = render(&mut app, &snap);
         assert!(screen.contains("Direct messages"), "{screen}");
         assert!(screen.contains("can you look at #19?"), "{screen}");
-        assert!(screen.contains("Message @flash3.8"), "{screen}");
+        assert!(screen.contains("Message @agent3.8"), "{screen}");
         type_text(&mut app, &snap, "on it");
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Enter]),
             Some(Action::Send {
-                target: "@flash3.8".into(),
+                target: "@agent3.8".into(),
                 body: "on it".into()
             })
         );
@@ -4352,17 +4333,17 @@ mod tests {
             panic!("no picker: {:?}", app.modal);
         };
         let nicks: Vec<&str> = items.iter().map(|(_, nick)| nick.as_str()).collect();
-        assert_eq!(nicks, ["flash3.8", "flash-lite"], "you cannot DM yourself");
+        assert_eq!(nicks, ["agent3.8", "agent-lite"], "you cannot DM yourself");
         press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]);
         assert!(app.modal.is_none());
         let screen = render(&mut app, &snap);
-        assert!(screen.contains("Message @flash-lite"), "{screen}");
-        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "@flash-lite");
+        assert!(screen.contains("Message @agent-lite"), "{screen}");
+        assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "@agent-lite");
         type_text(&mut app, &snap, "hello");
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Enter]),
             Some(Action::Send {
-                target: "@flash-lite".into(),
+                target: "@agent-lite".into(),
                 body: "hello".into()
             })
         );
@@ -4376,11 +4357,11 @@ mod tests {
             ..App::default()
         };
         render(&mut app, &snap);
-        assert!(app.people_rows.iter().all(|(_, nick)| nick != "tony"));
+        assert!(app.people_rows.iter().all(|(_, nick)| nick != "user"));
         let (row, nick) = app
             .people_rows
             .iter()
-            .find(|(_, nick)| nick == "flash-lite")
+            .find(|(_, nick)| nick == "agent-lite")
             .cloned()
             .unwrap();
         let x = app.people_area.x + 2;
@@ -4419,7 +4400,7 @@ mod tests {
         snap.messages
             .get_mut("@codex")
             .unwrap()
-            .push(dm(10, "tony", "sure"));
+            .push(dm(10, "user", "sure"));
         press(&mut app, &snap, &[KeyCode::Up]);
         let screen = render(&mut app, &snap);
         assert_eq!(chat_rooms(&app, &snap)[app.channel_idx], "@codex");
@@ -4445,7 +4426,7 @@ mod tests {
             ..App::default()
         };
         let screen = render(&mut app, &snap);
-        for expected in ["[-] Quest player", "#quest-video", "s1 Local play", "Message #quest-video-s1"] {
+        for expected in ["[-] Demo project", "#sample-app", "s1 Local play", "Message #sample-app-s1"] {
             assert!(screen.contains(expected), "chat is missing {expected:?}");
         }
         // The project line names the current sprint and the task row its sprint.
@@ -4455,12 +4436,12 @@ mod tests {
 
         // In a sprint room the dots come from that sprint's tasks only.
         assert_eq!(
-            member_state(&snap, "#quest-video-s1", "codex"),
+            member_state(&snap, "#sample-app-s1", "codex"),
             Some((Color::Red, "needs you"))
         );
-        snap.projects[0].tasks[0].sprint = Some("#quest-video-s2".into());
-        assert_eq!(member_state(&snap, "#quest-video-s1", "codex"), None);
-        assert!(member_state(&snap, "#quest-video", "codex").is_some());
+        snap.projects[0].tasks[0].sprint = Some("#sample-app-s2".into());
+        assert_eq!(member_state(&snap, "#sample-app-s1", "codex"), None);
+        assert!(member_state(&snap, "#sample-app", "codex").is_some());
     }
 
     #[test]
@@ -4468,13 +4449,13 @@ mod tests {
         let snap = fixture();
         for mut app in [home(), App::default()] {
             press(&mut app, &snap, &[KeyCode::Char('o')]);
-            assert!(render(&mut app, &snap).contains("Open the next sprint of #quest-video"));
+            assert!(render(&mut app, &snap).contains("Open the next sprint of #sample-app"));
             type_text(&mut app, &snap, "Subtitles");
             assert_eq!(
                 press(&mut app, &snap, &[KeyCode::Enter]),
                 sent(
                     "/v1/rooms",
-                    json!({"project": "#quest-video", "title": "Subtitles"}),
+                    json!({"project": "#sample-app", "title": "Subtitles"}),
                     "Sprint opened"
                 )
             );
@@ -4485,7 +4466,7 @@ mod tests {
             press(&mut app, &snap, &[KeyCode::Char('o'), KeyCode::Enter]),
             sent(
                 "/v1/rooms",
-                json!({"project": "#quest-video", "title": null}),
+                json!({"project": "#sample-app", "title": null}),
                 "Sprint opened"
             )
         );
@@ -4506,7 +4487,7 @@ mod tests {
         // m, then "+ create a new account", then the client.
         press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
         let screen = render(&mut app, &snap);
-        assert!(screen.contains("New account for #quest-video: client"), "{screen}");
+        assert!(screen.contains("New account for #sample-app: client"), "{screen}");
         assert!(screen.contains("LM Studio  (not installed)"), "{screen}");
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Enter]),
@@ -4535,13 +4516,13 @@ mod tests {
         ));
         type_text(&mut app, &snap, "-2");
         press(&mut app, &snap, &[KeyCode::Enter]);
-        assert!(render(&mut app, &snap).contains("Role for @gemini-3.8-flash-low-2 in #quest-video"));
+        assert!(render(&mut app, &snap).contains("Role for @gemini-3.8-flash-low-2 in #sample-app"));
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Down, KeyCode::Enter]),
             Some(Action::CreateAccount {
                 body: json!({
                     "template": "agy", "model": "gemini-3.8-flash-low",
-                    "nick": "gemini-3.8-flash-low-2", "channel": "#quest-video",
+                    "nick": "gemini-3.8-flash-low-2", "channel": "#sample-app",
                     "role": "builder",
                 }),
             })
@@ -4631,13 +4612,13 @@ mod tests {
         // An existing file keeps its default, other profiles and other keys.
         std::fs::write(
             &path,
-            r#"{"default": "tony", "extra": 1, "profiles": {"tony": {"token": "t", "nick": "tony", "server": "s"}}}"#,
+            r#"{"default": "user", "extra": 1, "profiles": {"user": {"token": "t", "nick": "user", "server": "s"}}}"#,
         )?;
         save_profile(&dir, "new-model", "http://127.0.0.1:6680", "tok-2")?;
         let data: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        assert_eq!(data["default"], "tony");
+        assert_eq!(data["default"], "user");
         assert_eq!(data["extra"], 1);
-        assert_eq!(data["profiles"]["tony"]["token"], "t");
+        assert_eq!(data["profiles"]["user"]["token"], "t");
         assert_eq!(
             data["profiles"]["new-model"],
             json!({"server": "http://127.0.0.1:6680", "token": "tok-2", "nick": "new-model"})
@@ -4656,13 +4637,13 @@ mod tests {
         let snap = fixture();
         let mut app = App::default();
         press(&mut app, &snap, &[KeyCode::Char('m'), KeyCode::Enter]);
-        assert!(render(&mut app, &snap).contains("Role for @flash3.8"));
+        assert!(render(&mut app, &snap).contains("Role for @agent3.8"));
         assert_eq!(
             press(&mut app, &snap, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]),
             sent(
                 "/v1/projects/members",
-                json!({"channel": "#quest-video", "nick": "flash3.8", "role": "reviewer"}),
-                "@flash3.8 is now reviewer in #quest-video"
+                json!({"channel": "#sample-app", "nick": "agent3.8", "role": "reviewer"}),
+                "@agent3.8 is now reviewer in #sample-app"
             )
         );
     }
@@ -4760,11 +4741,11 @@ mod tests {
     fn task_details_show_the_reviewer_and_the_parent_task() {
         let body = |task: Value| json!({"task": task, "events": []});
         let child = json!({
-            "title": "Child", "kind": "task", "channel": "#quest-video", "status": "assigned",
+            "title": "Child", "kind": "task", "channel": "#sample-app", "status": "assigned",
             "assignee": "worker", "reviewer": "lead", "parent_task_id": "task_parent",
         });
         let parent = json!({"title": "Parent work", "assignee": "lead"});
-        let lines = task_detail_lines(&body(child.clone()), Some(&parent), Some("flash3.8"));
+        let lines = task_detail_lines(&body(child.clone()), Some(&parent), Some("agent3.8"));
         assert!(
             lines.contains(
                 &"reviewer @lead (lead)   parent task_parent \"Parent work\"".to_string()
@@ -4779,14 +4760,14 @@ mod tests {
         );
 
         // A top-level task is reviewed by the project manager.
-        let top = json!({"title": "Top", "kind": "task", "reviewer": "flash3.8"});
-        let lines = task_detail_lines(&body(top), None, Some("flash3.8"));
+        let top = json!({"title": "Top", "kind": "task", "reviewer": "agent3.8"});
+        let lines = task_detail_lines(&body(top), None, Some("agent3.8"));
         assert!(
-            lines.contains(&"reviewer @flash3.8 (PM)   parent -".to_string()),
+            lines.contains(&"reviewer @agent3.8 (PM)   parent -".to_string()),
             "{lines:#?}"
         );
         let none = json!({"title": "Unassigned", "kind": "task"});
-        let lines = task_detail_lines(&body(none), None, Some("flash3.8"));
+        let lines = task_detail_lines(&body(none), None, Some("agent3.8"));
         assert!(
             lines.contains(&"reviewer -   parent -".to_string()),
             "{lines:#?}"
@@ -4841,7 +4822,7 @@ mod tests {
     fn a_hub_that_is_down_offers_a_key_to_start_it() {
         let down = Snapshot {
             server: "http://127.0.0.1:6680".into(),
-            me: "tony".into(),
+            me: "user".into(),
             error: Some("cannot reach the hub at http://127.0.0.1:6680".into()),
             hub_down: true,
             ..Snapshot::default()

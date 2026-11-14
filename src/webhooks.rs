@@ -796,9 +796,9 @@ mod tests {
 
     #[test]
     fn mentions_keep_dots_inside_names_but_not_sentence_punctuation() {
-        let found = extract_mentions("ping @flash3.8. and @opus5.5, then @codex.");
-        assert!(found.contains("flash3.8"));
-        assert!(found.contains("opus5.5"));
+        let found = extract_mentions("ping @worker3.8. and @reviewer5.5, then @codex.");
+        assert!(found.contains("worker3.8"));
+        assert!(found.contains("reviewer5.5"));
         assert!(found.contains("codex"));
         assert_eq!(found.len(), 3);
     }
