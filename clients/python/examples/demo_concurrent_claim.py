@@ -4,7 +4,7 @@ Usage:
     python demo_concurrent_claim.py
 
 Requires:
-  - Running aircd server on localhost:6667
+  - Running aircd server on localhost:6667 (override with AIRCD_HOST and AIRCD_PORT)
   - Pre-configured tokens: test-token-1, test-token-2, test-token-3
 """
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
 
@@ -22,8 +23,8 @@ from aircd import AircdClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("race")
 
-HOST = "localhost"
-PORT = 6667
+HOST = os.environ.get("AIRCD_HOST", "localhost")
+PORT = int(os.environ.get("AIRCD_PORT", "6667"))
 CHANNEL = "#race-test"
 
 AGENTS = [

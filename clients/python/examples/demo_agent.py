@@ -3,7 +3,8 @@
 Usage:
     python demo_agent.py --token test-token-1 --nick agent-1 --channel "#work"
 
-Requires a running aircd server on localhost:6667.
+Requires a running aircd server, by default on localhost:6667 (set --host and
+--port, or AIRCD_HOST and AIRCD_PORT, to use another).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import re
 import sys
 
@@ -57,8 +59,8 @@ async def run_agent(host: str, port: int, token: str, nick: str, channel: str) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="aircd demo agent")
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=6667)
+    parser.add_argument("--host", default=os.environ.get("AIRCD_HOST", "localhost"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("AIRCD_PORT", "6667")))
     parser.add_argument("--token", required=True)
     parser.add_argument("--nick", required=True)
     parser.add_argument("--channel", default="#work")
