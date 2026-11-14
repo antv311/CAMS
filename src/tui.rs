@@ -35,6 +35,7 @@ const STATUS_CHOICES: &[&str] = &[
     "changes_requested",
     "merged",
     "cancelled",
+    "super_review",
 ];
 const ROLE_CHOICES: &[&str] = &["member", "builder", "reviewer", "tester", "coordinator"];
 const KIND_CHOICES: &[&str] = &["task", "bug", "feature"];
@@ -936,6 +937,31 @@ pub fn task_detail_lines(body: &Value, parent: Option<&Value>, pm: Option<&str>)
         ),
         String::new(),
     ];
+    if let Some(round) = task["review_round"].as_object() {
+        lines.push(format!(
+            "Peer review {}   commit {}   quorum {}",
+            text(&round["revision"]),
+            text(&round["commit"]),
+            round["quorum"]
+        ));
+        if let Some(peers) = round["peer_reviewers"].as_array() {
+            lines.push(format!(
+                "Peers: {}",
+                peers.iter().map(text).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if let Some(votes) = round["votes"].as_array() {
+            for vote in votes {
+                lines.push(format!(
+                    "  @{}: {} - {}",
+                    text(&vote["reviewer"]),
+                    text(&vote["decision"]),
+                    text(&vote["note"])
+                ));
+            }
+        }
+        lines.push(String::new());
+    }
     if let Some(description) = task["body"].as_str() {
         lines.push(description.to_string());
         lines.push(String::new());
@@ -2103,7 +2129,7 @@ fn status_color(status: &str) -> Color {
     match status {
         "blocked" => Color::Red,
         "testing" => Color::Magenta,
-        "review" => Color::Blue,
+        "review" | "super_review" => Color::Blue,
         "changes_requested" => Color::Yellow,
         "in_progress" | "claimed" => Color::Green,
         _ => Color::Gray,
@@ -2536,6 +2562,7 @@ pub fn member_state(snap: &Snapshot, channel: &str, nick: &str) -> Option<(Color
                 (Some(_), _) | (None, "blocked") => (1, Color::Yellow, "waiting on PM"),
                 (None, "testing") => (2, Color::Magenta, "testing"),
                 (None, "review") => (3, Color::Blue, "in review"),
+                (None, "super_review") => (3, Color::Blue, "PM review"),
                 (None, "in_progress" | "claimed") => (4, Color::Green, "coding"),
                 _ => (5, Color::White, "has work"),
             };

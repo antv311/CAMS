@@ -660,6 +660,8 @@ def cmd_task(args: argparse.Namespace) -> int:
     if args.task_cmd == "status":
         note = review_note(server, token, args) if args.status == "review" else args.note
         payload = {"status": args.status, "note": note, "branch": args.branch}
+        if getattr(args, "commit", None):
+            payload["commit"] = args.commit
         report_id = (getattr(args, "report", None) or "").strip()
         if args.status == "review" and report_id:
             # The hub validates the report (assignee-authored, same task) and
@@ -674,6 +676,14 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (branch={t.get('branch') or '-'})"])
+        return 0
+    if args.task_cmd == "peer-review":
+        data = http_json(
+            server, "POST", f"/v1/tasks/{urllib.parse.quote(args.id, safe='')}/peer-review",
+            token=token, payload={"revision": args.revision, "decision": args.decision, "note": args.note},
+        )
+        t = data["task"]
+        print_out(args, data, [f"Task {t['id']} peer {args.decision} -> {t['status']}"])
         return 0
     if args.task_cmd in ("ask", "answer", "escalate"):
         text = " ".join(args.text or []).strip()
@@ -699,6 +709,11 @@ def cmd_task(args: argparse.Namespace) -> int:
         ]
         if t.get("parent_task_id") or t.get("reviewer"):
             lines.append(f"parent={t.get('parent_task_id') or '-'} reviewer={t.get('reviewer') or '-'}")
+        if t.get("review_round"):
+            r = t["review_round"]
+            lines.append(f"peer revision={r['revision']} commit={r['commit']} quorum={r['quorum']} peers={','.join(r['peer_reviewers'])}")
+            for vote in r.get("votes", []):
+                lines.append(f"  @{vote['reviewer']}: {vote['decision']} - {vote['note']}")
         for child in data.get("subtasks") or []:
             lines.append(
                 f"  subtask {child['id']} [{child.get('status', '?')}] "
@@ -1085,6 +1100,10 @@ def group_lines(g: Group) -> list[str]:
         "  workers: " + (", ".join(w.label() for w in g.workers) or "-"),
         "  projects: " + (", ".join(g.projects) or "-"),
     ]
+    if g.review_policy is not None:
+        policy = g.review_policy
+        quorum = policy.get("quorum") or "all eligible peers"
+        lines.append(f"  peer review: {', '.join(policy['peer_reviewers'])}; quorum={quorum}")
     for label, prompt in (("lead prompt", g.lead_prompt), ("worker prompt", g.worker_prompt)):
         if prompt:
             first = prompt.strip().splitlines()[0] if prompt.strip() else ""
@@ -1143,8 +1162,11 @@ def cmd_inbox(args: argparse.Namespace) -> int:
             )
         for t in proj.get("to_review", []):
             lines.append(
-                f"  REVIEW {t['id']} by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
+                f"  REVIEW {t['id']} [{t.get('status', 'review')}] by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
             )
+            if t.get("review_round"):
+                r = t["review_round"]
+                lines.append(f"    peer revision={r['revision']} commit={r['commit']} quorum={r['quorum']}")
         for q in proj.get("questions", []):
             lines.append(f"  QUESTION {q['task_id']} from @{q['asked_by']}: {q['question']}")
     for q in inbox.get("needs_you", []):
@@ -2139,7 +2161,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tst.add_argument("--note", help="Your test report: what you ran and the result (needed for review)")
     p_tst.add_argument("--report", metavar="REPORT_ID", help="Attach a report from 'airc report create --task-id ID' as the test report")
     p_tst.add_argument("--branch")
+    p_tst.add_argument("--commit", help="Full submitted commit hash (required for group peer review unless supplied by --report)")
     p_tst.set_defaults(func=cmd_task)
+
+    p_tpr = task_sub.add_parser("peer-review", help="Approve or reject an exact group review revision")
+    p_tpr.add_argument("id")
+    p_tpr.add_argument("decision", choices=["approve", "reject"])
+    p_tpr.add_argument("--revision", required=True, help="Review revision from task show/inbox")
+    p_tpr.add_argument("--note", required=True, help="Review findings for this submission")
+    p_tpr.set_defaults(func=cmd_task)
 
     for name, text in (
         ("ask", "Assignee: park the task and ask its reviewer or project manager"),

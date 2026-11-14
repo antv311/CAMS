@@ -15,12 +15,12 @@ use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredM
 use crate::locks::{LockStore, ResourceLock};
 use crate::logging::{EventForwarder, LogEvent, Severity};
 use crate::notes::NoteStore;
-use crate::rooms::{Room, RoomStore};
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
+use crate::rooms::{Room, RoomStore};
 use crate::store::{ClientTemplate, ClientTemplateStore, GroupStore, SharedConnection};
-use crate::tasks::{NewTask, Task, TaskStore, TERMINAL_STATUSES};
+use crate::tasks::{NewTask, ReviewRound, Task, TaskStore, TERMINAL_STATUSES};
 use crate::wake::{WakeConfig, WakeContext, WakeManager};
 use crate::webhooks::{WebhookEvent, WebhookStore};
 
@@ -77,6 +77,7 @@ pub struct Server {
     // Lock before db/inner: registration, command effects, reissue and cleanup
     // must agree on which session owns a principal across credential changes.
     session_gate: Arc<Mutex<()>>,
+    task_gate: Arc<Mutex<()>>,
     inner: Arc<Mutex<ServerInner>>,
 }
 
@@ -174,6 +175,7 @@ impl Server {
             logger: logger.clone(),
             db,
             session_gate: Arc::new(Mutex::new(())),
+            task_gate: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(ServerInner::default())),
         };
         // The poster gets its own idle launcher so the server's launcher does
@@ -1163,7 +1165,31 @@ impl Server {
     }
 
     /// Task wakes follow workflow ownership, never mentions in a title/report.
-    fn task_wake_recipients(&self, task: &Task, action: &str) -> Result<HashSet<String>> {
+    pub(crate) fn task_wake_recipients(
+        &self,
+        task: &Task,
+        action: &str,
+    ) -> Result<HashSet<String>> {
+        if let Some(round) = &task.review_round {
+            if matches!(action, "status" | "peer_review")
+                && matches!(task.status.as_str(), "review" | "super_review")
+            {
+                let ids = if task.status == "super_review" {
+                    self.project_managers(&task.channel)?
+                } else if action == "peer_review" {
+                    // A rejected review needs the author's attention. Do not
+                    // repeatedly wake peers after each partial approval.
+                    if round.votes.iter().any(|v| v.decision == "reject") {
+                        task.assignee.iter().cloned().collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    self.eligible_review_peers(task, round)?
+                };
+                return Ok(ids.into_iter().collect());
+            }
+        }
         let reviewer = match task.reviewer.as_ref() {
             Some(id)
                 if task.assignee.as_ref() != Some(id)
@@ -2553,6 +2579,7 @@ impl Server {
         task_id: &str,
         assignee: Option<&str>,
     ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let current = self.get_task_api(task_id)?;
         let parent = current
             .parent_task_id
@@ -2599,6 +2626,7 @@ impl Server {
     /// coordinator oversees reviews. A named reviewer can decide their assigned
     /// reviews, but cannot approve their own work or cancel project tasks.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn set_task_status_api(
         &self,
         actor: &Principal,
@@ -2609,6 +2637,31 @@ impl Server {
         report_body: Option<&str>,
         report_id: Option<&str>,
     ) -> Result<Task> {
+        self.set_task_status_revision_api(
+            actor,
+            task_id,
+            raw_to,
+            note,
+            branch,
+            report_body,
+            report_id,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_task_status_revision_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        raw_to: &str,
+        note: Option<&str>,
+        branch: Option<&str>,
+        report_body: Option<&str>,
+        report_id: Option<&str>,
+        commit: Option<&str>,
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
         let current = self.get_task_api(task_id)?;
         let to = raw_to.trim().to_ascii_lowercase().replace('-', "_");
         let from = current.status.clone();
@@ -2625,8 +2678,11 @@ impl Server {
             ("assigned" | "changes_requested" | "testing", "in_progress") => is_assignee,
             ("assigned" | "in_progress" | "changes_requested", "testing") => is_assignee,
             ("testing", "review") => is_assignee,
-            ("review", "in_progress") => is_assignee,
-            ("review", "merged" | "changes_requested") => is_manager || is_reviewer,
+            ("review" | "super_review", "in_progress") => is_assignee,
+            ("review" | "super_review", "changes_requested") => is_manager || is_reviewer,
+            ("review", "merged") => is_manager || (is_reviewer && current.review_round.is_none()),
+            ("super_review", "merged") => is_manager,
+            ("review", "super_review") => is_manager && current.review_round.is_some(),
             (current_status, "cancelled") if !TERMINAL_STATUSES.contains(&current_status) => {
                 is_manager
             }
@@ -2645,6 +2701,13 @@ impl Server {
             .into_iter()
             .collect();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+        if matches!(from.as_str(), "review" | "super_review")
+            && current.review_round.is_some()
+            && (branch.is_some_and(|b| Some(b) != current.branch.as_deref()) || commit.is_some())
+        {
+            return Err(anyhow!("submitted branch and commit are immutable; return to in_progress, test and resubmit"));
+        }
+        let mut report_commit = None;
         // Whoever reviews reads the evidence instead of re-running the tests.
         if from == "testing" && to == "review" {
             if let Some(body) = report_body.map(str::trim).filter(|b| !b.is_empty()) {
@@ -2663,6 +2726,7 @@ impl Server {
                     return Err(anyhow!("test report must have a nonblank body, be authored by the assignee and belong to this task and project"));
                 }
                 evidence.push(format!("Test report {}:\n{}", report.id, report.body));
+                report_commit = report.git_commit;
             }
             if evidence.is_empty() {
                 return Err(anyhow!(
@@ -2670,11 +2734,54 @@ impl Server {
                 ));
             }
         }
-        let evidence = evidence.join("\n\n");
+        let mut evidence = evidence.join("\n\n");
+        let round = if from == "testing" && to == "review" {
+            self.new_review_round(
+                &current,
+                branch.or(current.branch.as_deref()),
+                commit.or(report_commit.as_deref()),
+                &evidence,
+            )?
+        } else {
+            None
+        };
+        if round.is_some()
+            && commit
+                .zip(report_commit.as_deref())
+                .is_some_and(|(submitted, reported)| {
+                    !submitted.trim().eq_ignore_ascii_case(reported.trim())
+                })
+        {
+            return Err(anyhow!(
+                "submitted commit differs from the linked test report commit"
+            ));
+        }
+        if let Some(round) = current
+            .review_round
+            .as_ref()
+            .filter(|_| is_manager && matches!(to.as_str(), "merged" | "super_review"))
+        {
+            // The approved PM/owner override is explicit in the audit history.
+            let eligible = self.eligible_review_peers(&current, round)?;
+            if !round.consensus(&eligible) {
+                if evidence.is_empty() {
+                    return Err(anyhow!(
+                        "a note explaining the PM/owner consensus bypass is required"
+                    ));
+                }
+                evidence = format!("PM/owner consensus bypass: {evidence}");
+            }
+        }
         let note = (!evidence.is_empty()).then_some(evidence.as_str());
-        let task = self
-            .tasks
-            .set_status(&current.id, &from, &to, &actor.id, note, branch)?;
+        let task = self.tasks.set_status_with_round(
+            &current.id,
+            &from,
+            &to,
+            &actor.id,
+            note,
+            branch,
+            round.as_ref(),
+        )?;
 
         let mut text = format!(
             "TASK {} {} -> {} by @{}: {}",
@@ -2684,6 +2791,135 @@ impl Server {
             text.push_str(&format!(" - {note}"));
         }
         self.broadcast_task_event(&task, "status", "success", &actor.nick, text)?;
+        Ok(task)
+    }
+
+    fn new_review_round(
+        &self,
+        task: &Task,
+        branch: Option<&str>,
+        commit: Option<&str>,
+        evidence: &str,
+    ) -> Result<Option<ReviewRound>> {
+        let assignee = self
+            .auth
+            .resolve_by_name(task.assignee.as_deref().unwrap_or_default())?
+            .ok_or_else(|| anyhow!("task assignee not found"))?;
+        let mut selected = None;
+        for group in self.groups.list()? {
+            if group.definition.review_policy.is_none() || !group.projects.contains(&task.channel) {
+                continue;
+            }
+            let named = std::iter::once(&group.definition.lead)
+                .chain(&group.definition.workers)
+                .any(|member| {
+                    member.nick.as_deref().is_some_and(|nick| {
+                        nick.trim_start_matches('@')
+                            .eq_ignore_ascii_case(&assignee.nick)
+                    })
+                });
+            if named && selected.replace(group).is_some() {
+                return Err(anyhow!(
+                    "ambiguous group consensus policy for the task assignee"
+                ));
+            }
+        }
+        let Some(group) = selected else {
+            return Ok(None);
+        };
+        let policy = group.definition.review_policy.as_ref().unwrap();
+        let mut peers = Vec::new();
+        for nick in &policy.peer_reviewers {
+            let id = self.resolve_task_account(&task.channel, nick)?;
+            if id != assignee.id && !peers.contains(&id) {
+                peers.push(id);
+            }
+        }
+        let quorum = policy.quorum.map(|q| q as usize).unwrap_or(peers.len());
+        if quorum == 0 || quorum > peers.len() {
+            return Err(anyhow!("review quorum cannot be met after excluding the assignee; configure enough named peers"));
+        }
+        let commit = commit.unwrap_or_default().trim();
+        if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(anyhow!("group peer review requires a full commit hash via commit or the linked test report"));
+        }
+        let branch = branch
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| anyhow!("group peer review requires a submitted branch"))?;
+        Ok(Some(ReviewRound {
+            revision: format!("review_{}", uuid::Uuid::new_v4().simple()),
+            group: group.definition.name,
+            assignee: assignee.id,
+            commit: commit.to_ascii_lowercase(),
+            branch: branch.to_string(),
+            evidence: evidence.to_string(),
+            peer_reviewers: peers,
+            quorum,
+            votes: Vec::new(),
+        }))
+    }
+
+    fn eligible_review_peers(&self, task: &Task, round: &ReviewRound) -> Result<Vec<String>> {
+        let Some(group) = self.groups.get(&round.group)? else {
+            return Ok(Vec::new());
+        };
+        if !group.projects.contains(&task.channel) {
+            return Ok(Vec::new());
+        }
+        let mut eligible = Vec::new();
+        for id in &round.peer_reviewers {
+            if task.assignee.as_ref() == Some(id)
+                || self.projects.role_of(&task.channel, id)?.is_none()
+            {
+                continue;
+            }
+            let Some(peer) = self.auth.resolve_by_name(id)? else {
+                continue;
+            };
+            if std::iter::once(&group.definition.lead)
+                .chain(&group.definition.workers)
+                .any(|member| {
+                    member.nick.as_deref().is_some_and(|nick| {
+                        nick.trim_start_matches('@')
+                            .eq_ignore_ascii_case(&peer.nick)
+                    })
+                })
+            {
+                eligible.push(id.clone());
+            }
+        }
+        Ok(eligible)
+    }
+
+    pub fn peer_review_task_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        revision: &str,
+        decision: &str,
+        note: &str,
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        let round = current
+            .review_round
+            .as_ref()
+            .ok_or_else(|| anyhow!("task has no peer review round"))?;
+        let eligible = self.eligible_review_peers(&current, round)?;
+        let task =
+            self.tasks
+                .peer_vote(&current.id, revision, &actor.id, decision, note, &eligible)?;
+        self.broadcast_task_event(
+            &task,
+            "peer_review",
+            "success",
+            &actor.nick,
+            format!(
+                "TASK {} peer {} by @{} for {}: {} - {}",
+                task.id, decision, actor.nick, revision, task.status, note
+            ),
+        )?;
         Ok(task)
     }
 
@@ -2709,17 +2945,27 @@ impl Server {
                 .as_deref()
                 .is_some_and(|role| MANAGER_ROLES.contains(&role))
                 || Self::is_owner(actor);
-            let to_review: Vec<Task> = self
-                .tasks
-                .review_queue(&channel)?
-                .into_iter()
-                .filter(|task| {
+            let mut to_review = Vec::new();
+            for task in self.tasks.review_queue(&channel)? {
+                let routed = if let Some(round) = &task.review_round {
+                    is_manager
+                        || (self
+                            .eligible_review_peers(&task, round)?
+                            .contains(&actor.id)
+                            && !round
+                                .votes
+                                .iter()
+                                .any(|v| v.reviewer == actor.id && v.decision == "approve"))
+                } else {
                     is_manager
                         || (my_role.is_some()
                             && task.reviewer.as_deref() == Some(actor.id.as_str())
                             && task.assignee.as_deref() != Some(actor.id.as_str()))
-                })
-                .collect();
+                };
+                if routed {
+                    to_review.push(task);
+                }
+            }
             // Questions from blocked workers that this account should answer.
             let mut questions = Vec::new();
             for question in self.tasks.questions(Some(&channel), "open")? {

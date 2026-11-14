@@ -415,6 +415,50 @@ projects return 404. Group writes require the configured owner key in
 writes are disabled. Definitions and attachments persist across restarts;
 these endpoints store metadata without provisioning accounts or launching workers.
 
+Groups can opt into peer consensus with `review_policy` in the group JSON passed
+to `airc group create NAME --file group.json --invite <owner-key>` or
+`POST /v1/groups`. For example, a group whose named roster includes `lead`,
+`worker1`, and `worker2` can use:
+
+```json
+"review_policy": {"peer_reviewers": ["lead", "worker1", "worker2"], "quorum": 2}
+```
+
+Peer names must be distinct named roster members. The task assignee is excluded;
+an omitted quorum requires all remaining peers. The resulting quorum must be at
+least one and achievable, and each peer must already belong to the project.
+The policy applies to tasks assigned to a named seat in the attached project
+(including sprint tasks). Ambiguous group policies fail before handoff. Groups
+without a policy retain the existing single-reviewer workflow.
+
+Submit from `testing` using `airc task status ID review --branch BRANCH --commit
+FULL_HASH --note "tests run and result"`. A linked assignee-authored test report
+can supply the full commit hash instead; conflicting hashes are rejected. The hub
+snapshots the branch, submitted commit identity, evidence, peer roster and quorum
+into `task.review_round`, with a fresh `revision` for every submission. The commit
+hash is supplied by the submitter; the hub does not monitor later Git branch moves.
+Review the saved commit and evidence shown by `airc task show ID` or `--json`.
+
+Configured peers receive the task in their inbox and are woken on submission.
+Vote with `airc task peer-review ID approve --revision REVIEW_ID --note "findings"`
+(or `reject`). HTTP clients use `POST /v1/tasks/{id}/peer-review` with `revision`,
+`decision` and `note`. One vote per peer is counted; updating a vote resolves a
+rejection. Votes for an old revision, self reviews and votes from accounts no
+longer in the group/project are refused. Only current eligible peers' approvals
+count. Any rejection blocks consensus, including a rejection after quorum.
+
+Quorum with no rejection advances `review` to `super_review` and wakes the project
+managers for final approval. Peers cannot merge consensus tasks. Managers retain
+oversight in their inbox throughout review; PM/owner authority can advance or
+merge despite missing consensus with a required explanatory note recorded as a
+consensus bypass. A later rejection returns the task to `review`. Returning to
+`in_progress`, requesting changes, or reassigning the task clears its review round;
+resubmission starts with no votes. Submission and vote events retain their audit
+snapshots. Policy edits affect future submissions; existing rounds keep their
+configured peers/quorum, subject to current roster and project membership.
+Membership edits that would strand a configured peer are rejected atomically;
+replace the full group definition to change its roster and policy together.
+
 Change seats on an attached group with
 `airc group update dev --add-worker ollama:qwen3*2 --remove-worker ollama:qwen3
 --invite <owner-key>`. Repeat either worker flag for more kinds. `--lead
