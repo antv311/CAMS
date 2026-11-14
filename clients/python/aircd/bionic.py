@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
@@ -178,6 +178,25 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+class MaxTurnsError(BionicError):
+    """``run_agent`` used every turn without a final answer; carries the work done so far."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        turns: int = 0,
+        tool_calls: int = 0,
+        usage: Optional[dict[str, int]] = None,
+        turn_usage: Optional[list[Optional[dict[str, int]]]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.turns = turns
+        self.tool_calls = tool_calls
+        self.usage = dict(usage or {})
+        self.turn_usage = list(turn_usage or [])
+
+
 @dataclass
 class BionicConfig:
     """Runtime settings for the Bionic agent runner."""
@@ -215,6 +234,12 @@ class RunResult:
     turns: int
     tool_calls: int
     session_id: Optional[str] = None
+    #: Token totals summed over every turn that reported ``usage``
+    #: (``prompt_tokens``, ``completion_tokens``, ``total_tokens``); empty when
+    #: the server sent no usage.
+    usage: dict[str, int] = field(default_factory=dict)
+    #: Per-turn ``usage`` objects in turn order (``None`` for a turn without one).
+    turn_usage: list[Optional[dict[str, int]]] = field(default_factory=list)
 
 
 def _env_first(*names: str) -> str:
@@ -1205,6 +1230,7 @@ def accumulate_stream(events: Iterable[str], emit: Optional[StreamEmit] = None) 
     content: list[str] = []
     reasoning: list[str] = []
     calls: dict[int, dict[str, Any]] = {}
+    usage: Optional[dict[str, int]] = None
     saw_chunk = False
     for data in events:
         if data.strip() == "[DONE]":
@@ -1218,6 +1244,8 @@ def accumulate_stream(events: Iterable[str], emit: Optional[StreamEmit] = None) 
         if obj.get("error"):
             raise BionicError(f"Bionic API stream error: {_error_detail(obj, json.dumps(obj)[:400])}")
         saw_chunk = True
+        if isinstance(obj.get("usage"), dict):
+            usage = obj["usage"]
         choices = obj.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             continue  # e.g. a trailing usage-only chunk
@@ -1275,6 +1303,8 @@ def accumulate_stream(events: Iterable[str], emit: Optional[StreamEmit] = None) 
                 del call["id"]
             tool_calls.append(call)
         msg["tool_calls"] = tool_calls
+    if usage is not None:
+        msg["usage"] = usage
     return msg
 
 
@@ -1293,7 +1323,7 @@ def _http_chat_stream(
     req = _build_request(
         url,
         method="POST",
-        payload={**payload, "stream": True},
+        payload={**payload, "stream": True, "stream_options": {"include_usage": True}},
         api_key=api_key,
         accept="text/event-stream, application/json",
     )
@@ -1306,6 +1336,8 @@ def _http_chat_stream(
                 msg = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
                 if not isinstance(msg, dict):
                     raise BionicError(f"Bionic API returned no choices: {json.dumps(body)[:400]}")
+                if isinstance(body.get("usage"), dict):
+                    msg = {**msg, "usage": body["usage"]}
                 if emit is not None and isinstance(msg.get("content"), str) and msg["content"]:
                     emit("token", msg["content"])
                 return msg
@@ -1690,6 +1722,19 @@ def _normalize_assistant_message(msg: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def _usage_counts(raw: Any) -> Optional[dict[str, int]]:
+    """Pick the integer token counts out of an OpenAI ``usage`` object."""
+    if not isinstance(raw, dict):
+        return None
+    counts = {k: int(raw[k]) for k in _USAGE_KEYS if isinstance(raw.get(k), (int, float)) and not isinstance(raw.get(k), bool)}
+    if counts and "total_tokens" not in counts:
+        counts["total_tokens"] = counts.get("prompt_tokens", 0) + counts.get("completion_tokens", 0)
+    return counts or None
+
+
 def _tool_result_error(result: str) -> Optional[str]:
     try:
         parsed = json.loads(result)
@@ -1811,6 +1856,8 @@ def run_agent(
     messages.append({"role": "user", "content": prompt})
 
     total_tool_calls = 0
+    usage_totals: dict[str, int] = {}
+    turn_usage: list[Optional[dict[str, int]]] = []
     for turn in range(1, config.max_turns + 1):
         payload: dict[str, Any] = {
             "model": model,
@@ -1846,6 +1893,13 @@ def run_agent(
             msg = choices[0].get("message")
             if not isinstance(msg, dict):
                 raise BionicError(f"Bionic API choice missing 'message': {json.dumps(choices[0])[:400]}")
+            if isinstance(resp.get("usage"), dict):
+                msg = {**msg, "usage": resp["usage"]}
+
+        usage = _usage_counts(msg.get("usage"))
+        turn_usage.append(usage)
+        for key, value in (usage or {}).items():
+            usage_totals[key] = usage_totals.get(key, 0) + value
 
         cleaned = _normalize_assistant_message(msg)
         messages.append(cleaned)
@@ -1864,6 +1918,8 @@ def run_agent(
                 turns=turn,
                 tool_calls=total_tool_calls,
                 session_id=active_session_id,
+                usage=usage_totals,
+                turn_usage=turn_usage,
             )
 
         for idx, tc in enumerate(tool_calls):
@@ -1926,7 +1982,13 @@ def run_agent(
 
     if session_file is not None:
         _save_session_messages(session_file, messages)
-    raise BionicError(f"Reached max_turns={config.max_turns} without a final response")
+    raise MaxTurnsError(
+        f"Reached max_turns={config.max_turns} without a final response",
+        turns=config.max_turns,
+        tool_calls=total_tool_calls,
+        usage=usage_totals,
+        turn_usage=turn_usage,
+    )
 
 
 Approver = Callable[[str, dict[str, Any]], bool]
@@ -2340,6 +2402,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "turns": result.turns,
                         "tool_calls": result.tool_calls,
                         "session_id": result.session_id,
+                        "usage": result.usage,
                         "content": result.content,
                     }
                 )

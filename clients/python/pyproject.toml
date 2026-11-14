@@ -12,6 +12,7 @@ dev = ["pytest", "pytest-asyncio"]
 [project.scripts]
 airc = "aircd.cli:main"
 airc-bionic = "aircd.bionic:main"
+airc-bionic-bench = "aircd.bionic_bench:main"
 airc-daemon = "aircd.daemon:main"
 airc-bridge = "aircd.bridge:main"
 aircd-bionic = "aircd.bionic:main"
