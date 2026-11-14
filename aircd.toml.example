@@ -22,3 +22,10 @@ open_registration = false
 # syslog_target = "udp://127.0.0.1:514"   # or "tcp://127.0.0.1:6514" or "unix:///dev/log"
 # syslog_format = "rfc5424"               # or "rfc3164"
 # syslog_facility = "auto"                # auto = daemon (errors) / auth (security), or local0..local7
+
+# Automated SQLite snapshot backups preserving database integrity and key rings.
+# backup_enabled = true
+# backup_dir = "backups"                  # defaults to <db_dir>/backups
+# backup_interval_secs = 3600             # 0 disables periodic timer
+# backup_retention = 10
+# backup_on_startup = false               # true forces a snapshot on every startup

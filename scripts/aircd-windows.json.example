@@ -13,6 +13,11 @@
     "syslog_target": "",
     "syslog_format": "rfc5424",
     "syslog_facility": "auto",
+    "backup_enabled": true,
+    "backup_dir": "",
+    "backup_interval_secs": 3600,
+    "backup_retention": 10,
+    "backup_on_startup": false,
     "executable_path": ""
   },
   "service": {

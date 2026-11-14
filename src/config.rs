@@ -1,5 +1,6 @@
 //! Editable server settings and shared per-user configuration discovery.
 
+use crate::backup::{default_owner_key_path, BackupConfig};
 use crate::logging::{
     validate_event_log_source, LogConfig, SyslogFacility, SyslogFormat, SyslogTarget,
 };
@@ -54,6 +55,11 @@ pub struct ServerConfig {
     pub syslog_target: Option<String>,
     pub syslog_format: String,
     pub syslog_facility: Option<String>,
+    pub backup_enabled: bool,
+    pub backup_dir: Option<String>,
+    pub backup_interval_secs: u64,
+    pub backup_retention: usize,
+    pub backup_on_startup: bool,
 }
 
 impl Default for ServerConfig {
@@ -73,6 +79,11 @@ impl Default for ServerConfig {
             syslog_target: None,
             syslog_format: "rfc5424".into(),
             syslog_facility: None,
+            backup_enabled: true,
+            backup_dir: None,
+            backup_interval_secs: 3600,
+            backup_retention: 10,
+            backup_on_startup: false,
         }
     }
 }
@@ -110,6 +121,23 @@ impl ServerConfig {
         })
     }
 
+    pub fn to_backup_config(&self) -> Result<BackupConfig> {
+        if self.backup_retention == 0 {
+            bail!("server setting backup_retention must be at least 1");
+        }
+        Ok(BackupConfig {
+            enabled: self.backup_enabled,
+            db_path: self.db.clone(),
+            backup_dir: self.backup_dir.as_deref().map(PathBuf::from),
+            interval_secs: self.backup_interval_secs,
+            retention: self.backup_retention,
+            on_startup: self.backup_on_startup,
+            owner_key_path: default_owner_key_path(&self.db),
+            tls_cert_path: self.tls_cert.as_deref().map(PathBuf::from),
+            tls_key_path: self.tls_key.as_deref().map(PathBuf::from),
+        })
+    }
+
     fn load_with(
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
@@ -119,7 +147,11 @@ impl ServerConfig {
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let value = match arg.as_str() {
-                "--open-registration" | "--windows-event-log" => "true",
+                "--open-registration"
+                | "--windows-event-log"
+                | "--backup-enabled"
+                | "--backup-on-startup" => "true",
+                "--no-backups" => "false",
                 "--config"
                 | "--bind"
                 | "--http-bind"
@@ -131,7 +163,10 @@ impl ServerConfig {
                 | "--windows-event-log-source"
                 | "--syslog-target"
                 | "--syslog-format"
-                | "--syslog-facility" => iter
+                | "--syslog-facility"
+                | "--backup-dir"
+                | "--backup-interval-secs"
+                | "--backup-retention" => iter
                     .next()
                     .filter(|value| !value.starts_with("--"))
                     .with_context(|| format!("{arg} requires a value"))?,
@@ -166,9 +201,13 @@ impl ServerConfig {
                     }
                 };
                 relative(&mut config.db);
-                for value in [&mut config.tls_cert, &mut config.tls_key]
-                    .into_iter()
-                    .flatten()
+                for value in [
+                    &mut config.tls_cert,
+                    &mut config.tls_key,
+                    &mut config.backup_dir,
+                ]
+                .into_iter()
+                .flatten()
                 {
                     relative(value);
                 }
@@ -195,6 +234,11 @@ impl ServerConfig {
             ("AIRCD_SYSLOG_TARGET", "--syslog-target"),
             ("AIRCD_SYSLOG_FORMAT", "--syslog-format"),
             ("AIRCD_SYSLOG_FACILITY", "--syslog-facility"),
+            ("AIRCD_BACKUP_ENABLED", "--backup-enabled"),
+            ("AIRCD_BACKUP_DIR", "--backup-dir"),
+            ("AIRCD_BACKUP_INTERVAL_SECS", "--backup-interval-secs"),
+            ("AIRCD_BACKUP_RETENTION", "--backup-retention"),
+            ("AIRCD_BACKUP_ON_STARTUP", "--backup-on-startup"),
         ] {
             if let Some(value) = env(name) {
                 // Preserve the existing empty invite-key environment fallback.
@@ -230,12 +274,14 @@ impl ServerConfig {
             ("register_key", &config.register_key),
             ("syslog_target", &config.syslog_target),
             ("syslog_facility", &config.syslog_facility),
+            ("backup_dir", &config.backup_dir),
         ] {
             if value.as_ref().is_some_and(|s| s.trim().is_empty()) {
                 bail!("server setting {name} must not be empty");
             }
         }
         let _ = config.to_log_config()?;
+        let _ = config.to_backup_config()?;
         Ok(config)
     }
 
@@ -259,6 +305,25 @@ impl ServerConfig {
             "--syslog-target" => self.syslog_target = Some(value.into()),
             "--syslog-format" => self.syslog_format = value.into(),
             "--syslog-facility" => self.syslog_facility = Some(value.into()),
+            "--backup-enabled" | "--no-backups" => {
+                self.backup_enabled = parse_bool_setting("backup_enabled", value)?;
+            }
+            "--backup-dir" => self.backup_dir = Some(value.into()),
+            "--backup-interval-secs" => {
+                self.backup_interval_secs = value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("backup_interval_secs must be a non-negative integer, got '{value}'"))?;
+            }
+            "--backup-retention" => {
+                self.backup_retention = value
+                    .trim()
+                    .parse::<usize>()
+                    .with_context(|| format!("backup_retention must be a positive integer, got '{value}'"))?;
+            }
+            "--backup-on-startup" => {
+                self.backup_on_startup = parse_bool_setting("backup_on_startup", value)?;
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -534,6 +599,8 @@ mod tests {
             "syslog_facility = 'bogus'",
             "windows_event_log_source = ' '",
             "windows_event_log_source = 'bad/source'",
+            "backup_retention = 0",
+            "backup_dir = ' '",
         ] {
             let bad_path = fixture.write(bad);
             assert!(
@@ -541,6 +608,53 @@ mod tests {
                 "expected invalid config for {bad}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn backup_settings_respect_precedence_and_relative_paths() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "db = 'hub.sqlite3'\n\
+             backup_enabled = false\n\
+             backup_dir = 'snapshots'\n\
+             backup_interval_secs = 900\n\
+             backup_retention = 5\n\
+             backup_on_startup = true\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        let backup_cfg = cfg.to_backup_config()?;
+        assert!(!backup_cfg.enabled);
+        assert_eq!(backup_cfg.backup_dir, Some(fixture.0.join("snapshots")));
+        assert_eq!(backup_cfg.interval_secs, 900);
+        assert_eq!(backup_cfg.retention, 5);
+        assert!(backup_cfg.on_startup);
+        assert_eq!(
+            backup_cfg.owner_key_path,
+            Some(fixture.0.join("aircd-owner.key"))
+        );
+
+        let env = environment(&[
+            ("AIRCD_BACKUP_ENABLED", "true"),
+            ("AIRCD_BACKUP_INTERVAL_SECS", "120"),
+            ("AIRCD_BACKUP_RETENTION", "12"),
+            ("AIRCD_BACKUP_ON_STARTUP", "false"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--no-backups".into(),
+                "--backup-retention".into(),
+                "4".into(),
+                "--backup-on-startup".into(),
+            ],
+            env,
+            &path,
+        )?;
+        let backup_cfg = cfg.to_backup_config()?;
+        assert!(!backup_cfg.enabled);
+        assert_eq!(backup_cfg.interval_secs, 120);
+        assert_eq!(backup_cfg.retention, 4);
+        assert!(backup_cfg.on_startup);
         Ok(())
     }
 }

@@ -412,6 +412,11 @@ function Resolve-AircdWindowsConfig {
     $SyslogTargetRes = & $ResolveSetting 'SyslogTarget' @('AIRCD_SYSLOG_TARGET') @('server', '') @('syslog_target') ''
     $SyslogFormatRes = & $ResolveSetting 'SyslogFormat' @('AIRCD_SYSLOG_FORMAT') @('server', '') @('syslog_format') ''
     $SyslogFacilityRes = & $ResolveSetting 'SyslogFacility' @('AIRCD_SYSLOG_FACILITY') @('server', '') @('syslog_facility') ''
+    $BackupEnabledRes = & $ResolveSetting 'BackupEnabled' @('AIRCD_BACKUP_ENABLED') @('server', '') @('backup_enabled') $true -IsBool
+    $BackupDirRes = & $ResolveSetting 'BackupDir' @('AIRCD_BACKUP_DIR') @('server', '') @('backup_dir') '' -IsPath
+    $BackupIntervalRes = & $ResolveSetting 'BackupIntervalSecs' @('AIRCD_BACKUP_INTERVAL_SECS') @('server', '') @('backup_interval_secs') ''
+    $BackupRetentionRes = & $ResolveSetting 'BackupRetention' @('AIRCD_BACKUP_RETENTION') @('server', '') @('backup_retention') ''
+    $BackupOnStartupRes = & $ResolveSetting 'BackupOnStartup' @('AIRCD_BACKUP_ON_STARTUP') @('server', '') @('backup_on_startup') $false -IsBool
     $ExeRes = & $ResolveSetting 'ExecutablePath' @('AIRCD_EXECUTABLE') @('server', 'service', 'tray', '') @('executable_path', 'executable') '' -IsPath
 
     $NameRes = & $ResolveSetting 'Name' @('AIRCD_SERVICE_NAME') @('service', '') @('name', 'service_name') 'CAMS-Aircd'
@@ -439,6 +444,11 @@ function Resolve-AircdWindowsConfig {
         SyslogTarget          = $SyslogTargetRes.Value
         SyslogFormat          = $SyslogFormatRes.Value
         SyslogFacility        = $SyslogFacilityRes.Value
+        BackupEnabled         = $BackupEnabledRes.Value
+        BackupDir             = $BackupDirRes.Value
+        BackupIntervalSecs    = $BackupIntervalRes.Value
+        BackupRetention       = $BackupRetentionRes.Value
+        BackupOnStartup       = $BackupOnStartupRes.Value
         ExecutablePath        = $ExeRes.Value
         Name                  = $NameRes.Value
         TaskPath              = $TaskPathRes.Value

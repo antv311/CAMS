@@ -221,6 +221,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/owner/wake", post(owner_wake))
         .route("/v1/owner/models", post(owner_models))
         .route("/v1/owner/accounts", post(owner_create_account))
+        .route("/v1/owner/backups", get(owner_list_backups))
+        .route("/v1/owner/backup", post(owner_backup_action))
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
         .route("/v1/templates", get(list_templates))
@@ -1203,6 +1205,101 @@ async fn owner_reissue_token(
         with_cors_headers(),
         Json(json!({ "ok": true, "principal": principal, "token": token })),
     ))
+}
+
+#[derive(Deserialize, Default)]
+struct OwnerBackupReq {
+    invite: Option<String>,
+    /// `run` (default), `verify`, or `list`.
+    action: Option<String>,
+    snapshot_id: Option<String>,
+}
+
+async fn owner_list_backups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, None)?;
+    let backups = state.server.backups();
+    let status = backups.status();
+    let snapshots = backups.list_snapshots().map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "status": status,
+            "snapshots": snapshots,
+        })),
+    ))
+}
+
+async fn owner_backup_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OwnerBackupReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let action = req
+        .action
+        .as_deref()
+        .unwrap_or("run")
+        .trim()
+        .to_ascii_lowercase();
+    let backups = state.server.backups();
+    match action.as_str() {
+        "run" => {
+            let result = backups
+                .run_once("manual")
+                .await
+                .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            let status = backups.status();
+            Ok((
+                StatusCode::OK,
+                with_cors_headers(),
+                Json(json!({
+                    "ok": true,
+                    "result": result,
+                    "status": status,
+                })),
+            ))
+        }
+        "verify" => {
+            let id = req.snapshot_id.clone();
+            let manager = backups.clone();
+            let verification = tokio::task::spawn_blocking(move || {
+                manager.verify_snapshot_by_id(id.as_deref())
+            })
+            .await
+            .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            Ok((
+                StatusCode::OK,
+                with_cors_headers(),
+                Json(json!({
+                    "ok": true,
+                    "verification": verification,
+                })),
+            ))
+        }
+        "list" => {
+            let status = backups.status();
+            let snapshots = backups.list_snapshots().map_err(ApiError::internal)?;
+            Ok((
+                StatusCode::OK,
+                with_cors_headers(),
+                Json(json!({
+                    "ok": true,
+                    "status": status,
+                    "snapshots": snapshots,
+                })),
+            ))
+        }
+        other => Err(ApiError::bad_request(format!(
+            "unsupported backup action '{other}': expected run, verify, or list"
+        ))),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -6263,6 +6360,121 @@ mod tests {
             "expected daemon error PRI <27> for http.internal_error"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_backup_endpoints_enforce_owner_key_and_verify_snapshots() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("aircd-http-backup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let db_path = dir.join("hub.sqlite3");
+        let owner_key_path = dir.join("aircd-owner.key");
+        let backup_dir = dir.join("backups");
+        let owner_secret = "owner-backup-secret-xyz";
+        std::fs::write(&owner_key_path, format!("{owner_secret}\n"))?;
+
+        let db = store::open(&db_path)?;
+        let backup_cfg = crate::backup::BackupConfig {
+            enabled: true,
+            db_path: db_path.display().to_string(),
+            backup_dir: Some(backup_dir.clone()),
+            interval_secs: 3600,
+            retention: 3,
+            on_startup: false,
+            owner_key_path: Some(owner_key_path.clone()),
+            tls_cert_path: None,
+            tls_key_path: None,
+        };
+        let server = Server::with_logger_and_backup(
+            db,
+            crate::logging::EventForwarder::default(),
+            backup_cfg,
+        );
+        let (_, worker_token) = server
+            .auth()
+            .register_principal("worker-b", Some("dev"), None)?;
+
+        let mut info = build_runtime_info("127.0.0.1:0", "127.0.0.1:0", None);
+        info.register_key = Some(owner_secret.to_string());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(server, info)).await;
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Reject missing/wrong owner key and ordinary agent bearer tokens.
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/owner/backups"))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/owner/backup"))
+                .header("Authorization", format!("Bearer {worker_token}"))
+                .json(&json!({ "action": "run" }))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Trigger a verified backup with the owner key.
+        let run_resp = client
+            .post(format!("{base}/v1/owner/backup"))
+            .header("X-AirCD-Invite", owner_secret)
+            .json(&json!({ "action": "run" }))
+            .send()
+            .await?;
+        assert_eq!(run_resp.status(), StatusCode::OK);
+        let run_text = run_resp.text().await?;
+        assert!(!run_text.contains(owner_secret));
+        let run_json: serde_json::Value = serde_json::from_str(&run_text)?;
+        assert_eq!(run_json["ok"], true);
+        let snapshot_id = run_json["result"]["snapshot"]["snapshot_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            run_json["result"]["snapshot"]["integrity_check"],
+            "ok"
+        );
+        assert_eq!(
+            run_json["result"]["snapshot"]["key_ring"]["files"][0]["kind"],
+            "owner_key"
+        );
+
+        // List and verify via owner endpoints.
+        let list_json: serde_json::Value = client
+            .get(format!("{base}/v1/owner/backups"))
+            .header("X-AirCD-Invite", owner_secret)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(list_json["ok"], true);
+        assert_eq!(list_json["snapshots"].as_array().unwrap().len(), 1);
+
+        let verify_json: serde_json::Value = client
+            .post(format!("{base}/v1/owner/backup"))
+            .header("X-AirCD-Invite", owner_secret)
+            .json(&json!({ "action": "verify", "snapshot_id": snapshot_id }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(verify_json["ok"], true);
+        assert_eq!(verify_json["verification"]["ok"], true);
+        assert_eq!(verify_json["verification"]["key_ring_verified"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }
