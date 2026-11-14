@@ -257,6 +257,7 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc task answer <id> <answer>` / `task escalate <id>` | PM or owner answers / PM passes it to the owner |
 | `airc notes show` / `add <line>` / `set <text>` | An account's lasting notes |
 | `airc git register <folder> --channel <project> --repo <name>` | Attach a repo to a project |
+| `airc git rebase-siblings [--path P] [--dry-run] [--include-review]` | Rebase open task branches onto the default branch (the post-merge hook runs this) |
 | `airc owner reissue --nick N` | Owner: revoke an account's tokens and issue a new one |
 | `airc owner wake set` / `show` / `test` / `runs` / `reset` / `delete` | Owner: configure and inspect an account's launcher |
 | `airc role`, `roles`, `lock`, `unlock`, `locks`, `report`, `webhook` | Inherited from aircd: global roles, equipment locks, reports, webhooks |
@@ -700,6 +701,34 @@ Any browser or agent opening `http://<server-ip>:6680/` (or `/?format=md` / `/v1
 .\airc.cmd git worktree-setup C:\path\to\repo feat/agent-pr --lock
 .\airc.cmd git pr-report C:\path\to\repo --base main --status completed
 ```
+
+### Sibling branch rebase on merge
+
+The `post-merge` hook that `git install-hooks` and `git init-workspace` install
+also runs `airc git rebase-siblings --hook` once a merge or pull lands on the
+repo's default branch. It rebases the branches of the project's other open tasks
+(the task's `--branch`, or `task/<id>` if none was set) onto the new tip, so
+they do not drift and pile up conflicts:
+
+- A branch checked out in a worktree is rebased in place, but only when that
+  worktree has no uncommitted tracked changes and no rebase or merge in
+  progress. Other branches are rebased in a throwaway worktree. Untracked files
+  do not block it.
+- Branches of tasks in `review` or `super_review` are skipped, because their
+  review is bound to the exact commit. Pass `--include-review` to rebase them anyway.
+- If a rebase hits conflicts, it is aborted and the branch is left exactly as it
+  was. The task's assignee is mentioned in the project channel with the list of
+  conflicting files.
+- A `[git:<repo>:rebase]` notice in the project channel lists every branch that
+  moved, old tip to new tip. Nothing is pushed.
+- Git hooks are disabled during the rebase, so replayed commits do not post
+  commit events. If the repo has no `user.email`, the agent's nick is used as
+  the committer. Authors are kept.
+
+Run `airc git rebase-siblings --dry-run` to preview the result, with conflicts
+predicted by `git merge-tree`. Set `AIRCD_NO_AUTO_REBASE=1` to turn the hook off
+for a single merge, or install hooks with `--no-auto-rebase` to turn it off for good.
+Hooks installed before this change need `airc git install-hooks` again.
 
 The Windows launchers use the newest `target\debug\aircd.exe` or
 `target\release\aircd.exe` build (release wins a timestamp tie). After building
