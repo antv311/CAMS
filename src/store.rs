@@ -45,6 +45,16 @@ pub struct Group {
     pub updated_at: i64,
 }
 
+/// Atomic changes to an existing group's seats; other definition fields are preserved.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GroupMembershipUpdate {
+    pub lead: Option<GroupMember>,
+    #[serde(default)]
+    pub add_workers: Vec<GroupMember>,
+    #[serde(default)]
+    pub remove_workers: Vec<GroupMember>,
+}
+
 #[derive(Debug)]
 pub enum GroupStoreError {
     GroupNotFound(String),
@@ -124,6 +134,91 @@ impl GroupStore {
         let name = group_name(name)?;
         let db = self.db.lock().expect("sqlite mutex poisoned");
         Self::get_locked(&db, name)
+    }
+
+    pub fn update_membership(
+        &self,
+        name: &str,
+        mut update: GroupMembershipUpdate,
+    ) -> Result<Group> {
+        let name = group_name(name)?;
+        if update.lead.is_none()
+            && update.add_workers.is_empty()
+            && update.remove_workers.is_empty()
+        {
+            return Err(anyhow!(
+                "group update needs a lead, add_workers, or remove_workers"
+            ));
+        }
+        if let Some(lead) = &mut update.lead {
+            validate_group_member(lead)?;
+            if lead.count != 1 {
+                return Err(anyhow!("a group must have exactly one lead"));
+            }
+        }
+        for member in update
+            .add_workers
+            .iter_mut()
+            .chain(&mut update.remove_workers)
+        {
+            validate_group_member(member)?;
+        }
+        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        // Reserve the write before reading, including across separate DB connections.
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut group = Self::get_locked(&tx, name)?
+            .ok_or_else(|| GroupStoreError::GroupNotFound(name.to_string()))?;
+        let before = group.definition.clone();
+        if let Some(lead) = update.lead {
+            group.definition.lead = lead;
+        }
+        let workers = &mut group.definition.workers;
+        // Remove first so a single request can replace the last worker kind.
+        for removal in update.remove_workers {
+            let available: u64 = workers
+                .iter()
+                .filter(|w| same_seat(w, &removal))
+                .map(|w| u64::from(w.count))
+                .sum();
+            if available < u64::from(removal.count) {
+                return Err(anyhow!(
+                    "cannot remove {} worker seat(s) for {}:{}: only {available} matching seats",
+                    removal.count,
+                    removal.template,
+                    removal.model
+                ));
+            }
+            let mut remaining = removal.count;
+            for worker in workers.iter_mut().filter(|w| same_seat(w, &removal)) {
+                let removed = worker.count.min(remaining);
+                worker.count -= removed;
+                remaining -= removed;
+            }
+            workers.retain(|w| w.count > 0);
+        }
+        for addition in update.add_workers {
+            if let Some(worker) = workers.iter_mut().find(|w| same_seat(w, &addition)) {
+                worker.count = worker
+                    .count
+                    .checked_add(addition.count)
+                    .ok_or_else(|| anyhow!("group worker count exceeds {}", u32::MAX))?;
+            } else {
+                workers.push(addition);
+            }
+        }
+        if workers.is_empty() {
+            return Err(anyhow!("a group needs at least one worker"));
+        }
+        if group.definition != before {
+            tx.execute(
+                "UPDATE groups SET lead_json = ?2, workers_json = ?3, updated_at = ?4 WHERE name = ?1",
+                params![name, serde_json::to_string(&group.definition.lead)?,
+                    serde_json::to_string(&group.definition.workers)?, unix_timestamp()],
+            )?;
+        }
+        let saved = Self::get_locked(&tx, name)?.ok_or_else(|| anyhow!("group {name} vanished"))?;
+        tx.commit()?;
+        Ok(saved)
     }
 
     pub fn list(&self) -> Result<Vec<Group>> {
@@ -234,6 +329,10 @@ impl GroupStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(Some(group))
     }
+}
+
+fn same_seat(left: &GroupMember, right: &GroupMember) -> bool {
+    left.template == right.template && left.model == right.model && left.nick == right.nick
 }
 
 fn group_name(name: &str) -> Result<&str> {
@@ -1178,6 +1277,174 @@ mod tests {
 
     fn group_project(db: &SharedConnection, channel: &str) -> Result<()> {
         crate::projects::ProjectStore::new(db.clone()).create(channel, "Project", None, "owner")?;
+        Ok(())
+    }
+
+    fn membership_update(value: serde_json::Value) -> GroupMembershipUpdate {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn groups_membership_updates_attached_seats_and_preserves_other_fields() -> Result<()> {
+        let db = open(":memory:")?;
+        group_project(&db, "#one")?;
+        let groups = GroupStore::new(db.clone());
+        groups.upsert(group_input("dev"))?;
+        groups.attach("dev", "#one")?;
+        db.lock()
+            .unwrap()
+            .execute("UPDATE groups SET created_at = 10, updated_at = 20", [])?;
+        let before = groups.get("dev")?.unwrap();
+        let updated = groups.update_membership(
+            " dev ",
+            membership_update(serde_json::json!({
+                "lead": {"template": "codex", "model": "default", "nick": "new-lead"},
+                "remove_workers": [{"template": "ollama", "model": "qwen3:35b", "count": 2}],
+                "add_workers": [
+                    {"template": "ollama", "model": "qwen3:35b", "count": 3},
+                    {"template": "claude", "model": "sonnet", "nick": "worker1"}
+                ]
+            })),
+        )?;
+        assert_eq!(updated.definition.workers[0].count, 4);
+        assert_eq!(
+            updated.definition.workers[1].nick.as_deref(),
+            Some("worker1")
+        );
+        assert_eq!(updated.definition.lead.nick.as_deref(), Some("new-lead"));
+        assert_eq!(updated.projects, before.projects);
+        assert_eq!(updated.created_at, 10);
+        assert_ne!(updated.updated_at, 20);
+        assert_eq!(
+            updated.definition.description,
+            before.definition.description
+        );
+        assert_eq!(
+            updated.definition.lead_prompt,
+            before.definition.lead_prompt
+        );
+        assert_eq!(
+            updated.definition.worker_prompt,
+            before.definition.worker_prompt
+        );
+        let removed = groups.update_membership(
+            "dev",
+            membership_update(serde_json::json!({
+                "remove_workers": [{"template": "claude", "model": "sonnet", "nick": "worker1"}]
+            })),
+        )?;
+        assert_eq!(removed.definition.workers.len(), 1);
+        let noop = groups.update_membership(
+            "dev",
+            GroupMembershipUpdate {
+                lead: Some(removed.definition.lead.clone()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(noop, removed);
+        Ok(())
+    }
+
+    #[test]
+    fn groups_membership_rejects_invalid_batches_without_mutation() -> Result<()> {
+        let db = open(":memory:")?;
+        let groups = GroupStore::new(db);
+        groups.upsert(group_input("dev"))?;
+        let before = groups.list()?;
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"lead": {"template": "c", "model": "m", "count": 2}}),
+            serde_json::json!({"add_workers": [{"template": "c", "model": "m", "count": 0}]}),
+            serde_json::json!({"add_workers": [{"template": "../bad", "model": "m"}]}),
+            serde_json::json!({"remove_workers": [{"template": "ollama", "model": "qwen3:35b", "count": 3}]}),
+            serde_json::json!({"remove_workers": [{"template": "ollama", "model": "qwen3:35b", "count": 4}]}),
+            serde_json::json!({"remove_workers": [
+                {"template": "ollama", "model": "qwen3:35b"},
+                {"template": "ollama", "model": "qwen3:35b", "nick": "unmatched"}
+            ], "lead": {"template": "c", "model": "m"}}),
+            serde_json::json!({"add_workers": [
+                {"template": "c", "model": "m"},
+                {"template": "ollama", "model": "qwen3:35b", "count": u32::MAX}
+            ]}),
+        ] {
+            assert!(
+                groups
+                    .update_membership("dev", membership_update(value.clone()))
+                    .is_err(),
+                "{value}"
+            );
+            assert_eq!(groups.list()?, before);
+        }
+        let error = groups
+            .update_membership(
+                "missing",
+                membership_update(serde_json::json!({
+                    "add_workers": [{"template": "c", "model": "m"}]
+                })),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<GroupStoreError>(),
+            Some(GroupStoreError::GroupNotFound(_))
+        ));
+        assert_eq!(groups.list()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn groups_membership_removes_duplicate_rows_and_replaces_last_worker() -> Result<()> {
+        let groups = GroupStore::new(open(":memory:")?);
+        let mut input = group_input("dev");
+        input.workers.push(input.workers[0].clone());
+        groups.upsert(input)?;
+        let updated = groups.update_membership(
+            "dev",
+            membership_update(serde_json::json!({
+                "remove_workers": [{"template": "ollama", "model": "qwen3:35b", "count": 6}],
+                "add_workers": [{"template": "c", "model": "m"}]
+            })),
+        )?;
+        assert_eq!(updated.definition.workers.len(), 1);
+        assert_eq!(updated.definition.workers[0].template, "c");
+        Ok(())
+    }
+
+    #[test]
+    fn groups_membership_serializes_updates_across_connections_and_persists() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("aircd-membership-{}.sqlite3", uuid::Uuid::new_v4()));
+        {
+            let groups = GroupStore::new(open(&path)?);
+            groups.upsert(group_input("dev"))?;
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let mut threads = Vec::new();
+            for _ in 0..4 {
+                let db = open(&path)?;
+                let barrier = barrier.clone();
+                threads.push(std::thread::spawn(move || -> Result<()> {
+                    let groups = GroupStore::new(db);
+                    barrier.wait();
+                    for _ in 0..10 {
+                        groups.update_membership(
+                            "dev",
+                            membership_update(serde_json::json!({
+                                "add_workers": [{"template": "ollama", "model": "qwen3:35b"}]
+                            })),
+                        )?;
+                    }
+                    Ok(())
+                }));
+            }
+            for thread in threads {
+                thread.join().unwrap()?;
+            }
+            assert_eq!(groups.get("dev")?.unwrap().definition.workers[0].count, 43);
+        }
+        {
+            let groups = GroupStore::new(open(&path)?);
+            assert_eq!(groups.get("dev")?.unwrap().definition.workers[0].count, 43);
+        }
+        std::fs::remove_file(path)?;
         Ok(())
     }
 

@@ -3,7 +3,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,7 +15,10 @@ use crate::auth::{DuplicatePrincipalError, Principal};
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::locks::LockConflictError;
 use crate::server::{Server, SpawnError};
-use crate::store::{ClientTemplate, ClientTemplateInput, GroupInput, GroupStoreError};
+use crate::store::{
+    ClientTemplate, ClientTemplateInput, GroupInput, GroupMember, GroupMembershipUpdate,
+    GroupStoreError,
+};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HttpRuntimeInfo {
@@ -186,6 +189,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/me", get(get_me))
         .route("/v1/templates", get(list_templates))
         .route("/v1/groups", get(list_groups).post(upsert_group))
+        .route(
+            "/v1/groups/{name}",
+            patch(update_group_membership).options(cors_preflight_or_404),
+        )
         .route("/v1/groups/{name}/attach", post(attach_group))
         .route("/v1/templates/{id}/spawn", post(spawn_template_worker))
         .route(
@@ -485,6 +492,43 @@ async fn upsert_group(
         .server
         .groups()
         .upsert(req.group)
+        .map_err(group_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "group": group})),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateGroupMembershipReq {
+    invite: Option<String>,
+    lead: Option<GroupMember>,
+    #[serde(default)]
+    add_workers: Vec<GroupMember>,
+    #[serde(default)]
+    remove_workers: Vec<GroupMember>,
+}
+
+async fn update_group_membership(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateGroupMembershipReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let group = state
+        .server
+        .groups()
+        .update_membership(
+            &name,
+            GroupMembershipUpdate {
+                lead: req.lead,
+                add_workers: req.add_workers,
+                remove_workers: req.remove_workers,
+            },
+        )
         .map_err(group_store_error)?;
     Ok((
         StatusCode::OK,
@@ -2756,11 +2800,11 @@ fn with_cors_headers() -> [(header::HeaderName, &'static str); 3] {
         (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
         (
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            "Authorization, Content-Type, X-Aircd-Token",
+            "Authorization, Content-Type, X-Aircd-Token, X-AirCD-Invite",
         ),
         (
             header::ACCESS_CONTROL_ALLOW_METHODS,
-            "GET, POST, DELETE, OPTIONS",
+            "GET, POST, PATCH, DELETE, OPTIONS",
         ),
     ]
 }
@@ -2875,6 +2919,218 @@ mod tests {
             "lead_prompt": "Split {task}.\nTest and review.\n",
             "worker_prompt": "Write the assigned code.\n"
         })
+    }
+
+    #[tokio::test]
+    async fn groups_membership_http_updates_attached_groups_without_provisioning() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        let counts = provisioning_counts(&api)?;
+        api.write("POST", "/v1/groups", Some(&group_body())).await?;
+        let (_, attached) = api
+            .write(
+                "POST",
+                "/v1/groups/dev/attach",
+                Some(&json!({"channel": "#one"})),
+            )
+            .await?;
+        let (status, response) = api
+            .write(
+                "PATCH",
+                "/v1/groups/dev",
+                Some(&json!({
+                    "lead": {"template": "codex", "model": "default", "nick": "lead2"},
+                    "remove_workers": [{"template": "ollama", "model": "qwen3:35b", "count": 2}],
+                    "add_workers": [{"template": "claude", "model": "sonnet", "nick": "worker1"}]
+                })),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let group = &response["group"];
+        assert_eq!(group["lead"]["nick"], "lead2");
+        assert_eq!(group["workers"][0]["count"], 1);
+        assert_eq!(group["workers"][1]["nick"], "worker1");
+        for key in [
+            "projects",
+            "created_at",
+            "description",
+            "lead_prompt",
+            "worker_prompt",
+        ] {
+            assert_eq!(group[key], attached["group"][key]);
+        }
+        assert_eq!(api.read("/v1/groups").await?.1["groups"][0], *group);
+        assert_eq!(provisioning_counts(&api)?, counts);
+        assert!(api.server.wakes().runs(None, 10)?.is_empty());
+        let mut named = group_body();
+        named["name"] = json!("dev équipe");
+        api.write("POST", "/v1/groups", Some(&named)).await?;
+        assert_eq!(
+            api.write(
+                "PATCH",
+                "/v1/groups/dev%20%C3%A9quipe",
+                Some(&json!({
+                    "add_workers": [{"template": "c", "model": "m"}]
+                }))
+            )
+            .await?
+            .0,
+            StatusCode::OK
+        );
+        let preflight = api
+            .client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("{}/v1/groups/dev", api.base),
+            )
+            .header("Origin", "http://example.test")
+            .header("Access-Control-Request-Method", "PATCH")
+            .send()
+            .await?;
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert!(preflight.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
+            .to_str()?
+            .contains("PATCH"));
+        assert!(preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+            .to_str()?
+            .contains("X-AirCD-Invite"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn groups_membership_http_enforces_owner_key_and_closed_writes() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        api.write("POST", "/v1/groups", Some(&group_body())).await?;
+        let before = api.server.groups().list()?;
+        let body = json!({"add_workers": [{"template": "c", "model": "m"}]});
+        let (_, owner_token) =
+            api.server
+                .auth()
+                .register_principal("owner", Some("leader"), None)?;
+        for token in [
+            None,
+            Some("invalid"),
+            Some(api.token.as_str()),
+            Some(owner_token.as_str()),
+        ] {
+            for key in [None, Some("wrong")] {
+                assert_eq!(
+                    api.request("PATCH", "/v1/groups/dev", token, key, Some(&body))
+                        .await?
+                        .0,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(api.server.groups().list()?, before);
+            }
+        }
+        let mut with_key = body.clone();
+        with_key["invite"] = json!("template-owner-key");
+        assert_eq!(
+            api.request(
+                "PATCH",
+                "/v1/groups/dev",
+                None,
+                Some("wrong"),
+                Some(&with_key)
+            )
+            .await?
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(api.server.groups().list()?, before);
+        assert_eq!(
+            api.request("PATCH", "/v1/groups/dev", None, None, Some(&with_key))
+                .await?
+                .0,
+            StatusCode::OK
+        );
+        with_key["invite"] = json!("wrong");
+        assert_eq!(
+            api.write("PATCH", "/v1/groups/dev", Some(&with_key))
+                .await?
+                .0,
+            StatusCode::OK
+        );
+        let open = TemplateApi::start(None).await?;
+        assert_eq!(
+            open.write("PATCH", "/v1/groups/dev", Some(&body)).await?.0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(open.server.groups().list()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn groups_membership_http_rejects_bad_batches_and_storage_errors() -> Result<()> {
+        let api = spawn_api(Some("template-owner-key")).await?;
+        api.write("POST", "/v1/groups", Some(&group_body())).await?;
+        let before = api.server.groups().list()?;
+        for (body, expected) in [
+            (json!({}), StatusCode::BAD_REQUEST),
+            (
+                json!({"remove_workers": [{"template": "ollama", "model": "qwen3:35b", "count": 3}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                json!({"add_workers": [{"template": "c", "model": "m", "count": 0}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                json!({"lead": {"template": "c", "model": "m", "count": 2}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                json!({"add_workers": [{"template": "c", "model": "m", "count": -1}]}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({"add_workers": [{"template": "c", "model": "m", "count": 4294967296u64}]}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({"remove_workers": [{"template": "no", "model": "match"}], "lead": {"template": "c", "model": "m"}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (json!({"workers": []}), StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let response = api
+                .client
+                .patch(format!("{}/v1/groups/dev", api.base))
+                .header("X-AirCD-Invite", "template-owner-key")
+                .json(&body)
+                .send()
+                .await?;
+            assert_eq!(response.status(), expected, "{body}");
+            assert_eq!(api.server.groups().list()?, before);
+        }
+        assert_eq!(
+            api.write(
+                "PATCH",
+                "/v1/groups/missing",
+                Some(&json!({
+                    "add_workers": [{"template": "c", "model": "m"}]
+                }))
+            )
+            .await?
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        api.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE groups SET workers_json = 'corrupt'", [])?;
+        assert_eq!(
+            api.write(
+                "PATCH",
+                "/v1/groups/dev",
+                Some(&json!({
+                    "add_workers": [{"template": "c", "model": "m"}]
+                }))
+            )
+            .await?
+            .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        Ok(())
     }
 
     #[tokio::test]

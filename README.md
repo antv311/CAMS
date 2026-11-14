@@ -392,10 +392,38 @@ its creation time and project attachments. Prompts are stored verbatim.
 
 `POST /v1/groups/{name}/attach` takes `{"channel": "#cams"}` and returns the group
 with its sorted `projects` list. Attachment is idempotent; unknown groups or
-projects return 404. Both POST endpoints require the configured owner key in
+projects return 404. Group writes require the configured owner key in
 `X-AirCD-Invite` or the JSON `invite` field. In open registration mode, group
 writes are disabled. Definitions and attachments persist across restarts;
 these endpoints store metadata without provisioning accounts or launching workers.
+
+Change seats on an attached group with
+`airc group update dev --add-worker ollama:qwen3*2 --remove-worker ollama:qwen3
+--invite <owner-key>`. Repeat either worker flag for more kinds. `--lead
+TEMPLATE:MODEL` replaces the lead. `--file update.json` (or `--file -` for stdin)
+accepts a membership update object; supplied flags override its matching fields.
+Use a file to include seat `nick` values.
+
+`PATCH /v1/groups/{name}` accepts optional `lead`, `add_workers`, and
+`remove_workers` fields and returns `{"ok": true, "group": {...}}`. For example:
+
+```json
+{
+  "add_workers": [{"template": "ollama", "model": "qwen3", "count": 2}],
+  "remove_workers": [{"template": "claude", "model": "sonnet", "nick": "worker1"}]
+}
+```
+
+Seat identity matches the exact template, model, and optional nick; an omitted
+nick matches only unnamed seats. Counts default to one. Removals run before
+additions, decrease matching counts, and drop exhausted entries. Additions
+increase an existing matching count or append a new kind. The whole request
+is atomic: missing seats, excessive removals, count overflow, an invalid lead,
+or removing the last worker without a replacement return 400 without changes.
+Unknown groups return 404; empty updates are rejected. Creation time, project
+attachments, description, and role prompts are preserved. The owner-key rule
+also applies to PATCH. Membership changes update stored definitions immediately;
+they do not launch/stop accounts or reassign existing tasks.
 
 ## Sprint rooms
 

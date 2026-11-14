@@ -607,6 +607,20 @@ class AircdHttpClient:
         data = self._request("POST", "/v1/groups", payload=group.to_dict(), owner=bool(self.invite))
         return Group.from_dict(data["group"])
 
+    def update_group(self, name: str, update: dict[str, Any]) -> Group:
+        """Atomically add/remove worker counts or replace the lead on an existing group.
+
+        Keys are ``lead``, ``add_workers``, and ``remove_workers``; members use
+        the same {template, model, count, nick?} shape as group creation.
+        """
+        allowed = {"lead", "add_workers", "remove_workers"}
+        if not isinstance(update, dict) or set(update) - allowed:
+            raise AircdHttpError("group update accepts only lead, add_workers, and remove_workers")
+        if not any(update.get(key) for key in allowed):
+            raise AircdHttpError("group update needs a lead, add_workers, or remove_workers")
+        data = self._request("PATCH", _group_path(name), payload=update, owner=bool(self.invite))
+        return Group.from_dict(data["group"])
+
     def attach_group(self, name: str, channel: str) -> Group:
         """Attach a group to a project channel; one group can serve many projects."""
         channel = channel.strip()
