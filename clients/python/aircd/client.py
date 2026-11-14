@@ -17,6 +17,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+# Re-exported so ``from aircd.client import BionicAgent`` works alongside the hub clients.
+from aircd.bionic import BionicAgent, BionicConfig, BionicError, RunResult  # noqa: F401
+
 logger = logging.getLogger("aircd")
 
 

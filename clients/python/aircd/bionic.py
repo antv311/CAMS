@@ -12,13 +12,16 @@ Configuration precedence (highest wins):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import platform
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -1671,6 +1674,229 @@ def run_agent(
     if session_file is not None:
         _save_session_messages(session_file, messages)
     raise BionicError(f"Reached max_turns={config.max_turns} without a final response")
+
+
+Approver = Callable[[str, dict[str, Any]], bool]
+EventHandler = Callable[[dict[str, Any]], None]
+
+_CONFIG_FIELDS = frozenset(f.name for f in dataclasses.fields(BionicConfig))
+_AGENT_OPTIONS = _CONFIG_FIELDS | {"system_prompt_file"}
+
+
+class _StreamCancelled(BaseException):
+    """Raised inside a worker thread to abort a run whose consumer went away.
+
+    Derives from ``BaseException`` so the tool loop's ``except Exception``
+    guards do not swallow it.
+    """
+
+
+def _config_from_options(options: dict[str, Any]) -> BionicConfig:
+    unknown = sorted(set(options) - _AGENT_OPTIONS)
+    if unknown:
+        raise TypeError(f"unknown BionicAgent option(s): {', '.join(unknown)}")
+    config = resolve_config(argparse.Namespace(**options))
+    # resolve_config follows CLI semantics (stream_format implies stream); an
+    # explicit SDK ``stream=`` value always wins.
+    if "stream" in options:
+        config.stream = bool(options["stream"])
+    return config
+
+
+class BionicAgent:
+    """Programmatic client for running Bionic agent workflows from Python.
+
+    Wraps :func:`run_agent` with validated configuration, cached model
+    resolution, optional conversation continuity, and an event iterator::
+
+        from aircd import BionicAgent
+
+        agent = BionicAgent(model="auto", cwd="repo", approval="read-only", keep_session=True)
+        print(agent.run("Summarize README.md").content)
+        print(agent.run("Now list its section headings").content)  # same conversation
+
+        for event in agent.stream("Explain src/main.rs"):
+            if event["type"] == "token":
+                print(event["text"], end="", flush=True)
+
+    Options are the :class:`BionicConfig` field names (plus ``system_prompt_file``)
+    and resolve exactly like the CLI: explicit arguments, then ``BIONIC_*``
+    environment variables, then defaults. Pass a ready ``config=`` instead to
+    skip resolution entirely.
+    """
+
+    def __init__(
+        self,
+        config: Optional[BionicConfig] = None,
+        *,
+        approver: Optional[Approver] = None,
+        on_event: Optional[EventHandler] = None,
+        log: Optional[Callable[[str], None]] = None,
+        keep_session: bool = False,
+        **options: Any,
+    ) -> None:
+        if config is not None and options:
+            raise TypeError("pass either config= or keyword options, not both")
+        self._config = dataclasses.replace(config) if config is not None else _config_from_options(options)
+        self._approver = approver
+        self._on_event = on_event
+        self._log = log
+        self._resolved_model: Optional[str] = None
+        self.keep_session = keep_session
+        self.session_id: Optional[str] = self._config.session_id
+
+    @classmethod
+    def from_env(cls, **kwargs: Any) -> "BionicAgent":
+        """Build an agent purely from ``BIONIC_*`` environment variables (plus ``kwargs``)."""
+        return cls(**kwargs)
+
+    @property
+    def config(self) -> BionicConfig:
+        """A copy of the resolved configuration (mutating it does not affect the agent)."""
+        return dataclasses.replace(self._config)
+
+    @property
+    def model(self) -> str:
+        """The concrete model id; ``auto`` is discovered via ``/models`` once and cached."""
+        if self._resolved_model is None:
+            self._resolved_model = resolve_model(self._config)
+        return self._resolved_model
+
+    def with_options(self, **options: Any) -> "BionicAgent":
+        """Return a new agent with some options changed, re-validated like the constructor.
+
+        Handlers, ``keep_session`` and the current ``session_id`` carry over
+        unless overridden (``keep_session=``/``session_id=`` are accepted).
+        """
+        keep_session = bool(options.pop("keep_session", self.keep_session))
+        merged = dataclasses.asdict(self._config)
+        merged["session_id"] = self.session_id
+        if "system_prompt_file" in options:
+            merged.pop("system_prompt", None)
+        merged.update(options)
+        clone = BionicAgent(
+            _config_from_options(merged),
+            approver=self._approver,
+            on_event=self._on_event,
+            log=self._log,
+            keep_session=keep_session,
+        )
+        if self._resolved_model is not None and clone._config.model == self._config.model and (
+            clone._config.base_url == self._config.base_url
+        ):
+            clone._resolved_model = self._resolved_model
+        return clone
+
+    def list_models(self, *, include_all: bool = False) -> list[dict[str, str]]:
+        """List models served by the configured endpoint (embeddings excluded by default)."""
+        return list_models(
+            self._config.base_url,
+            api_key=self._config.api_key,
+            timeout=min(self._config.timeout, 30.0),
+            include_all=include_all,
+        )
+
+    def new_session(self) -> None:
+        """Forget the current conversation; the next ``keep_session`` run starts fresh."""
+        self.session_id = None
+
+    def _run_config(self, session_id: Optional[str], stream: Optional[bool]) -> BionicConfig:
+        sid = session_id if session_id is not None else self.session_id
+        return dataclasses.replace(
+            self._config,
+            model=self.model,
+            session_id=sid,
+            emit_session_id=bool(self._config.emit_session_id or self.keep_session or sid is not None),
+            stream=self._config.stream if stream is None else bool(stream),
+        )
+
+    def run(
+        self,
+        prompt: str,
+        *,
+        session_id: Optional[str] = None,
+        stream: Optional[bool] = None,
+        on_event: Optional[EventHandler] = None,
+        approver: Optional[Approver] = None,
+    ) -> RunResult:
+        """Run one prompt to completion and return its :class:`RunResult`.
+
+        ``session_id`` resumes (or creates) that saved conversation for this
+        call only. With ``keep_session=True`` the agent otherwise continues its
+        own conversation across calls and updates :attr:`session_id`.
+        ``on_event`` receives progress events in addition to the agent-wide
+        handler; ``stream=True`` adds ``token``/``reasoning`` events.
+        """
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise BionicError("prompt must not be empty")
+        config = self._run_config(session_id, stream)
+        handlers = [h for h in (self._on_event, on_event) if h is not None]
+
+        def dispatch(event: dict[str, Any]) -> None:
+            for handler in handlers:
+                handler(event)
+
+        result = run_agent(
+            prompt,
+            config,
+            log=self._log,
+            approver=approver or self._approver,
+            on_event=dispatch if handlers else None,
+        )
+        if self.keep_session and session_id is None:
+            self.session_id = result.session_id
+        return result
+
+    def stream(
+        self,
+        prompt: str,
+        *,
+        session_id: Optional[str] = None,
+        approver: Optional[Approver] = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Run ``prompt`` with SSE streaming and yield progress events as they happen.
+
+        Yields the same events as ``run(..., on_event=...)`` and finishes with
+        ``{"type": "result", "result": RunResult}``. Errors are raised from the
+        iterator. Closing the iterator early cancels the run at its next event.
+        """
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise BionicError("prompt must not be empty")
+        self.model  # resolve (and surface errors) in the caller's thread
+        events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        cancelled = threading.Event()
+
+        def on_event(event: dict[str, Any]) -> None:
+            if cancelled.is_set():
+                raise _StreamCancelled()
+            events.put(("event", event))
+
+        def worker() -> None:
+            try:
+                result = self.run(prompt, session_id=session_id, stream=True, on_event=on_event, approver=approver)
+            except _StreamCancelled:
+                events.put(("cancelled", None))
+            except BaseException as exc:  # re-raised in the consumer thread
+                events.put(("error", exc))
+            else:
+                events.put(("result", result))
+
+        thread = threading.Thread(target=worker, name="bionic-agent-stream", daemon=True)
+        thread.start()
+        try:
+            while True:
+                kind, value = events.get()
+                if kind == "event":
+                    yield value
+                elif kind == "result":
+                    yield {"type": "result", "result": value}
+                    return
+                elif kind == "error":
+                    raise value
+                else:
+                    return
+        finally:
+            cancelled.set()
 
 
 def build_parser() -> argparse.ArgumentParser:
