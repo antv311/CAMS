@@ -3646,6 +3646,40 @@ impl Server {
         Ok(task)
     }
 
+    /// Edit descriptive attributes without changing workflow, leases or output.
+    pub fn set_task_attributes_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        tags: Option<&[String]>,
+        metadata: Option<&crate::tasks::TaskMetadata>,
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let task = self.get_task_api(task_id)?;
+        let parent = task
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        let allowed = Self::is_owner(actor)
+            || task.assignee.as_deref() == Some(actor.id.as_str())
+            || (task.status == "claimed"
+                && task.claimed_by.as_deref() == Some(actor.id.as_str())
+                && task
+                    .lease_expires_at
+                    .is_some_and(|expires| expires > crate::history::unix_timestamp()))
+            || task.reviewer.as_deref() == Some(actor.id.as_str())
+            || parent
+                .as_ref()
+                .is_some_and(|p| p.assignee.as_deref() == Some(actor.id.as_str()))
+            || self.is_project_manager(actor, &task.channel)?;
+        if !allowed {
+            return Err(anyhow!("only the assignee, lease holder, reviewer, parent lead or project manager can edit task attributes"));
+        }
+        self.tasks
+            .set_attributes(&task.id, tags, metadata, &actor.id)
+    }
+
     /// Update the priority (`urgent`, `high`, `normal`, `low`) of an active task.
     pub fn set_task_priority_api(
         &self,

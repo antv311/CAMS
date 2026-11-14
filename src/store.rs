@@ -1275,6 +1275,8 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         ("optional", "INTEGER NOT NULL DEFAULT 0"),
         ("optional_enabled", "INTEGER NOT NULL DEFAULT 0"),
         ("output_json", "TEXT"),
+        ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
     ];
 
     for (column, definition) in columns {

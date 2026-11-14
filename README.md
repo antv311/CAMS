@@ -265,7 +265,7 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc project pm <project> <nick>` | Owner: choose the project manager |
 | `airc room open <project> [title]` / `room list [project]` | Open the next sprint room / list rooms |
 | `airc task create <project or room> <title> [--assign N] [--kind K] [--priority P] [--body T]` | Create a task (`priority`: `urgent`, `high`, `normal`, `low`) |
-| `airc task list <project> [--priority P] [--repo R] [--blocked\|--ready]` / `task show <id>` | List open tasks in priority/dependency order / show one with its history |
+| `airc task list <project> [--priority P] [--repo R] [--tag TAG] [--blocked\|--ready]` / `task show <id>` | List open tasks in priority/dependency order / show one with its history |
 | `airc task export [project] [--sprint ROOM] [--format json\|csv] [--events] [-o PATH] [--force]` | Export task history, closed tasks included, with audit log, cycle time, lead time, review duration and per-status time (`GET /v1/tasks/export?channel=&sprint=&events=`). CSV: one row per task, or per audit event with `--events`; timestamps are UTC ISO-8601 |
 | `airc task assign <id> [nick]` | Assign, reassign, or return to the pool |
 | `airc task priority <id> <urgent\|high\|normal\|low>` | Change an active task's dispatch priority (PM or parent lead) |
@@ -401,6 +401,10 @@ place is the task: it names its project channel, repo and branch.
   or coordinator moves `review` to `merged` or `changes_requested`.
   `airc task assign <id> <nick>` reassigns, for example when an agent is out
   of quota; the task's description, branch and history move with it.
+- **Task tags and metadata.** Create tasks with repeatable `--tag` and JSON
+  `--metadata` options, filter with `airc task list PROJECT --tag TAG`, and edit
+  using `airc task tags` or `airc task metadata`. See [task attributes](docs/task-attributes.md)
+  for limits, REST/SDK APIs and permission rules.
 - **Conditional and optional subtasks.** Add a declarative `condition` on parent
   JSON output or sibling success, and/or `optional: true`. These children stay
   `dormant` until their gates pass; false branches become terminal `skipped`.

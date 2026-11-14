@@ -630,6 +630,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/priority", post(set_task_priority))
+        .route(
+            "/v1/tasks/{id}/attributes",
+            axum::routing::patch(set_task_attributes),
+        )
         .route("/v1/tasks/{id}/timeout", post(set_task_timeout))
         .route("/v1/tasks/{id}/heartbeat", post(task_heartbeat))
         .route(
@@ -3441,6 +3445,7 @@ struct ChannelQuery {
 
 #[derive(Deserialize)]
 struct TaskListQuery {
+    tag: Option<String>,
     channel: Option<String>,
     priority: Option<String>,
     repo: Option<String>,
@@ -3457,11 +3462,12 @@ async fn list_tasks(
     let tasks = state
         .server
         .tasks()
-        .list_filtered_with_options(
+        .list_filtered_with_tag(
             &channel,
             q.priority.as_deref(),
             q.repo.as_deref(),
             q.blocked,
+            q.tag.as_deref(),
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
@@ -3563,6 +3569,10 @@ async fn export_tasks(
 
 #[derive(Deserialize)]
 struct CreateTaskReq {
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    metadata: crate::tasks::TaskMetadata,
     condition: Option<crate::tasks::TaskCondition>,
     #[serde(default)]
     optional: bool,
@@ -3624,6 +3634,8 @@ impl CreateTaskReq {
             timeout_seconds: self.timeout_seconds,
             condition: self.condition,
             optional: self.optional,
+            tags: self.tags,
+            metadata: self.metadata,
         })
     }
 }
@@ -3804,6 +3816,43 @@ async fn set_task_priority(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTaskAttributesReq {
+    #[serde(default, deserialize_with = "attribute_field")]
+    tags: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "attribute_field")]
+    metadata: Option<crate::tasks::TaskMetadata>,
+}
+
+fn attribute_field<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+async fn set_task_attributes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTaskAttributesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Write, "/v1/tasks/{id}/attributes")?
+            .principal;
+    let task = state
+        .server
+        .set_task_attributes_api(&actor, &id, req.tags.as_deref(), req.metadata.as_ref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "task": task})),
     ))
 }
 
@@ -5844,6 +5893,7 @@ mod tests {
     include!("http_task_timeout_tests.rs");
     include!("http_task_batch_tests.rs");
     include!("http_task_condition_tests.rs");
+    include!("http_task_attributes_tests.rs");
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
     include!("http_alerts_tests.rs");

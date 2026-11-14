@@ -27,6 +27,10 @@ mod conditions;
 pub(crate) use conditions::deserialize_output;
 pub use conditions::TaskCondition;
 
+#[path = "task_attributes.rs"]
+mod attributes;
+pub use attributes::{normalize_tags, validate_metadata, TaskMetadata};
+
 /// Statuses after which a task no longer appears in lists or inboxes.
 pub const TERMINAL_STATUSES: &[&str] = &["done", "merged", "cancelled", "skipped"];
 
@@ -62,7 +66,7 @@ const PRIORITY_ORDER_SQL: &str = "CASE priority \
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
      body, kind, priority, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
      reviewer, parent_task_id, review_round_json, timeout_seconds, execution_heartbeat_at, \
-     condition_json, optional, optional_enabled, output_json";
+     condition_json, optional, optional_enabled, output_json, tags_json, metadata_json";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Task {
@@ -99,6 +103,8 @@ pub struct Task {
     pub optional: bool,
     pub optional_enabled: bool,
     pub output: Option<serde_json::Value>,
+    pub tags: Vec<String>,
+    pub metadata: TaskMetadata,
 }
 
 /// Summary of one dependency link (either a blocker or a dependent task).
@@ -168,6 +174,8 @@ pub struct NewTask {
     pub timeout_seconds: Option<u32>,
     pub condition: Option<TaskCondition>,
     pub optional: bool,
+    pub tags: Vec<String>,
+    pub metadata: TaskMetadata,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -435,6 +443,8 @@ impl TaskStore {
         if new.timeout_seconds == Some(0) {
             return Err(anyhow!("task timeout must be positive seconds"));
         }
+        let tags = normalize_tags(&new.tags)?;
+        validate_metadata(&new.metadata)?;
         let kind = normalize_kind(new.kind.as_deref())?;
         let priority = normalize_priority(new.priority.as_deref())?;
         let assignee = clean_opt(new.assignee);
@@ -450,8 +460,8 @@ impl TaskStore {
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, priority, assignee, created_by, repo, branch, issue_url,
                                 created_at, updated_at, sprint, reviewer, parent_task_id, timeout_seconds,
-                                condition_json, optional)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                                condition_json, optional, tags_json, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 id,
                 new.channel,
@@ -471,7 +481,9 @@ impl TaskStore {
                 clean_opt(new.parent_task_id),
                 new.timeout_seconds,
                 new.condition.as_ref().map(serde_json::to_string).transpose()?,
-                new.optional
+                new.optional,
+                serde_json::to_string(&tags)?,
+                serde_json::to_string(&new.metadata)?,
             ],
         )
         .context("insert task")?;
@@ -1772,6 +1784,20 @@ impl TaskStore {
         repo: Option<&str>,
         blocked: Option<bool>,
     ) -> Result<Vec<Task>> {
+        self.list_filtered_with_tag(channel, priority, repo, blocked, None)
+    }
+
+    pub fn list_filtered_with_tag(
+        &self,
+        channel: &str,
+        priority: Option<&str>,
+        repo: Option<&str>,
+        blocked: Option<bool>,
+        tag: Option<&str>,
+    ) -> Result<Vec<Task>> {
+        if let Some(tag) = tag {
+            normalize_tags(&[tag.to_string()])?;
+        }
         let normalized_priority = priority
             .map(str::trim)
             .filter(|p| !p.is_empty())
@@ -1787,13 +1813,14 @@ impl TaskStore {
                    AND status NOT IN ('done', 'merged', 'cancelled', 'skipped')
                    AND (?2 IS NULL OR priority = ?2)
                    AND (?3 IS NULL OR LOWER(COALESCE(repo, '')) = LOWER(?3))
+                   AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(tasks.tags_json) WHERE value = ?4))
                  ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
             ))
             .context("prepare task list")?;
 
         let mut tasks = statement
             .query_map(
-                params![channel, normalized_priority, normalized_repo],
+                params![channel, normalized_priority, normalized_repo, tag],
                 Self::from_row,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2495,6 +2522,8 @@ impl TaskStore {
             optional: row.get(23)?,
             optional_enabled: row.get(24)?,
             output: conditions::json_column(row, 25)?,
+            tags: conditions::json_column(row, 26)?.unwrap_or_default(),
+            metadata: conditions::json_column(row, 27)?.unwrap_or_default(),
         })
     }
 }

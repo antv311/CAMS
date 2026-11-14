@@ -738,6 +738,8 @@ class AircdHttpClient:
         timeout_seconds: Optional[int] = None,
         condition: Optional[dict[str, Any]] = None,
         optional: bool = False,
+        tags: Optional[list[str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Create a task and return it. ``parent`` makes it a subtask of that task
         id; ``reviewer`` names who reviews it (the hub defaults to the parent's
@@ -746,8 +748,35 @@ class AircdHttpClient:
             channel, title, body=body, kind=kind, priority=priority, assignee=assignee,
             repo=repo, branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
             blocked_by=blocked_by, timeout_seconds=timeout_seconds, condition=condition, optional=optional,
+            tags=tags, metadata=metadata,
         )
         return self._request("POST", "/v1/tasks", payload=payload)["task"]
+
+    def list_tasks(
+        self, channel: str, *, tag: Optional[str] = None, priority: Optional[str] = None,
+        repo: Optional[str] = None, blocked: Optional[bool] = None,
+    ) -> list[dict[str, Any]]:
+        """List active tasks, optionally matching an exact, case-sensitive tag."""
+        query = {"channel": channel}
+        for key, value in (("tag", tag), ("priority", priority), ("repo", repo)):
+            if value is not None:
+                query[key] = value
+        if blocked is not None:
+            query["blocked"] = str(blocked).lower()
+        return self._request("GET", "/v1/tasks?" + urllib.parse.urlencode(query))["tasks"]
+
+    def set_task_attributes(
+        self, task_id: str, *, tags: Optional[list[str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Replace supplied tags/metadata; [] and {} clear them, omission preserves them."""
+        payload: dict[str, Any] = {}
+        if tags is not None:
+            payload["tags"] = tags
+        if metadata is not None:
+            payload["metadata"] = metadata
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/attributes"
+        return self._request("PATCH", path, payload=payload)["task"]
 
     def create_task_batch(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         """Atomically create 1..100 tasks; return ``tasks`` and local ``task_ids``.
@@ -1160,6 +1189,8 @@ def task_create_payload(
     timeout_seconds: Optional[int] = None,
     condition: Optional[dict[str, Any]] = None,
     optional: bool = False,
+    tags: Optional[list[str]] = None,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """The POST /v1/tasks body. ``parent_task_id``, ``reviewer``, ``priority``,
     and ``blocked_by`` are only sent when set, so a hub without those features
@@ -1174,6 +1205,10 @@ def task_create_payload(
         "branch": branch,
         "issue_url": issue_url,
     }
+    if tags is not None:
+        payload["tags"] = tags
+    if metadata is not None:
+        payload["metadata"] = metadata
     if timeout_seconds is not None:
         payload["timeout_seconds"] = timeout_seconds
     if condition is not None:

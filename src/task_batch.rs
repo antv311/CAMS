@@ -82,6 +82,8 @@ fn parent_snapshot(id: &str, new: &NewTask) -> Task {
         optional: new.optional,
         optional_enabled: false,
         output: None,
+        tags: new.tags.clone(),
+        metadata: new.metadata.clone(),
     }
 }
 
