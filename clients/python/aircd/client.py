@@ -638,6 +638,24 @@ class AircdHttpClient:
         )
         return Group.from_dict(data["group"])
 
+    # Shared group context
+
+    def group_memory(self, name: str, kind: str = "notes") -> dict[str, Any]:
+        """Read shared context as a current named member (always uses the bearer token)."""
+        return self._request("GET", _group_memory_path(name, kind))["memory"]
+
+    def write_group_memory(
+        self, name: str, text: str, *, kind: str = "notes", append: bool = False,
+        expected_revision: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Append atomically, or replace at the revision returned by group_memory()."""
+        if not append and expected_revision is None:
+            raise AircdHttpError("replacing memory requires expected_revision (read it first)")
+        payload: dict[str, Any] = {"text": text, "append": append}
+        if expected_revision is not None:
+            payload["expected_revision"] = expected_revision
+        return self._request("POST", _group_memory_path(name, kind), payload=payload)["memory"]
+
     # Tasks
 
     def create_task(
@@ -740,6 +758,12 @@ REVIEW_NEEDS_REPORT = (
     "handing in for review needs a test report: pass --note \"<what you ran and the result>\" "
     "or --report <report id>"
 )
+
+
+def _group_memory_path(name: str, kind: str) -> str:
+    if kind not in ("notes", "scratchpad"):
+        raise AircdHttpError("memory kind must be notes or scratchpad")
+    return _group_path(name) + "/memory/" + kind
 
 
 def _group_path(name: str) -> str:

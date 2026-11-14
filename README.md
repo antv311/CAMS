@@ -410,10 +410,44 @@ its creation time and project attachments. Prompts are stored verbatim.
 
 `POST /v1/groups/{name}/attach` takes `{"channel": "#cams"}` and returns the group
 with its sorted `projects` list. Attachment is idempotent; unknown groups or
-projects return 404. Group writes require the configured owner key in
+projects return 404. Definition and attachment writes require the configured owner key in
 `X-AirCD-Invite` or the JSON `invite` field. In open registration mode, group
-writes are disabled. Definitions and attachments persist across restarts;
+writes to definitions and attachments are disabled. Definitions and attachments persist across restarts;
 these endpoints store metadata without provisioning accounts or launching workers.
+
+Each group also has persistent `notes` and `scratchpad` documents in SQLite,
+shared across wakes and all projects using that group. Current **named** lead
+and worker seats may read and edit them using their own bearer token; unnamed
+model/count seats, project roles and the owner key do not grant memory access.
+Roster changes take effect on the next request. Read context at the start of a
+wake, and save decisions or handoff details before finishing:
+
+```sh
+airc --profile worker group memory show dev
+airc --profile worker group memory show dev --kind scratchpad
+airc --profile worker group memory add dev "Decision: use the existing parser"
+airc --profile worker group memory set dev --file context.txt
+airc --profile worker group memory clear dev --kind scratchpad
+```
+
+`--file -` reads UTF-8 text from stdin. Both documents hold at most 16,000 Unicode
+characters each. Replacing/clearing preserves the supplied text and increments a
+revision, even when empty; adding trims the addition and appends one line atomically.
+`set`/`clear` read the current revision first; pass `--revision N` to guard edits
+prepared from an earlier read. A stale revision returns 409 without changing
+anything. Appends cannot lose concurrent additions. Memory survives hub restarts,
+definition replacement and seat edits; deleting a group removes its memory.
+It is working context, with last-editor/time metadata, rather than a revision archive.
+Memory is fetched explicitly, never copied into public group listings or wake prompts.
+
+`GET /v1/groups/{name}/memory/{kind}` returns `{"ok": true, "memory":
+{group, kind, body, revision, updated_at, updated_by}}`. A never-written document
+is empty at revision 0 with null editor/time. `POST` takes `text`, optional
+`append` (default false), and `expected_revision` (required for replacement,
+optional for append). Unknown groups return 404; nonmembers return 403.
+Python callers use `AircdHttpClient.group_memory(name, kind="notes")` and
+`write_group_memory(name, text, kind="notes", append=False, expected_revision=N)`.
+These calls use the account token even when the client has an owner invite key.
 
 Groups can opt into peer consensus with `review_policy` in the group JSON passed
 to `airc group create NAME --file group.json --invite <owner-key>` or
