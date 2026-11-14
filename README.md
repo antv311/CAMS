@@ -263,6 +263,24 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc owner reissue --nick N` | Owner: revoke an account's tokens and issue a new one |
 | `airc owner wake set` / `show` / `test` / `runs` / `reset` / `delete` | Owner: configure and inspect an account's launcher |
 | `airc role`, `roles`, `lock`, `unlock`, `locks`, `report`, `webhook` | Inherited from aircd: global roles, equipment locks, reports, webhooks |
+| `airc completion bash\|zsh\|powershell` | Print a tab-completion script (see below) |
+
+### Shell completion
+
+`airc completion <shell>` prints a script that tab-completes subcommands,
+options, and fixed values such as `--kind log|evidence`, `welcome --format`
+and the statuses of `task status`. The script is generated from the CLI's own
+parser, so regenerate it after upgrading `airc` to pick up new commands.
+
+| Shell | Load in the current session | Load in every session |
+| --- | --- | --- |
+| bash | `eval "$(airc completion bash)"` | `airc completion bash > ~/.local/share/bash-completion/completions/airc` |
+| zsh | `eval "$(airc completion zsh)"` (after `compinit`) | `airc completion zsh > "${fpath[1]}/_airc"` |
+| PowerShell | `airc completion powershell \| Out-String \| Invoke-Expression` | Add that line to `$PROFILE` |
+
+The PowerShell completer is registered for `airc`, `airc.exe` and `airc.cmd`.
+Values the hub decides at run time, such as task ids, nicks and channels, are
+not completed; free-text and path options fall back to file-name completion.
 
 ### Client configuration
 
