@@ -33,7 +33,16 @@ function Wait-TrayLog([string]$Pattern) {
     $Log = Join-Path $Config.LogDir 'aircd.tray.log'
     $Deadline = [datetime]::UtcNow.AddSeconds(20)
     do {
-        if ((Test-Path -LiteralPath $Log) -and (Get-Content -LiteralPath $Log -Raw) -like "*$Pattern*") { return }
+        try {
+            if (Test-Path -LiteralPath $Log) {
+                $Stream = [System.IO.FileStream]::new($Log, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $Reader = [System.IO.StreamReader]::new($Stream, [System.Text.Encoding]::UTF8)
+                $Content = $Reader.ReadToEnd()
+                $Reader.Close()
+                $Stream.Close()
+                if ($Content -like "*$Pattern*") { return }
+            }
+        } catch {}
         Start-Sleep -Milliseconds 200
     } while ([datetime]::UtcNow -lt $Deadline)
     throw "Tray never displayed $Pattern"
