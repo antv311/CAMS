@@ -592,3 +592,147 @@ async fn prometheus_metrics_live_wake_slots_timeout_quota_skip_and_strict_format
 
     Ok(())
 }
+
+#[tokio::test]
+async fn owner_drain_endpoint_and_metrics_track_shutdown_state() -> Result<()> {
+    let db = crate::store::open(":memory:")?;
+    let server = crate::server::Server::new(db).with_shutdown_config(crate::shutdown::ShutdownConfig {
+        drain_timeout_secs: 0,
+        http_drain_timeout_secs: 1,
+        checkpoint_leases_on_drain: true,
+        lease_checkpoint_extension_secs: 300,
+    })?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let base = format!("http://{addr}");
+    let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+    info.http_port = addr.port();
+    info.register_key = Some("drain-owner-key".into());
+    let http_server = server.clone();
+    let stop_rx = server.shutdown().stop_accepting_rx();
+    let http_task = tokio::spawn(async move {
+        let _ = crate::http::serve_on_with_shutdown(listener, http_server, info, stop_rx).await;
+    });
+
+    let client = reqwest::Client::new();
+    let (worker, _) = server
+        .auth()
+        .register_principal("api-drain-worker", Some("member"), None)?;
+    server
+        .projects()
+        .create("#proj", "Proj", None, &worker.id)?;
+    let task = server.tasks().create("#proj", "Drain task")?;
+    let _ = server.tasks().claim(&task.id, &worker.id)?;
+
+    // Hold worker slot running so a queued wake exists when drain starts.
+    let script = if cfg!(windows) {
+        "ping -n 3 127.0.0.1 >nul"
+    } else {
+        "sleep 2"
+    };
+    server
+        .wakes()
+        .upsert(&worker.id, shell_wake_input(script, 0, 10))?;
+    let wake_ctx = crate::wake::WakeContext {
+        principal_id: worker.id.clone(),
+        nick: worker.nick.clone(),
+        reason: "initial wake".into(),
+        channel: "#proj".into(),
+        task_id: Some(task.id.clone()),
+        ..Default::default()
+    };
+    assert!(server.wakes().request(wake_ctx.clone())?);
+    for _ in 0..60 {
+        if server.wakes().active_execution_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.wakes().active_execution_count(), 1);
+    assert!(server.wakes().request(wake_ctx)?); // queued in pending slot
+
+    // 1. /healthz keeps service=aircd, ok=true and reports draining=false before drain.
+    let hz: Value = client
+        .get(format!("{base}/healthz"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(hz["ok"], true);
+    assert_eq!(hz["service"], "aircd");
+    assert_eq!(hz["draining"], false);
+    assert_eq!(hz["phase"], "running");
+    assert_eq!(hz["active_wake_executions"], 1);
+
+    // 2. Non-owner cannot query or trigger drain.
+    let (_, non_owner_tok) = server
+        .auth()
+        .register_principal("ordinary", Some("member"), None)?;
+    let unauth_get = client
+        .get(format!("{base}/v1/owner/drain"))
+        .bearer_auth(&non_owner_tok)
+        .send()
+        .await?;
+    assert_eq!(unauth_get.status(), StatusCode::FORBIDDEN);
+    let unauth_post = client
+        .post(format!("{base}/v1/owner/drain"))
+        .bearer_auth(&non_owner_tok)
+        .send()
+        .await?;
+    assert_eq!(unauth_post.status(), StatusCode::FORBIDDEN);
+
+    let status_before: Value = client
+        .get(format!("{base}/v1/owner/drain"))
+        .header("X-AirCD-Invite", "drain-owner-key")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(status_before["ok"], true);
+    assert_eq!(status_before["draining"], false);
+    assert_eq!(status_before["phase"], "running");
+
+    // 3. POST /v1/owner/drain triggers asynchronous drain and returns 202.
+    let drain_resp = client
+        .post(format!("{base}/v1/owner/drain"))
+        .header("X-AirCD-Invite", "drain-owner-key")
+        .json(&json!({ "reason": "operator test" }))
+        .send()
+        .await?;
+    assert_eq!(drain_resp.status(), StatusCode::ACCEPTED);
+    let drain_json: Value = drain_resp.json().await?;
+    assert_eq!(drain_json["ok"], true);
+    assert_eq!(drain_json["draining"], true);
+
+    // Simulate main() wait loop: wait for drain request, run graceful_drain, check metrics & clean HTTP exit.
+    let drain_signal = server.shutdown().wait_for_drain_request().await;
+    assert_eq!(drain_signal, "owner_api (operator test)");
+    let report = server.graceful_drain(&drain_signal, None).await;
+    assert_eq!(report.cancelled_pending_wakes, 1);
+    assert_eq!(report.detached_wake_runs, 1);
+    assert_eq!(report.checkpointed_tasks, 1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), http_task).await??;
+
+    // Metrics reflect shutdown counters and draining gauge directly in rendered Prometheus text.
+    let metrics_text = server.metrics().render_prometheus(&server.metrics_snapshot()?);
+    assert_eq!(scrape_metric_u64(&metrics_text, "aircd_hub_draining"), 1);
+    assert_eq!(
+        scrape_metric_u64(&metrics_text, "aircd_shutdown_cancelled_wakes_total"),
+        1
+    );
+    assert_eq!(
+        scrape_metric_u64(&metrics_text, "aircd_shutdown_lease_checkpoints_total"),
+        1
+    );
+    assert_eq!(
+        scrape_metric_u64(&metrics_text, "aircd_shutdown_detached_workers_total"),
+        1
+    );
+    assert_eq!(
+        scrape_metric_u64(&metrics_text, "aircd_wake_runs_total{status=\"detached\"}"),
+        1
+    );
+
+    Ok(())
+}

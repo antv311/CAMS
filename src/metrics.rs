@@ -27,7 +27,7 @@ const WAKE_EXECUTION_BUCKETS: &[f64] = &[
 
 const TASK_KINDS: &[&str] = &["task", "bug", "feature"];
 const WAKE_OUTCOMES: &[&str] = &["ok", "failed", "timeout"];
-const WAKE_RUN_STATUSES: &[&str] = &["ok", "failed", "timeout", "skipped"];
+const WAKE_RUN_STATUSES: &[&str] = &["ok", "failed", "timeout", "skipped", "detached"];
 const WAKE_REQUEST_RESULTS: &[&str] = &["started", "queued", "coalesced", "skipped", "disabled"];
 const IRC_SESSION_EVENTS: &[&str] = &[
     "connected",
@@ -177,6 +177,7 @@ pub struct MetricsSnapshot {
     pub db_pages: Option<DbPageStats>,
     pub disk: Option<DiskStats>,
     pub alert_states: Vec<AlertMetricSample>,
+    pub draining: bool,
 }
 
 /// Central thread-safe Prometheus metrics store shared across server subsystems.
@@ -201,6 +202,9 @@ pub struct MetricsRegistry {
     alerts_fired_total: BTreeMap<&'static str, AtomicU64>,
     alerts_resolved_total: BTreeMap<&'static str, AtomicU64>,
     alert_webhook_deliveries_total: BTreeMap<&'static str, AtomicU64>,
+    shutdown_lease_checkpoints_total: AtomicU64,
+    shutdown_detached_workers_total: AtomicU64,
+    shutdown_cancelled_wakes_total: AtomicU64,
 }
 
 impl Default for MetricsRegistry {
@@ -231,6 +235,9 @@ impl MetricsRegistry {
             alerts_fired_total: counter_map(ALERT_RULE_KEYS),
             alerts_resolved_total: counter_map(ALERT_RULE_KEYS),
             alert_webhook_deliveries_total: counter_map(ALERT_DELIVERY_STATUSES),
+            shutdown_lease_checkpoints_total: AtomicU64::new(0),
+            shutdown_detached_workers_total: AtomicU64::new(0),
+            shutdown_cancelled_wakes_total: AtomicU64::new(0),
         }
     }
 
@@ -318,6 +325,26 @@ impl MetricsRegistry {
         if let Some(counter) = self.wake_runs_total.get("skipped") {
             counter.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_wake_run_detached(&self) {
+        if let Some(counter) = self.wake_runs_total.get("detached") {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_shutdown_drain(
+        &self,
+        cancelled_wakes: usize,
+        detached_workers: usize,
+        checkpointed_leases: usize,
+    ) {
+        self.shutdown_cancelled_wakes_total
+            .fetch_add(cancelled_wakes as u64, Ordering::Relaxed);
+        self.shutdown_detached_workers_total
+            .fetch_add(detached_workers as u64, Ordering::Relaxed);
+        self.shutdown_lease_checkpoints_total
+            .fetch_add(checkpointed_leases as u64, Ordering::Relaxed);
     }
 
     pub fn record_wake_dispatch(&self, dispatch_secs: f64) {
@@ -1082,6 +1109,53 @@ impl MetricsRegistry {
                 val,
             );
         }
+
+        write_header(
+            &mut out,
+            "aircd_hub_draining",
+            "gauge",
+            "Whether the hub is currently draining for shutdown (1) or running normally (0).",
+        );
+        write_sample(&mut out, "aircd_hub_draining", &[], u64::from(snap.draining));
+
+        write_header(
+            &mut out,
+            "aircd_shutdown_lease_checkpoints_total",
+            "counter",
+            "Total active task leases checkpointed during hub shutdown draining.",
+        );
+        write_sample(
+            &mut out,
+            "aircd_shutdown_lease_checkpoints_total",
+            &[],
+            self.shutdown_lease_checkpoints_total.load(Ordering::Relaxed),
+        );
+
+        write_header(
+            &mut out,
+            "aircd_shutdown_detached_workers_total",
+            "counter",
+            "Total worker sessions or wake executions cleanly detached during hub shutdown.",
+        );
+        write_sample(
+            &mut out,
+            "aircd_shutdown_detached_workers_total",
+            &[],
+            self.shutdown_detached_workers_total.load(Ordering::Relaxed),
+        );
+
+        write_header(
+            &mut out,
+            "aircd_shutdown_cancelled_wakes_total",
+            "counter",
+            "Total queued wakeups cancelled because hub wake dispatch was paused for shutdown.",
+        );
+        write_sample(
+            &mut out,
+            "aircd_shutdown_cancelled_wakes_total",
+            &[],
+            self.shutdown_cancelled_wakes_total.load(Ordering::Relaxed),
+        );
 
         out
     }

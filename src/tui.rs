@@ -4992,6 +4992,7 @@ fn draw_trio(frame: &mut Frame, snap: &Snapshot, top: Rect) {
                     Some("running") => Color::Cyan,
                     Some("ok") => Color::Green,
                     Some("skipped") => Color::DarkGray,
+                    Some("detached") => Color::Yellow,
                     _ => Color::Red,
                 };
                 Line::from(Span::styled(run.clone(), Style::default().fg(color)))

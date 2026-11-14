@@ -18,6 +18,7 @@ mod rate_limit;
 mod reports;
 mod rooms;
 mod server;
+mod shutdown;
 mod store;
 mod task_metrics;
 mod tasks;
@@ -163,7 +164,11 @@ async fn main() -> Result<()> {
                        --alerts-disk-used-ratio-threshold <f>  Disk used ratio 0.0..=1.0 (default 0.90; 0 disables)\n  \
                        --alerts-disk-min-free-bytes <n>  Minimum free bytes on DB volume (default 1073741824; 0 disables)\n  \
                        --alerts-disk-pressure-for-secs <n>  Sustained seconds before disk pressure alert fires (default 60)\n  \
-                       --alerts-disk-path <path>  Override filesystem path checked for disk pressure"
+                       --alerts-disk-path <path>  Override filesystem path checked for disk pressure\n  \
+                       --drain-timeout-secs <n>  Max seconds to wait for active wake workers on shutdown (env AIRCD_DRAIN_TIMEOUT_SECS, default 30)\n  \
+                       --http-drain-timeout-secs <n>  Max seconds for in-flight HTTP requests on shutdown (env AIRCD_HTTP_DRAIN_TIMEOUT_SECS, default 5)\n  \
+                       --no-shutdown-checkpoint-leases  Disable checkpointing active task leases on shutdown (env AIRCD_SHUTDOWN_CHECKPOINT_LEASES=0)\n  \
+                       --lease-checkpoint-extension-secs <n>  Lease extension seconds when checkpointing on shutdown (default 300)"
                 );
         return Ok(());
     }
@@ -173,6 +178,7 @@ async fn main() -> Result<()> {
     let sqlite_config = server_config.to_sqlite_config()?;
     let vacuum_config = server_config.to_vacuum_config()?;
     let alert_config = server_config.to_alert_config()?;
+    let shutdown_config = server_config.to_shutdown_config()?;
     let tls_spec = server_config.to_tls_config()?;
     let logger = logging::EventForwarder::new(log_config)?;
     let task_timeout_config = server_config.task_timeout.clone();
@@ -200,13 +206,15 @@ async fn main() -> Result<()> {
         backup_config.clone(),
         auth_config.token_ttl_seconds,
     )
-    .with_task_timeout_config(task_timeout_config)?;
+    .with_task_timeout_config(task_timeout_config)?
+    .with_shutdown_config(shutdown_config.clone())?;
     server.vacuum().update_config(vacuum_config.clone());
     server.alerts().update_config(alert_config.clone());
-    let _webhook_worker = server.webhooks().spawn_worker();
-    let _backup_worker = server.backups().spawn_worker();
-    let _vacuum_worker = server.vacuum().spawn_worker();
-    let _alert_worker = server.spawn_alert_worker();
+    let stop_rx = server.shutdown().stop_accepting_rx();
+    let webhook_worker = server.webhooks().spawn_worker_with_shutdown(stop_rx.clone());
+    let backup_worker = server.backups().spawn_worker_with_shutdown(stop_rx.clone());
+    let vacuum_worker = server.vacuum().spawn_worker_with_shutdown(stop_rx.clone());
+    let alert_worker = server.spawn_alert_worker_with_shutdown(stop_rx.clone());
 
     let tls_acceptor = tls_spec
         .as_ref()
@@ -252,8 +260,8 @@ async fn main() -> Result<()> {
         format!("http://{wake_host}:{}", runtime_info.http_port)
     };
     server.wakes().set_server_url(&wake_url);
-    let _group_inactivity_worker = server.spawn_group_inactivity_worker();
-    let _task_timeout_worker = server.spawn_task_timeout_worker();
+    let group_inactivity_worker = server.spawn_group_inactivity_worker_with_shutdown(stop_rx.clone());
+    let task_timeout_worker = server.spawn_task_timeout_worker_with_shutdown(stop_rx.clone());
     println!("  registration: {register_note}");
     println!(
         "  database:     {} (pool={}, busy={}ms, sync={}, autocheckpoint={}p)",
@@ -312,6 +320,12 @@ async fn main() -> Result<()> {
     } else {
         println!("  rate limit:   disabled");
     }
+    println!(
+        "  shutdown:     drain_timeout={}s, http_drain={}s, checkpoint_leases={}",
+        shutdown_config.drain_timeout_secs,
+        shutdown_config.http_drain_timeout_secs,
+        shutdown_config.checkpoint_leases_on_drain,
+    );
     if tls_acceptor.is_some() {
         println!(
             "  TLS:          irc={tls_bind}, https={}, client_auth={tls_client_auth_mode}, tls_only={tls_only}",
@@ -344,11 +358,12 @@ async fn main() -> Result<()> {
     let plain_irc_fut = {
         let server = server.clone();
         let bind_addr = bind_addr.clone();
+        let stop_rx = stop_rx.clone();
         async move {
             if tls_only {
                 std::future::pending::<Result<()>>().await
             } else {
-                server.listen(&bind_addr).await
+                server.listen_with_shutdown(&bind_addr, stop_rx).await
             }
         }
     };
@@ -356,11 +371,12 @@ async fn main() -> Result<()> {
         let server = server.clone();
         let http_bind = http_bind.clone();
         let runtime_info = runtime_info.clone();
+        let stop_rx = stop_rx.clone();
         async move {
             if tls_only {
                 std::future::pending::<Result<()>>().await
             } else {
-                http::serve(server, &http_bind, runtime_info).await
+                http::serve_with_shutdown(server, &http_bind, runtime_info, stop_rx).await
             }
         }
     };
@@ -368,34 +384,122 @@ async fn main() -> Result<()> {
         let server = server.clone();
         let tls_bind = tls_bind.clone();
         let acceptor = tls_acceptor.clone();
+        let stop_rx = stop_rx.clone();
         async move {
             match acceptor {
-                Some(acceptor) => server.listen_tls(&tls_bind, acceptor).await,
+                Some(acceptor) => {
+                    server
+                        .listen_tls_with_shutdown(&tls_bind, acceptor, stop_rx)
+                        .await
+                }
                 None => std::future::pending::<Result<()>>().await,
             }
         }
     };
     let https_fut = {
-        let server = server;
+        let server = server.clone();
         let runtime_info = runtime_info;
+        let stop_rx = stop_rx.clone();
         async move {
             match (http_tls_bind, tls_acceptor) {
                 (Some(addr), Some(acceptor)) => {
-                    http::serve_tls(server, &addr, runtime_info, acceptor).await
+                    http::serve_tls_with_shutdown(server, &addr, runtime_info, acceptor, stop_rx)
+                        .await
                 }
                 _ => std::future::pending::<Result<()>>().await,
             }
         }
     };
 
-    let run_result =
-        tokio::try_join!(plain_irc_fut, plain_http_fut, irc_tls_fut, https_fut).map(|_| ());
+    let mut listeners_handle = tokio::spawn(async move {
+        tokio::try_join!(plain_irc_fut, plain_http_fut, irc_tls_fut, https_fut).map(|_| ())
+    });
+    let mut signal_listener = shutdown::ShutdownSignalListener::bind();
 
-    if let Err(err) = run_result {
-        logger.log_error("server.startup_error", format!("aircd server error: {err:#}"));
-        logger.flush();
-        return Err(err);
+    let drain_signal = tokio::select! {
+        res = &mut listeners_handle => {
+            let run_result = res.map_err(|err| anyhow::anyhow!("aircd listener task panicked: {err}"))?;
+            if let Err(err) = run_result {
+                logger.log_error("server.startup_error", format!("aircd server error: {err:#}"));
+                logger.flush();
+                return Err(err);
+            }
+            return Ok(());
+        }
+        sig = signal_listener.recv() => sig.to_string(),
+        req_sig = server.shutdown().wait_for_drain_request() => req_sig,
+    };
+
+    println!("\naircd received {drain_signal}; starting graceful worker drain...");
+    let report = server
+        .graceful_drain(&drain_signal, Some(&mut signal_listener))
+        .await;
+    println!(
+        "aircd drain complete ({}ms): initial_active_wakes={}, detached_wakes={}, cancelled_pending={}, checkpointed_tasks={}, detached_irc={}",
+        report.elapsed_ms,
+        report.initial_active_wakes,
+        report.detached_wake_runs,
+        report.cancelled_pending_wakes,
+        report.checkpointed_tasks,
+        report.detached_irc_clients,
+    );
+
+    let http_drain_timeout = std::time::Duration::from_secs(shutdown_config.http_drain_timeout_secs);
+    if !http_drain_timeout.is_zero() {
+        match tokio::time::timeout(http_drain_timeout, &mut listeners_handle).await {
+            Ok(Ok(Err(err))) => {
+                logger.log_error(
+                    "server.shutdown_error",
+                    format!("listener error during shutdown: {err:#}"),
+                );
+            }
+            Ok(Err(err)) => {
+                logger.log_error(
+                    "server.shutdown_error",
+                    format!("listener task panicked during shutdown: {err}"),
+                );
+            }
+            Ok(Ok(Ok(()))) => {}
+            Err(_) => {
+                listeners_handle.abort();
+            }
+        }
+    } else {
+        listeners_handle.abort();
     }
+
+    let workers = vec![
+        webhook_worker,
+        backup_worker,
+        vacuum_worker,
+        alert_worker,
+        group_inactivity_worker,
+        task_timeout_worker,
+    ];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for handle in workers {
+            let _ = handle.await;
+        }
+    })
+    .await;
+
+    if let Err(err) = server.db().checkpoint(db::WalCheckpointMode::Truncate) {
+        logger.log_error(
+            "server.wal_checkpoint_error",
+            format!("shutdown WAL checkpoint failed: {err:#}"),
+        );
+    }
+    logger.log_security(
+        logging::Severity::Info,
+        "server.stopped",
+        "success",
+        Some("system"),
+        None,
+        None,
+        format!("aircd stopped gracefully after {drain_signal}"),
+    );
+    logger.flush();
+    drop(server);
 
     Ok(())
 }

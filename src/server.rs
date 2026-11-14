@@ -2,10 +2,12 @@ use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::{watch, Notify};
 use tokio_rustls::TlsAcceptor;
 
 use crate::alerts::{AlertConfig, AlertDeliveryRecord, AlertEvalSnapshot, AlertManager};
@@ -22,6 +24,9 @@ use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, M
 use crate::protocol::{parse_command, Command};
 use crate::reports::{NewReport, Report, ReportStore};
 use crate::rooms::{Room, RoomStore};
+use crate::shutdown::{
+    DrainReport, ShutdownConfig, ShutdownCoordinator, ShutdownPhase, ShutdownSignalListener,
+};
 use crate::store::{ClientTemplate, ClientTemplateStore, GroupStore, SharedConnection};
 use crate::tasks::{NewTask, ReviewRound, Task, TaskStore, TERMINAL_STATUSES};
 use crate::vacuum::{VacuumConfig, VacuumManager};
@@ -87,6 +92,9 @@ pub struct Server {
     session_gate: Arc<Mutex<()>>,
     task_gate: Arc<Mutex<()>>,
     inner: Arc<Mutex<ServerInner>>,
+    shutdown: ShutdownCoordinator,
+    active_irc_tasks: Arc<AtomicUsize>,
+    irc_idle_notify: Arc<Notify>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -220,6 +228,9 @@ impl Server {
             session_gate: Arc::new(Mutex::new(())),
             task_gate: Arc::new(Mutex::new(())),
             inner: Arc::new(Mutex::new(ServerInner::default())),
+            shutdown: ShutdownCoordinator::default(),
+            active_irc_tasks: Arc::new(AtomicUsize::new(0)),
+            irc_idle_notify: Arc::new(Notify::new()),
         };
         // The poster gets its own idle launcher so the server's launcher does
         // not hold a reference to itself. Posting never wakes anyone.
@@ -309,6 +320,225 @@ impl Server {
 
     pub fn db(&self) -> &SharedConnection {
         &self.db
+    }
+
+    pub fn shutdown(&self) -> &ShutdownCoordinator {
+        &self.shutdown
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.shutdown.is_draining()
+    }
+
+    pub fn shutdown_phase(&self) -> ShutdownPhase {
+        self.shutdown.phase()
+    }
+
+    pub fn with_shutdown_config(self, config: ShutdownConfig) -> Result<Self> {
+        config.validate()?;
+        self.shutdown.update_config(config);
+        Ok(self)
+    }
+
+    pub fn checkpoint_active_leases(&self, now: i64, extension_secs: i64) -> Result<usize> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let checkpointed = self.tasks.checkpoint_active_leases(now, extension_secs)?;
+        Ok(checkpointed.len())
+    }
+
+    pub fn broadcast_shutdown_notice(&self, notice: &str) {
+        let clients: Vec<ClientHandle> = self
+            .inner
+            .lock()
+            .expect("server mutex poisoned")
+            .clients
+            .values()
+            .cloned()
+            .collect();
+        let line = format!(":{SERVER_NAME} NOTICE * :{notice}");
+        for client in clients {
+            let _ = client.tx.send(line.clone());
+        }
+    }
+
+    pub async fn detach_irc_clients(&self, reason: &str, timeout: std::time::Duration) -> usize {
+        let clients: Vec<ClientHandle> = self
+            .inner
+            .lock()
+            .expect("server mutex poisoned")
+            .clients
+            .values()
+            .cloned()
+            .collect();
+        let detached = clients.len();
+        let notice = format!(":{SERVER_NAME} NOTICE * :{reason}");
+        for client in clients {
+            let _ = client.tx.send(notice.clone());
+            let _ = client.shutdown_tx.send(reason.to_string());
+        }
+        if !timeout.is_zero() {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let notified = self.irc_idle_notify.notified();
+                if self.active_irc_tasks.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+        }
+        detached
+    }
+
+    /// Execute graceful hub draining on shutdown:
+    /// 1. Pause wake dispatch and cancel any pending queued wakeups.
+    /// 2. Wait up to `drain_timeout_secs` (or a second OS signal) for active wake
+    ///    executions to complete while keeping HTTP/IRC open for status updates.
+    /// 3. Stop accepting new connections, detach any remaining wake workers without
+    ///    killing them, checkpoint active task leases, and cleanly detach IRC clients.
+    pub async fn graceful_drain(
+        &self,
+        signal: &str,
+        mut force_listener: Option<&mut ShutdownSignalListener>,
+    ) -> DrainReport {
+        let started = std::time::Instant::now();
+        let cfg = self.shutdown.config();
+        self.shutdown.set_phase(ShutdownPhase::Draining);
+        self.logger.log_security(
+            Severity::Info,
+            "server.draining",
+            "success",
+            Some("system"),
+            None,
+            None,
+            format!(
+                "Graceful hub drain started on {signal} (drain_timeout_secs={}, checkpoint_leases={})",
+                cfg.drain_timeout_secs, cfg.checkpoint_leases_on_drain
+            ),
+        );
+        self.broadcast_shutdown_notice(&format!(
+            "Hub received {signal}; pausing wake dispatch and draining active workers"
+        ));
+
+        let cancelled_pending_wakes = self.wakes.pause_dispatch();
+        let (initial_active_wakes, _, _) = self.wakes.runtime_session_counts();
+
+        let mut forced_by_signal = false;
+        if initial_active_wakes > 0 && cfg.drain_timeout_secs > 0 {
+            let drain_wait = std::time::Duration::from_secs(cfg.drain_timeout_secs);
+            if let Some(listener) = force_listener {
+                tokio::select! {
+                    biased;
+                    _ = self.wakes.wait_until_idle(drain_wait) => {}
+                    second_signal = listener.recv() => {
+                        forced_by_signal = true;
+                        self.logger.log_security(
+                            Severity::Warning,
+                            "server.drain_forced",
+                            "success",
+                            Some("system"),
+                            None,
+                            None,
+                            format!("Second shutdown signal ({second_signal}) received; skipping remaining drain wait"),
+                        );
+                    }
+                }
+            } else {
+                let _ = self.wakes.wait_until_idle(drain_wait).await;
+            }
+        }
+
+        let remaining_active_wakes = self.wakes.active_execution_count();
+        let completed_within_timeout = remaining_active_wakes == 0;
+        let timed_out = !completed_within_timeout && !forced_by_signal;
+
+        self.shutdown.set_phase(ShutdownPhase::Detaching);
+        self.shutdown.trigger_stop_accepting();
+
+        let detached_wake_runs = self
+            .wakes
+            .detach_running_executions(std::time::Duration::from_millis(500))
+            .await;
+
+        let checkpointed_tasks = if cfg.checkpoint_leases_on_drain {
+            let worker = self.clone();
+            let ext = cfg.lease_checkpoint_extension_secs.min(i64::MAX as u64) as i64;
+            match tokio::task::spawn_blocking(move || {
+                worker.checkpoint_active_leases(unix_timestamp(), ext)
+            })
+            .await
+            {
+                Ok(Ok(count)) => count,
+                Ok(Err(err)) => {
+                    self.logger.log_error(
+                        "shutdown.lease_checkpoint_error",
+                        format!("failed to checkpoint task leases on shutdown: {err:#}"),
+                    );
+                    0
+                }
+                Err(err) => {
+                    self.logger.log_error(
+                        "shutdown.lease_checkpoint_error",
+                        format!("lease checkpoint blocking task failed: {err}"),
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        let detached_irc_clients = self
+            .detach_irc_clients(
+                "Closing Link: aircd shutting down (graceful drain)",
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+
+        self.shutdown.set_phase(ShutdownPhase::Stopped);
+        self.metrics.record_shutdown_drain(
+            cancelled_pending_wakes,
+            detached_wake_runs + detached_irc_clients,
+            checkpointed_tasks,
+        );
+
+        let report = DrainReport {
+            signal: signal.to_string(),
+            completed_within_timeout,
+            timed_out,
+            forced_by_signal,
+            cancelled_pending_wakes,
+            initial_active_wakes,
+            remaining_active_wakes,
+            detached_wake_runs,
+            checkpointed_tasks,
+            detached_irc_clients,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        };
+        self.shutdown.store_report(report.clone());
+        self.logger.log_security(
+            Severity::Info,
+            "server.drain_completed",
+            "success",
+            Some("system"),
+            None,
+            None,
+            format!(
+                "Graceful hub drain completed on {signal} in {}ms (initial_active_wakes={}, detached_wakes={}, cancelled_pending={}, checkpointed_tasks={}, detached_irc={})",
+                report.elapsed_ms,
+                report.initial_active_wakes,
+                report.detached_wake_runs,
+                report.cancelled_pending_wakes,
+                report.checkpointed_tasks,
+                report.detached_irc_clients,
+            ),
+        );
+        report
     }
 
     /// Commit the credential reset before invalidating the active IRC session.
@@ -410,13 +640,32 @@ impl Server {
         Ok(events.len())
     }
 
+    #[allow(dead_code)]
     pub fn spawn_task_timeout_worker(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_task_timeout_worker_with_shutdown(crate::shutdown::never_stop_rx())
+    }
+
+    pub fn spawn_task_timeout_worker_with_shutdown(
+        &self,
+        mut stop_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let server = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {}
+                }
+                if *stop_rx.borrow() {
+                    break;
+                }
                 let worker = server.clone();
                 match tokio::task::spawn_blocking(move || {
                     worker.recover_task_timeouts(unix_timestamp())
@@ -549,6 +798,7 @@ impl Server {
             db_pages,
             disk,
             alert_states,
+            draining: self.is_draining(),
         })
     }
 
@@ -588,23 +838,49 @@ impl Server {
         Ok(self.alerts.dispatch_notifications(notifications).await)
     }
 
+    #[allow(dead_code)]
     pub fn spawn_alert_worker(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_alert_worker_with_shutdown(crate::shutdown::never_stop_rx())
+    }
+
+    pub fn spawn_alert_worker_with_shutdown(
+        &self,
+        mut stop_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let server = self.clone();
         tokio::spawn(async move {
             loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
                 let cfg = server.alerts.config();
                 if !cfg.enabled || cfg.eval_interval_secs == 0 {
-                    server.alerts.notify_handle().notified().await;
-                    continue;
+                    tokio::select! {
+                        biased;
+                        res = stop_rx.changed() => {
+                            if res.is_err() || *stop_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = server.alerts.notify_handle().notified() => {
+                            continue;
+                        }
+                    }
                 }
                 tokio::select! {
+                    biased;
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(cfg.eval_interval_secs.max(1))) => {}
                     _ = server.alerts.notify_handle().notified() => {
                         continue;
                     }
                 }
                 let latest = server.alerts.config();
-                if !latest.enabled || latest.eval_interval_secs == 0 {
+                if !latest.enabled || latest.eval_interval_secs == 0 || *stop_rx.borrow() {
                     continue;
                 }
                 if let Err(err) = server.evaluate_alerts(true).await {
@@ -632,13 +908,32 @@ impl Server {
         Ok(events.len())
     }
 
+    #[allow(dead_code)]
     pub fn spawn_group_inactivity_worker(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_group_inactivity_worker_with_shutdown(crate::shutdown::never_stop_rx())
+    }
+
+    pub fn spawn_group_inactivity_worker_with_shutdown(
+        &self,
+        mut stop_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let server = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {}
+                }
+                if *stop_rx.borrow() {
+                    break;
+                }
                 let worker = server.clone();
                 match tokio::task::spawn_blocking(move || {
                     worker.reassign_inactive_group_tasks(unix_timestamp())
@@ -671,17 +966,49 @@ impl Server {
         &self.locks
     }
 
+    #[allow(dead_code)]
     pub async fn listen(self, bind_addr: &str) -> Result<()> {
+        self.listen_with_shutdown(bind_addr, crate::shutdown::never_stop_rx())
+            .await
+    }
+
+    pub async fn listen_with_shutdown(
+        self,
+        bind_addr: &str,
+        stop_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("bind {bind_addr}"))?;
         println!("aircd listening on {bind_addr}");
-        self.listen_on(listener).await
+        self.listen_on_with_shutdown(listener, stop_rx).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn listen_on(self, listener: TcpListener) -> Result<()> {
+        self.listen_on_with_shutdown(listener, crate::shutdown::never_stop_rx())
+            .await
+    }
+
+    pub(crate) async fn listen_on_with_shutdown(
+        self,
+        listener: TcpListener,
+        mut stop_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
+            if *stop_rx.borrow() {
+                return Ok(());
+            }
+            let (stream, peer_addr) = tokio::select! {
+                biased;
+                res = stop_rx.changed() => {
+                    if res.is_err() || *stop_rx.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                accepted = listener.accept() => accepted?,
+            };
             let server = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = server.handle_stream(stream).await {
@@ -697,14 +1024,37 @@ impl Server {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn listen_tls(self, bind_addr: &str, acceptor: TlsAcceptor) -> Result<()> {
+        self.listen_tls_with_shutdown(bind_addr, acceptor, crate::shutdown::never_stop_rx())
+            .await
+    }
+
+    pub async fn listen_tls_with_shutdown(
+        self,
+        bind_addr: &str,
+        acceptor: TlsAcceptor,
+        mut stop_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("bind {bind_addr}"))?;
         println!("aircd listening on {bind_addr} (TLS)");
 
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
+            if *stop_rx.borrow() {
+                return Ok(());
+            }
+            let (stream, peer_addr) = tokio::select! {
+                biased;
+                res = stop_rx.changed() => {
+                    if res.is_err() || *stop_rx.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                accepted = listener.accept() => accepted?,
+            };
             let acceptor = acceptor.clone();
             let server = self.clone();
             tokio::spawn(async move {
@@ -754,6 +1104,23 @@ impl Server {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        struct IrcTaskGuard {
+            counter: Arc<AtomicUsize>,
+            idle_notify: Arc<Notify>,
+        }
+        impl Drop for IrcTaskGuard {
+            fn drop(&mut self) {
+                if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.idle_notify.notify_waiters();
+                }
+            }
+        }
+        self.active_irc_tasks.fetch_add(1, Ordering::SeqCst);
+        let _irc_guard = IrcTaskGuard {
+            counter: Arc::clone(&self.active_irc_tasks),
+            idle_notify: Arc::clone(&self.irc_idle_notify),
+        };
+
         let (reader, mut writer) = tokio::io::split(stream);
         let mut lines = BufReader::new(reader).lines();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -768,6 +1135,7 @@ impl Server {
                     break;
                 }
             }
+            let _ = writer.flush().await;
         });
 
         let mut session = Session {
@@ -813,7 +1181,8 @@ impl Server {
         .await;
 
         let cleanup = self.disconnect(&session);
-        writer_task.abort();
+        drop(session);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), writer_task).await;
         result.and(cleanup)
     }
 
@@ -5754,6 +6123,221 @@ mod tests {
             test_session_with_rx(Some(&admin_tok.token), Some("irc-leader"));
         server.try_register(&mut exp_session)?;
         assert!(!exp_session.registered);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_stops_listeners_detaches_irc_clients_and_checkpoints_tasks() -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let db = crate::store::open(":memory:")?;
+        let server = Server::new(db).with_shutdown_config(crate::shutdown::ShutdownConfig {
+            drain_timeout_secs: 2,
+            http_drain_timeout_secs: 1,
+            checkpoint_leases_on_drain: true,
+            lease_checkpoint_extension_secs: 600,
+        })?;
+
+        let (worker, worker_tok) = server
+            .auth()
+            .register_principal("drain-worker", Some("member"), None)?;
+        server.projects().create("#proj", "Proj", None, &worker.id)?;
+        let claimed = server.tasks().create("#proj", "Active claimed task")?;
+        let claimed = server.tasks().claim(&claimed.id, &worker.id)?;
+        let original_lease = claimed.lease_expires_at.unwrap();
+
+        // Start IRC listener wired to server shutdown stop_accepting_rx, plus background workers.
+        let irc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let irc_addr = irc_listener.local_addr()?;
+        let irc_server = server.clone();
+        let stop_rx = server.shutdown().stop_accepting_rx();
+        let irc_task = tokio::spawn(async move {
+            let _ = irc_server.listen_on_with_shutdown(irc_listener, stop_rx).await;
+        });
+        let timeout_worker = server.spawn_task_timeout_worker_with_shutdown(
+            server.shutdown().stop_accepting_rx(),
+        );
+        let webhook_worker = server
+            .webhooks()
+            .spawn_worker_with_shutdown(server.shutdown().stop_accepting_rx());
+
+        // Connect a real IRC client over TCP.
+        let stream = tokio::net::TcpStream::connect(irc_addr).await?;
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        w.write_all(
+            format!("PASS {worker_tok}\r\nNICK drain-worker\r\nUSER drain-worker 0 * :test\r\n")
+                .as_bytes(),
+        )
+        .await?;
+        while let Some(line) = lines.next_line().await? {
+            if line.contains(" 001 ") {
+                break;
+            }
+        }
+
+        // Execute graceful_drain while the IRC client is still connected.
+        let report = server.graceful_drain("SIGTERM", None).await;
+        drop(w);
+        assert_eq!(report.signal, "SIGTERM");
+        assert!(report.completed_within_timeout);
+        assert!(!report.timed_out);
+        assert_eq!(report.checkpointed_tasks, 1);
+        assert_eq!(report.detached_irc_clients, 1);
+        assert_eq!(server.shutdown_phase(), crate::shutdown::ShutdownPhase::Stopped);
+        assert!(server.is_draining());
+
+        // IRC client must receive shutdown NOTICE/ERROR and close cleanly.
+        let mut received = Vec::new();
+        while let Ok(Some(line)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line()).await?
+        {
+            received.push(line);
+        }
+        assert!(
+            received.iter().any(|l| l.contains("NOTICE") && l.contains("shutting down")),
+            "expected NOTICE in {received:?}"
+        );
+        assert!(
+            received.iter().any(|l| l.contains("ERROR") && l.contains("shutting down")),
+            "expected ERROR in {received:?}"
+        );
+
+        // Listener and workers must exit cleanly on stop_accepting_rx.
+        tokio::time::timeout(std::time::Duration::from_secs(2), irc_task).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(2), timeout_worker).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(2), webhook_worker).await??;
+
+        // Disconnected timestamp and checkpointed task lease persisted.
+        let disconnected_at: Option<i64> = server.db.lock().unwrap().query_row(
+            "SELECT disconnected_at FROM principals WHERE id = ?1",
+            rusqlite::params![&worker.id],
+            |row| row.get(0),
+        )?;
+        assert!(disconnected_at.is_some());
+        let updated = server.tasks().get(&claimed.id)?.unwrap();
+        assert!(updated.lease_expires_at.unwrap() > original_lease);
+        let events = server.tasks().events(&claimed.id)?;
+        assert!(events.iter().any(|ev| ev.action == "lease_checkpoint"));
+        Ok(())
+    }
+
+    fn shell_wake_config(script: &str) -> crate::wake::WakeConfigInput {
+        crate::wake::WakeConfigInput {
+            command: if cfg!(windows) {
+                "cmd".into()
+            } else {
+                "sh".into()
+            },
+            args: if cfg!(windows) {
+                vec!["/C".into(), script.into()]
+            } else {
+                vec!["-c".into(), script.into()]
+            },
+            cooldown_seconds: Some(0),
+            timeout_seconds: Some(10),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_waits_for_running_wake_to_finish_within_timeout() -> Result<()> {
+        let db = crate::store::open(":memory:")?;
+        let server = Server::new(db).with_shutdown_config(crate::shutdown::ShutdownConfig {
+            drain_timeout_secs: 5,
+            http_drain_timeout_secs: 1,
+            checkpoint_leases_on_drain: true,
+            lease_checkpoint_extension_secs: 300,
+        })?;
+        let (worker, _) = server
+            .auth()
+            .register_principal("fast-drain-worker", Some("member"), None)?;
+        let script = if cfg!(windows) {
+            "ping -n 2 127.0.0.1 >nul & echo finished"
+        } else {
+            "sleep 0.2; echo finished"
+        };
+        server.wakes().upsert(&worker.id, shell_wake_config(script))?;
+        assert!(server.wakes().request(crate::wake::WakeContext {
+            principal_id: worker.id.clone(),
+            nick: worker.nick.clone(),
+            reason: "drain completion check".into(),
+            channel: "#cams".into(),
+            ..Default::default()
+        })?);
+        for _ in 0..60 {
+            if server.wakes().active_execution_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.wakes().active_execution_count(), 1);
+
+        let report = server.graceful_drain("SIGINT", None).await;
+        assert_eq!(report.signal, "SIGINT");
+        assert!(report.completed_within_timeout);
+        assert!(!report.timed_out);
+        assert_eq!(report.initial_active_wakes, 1);
+        assert_eq!(report.remaining_active_wakes, 0);
+        assert_eq!(report.detached_wake_runs, 0);
+
+        let runs = server.wakes().runs(Some(&worker.id), 5)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_detaches_long_running_wake_when_timeout_expires() -> Result<()> {
+        let db = crate::store::open(":memory:")?;
+        let server = Server::new(db).with_shutdown_config(crate::shutdown::ShutdownConfig {
+            drain_timeout_secs: 1,
+            http_drain_timeout_secs: 1,
+            checkpoint_leases_on_drain: false,
+            lease_checkpoint_extension_secs: 300,
+        })?;
+        let (worker, _) = server
+            .auth()
+            .register_principal("slow-drain-worker", Some("member"), None)?;
+        let script = if cfg!(windows) {
+            "ping -n 4 127.0.0.1 >nul"
+        } else {
+            "sleep 3"
+        };
+        server.wakes().upsert(&worker.id, shell_wake_config(script))?;
+        assert!(server.wakes().request(crate::wake::WakeContext {
+            principal_id: worker.id.clone(),
+            nick: worker.nick.clone(),
+            reason: "drain timeout check".into(),
+            channel: "#cams".into(),
+            ..Default::default()
+        })?);
+        for _ in 0..60 {
+            if server.wakes().active_execution_count() == 1
+                && server
+                    .wakes()
+                    .runs(Some(&worker.id), 5)?
+                    .iter()
+                    .any(|run| run.status == "running")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(server.wakes().active_execution_count(), 1);
+
+        let report = server.graceful_drain("SIGTERM", None).await;
+        assert_eq!(report.signal, "SIGTERM");
+        assert!(!report.completed_within_timeout);
+        assert!(report.timed_out);
+        assert_eq!(report.initial_active_wakes, 1);
+        assert_eq!(report.remaining_active_wakes, 1);
+        assert_eq!(report.detached_wake_runs, 1);
+        assert_eq!(report.checkpointed_tasks, 0);
+
+        let runs = server.wakes().runs(Some(&worker.id), 5)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "detached");
         Ok(())
     }
 }

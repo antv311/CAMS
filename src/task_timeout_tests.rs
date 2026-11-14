@@ -266,3 +266,61 @@ fn timeout_and_claim_completion_race_preserves_winning_state() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn checkpoint_active_leases_extends_active_tasks_and_skips_expired() -> Result<()> {
+    let db = crate::store::open(":memory:")?;
+    let store = TaskStore::new(db, 60);
+
+    let claimed_live = store.create("#one", "Claimed live")?;
+    let claimed_live = store.claim(&claimed_live.id, "worker-a")?;
+    let claimed_expired = store.create("#one", "Claimed expired")?;
+    let claimed_expired = store.claim(&claimed_expired.id, "worker-b")?;
+    let in_progress_live = executing(&store, Some(120))?;
+    let testing_live = {
+        let t = executing(&store, Some(120))?;
+        store.set_status(&t.id, "in_progress", "testing", "worker", None, None)?
+    };
+    let in_progress_expired = executing(&store, Some(10))?;
+    let open_task = store.create("#one", "Still open")?;
+
+    let checkpoint_at = claimed_live.lease_expires_at.unwrap() - 5;
+    store.db.write()?.execute(
+        "UPDATE tasks SET lease_expires_at = ?1 WHERE id = ?2",
+        rusqlite::params![checkpoint_at - 1, &claimed_expired.id],
+    )?;
+    store.db.write()?.execute(
+        "UPDATE tasks SET execution_heartbeat_at = ?1 WHERE id = ?2",
+        rusqlite::params![checkpoint_at - 20, &in_progress_expired.id],
+    )?;
+    store.db.write()?.execute(
+        "UPDATE tasks SET execution_heartbeat_at = ?1 WHERE id IN (?2, ?3)",
+        rusqlite::params![checkpoint_at - 15, &in_progress_live.id, &testing_live.id],
+    )?;
+
+    let checkpointed = store.checkpoint_active_leases(checkpoint_at, 300)?;
+    let ids: Vec<&str> = checkpointed.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains(&claimed_live.id.as_str()));
+    assert!(ids.contains(&in_progress_live.id.as_str()));
+    assert!(ids.contains(&testing_live.id.as_str()));
+    assert!(!ids.contains(&claimed_expired.id.as_str()));
+    assert!(!ids.contains(&in_progress_expired.id.as_str()));
+    assert!(!ids.contains(&open_task.id.as_str()));
+
+    let updated_claim = store.get(&claimed_live.id)?.unwrap();
+    assert_eq!(updated_claim.lease_expires_at, Some(checkpoint_at + 300));
+    let updated_in_prog = store.get(&in_progress_live.id)?.unwrap();
+    assert_eq!(updated_in_prog.execution_heartbeat_at, Some(checkpoint_at));
+    let updated_testing = store.get(&testing_live.id)?.unwrap();
+    assert_eq!(updated_testing.execution_heartbeat_at, Some(checkpoint_at));
+
+    let events = store.events(&in_progress_live.id)?;
+    assert_eq!(events.last().unwrap().action, "lease_checkpoint");
+    let metrics = crate::task_metrics::compute(&updated_in_prog, &events, checkpoint_at + 10);
+    assert!(metrics.time_in_status["in_progress"] >= 10);
+
+    // Checkpointed claimed task is not immediately expired after checkpoint_at + 10.
+    assert!(store.recover_timeouts(checkpoint_at + 10)?.iter().all(|r| r.task.id != claimed_live.id));
+    Ok(())
+}

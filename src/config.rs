@@ -10,6 +10,7 @@ use crate::logging::{
     validate_event_log_source, LogConfig, SyslogFacility, SyslogFormat, SyslogTarget,
 };
 use crate::rate_limit::RateLimitConfig;
+use crate::shutdown::ShutdownConfig;
 use crate::tls::{ClientAuthMode, TlsServerConfigSpec};
 use crate::vacuum::{
     VacuumConfig, DEFAULT_VACUUM_BATCH_PAGES, DEFAULT_VACUUM_ENABLED,
@@ -100,6 +101,7 @@ pub struct ServerConfig {
     pub db_vacuum_step_delay_ms: u64,
     pub db_vacuum_max_batches_per_run: usize,
     pub alerts: AlertConfig,
+    pub shutdown: ShutdownConfig,
 }
 
 impl Default for ServerConfig {
@@ -145,6 +147,7 @@ impl Default for ServerConfig {
             db_vacuum_step_delay_ms: DEFAULT_VACUUM_STEP_DELAY_MS,
             db_vacuum_max_batches_per_run: DEFAULT_VACUUM_MAX_BATCHES_PER_RUN,
             alerts: AlertConfig::default(),
+            shutdown: ShutdownConfig::default(),
         }
     }
 }
@@ -265,6 +268,12 @@ impl ServerConfig {
         Ok(cfg)
     }
 
+    pub fn to_shutdown_config(&self) -> Result<ShutdownConfig> {
+        let cfg = self.shutdown.clone();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     fn load_with(
         args: &[String],
         env: impl Fn(&str) -> Option<String>,
@@ -286,7 +295,8 @@ impl ServerConfig {
                 | "--alerts-send-resolved"
                 | "--alerts-wake-failure-enabled"
                 | "--alerts-queue-backlog-enabled"
-                | "--alerts-disk-pressure-enabled" => "true",
+                | "--alerts-disk-pressure-enabled"
+                | "--shutdown-checkpoint-leases" => "true",
                 "--no-backups"
                 | "--no-db-vacuum"
                 | "--no-rate-limit"
@@ -294,7 +304,8 @@ impl ServerConfig {
                 | "--no-alerts-send-resolved"
                 | "--no-alerts-wake-failure"
                 | "--no-alerts-queue-backlog"
-                | "--no-alerts-disk-pressure" => "false",
+                | "--no-alerts-disk-pressure"
+                | "--no-shutdown-checkpoint-leases" => "false",
                 "--config"
                 | "--bind"
                 | "--http-bind"
@@ -348,7 +359,10 @@ impl ServerConfig {
                 | "--alerts-disk-min-free-bytes"
                 | "--alerts-disk-pressure-for-secs"
                 | "--alerts-disk-pressure-severity"
-                | "--alerts-disk-path" => iter
+                | "--alerts-disk-path"
+                | "--drain-timeout-secs"
+                | "--http-drain-timeout-secs"
+                | "--lease-checkpoint-extension-secs" => iter
                     .next()
                     .filter(|value| !value.starts_with("--"))
                     .with_context(|| format!("{arg} requires a value"))?,
@@ -474,6 +488,16 @@ impl ServerConfig {
             ("AIRCD_ALERTS_DISK_PRESSURE_FOR_SECS", "--alerts-disk-pressure-for-secs"),
             ("AIRCD_ALERTS_DISK_PRESSURE_SEVERITY", "--alerts-disk-pressure-severity"),
             ("AIRCD_ALERTS_DISK_PATH", "--alerts-disk-path"),
+            ("AIRCD_DRAIN_TIMEOUT_SECS", "--drain-timeout-secs"),
+            ("AIRCD_HTTP_DRAIN_TIMEOUT_SECS", "--http-drain-timeout-secs"),
+            (
+                "AIRCD_SHUTDOWN_CHECKPOINT_LEASES",
+                "--shutdown-checkpoint-leases",
+            ),
+            (
+                "AIRCD_LEASE_CHECKPOINT_EXTENSION_SECS",
+                "--lease-checkpoint-extension-secs",
+            ),
         ] {
             if let Some(value) = env(name) {
                 // Preserve the existing empty invite-key environment fallback.
@@ -546,6 +570,7 @@ impl ServerConfig {
         let _ = config.to_sqlite_config()?;
         let _ = config.to_vacuum_config()?;
         config.alerts.validate()?;
+        config.shutdown.validate()?;
         Ok(config)
     }
 
@@ -786,6 +811,22 @@ impl ServerConfig {
                 self.alerts.disk_pressure_severity = value.into();
             }
             "--alerts-disk-path" => self.alerts.disk_path = Some(value.into()),
+            "--drain-timeout-secs" => {
+                self.shutdown.drain_timeout_secs =
+                    parse_u64_setting("shutdown.drain_timeout_secs", value)?;
+            }
+            "--http-drain-timeout-secs" => {
+                self.shutdown.http_drain_timeout_secs =
+                    parse_u64_setting("shutdown.http_drain_timeout_secs", value)?;
+            }
+            "--shutdown-checkpoint-leases" | "--no-shutdown-checkpoint-leases" => {
+                self.shutdown.checkpoint_leases_on_drain =
+                    parse_bool_setting("shutdown.checkpoint_leases_on_drain", value)?;
+            }
+            "--lease-checkpoint-extension-secs" => {
+                self.shutdown.lease_checkpoint_extension_secs =
+                    parse_u64_setting("shutdown.lease_checkpoint_extension_secs", value)?;
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -1503,6 +1544,91 @@ mod tests {
             assert!(
                 ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
                 "expected invalid alerts config for {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_settings_load_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let empty = fixture.write("");
+        let defaults = ServerConfig::load_with(&[], |_| None, &empty)?.to_shutdown_config()?;
+        assert_eq!(defaults, ShutdownConfig::default());
+
+        let path = fixture.write(
+            "[shutdown]\n\
+             drain_timeout_secs = 45\n\
+             http_drain_timeout_secs = 8\n\
+             checkpoint_leases_on_drain = false\n\
+             lease_checkpoint_extension_secs = 600\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?.to_shutdown_config()?;
+        assert_eq!(cfg.drain_timeout_secs, 45);
+        assert_eq!(cfg.http_drain_timeout_secs, 8);
+        assert!(!cfg.checkpoint_leases_on_drain);
+        assert_eq!(cfg.lease_checkpoint_extension_secs, 600);
+
+        let env = environment(&[
+            ("AIRCD_DRAIN_TIMEOUT_SECS", "20"),
+            ("AIRCD_HTTP_DRAIN_TIMEOUT_SECS", "3"),
+            ("AIRCD_SHUTDOWN_CHECKPOINT_LEASES", "true"),
+            ("AIRCD_LEASE_CHECKPOINT_EXTENSION_SECS", "450"),
+        ]);
+        let cfg = ServerConfig::load_with(&[], &env, &path)?.to_shutdown_config()?;
+        assert_eq!(cfg.drain_timeout_secs, 20);
+        assert_eq!(cfg.http_drain_timeout_secs, 3);
+        assert!(cfg.checkpoint_leases_on_drain);
+        assert_eq!(cfg.lease_checkpoint_extension_secs, 450);
+
+        let cfg = ServerConfig::load_with(
+            &[
+                "--drain-timeout-secs".into(),
+                "12".into(),
+                "--http-drain-timeout-secs".into(),
+                "4".into(),
+                "--no-shutdown-checkpoint-leases".into(),
+                "--lease-checkpoint-extension-secs".into(),
+                "180".into(),
+            ],
+            &env,
+            &path,
+        )?
+        .to_shutdown_config()?;
+        assert_eq!(cfg.drain_timeout_secs, 12);
+        assert_eq!(cfg.http_drain_timeout_secs, 4);
+        assert!(!cfg.checkpoint_leases_on_drain);
+        assert_eq!(cfg.lease_checkpoint_extension_secs, 180);
+
+        let cfg = ServerConfig::load_with(
+            &["--shutdown-checkpoint-leases".into()],
+            &env,
+            &path,
+        )?
+        .to_shutdown_config()?;
+        assert!(cfg.checkpoint_leases_on_drain);
+
+        let zero_timeouts = fixture.write(
+            "[shutdown]\n\
+             drain_timeout_secs = 0\n\
+             http_drain_timeout_secs = 0\n",
+        );
+        let zero_cfg =
+            ServerConfig::load_with(&[], |_| None, &zero_timeouts)?.to_shutdown_config()?;
+        assert_eq!(zero_cfg.drain_timeout_secs, 0);
+        assert_eq!(zero_cfg.http_drain_timeout_secs, 0);
+
+        for bad in [
+            "[shutdown]\ndrain_timeout_secs = 90000",
+            "[shutdown]\nhttp_drain_timeout_secs = 4000",
+            "[shutdown]\nlease_checkpoint_extension_secs = 0",
+            "[shutdown]\nlease_checkpoint_extension_secs = 700000",
+            "[shutdown]\nunknown_key = 1",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid shutdown config for {bad}"
             );
         }
         Ok(())
