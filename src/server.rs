@@ -411,7 +411,7 @@ impl Server {
     pub async fn graceful_drain(
         &self,
         signal: &str,
-        mut force_listener: Option<&mut ShutdownSignalListener>,
+        force_listener: Option<&mut ShutdownSignalListener>,
     ) -> DrainReport {
         let started = std::time::Instant::now();
         let cfg = self.shutdown.config();
