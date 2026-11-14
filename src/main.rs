@@ -190,6 +190,7 @@ async fn main() -> Result<()> {
     server
         .wakes()
         .set_server_url(&format!("http://{wake_host}:{}", runtime_info.http_port));
+    let _group_inactivity_worker = server.spawn_group_inactivity_worker();
     println!("  registration: {register_note}");
     println!(
         "  database:     {} (pool={}, busy={}ms, sync={}, autocheckpoint={}p)",

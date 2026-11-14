@@ -234,6 +234,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
             patch(update_group_membership).options(cors_preflight_or_404),
         )
         .route("/v1/groups/{name}/attach", post(attach_group))
+        .route("/v1/groups/{name}/heartbeat", post(group_heartbeat))
+        .route("/v1/groups/{name}/events", get(group_reassignment_events))
         .route(
             "/v1/groups/{name}/memory/{kind}",
             get(get_group_memory).post(write_group_memory),
@@ -620,6 +622,44 @@ async fn write_group_memory(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({"ok": true, "memory": memory})),
+    ))
+}
+
+async fn group_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let last_activity_at = state
+        .server
+        .groups()
+        .heartbeat(&name, &actor.nick, &actor.id)
+        .map_err(group_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(
+            json!({"ok": true, "group": name, "principal_id": actor.id, "last_activity_at": last_activity_at}),
+        ),
+    ))
+}
+
+async fn group_reassignment_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_request(&state, &headers)?;
+    let events = state
+        .server
+        .groups()
+        .reassignment_events(&name, &actor.nick)
+        .map_err(group_store_error)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({"ok": true, "events": events})),
     ))
 }
 
@@ -3498,6 +3538,7 @@ mod tests {
     include!("http_consensus_tests.rs");
     include!("http_group_memory_tests.rs");
     include!("http_attachment_tests.rs");
+    include!("http_group_activity_tests.rs");
 
     struct TemplateApi {
         server: Server,

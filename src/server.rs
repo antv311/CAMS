@@ -327,6 +327,44 @@ impl Server {
         &self.attachments
     }
 
+    /// Run once for deterministic tests, or from the background worker.
+    pub fn reassign_inactive_group_tasks(&self, now: i64) -> Result<usize> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let events = self.groups.reassign_inactive(now)?;
+        for event in &events {
+            let task = self.get_task_api(&event.task_id)?;
+            self.broadcast_task_event(
+                &task, "assign", "success", SERVER_NAME,
+                format!("TASK {} automatically reassigned from @{} to @{} after inactivity in group {}: {}",
+                    task.id, event.old_assignee, event.new_assignee, event.group, task.title),
+            )?;
+        }
+        Ok(events.len())
+    }
+
+    pub fn spawn_group_inactivity_worker(&self) -> tokio::task::JoinHandle<()> {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let worker = server.clone();
+                match tokio::task::spawn_blocking(move || {
+                    worker.reassign_inactive_group_tasks(unix_timestamp())
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    result => server.logger.log_error(
+                        "group.inactivity_error",
+                        format!("group inactivity sweep failed: {result:?}"),
+                    ),
+                }
+            }
+        })
+    }
+
     pub fn notes(&self) -> &NoteStore {
         &self.notes
     }

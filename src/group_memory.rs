@@ -28,7 +28,7 @@ pub enum GroupMemoryError {
 impl std::fmt::Display for GroupMemoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Forbidden => write!(f, "group memory requires a current named group member"),
+            Self::Forbidden => write!(f, "group access requires a current named group member"),
             Self::Conflict => write!(
                 f,
                 "group memory revision changed; read it again before editing"
@@ -40,7 +40,7 @@ impl std::fmt::Display for GroupMemoryError {
 impl std::error::Error for GroupMemoryError {}
 
 impl GroupStore {
-    fn authorize_memory(db: &Connection, name: &str, nick: &str) -> Result<()> {
+    pub(super) fn authorize_memory(db: &Connection, name: &str, nick: &str) -> Result<()> {
         let group = Self::get_locked(db, name)?
             .ok_or_else(|| GroupStoreError::GroupNotFound(name.to_string()))?;
         let member = std::iter::once(&group.definition.lead)

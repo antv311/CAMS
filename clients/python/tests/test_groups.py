@@ -74,6 +74,13 @@ class _HubCase(unittest.TestCase):
 
 
 class GroupModelTest(unittest.TestCase):
+    def test_inactivity_policy_round_trip_and_validation(self) -> None:
+        self.assertNotIn("inactivity_timeout_secs", Group.from_dict(GROUP_REPLY).to_dict())
+        self.assertEqual(Group.from_dict({**GROUP_REPLY, "inactivity_timeout_secs": 120}).to_dict()["inactivity_timeout_secs"], 120)
+        for invalid in (0, -1, True, "60", 1.5):
+            with self.subTest(invalid=invalid), self.assertRaises(AircdHttpError):
+                Group.from_dict({**GROUP_REPLY, "inactivity_timeout_secs": invalid}).to_dict()
+
     def test_consensus_policy_survives_group_round_trip(self) -> None:
         policy = {"peer_reviewers": ["lead", "peer"], "quorum": 1}
         group = Group.from_dict({**GROUP_REPLY, "review_policy": policy})
@@ -125,6 +132,18 @@ class TaskPayloadTest(unittest.TestCase):
 
 
 class GroupHttpClientTest(_HubCase):
+    def test_group_activity_uses_member_token_and_encoded_paths(self) -> None:
+        heartbeat = {"ok": True, "principal_id": "worker", "last_activity_at": 100}
+        events = [{"task_id": "task_1", "old_assignee": "a", "new_assignee": "b", "created_at": 100}]
+        self.reply((200, heartbeat), (200, {"events": events}))
+        hub = AircdHttpClient(self.url, token="member-token", invite="owner")
+        self.assertEqual(hub.group_heartbeat("dev team"), heartbeat)
+        self.assertEqual(hub.group_events("dev team"), events)
+        for req, endpoint in zip(self.hub.requests, ("heartbeat", "events")):
+            self.assertEqual(req["path"], f"/v1/groups/dev%20team/{endpoint}")
+            self.assertEqual(req["headers"].get("authorization"), "Bearer member-token")
+            self.assertNotIn("x-aircd-invite", req["headers"])
+
     def test_group_memory_uses_member_token_and_carries_revision_conflicts(self) -> None:
         memory = {"group": "dev équipe", "kind": "notes", "body": "context", "revision": 2}
         self.reply((200, {"memory": memory}), (200, {"memory": memory}), (409, {"error": "revision changed"}))
@@ -250,6 +269,20 @@ class GroupHttpClientTest(_HubCase):
 
 
 class GroupCliTest(_HubCase):
+    def test_activity_cli_and_membership_denial(self) -> None:
+        self.reply((200, {"ok": True, "principal_id": "worker", "last_activity_at": 100}),
+                   (200, {"events": [{"task_id": "task_1", "old_assignee": "a", "new_assignee": "b", "created_at": 100}]}),
+                   (403, {"error": "current named group member required"}))
+        code, out, err = self.run_cli("group", "heartbeat", "dev")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Recorded activity for @worker", out)
+        code, out, err = self.run_cli("group", "events", "dev")
+        self.assertEqual(code, 0, err)
+        self.assertIn("task_1: @a -> @b", out)
+        code, _, err = self.run_cli("group", "heartbeat", "dev")
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 403", err)
+
     """`airc group` and the task flags, run in-process against the fake hub."""
 
     def setUp(self) -> None:
@@ -602,6 +635,27 @@ class SubtaskCliIntegrationTest(unittest.TestCase):
         if check and proc.returncode != 0:
             raise AssertionError(f"airc {' '.join(args)} failed:\n{proc.stdout}\n{proc.stderr}")
         return proc
+
+    def test_group_activity_cli_against_real_hub(self) -> None:
+        for nick in ("activity-lead", "activity-worker", "activity-outsider"):
+            self.cli("--profile", nick, "register", "--nick", nick, "--invite", OWNER_KEY, "--no-default")
+        group = {"name": "activity team", "inactivity_timeout_secs": 60,
+                 "lead": {"template": "example", "model": "lead", "nick": "activity-lead"},
+                 "workers": [{"template": "example", "model": "worker", "nick": "activity-worker"}]}
+        path = Path(self.tmp.name) / "activity-group.json"
+        path.write_text(json.dumps(group), encoding="utf-8")
+        saved = json.loads(self.cli("--json", "group", "create", group["name"], "--file", str(path), "--invite", OWNER_KEY).stdout)["group"]
+        self.assertEqual(saved["inactivity_timeout_secs"], 60)
+        beat = json.loads(self.cli("--profile", "activity-worker", "--json", "group", "heartbeat", group["name"]).stdout)
+        self.assertEqual(beat["principal_id"], "activity-worker")
+        self.assertLessEqual(abs(time.time() - beat["last_activity_at"]), 5)
+        events = json.loads(self.cli("--profile", "activity-lead", "--json", "group", "events", group["name"]).stdout)
+        self.assertEqual(events["events"], [])
+        self.assertEqual(self.cli("--profile", "activity-outsider", "group", "heartbeat", group["name"], check=False).returncode, 1)
+        group["inactivity_timeout_secs"] = None
+        path.write_text(json.dumps(group), encoding="utf-8")
+        disabled = json.loads(self.cli("--json", "group", "create", group["name"], "--file", str(path), "--invite", OWNER_KEY).stdout)["group"]
+        self.assertNotIn("inactivity_timeout_secs", disabled)
 
     def test_subtask_flags_and_review_report(self) -> None:
         self.cli("project", "create", "#grp")
