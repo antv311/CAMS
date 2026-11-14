@@ -79,18 +79,24 @@ fn group_prompt_interpolates_only_event_task_and_preserves_literal_values() -> R
     let (wakes, groups, cfg, mut ctx) = setup()?;
     groups.upsert(definition("dev")?)?;
     groups.attach("dev", "#one")?;
-    let task = TaskStore::new(wakes.db.clone(), 0).create_full(NewTask {
+    let tasks = TaskStore::new(wakes.db.clone(), 0);
+    let parent = tasks.create_full(NewTask {
+        channel: "#one".into(),
+        title: "Parent".into(),
+        ..Default::default()
+    })?;
+    let task = tasks.create_full(NewTask {
         channel: "#one".into(),
         title: "Implement {task_body}".into(),
         body: Some("Keep {nick} {prompt} {role} and café; $(literal)".into()),
-        parent_task_id: Some("parent-1".into()),
+        parent_task_id: Some(parent.id.clone()),
         reviewer: Some("lead".into()),
         ..Default::default()
     })?;
     ctx.task_id = Some(task.id.clone());
     let values = vars(&wakes, &cfg, &ctx)?;
     assert_eq!(values["prompt"], format!(
-        "WORKER Worker dev group worker #one #one-s1\n{}: Implement {{task_body}}\nKeep {{nick}} {{prompt}} {{role}} and café; $(literal)\nparent-1 lead\nliteral {{task_id}} {{prompt}} café\nrepo/{{nick}}\n{{unknown}}", task.id));
+        "WORKER Worker dev group worker #one #one-s1\n{}: Implement {{task_body}}\nKeep {{nick}} {{prompt}} {{role}} and café; $(literal)\n{} lead\nliteral {{task_id}} {{prompt}} café\nrepo/{{nick}}\n{{unknown}}", task.id, parent.id));
     ctx.channel = "#two".into();
     let values = vars(&wakes, &cfg, &ctx)?;
     assert_eq!(values["task_body"], "");
