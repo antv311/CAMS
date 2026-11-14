@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
+use crate::store::SharedConnection;
 
 const ALLOWED_STATUSES: &[&str] = &[
     "info",
@@ -34,7 +34,7 @@ pub struct Report {
 
 #[derive(Clone)]
 pub struct ReportStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
 }
 
 pub struct NewReport<'a> {
@@ -51,7 +51,7 @@ pub struct NewReport<'a> {
 }
 
 impl ReportStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self { db }
     }
 
@@ -82,7 +82,7 @@ impl ReportStore {
 
         let id = format!("rep_{}", Uuid::new_v4().simple());
         let created_at = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
 
         db.execute(
             "INSERT INTO reports
@@ -109,7 +109,7 @@ impl ReportStore {
     }
 
     pub fn get(&self, report_id: &str) -> Result<Option<Report>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         Self::get_locked(&db, report_id)
     }
 
@@ -120,7 +120,7 @@ impl ReportStore {
         limit: i64,
     ) -> Result<Vec<Report>> {
         let capped = limit.clamp(1, 200);
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT r.id, r.author_id, COALESCE(p.nick, r.author_id), r.channel, r.title,

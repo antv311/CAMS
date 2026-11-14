@@ -9,13 +9,14 @@ use serde::Serialize;
 use sha2::Sha256;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
 use crate::logging::EventForwarder;
+use crate::store::SharedConnection;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -75,7 +76,7 @@ pub struct WebhookEvent {
 
 #[derive(Clone)]
 pub struct WebhookStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     notify: Arc<Notify>,
     http_client: reqwest::Client,
     logger: EventForwarder,
@@ -83,11 +84,11 @@ pub struct WebhookStore {
 
 impl WebhookStore {
     #[allow(dead_code)]
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self::with_logger(db, EventForwarder::default())
     }
 
-    pub fn with_logger(db: Arc<Mutex<Connection>>, logger: EventForwarder) -> Self {
+    pub fn with_logger(db: SharedConnection, logger: EventForwarder) -> Self {
         let http_client = reqwest::Client::builder()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(10))
@@ -116,7 +117,7 @@ impl WebhookStore {
         let events_json = serde_json::to_string(&clean_events)?;
         let now = unix_timestamp();
 
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let existing_secret: Option<String> = db
             .query_row(
                 "SELECT secret FROM webhooks WHERE principal_id = ?1",
@@ -150,7 +151,7 @@ impl WebhookStore {
     }
 
     pub fn delete(&self, principal_id: &str) -> Result<bool> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let removed = db
             .execute(
                 "DELETE FROM webhooks WHERE principal_id = ?1",
@@ -161,12 +162,12 @@ impl WebhookStore {
     }
 
     pub fn get(&self, principal_id: &str) -> Result<Option<WebhookConfig>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         Self::get_locked(&db, principal_id)
     }
 
     pub fn configured_principals(&self) -> Result<HashSet<String>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut stmt = db.prepare("SELECT principal_id FROM webhooks WHERE enabled = 1")?;
         let ids = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -176,7 +177,7 @@ impl WebhookStore {
 
     pub fn list_deliveries(&self, principal_id: &str, limit: i64) -> Result<Vec<DeliveryRecord>> {
         let capped = limit.clamp(1, 100);
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut stmt = db
             .prepare(
                 "SELECT id, principal_id, event_type, channel, status, attempts, http_status,
@@ -207,11 +208,11 @@ impl WebhookStore {
         let member_set: HashSet<&str> = channel_members.iter().map(String::as_str).collect();
 
         let configs = {
-            let db = self.db.lock().expect("sqlite mutex poisoned");
+            let db = self.db.read()?;
             Self::list_enabled_locked(&db)?
         };
 
-        let mut queued = 0usize;
+        let mut pending = Vec::new();
         let now = unix_timestamp();
 
         for cfg in configs {
@@ -283,16 +284,21 @@ impl WebhookStore {
                 "lock": per_recipient.lock,
             });
             let payload_json = serde_json::to_string(&payload)?;
+            pending.push((delivery_id, cfg.principal_id, effective_event, payload_json));
+        }
 
-            {
-                let db = self.db.lock().expect("sqlite mutex poisoned");
-                db.execute(
+        let queued = pending.len();
+        if queued > 0 {
+            let mut db = self.db.write()?;
+            let tx = db.transaction().context("begin webhook enqueue tx")?;
+            for (delivery_id, principal_id, effective_event, payload_json) in pending {
+                tx.execute(
                     "INSERT INTO webhook_deliveries
                      (id, principal_id, event_type, channel, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?6, ?6)",
                     params![
                         delivery_id,
-                        cfg.principal_id,
+                        principal_id,
                         effective_event,
                         event.channel,
                         payload_json,
@@ -301,10 +307,7 @@ impl WebhookStore {
                 )
                 .context("enqueue webhook delivery")?;
             }
-            queued += 1;
-        }
-
-        if queued > 0 {
+            tx.commit().context("commit webhook enqueue tx")?;
             self.notify.notify_waiters();
         }
         Ok(queued)
@@ -332,7 +335,7 @@ impl WebhookStore {
         let payload_json = serde_json::to_string(&payload)?;
 
         {
-            let db = self.db.lock().expect("sqlite mutex poisoned");
+            let db = self.db.write()?;
             db.execute(
                 "INSERT INTO webhook_deliveries
                  (id, principal_id, event_type, channel, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
@@ -357,7 +360,7 @@ impl WebhookStore {
                     .ok_or_else(|| anyhow!("missing test delivery row"))
             }
             Err((status_code, err_msg)) => {
-                let db = self.db.lock().expect("sqlite mutex poisoned");
+                let db = self.db.write()?;
                 let ts = unix_timestamp();
                 db.execute(
                     "UPDATE webhook_deliveries
@@ -395,7 +398,7 @@ impl WebhookStore {
         loop {
             let now = unix_timestamp();
             let batch: Vec<(String, String, String, String, String, i64, String, String)> = {
-                let db = self.db.lock().expect("sqlite mutex poisoned");
+                let db = self.db.read()?;
                 let mut stmt = db.prepare(
                     "SELECT d.id, d.principal_id, d.event_type, d.payload_json, w.url, d.attempts, w.secret, d.channel
                      FROM webhook_deliveries d
@@ -497,7 +500,7 @@ impl WebhookStore {
         status_code: i64,
     ) -> Result<()> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "UPDATE webhook_deliveries
              SET status = 'delivered', attempts = attempts + 1, http_status = ?2, last_error = NULL, updated_at = ?3
@@ -529,7 +532,7 @@ impl WebhookStore {
             ("pending", now + backoff)
         };
 
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "UPDATE webhook_deliveries
              SET status = ?2, attempts = ?3, next_attempt_at = ?4, http_status = ?5, last_error = ?6, updated_at = ?7
@@ -554,7 +557,7 @@ impl WebhookStore {
     }
 
     fn get_delivery(&self, id: &str) -> Result<Option<DeliveryRecord>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             "SELECT id, principal_id, event_type, channel, status, attempts, http_status,
                     last_error, created_at, updated_at

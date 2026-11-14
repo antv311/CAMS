@@ -8,7 +8,7 @@
 //! built in.
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Stdio;
@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::history::unix_timestamp;
 use crate::logging::EventForwarder;
+use crate::store::SharedConnection;
 
 pub const DEFAULT_PROMPT: &str = "You are @{nick} on the aircd coordination hub at {server}. \
 You were woken because: {reason}. Read your notes with `airc --profile {nick} notes show`, then \
@@ -187,7 +188,7 @@ struct DmWakeState {
 
 #[derive(Clone)]
 pub struct WakeManager {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     slots: Arc<Mutex<HashMap<String, Slot>>>,
     dm_states: Arc<Mutex<HashMap<String, DmWakeState>>>,
     server_url: Arc<Mutex<String>>,
@@ -443,11 +444,11 @@ mod prompt_tests;
 
 impl WakeManager {
     #[allow(dead_code)]
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self::with_logger(db, EventForwarder::default())
     }
 
-    pub fn with_logger(db: Arc<Mutex<Connection>>, logger: EventForwarder) -> Self {
+    pub fn with_logger(db: SharedConnection, logger: EventForwarder) -> Self {
         Self {
             db,
             slots: Arc::new(Mutex::new(HashMap::new())),
@@ -523,7 +524,7 @@ impl WakeManager {
     }
 
     pub fn upsert(&self, principal_id: &str, input: WakeConfigInput) -> Result<WakeConfig> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let saved = Self::upsert_on(&db, principal_id, input)?;
         drop(db);
         // A changed launcher (another account or model) may have quota left.
@@ -624,7 +625,7 @@ impl WakeManager {
     }
 
     pub fn delete(&self, principal_id: &str) -> Result<bool> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let changed = db
             .execute(
                 "DELETE FROM wake_configs WHERE principal_id = ?1",
@@ -642,7 +643,7 @@ impl WakeManager {
     }
 
     pub fn get(&self, principal_id: &str) -> Result<Option<WakeConfig>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             "SELECT principal_id, command, args_json, cwd, env_json, prompt, enabled,
                     cooldown_seconds, timeout_seconds, max_runs_per_hour, updated_at,
@@ -657,7 +658,7 @@ impl WakeManager {
 
     /// The stored conversation id for an account (and project, when scoped).
     pub fn session(&self, principal_id: &str, scope_key: &str) -> Result<Option<String>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             "SELECT session_id FROM wake_sessions WHERE principal_id = ?1 AND scope_key = ?2",
             params![principal_id, scope_key],
@@ -668,7 +669,7 @@ impl WakeManager {
     }
 
     fn store_session(&self, principal_id: &str, scope_key: &str, session_id: &str) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "INSERT INTO wake_sessions (principal_id, scope_key, session_id, updated_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -683,7 +684,7 @@ impl WakeManager {
     /// Forget stored conversations so the next launch starts a new one.
     /// `scope_key = None` forgets every conversation of the account.
     pub fn clear_sessions(&self, principal_id: &str, scope_key: Option<&str>) -> Result<usize> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let removed = db
             .execute(
                 "DELETE FROM wake_sessions
@@ -696,7 +697,7 @@ impl WakeManager {
 
     /// Every configured launcher.
     pub fn list(&self) -> Result<Vec<WakeConfig>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT principal_id, command, args_json, cwd, env_json, prompt, enabled,
@@ -713,7 +714,7 @@ impl WakeManager {
 
     /// Switch an account's launcher on or off without touching its settings.
     pub fn set_enabled(&self, principal_id: &str, enabled: bool) -> Result<bool> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let changed = db
             .execute(
                 "UPDATE wake_configs SET enabled = ?1, updated_at = ?2 WHERE principal_id = ?3",
@@ -739,7 +740,7 @@ impl WakeManager {
         if clean.is_empty() {
             return Ok(false);
         }
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let enabled: Option<i64> = db
             .query_row(
                 "SELECT enabled FROM wake_configs WHERE lower(principal_id) = ?1",
@@ -821,7 +822,7 @@ impl WakeManager {
 
     /// Accounts that currently have an enabled launcher.
     pub fn enabled_principals(&self) -> Result<Vec<String>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare("SELECT principal_id FROM wake_configs WHERE enabled = 1")
             .context("prepare enabled wake configs")?;
@@ -832,7 +833,7 @@ impl WakeManager {
     }
 
     pub fn runs(&self, principal_id: Option<&str>, limit: i64) -> Result<Vec<WakeRun>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT id, principal_id, reason, channel, task_id, status, exit_code,
@@ -1233,7 +1234,7 @@ impl WakeManager {
     }
 
     fn count_runs_since(&self, principal_id: &str, since: i64) -> Result<i64> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             "SELECT COUNT(*) FROM wake_runs
              WHERE principal_id = ?1 AND started_at >= ?2 AND status != 'skipped'",
@@ -1254,7 +1255,7 @@ impl WakeManager {
         exit_code: Option<i64>,
         log_tail: Option<&str>,
     ) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "INSERT INTO wake_runs
                (id, principal_id, reason, channel, task_id, status, exit_code,
@@ -1284,7 +1285,7 @@ impl WakeManager {
         exit_code: Option<i64>,
         log_tail: Option<&str>,
     ) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "UPDATE wake_runs
              SET status = ?1, exit_code = ?2, finished_at = ?3, log_tail = ?4

@@ -254,6 +254,10 @@ impl Server {
         &self.backups
     }
 
+    pub fn db(&self) -> &SharedConnection {
+        &self.db
+    }
+
     /// Commit the credential reset before invalidating the active IRC session.
     /// Registration and IRC command effects cannot straddle this operation.
     pub fn reissue_token(&self, principal_id: &str) -> Result<String> {
@@ -2275,7 +2279,7 @@ impl Server {
 
         // A failed launcher/membership write must not strand an account whose
         // only token was never returned to the caller. Nothing launches here.
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut db = self.db.write()?;
         let tx = db.transaction().context("start worker provisioning")?;
         let (principal, token) = AuthStore::register_principal_on(&tx, nick, None, None)?;
         let wake = WakeManager::upsert_on(&tx, &principal.id, template.launcher_for(model))?;
@@ -3374,7 +3378,7 @@ impl Server {
     }
 
     fn channel_member_ids(&self, channel: &str) -> Result<Vec<String>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut stmt =
             db.prepare("SELECT principal_id FROM channel_memberships WHERE channel = ?1")?;
         let rows = stmt
@@ -3384,7 +3388,7 @@ impl Server {
     }
 
     fn channel_member_directory(&self, channel: &str) -> Result<Vec<(String, String, String)>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut stmt = db.prepare(
             "SELECT m.principal_id, COALESCE(p.nick, m.principal_id), COALESCE(p.role, 'member')
              FROM channel_memberships m
@@ -3481,7 +3485,7 @@ impl Server {
         };
 
         if should_mark_disconnected {
-            let db = self.db.lock().expect("sqlite mutex poisoned");
+            let db = self.db.write()?;
             db.execute(
                 "UPDATE principals SET disconnected_at = ?1 WHERE id = ?2",
                 params![unix_timestamp(), principal.id],
@@ -3518,7 +3522,7 @@ impl Server {
 
     fn mark_connected_and_memberships(&self, principal_id: &str) -> Result<Vec<Membership>> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "UPDATE principals SET connected_at = ?1, disconnected_at = NULL WHERE id = ?2",
             params![now, principal_id],
@@ -3539,7 +3543,7 @@ impl Server {
     }
 
     fn memberships(&self, principal_id: &str) -> Result<Vec<Membership>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db.prepare(
             "SELECT channel, last_seen_seq FROM channel_memberships WHERE principal_id = ?1 ORDER BY channel",
         )?;
@@ -3555,7 +3559,7 @@ impl Server {
     }
 
     fn add_membership(&self, principal_id: &str, channel: &str) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let current_channel_seq: i64 = db.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE channel = ?1",
             params![channel],
@@ -3570,7 +3574,7 @@ impl Server {
     }
 
     fn remove_membership(&self, principal_id: &str, channel: &str) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "DELETE FROM channel_memberships WHERE principal_id = ?1 AND channel = ?2",
             params![principal_id, channel],
@@ -3579,7 +3583,7 @@ impl Server {
     }
 
     fn is_member(&self, principal_id: &str, channel: &str) -> Result<bool> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let count: i64 = db.query_row(
             "SELECT COUNT(*) FROM channel_memberships WHERE principal_id = ?1 AND channel = ?2",
             params![principal_id, channel],
@@ -3593,7 +3597,7 @@ impl Server {
             return Ok(SERVER_NAME.to_string());
         }
 
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let nick = db.query_row(
             "SELECT nick FROM principals WHERE id = ?1",
             params![principal_id],
@@ -3604,7 +3608,7 @@ impl Server {
     }
 
     fn mark_seen(&self, principal_id: &str, channel: &str, seq: i64) -> Result<()> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "UPDATE principals
              SET last_seen_seq = MAX(last_seen_seq, ?1)

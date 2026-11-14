@@ -8,9 +8,9 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
 
 use crate::history::unix_timestamp;
+use crate::store::SharedConnection;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Room {
@@ -27,19 +27,19 @@ pub struct Room {
 
 #[derive(Clone)]
 pub struct RoomStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
 }
 
 const ROOM_COLUMNS: &str = "channel, project, label, title, opened_by, opened_at";
 
 impl RoomStore {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: SharedConnection) -> Self {
         Self { db }
     }
 
     /// Open the next sprint room of `project`.
     pub fn open(&self, project: &str, title: Option<&str>, opened_by: &str) -> Result<Room> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let existing: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM rooms WHERE project = ?1",
@@ -77,13 +77,13 @@ impl RoomStore {
     }
 
     pub fn get(&self, channel: &str) -> Result<Option<Room>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         Self::get_locked(&db, channel)
     }
 
     /// Rooms of one project, or of every project, oldest first.
     pub fn list(&self, project: Option<&str>) -> Result<Vec<Room>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!(
                 "SELECT {ROOM_COLUMNS} FROM rooms

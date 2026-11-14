@@ -3,12 +3,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
+pub use crate::db::{SharedConnection, SqlitePoolConfig, WalCheckpointMode};
 use crate::history::unix_timestamp;
 use crate::tokens;
-
-pub type SharedConnection = Arc<Mutex<Connection>>;
 
 /// A reusable seat definition. Counts describe workers; the lead has one seat.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +109,7 @@ impl GroupStore {
                 ));
             }
         }
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "INSERT INTO groups
                (name, description, lead_json, workers_json, lead_prompt, worker_prompt,
@@ -137,7 +135,7 @@ impl GroupStore {
 
     pub fn get(&self, name: &str) -> Result<Option<Group>> {
         let name = group_name(name)?;
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         Self::get_locked(&db, name)
     }
 
@@ -196,7 +194,7 @@ impl GroupStore {
         {
             validate_group_member(member)?;
         }
-        let mut db = self.db.lock().expect("sqlite mutex poisoned");
+        let mut db = self.db.write()?;
         // Reserve the write before reading, including across separate DB connections.
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut group = Self::get_locked(&tx, name)?
@@ -255,7 +253,7 @@ impl GroupStore {
     }
 
     pub fn list(&self) -> Result<Vec<Group>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db.prepare("SELECT name FROM groups ORDER BY name ASC")?;
         let names = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -280,7 +278,7 @@ impl GroupStore {
                 "project channel must start with '#' and contain no whitespace"
             ));
         }
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let group = Self::get_locked(&db, name)?
             .ok_or_else(|| GroupStoreError::GroupNotFound(name.to_string()))?;
         let exists: bool = db.query_row(
@@ -309,7 +307,7 @@ impl GroupStore {
 
     pub fn delete(&self, name: &str) -> Result<bool> {
         let name = group_name(name)?;
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let tx = db.unchecked_transaction()?;
         tx.execute("DELETE FROM group_projects WHERE group_name = ?1", [name])?;
         let changed = tx.execute("DELETE FROM groups WHERE name = ?1", [name])?;
@@ -502,7 +500,7 @@ impl ClientTemplateStore {
         {
             return Err(anyhow!("models_command must start with the program to run"));
         }
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "INSERT INTO client_templates
                (id, name, command, args_json, cwd, env_json, prompt, session_mode,
@@ -545,13 +543,13 @@ impl ClientTemplateStore {
 
     pub fn get(&self, id: &str) -> Result<Option<ClientTemplate>> {
         let id = client_template_id(id)?;
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         Self::get_locked(&db, id)
     }
 
     /// Stable directory order, independent of insertion or update order.
     pub fn list(&self) -> Result<Vec<ClientTemplate>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!("{CLIENT_TEMPLATE_SELECT} ORDER BY id ASC"))
             .context("prepare client template list")?;
@@ -565,7 +563,7 @@ impl ClientTemplateStore {
     /// Returns false when no template exists. Existing workers are untouched.
     pub fn delete(&self, id: &str) -> Result<bool> {
         let id = client_template_id(id)?;
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let changed = db
             .execute("DELETE FROM client_templates WHERE id = ?1", params![id])
             .context("delete client template")?;
@@ -712,11 +710,20 @@ const DEMO_PRINCIPALS: &[(&str, &str, &str)] = &[
     ("agent-3", "test-token-3", "test"),
 ];
 
+#[allow(dead_code)]
 pub fn open(path: impl AsRef<Path>) -> Result<SharedConnection> {
-    let seed_demo = path.as_ref() == Path::new(":memory:") || demo_seed_requested();
-    let connection = Connection::open(path).context("open sqlite database")?;
-    init_with(&connection, seed_demo)?;
-    Ok(Arc::new(Mutex::new(connection)))
+    open_with_config(path, SqlitePoolConfig::default())
+}
+
+pub fn open_with_config(
+    path: impl AsRef<Path>,
+    config: SqlitePoolConfig,
+) -> Result<SharedConnection> {
+    let path_ref = path.as_ref();
+    let seed_demo = path_ref == Path::new(":memory:") || demo_seed_requested();
+    SharedConnection::open_pool(path_ref, config, |connection| {
+        init_with(connection, seed_demo)
+    })
 }
 
 fn demo_seed_requested() -> bool {
@@ -1295,6 +1302,7 @@ fn backfill_principal_tokens(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn group_input(name: &str) -> GroupInput {
         serde_json::from_value(serde_json::json!({
@@ -1604,7 +1612,7 @@ mod tests {
             )?;
             init_with(&connection, false)?;
             init_with(&connection, false)?;
-            let db = Arc::new(Mutex::new(connection));
+            let db = SharedConnection::from_connection(connection);
             let groups = GroupStore::new(db);
             groups.upsert(group_input("dev"))?;
             groups.attach("dev", "#legacy")?;
@@ -1660,7 +1668,7 @@ mod tests {
     fn template_store() -> Result<ClientTemplateStore> {
         let connection = Connection::open_in_memory()?;
         init_with(&connection, false)?;
-        Ok(ClientTemplateStore::new(Arc::new(Mutex::new(connection))))
+        Ok(ClientTemplateStore::new(SharedConnection::from_connection(connection)))
     }
 
     #[test]
@@ -1684,7 +1692,7 @@ mod tests {
             )?;
             assert_eq!(definition, ("TEXT".to_string(), 0));
         }
-        let tasks = crate::tasks::TaskStore::new(Arc::new(Mutex::new(connection)), 60);
+        let tasks = crate::tasks::TaskStore::new(SharedConnection::from_connection(connection), 60);
         let legacy = tasks.get("legacy")?.unwrap();
         assert_eq!(legacy.title, "Keep me");
         assert_eq!(legacy.status, "claimed");
@@ -1959,7 +1967,7 @@ mod tests {
         )?;
         init_with(&connection, false)?;
         init_with(&connection, false)?;
-        let store = ClientTemplateStore::new(Arc::new(Mutex::new(connection)));
+        let store = ClientTemplateStore::new(SharedConnection::from_connection(connection));
         let old = store.get("old")?.unwrap();
         assert!(old.models.is_empty() && old.models_command.is_empty());
         assert_eq!((old.created_at, old.updated_at), (5, 6));
@@ -1983,7 +1991,7 @@ mod tests {
                 NULL, 1, 20, 1800, 12, 123);",
         )?;
         init_with(&connection, false)?;
-        let store = ClientTemplateStore::new(Arc::new(Mutex::new(connection)));
+        let store = ClientTemplateStore::new(SharedConnection::from_connection(connection));
         assert!(
             store.list()?.is_empty(),
             "templates are defined by the owner"
@@ -2061,7 +2069,7 @@ mod tests {
         init_with(&connection, false)?;
         init_with(&connection, false)?; // idempotent
 
-        let shared: SharedConnection = Arc::new(Mutex::new(connection));
+        let shared: SharedConnection = SharedConnection::from_connection(connection);
         let auth = crate::auth::AuthStore::new(shared.clone());
         for (_id, token, _team) in DEMO_PRINCIPALS {
             assert!(

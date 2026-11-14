@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
+use crate::store::SharedConnection;
 
 /// Statuses after which a task no longer appears in lists or inboxes.
 pub const TERMINAL_STATUSES: &[&str] = &["done", "merged", "cancelled"];
@@ -107,7 +107,7 @@ const QUESTION_COLUMNS: &str = "id, task_id, channel, asked_by, question, status
 
 #[derive(Clone)]
 pub struct TaskStore {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     lease_seconds: i64,
 }
 
@@ -130,7 +130,7 @@ fn clean_opt(value: Option<String>) -> Option<String> {
 }
 
 impl TaskStore {
-    pub fn new(db: Arc<Mutex<Connection>>, lease_seconds: i64) -> Self {
+    pub fn new(db: SharedConnection, lease_seconds: i64) -> Self {
         Self { db, lease_seconds }
     }
 
@@ -149,7 +149,7 @@ impl TaskStore {
         let assignee = clean_opt(new.assignee);
         let status = if assignee.is_some() { "assigned" } else { "open" };
 
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         db.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
                                 body, kind, assignee, created_by, repo, branch, issue_url,
@@ -179,7 +179,7 @@ impl TaskStore {
     }
 
     pub fn get(&self, task_id: &str) -> Result<Option<Task>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         db.query_row(
             &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
             params![task_id],
@@ -191,7 +191,7 @@ impl TaskStore {
 
     /// Include completed children so a lead can account for the whole decomposition.
     pub fn children(&self, parent_id: &str) -> Result<Vec<Task>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db.prepare(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at, rowid"
         ))?;
@@ -204,7 +204,7 @@ impl TaskStore {
     pub fn claim(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
         let lease_expires_at = now + self.lease_seconds;
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
 
         // Only the lease-based flow is claimable; assigned work has an owner.
         let changed = db
@@ -231,7 +231,7 @@ impl TaskStore {
 
     pub fn done(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
 
         let changed = db
             .execute(
@@ -251,7 +251,7 @@ impl TaskStore {
 
     pub fn release(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
 
         let changed = db
             .execute(
@@ -274,7 +274,7 @@ impl TaskStore {
     /// changes requested keeps that status so the new owner sees where it is.
     pub fn assign(&self, task_id: &str, assignee: Option<&str>, actor_id: &str) -> Result<Task> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let current = Self::get_locked(&db, task_id)?;
         if TERMINAL_STATUSES.contains(&current.status.as_str()) {
             return Err(anyhow!("task is {} and cannot be reassigned", current.status));
@@ -321,7 +321,7 @@ impl TaskStore {
             return Err(anyhow!("unknown task status '{to}'"));
         }
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let changed = db
             .execute(
                 "UPDATE tasks
@@ -349,7 +349,7 @@ impl TaskStore {
     /// The assignee is stuck: record the question and park the task.
     pub fn ask(&self, task_id: &str, actor_id: &str, question: &str) -> Result<(Task, TaskQuestion)> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let current = Self::get_locked(&db, task_id)?;
         if !matches!(
             current.status.as_str(),
@@ -388,14 +388,14 @@ impl TaskStore {
 
     /// The unanswered question on a task, if any.
     pub fn pending_question(&self, task_id: &str) -> Result<Option<TaskQuestion>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         Self::pending_question_locked(&db, task_id)
     }
 
     /// Answer the pending question and put the task back where it was.
     pub fn answer(&self, task_id: &str, actor_id: &str, answer: &str) -> Result<(Task, TaskQuestion)> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let question = Self::pending_question_locked(&db, task_id)?
             .ok_or_else(|| anyhow!("task has no unanswered question"))?;
         db.execute(
@@ -453,7 +453,7 @@ impl TaskStore {
         to: &str,
     ) -> Result<TaskQuestion> {
         let now = unix_timestamp();
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.write()?;
         let question = Self::pending_question_locked(&db, task_id)?
             .filter(|q| q.status == "open" || (to == "escalated" && q.status == "escalated_pm"))
             .ok_or_else(|| anyhow!("task has no open question to escalate"))?;
@@ -481,7 +481,7 @@ impl TaskStore {
 
     /// Questions with `status`, in one channel or everywhere.
     pub fn questions(&self, channel: Option<&str>, status: &str) -> Result<Vec<TaskQuestion>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!(
                 "SELECT {QUESTION_COLUMNS} FROM task_questions
@@ -536,7 +536,7 @@ impl TaskStore {
     }
 
     pub fn list(&self, channel: &str) -> Result<Vec<Task>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}
@@ -555,7 +555,7 @@ impl TaskStore {
 
     /// Open work owned by `principal_id`, across every channel.
     pub fn inbox(&self, principal_id: &str) -> Result<Vec<Task>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}
@@ -573,7 +573,7 @@ impl TaskStore {
 
     /// Tasks waiting for review in `channel`.
     pub fn review_queue(&self, channel: &str) -> Result<Vec<Task>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}
@@ -589,7 +589,7 @@ impl TaskStore {
     }
 
     pub fn events(&self, task_id: &str) -> Result<Vec<TaskEvent>> {
-        let db = self.db.lock().expect("sqlite mutex poisoned");
+        let db = self.db.read()?;
         let mut statement = db
             .prepare(
                 "SELECT task_id, actor_id, action, from_status, to_status, note, created_at

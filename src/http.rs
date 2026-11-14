@@ -19,7 +19,7 @@ use crate::logging::{LogEvent, Severity};
 use crate::server::{Server, SpawnError};
 use crate::store::{
     ClientTemplate, ClientTemplateInput, GroupInput, GroupMember, GroupMembershipUpdate,
-    GroupStoreError,
+    GroupStoreError, WalCheckpointMode,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -223,6 +223,8 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/owner/accounts", post(owner_create_account))
         .route("/v1/owner/backups", get(owner_list_backups))
         .route("/v1/owner/backup", post(owner_backup_action))
+        .route("/v1/owner/db", get(owner_db_status))
+        .route("/v1/owner/db/checkpoint", post(owner_db_checkpoint))
         .route("/v1/login", post(login_agent))
         .route("/v1/me", get(get_me))
         .route("/v1/templates", get(list_templates))
@@ -1300,6 +1302,61 @@ async fn owner_backup_action(
             "unsupported backup action '{other}': expected run, verify, or list"
         ))),
     }
+}
+
+#[derive(Deserialize, Default)]
+struct OwnerDbCheckpointReq {
+    invite: Option<String>,
+    mode: Option<String>,
+}
+
+async fn owner_db_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_owner(&state, &headers, None)?;
+    let db = state.server.db().clone();
+    let diagnostics = tokio::task::spawn_blocking(move || db.diagnostics())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "diagnostics": diagnostics,
+        })),
+    ))
+}
+
+async fn owner_db_checkpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OwnerDbCheckpointReq>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    require_owner(&state, &headers, req.invite.as_deref())?;
+    let mode = WalCheckpointMode::parse(req.mode.as_deref().unwrap_or("passive"))
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let db = state.server.db().clone();
+    let (checkpoint, diagnostics) = tokio::task::spawn_blocking(move || {
+        let checkpoint = db.checkpoint(mode)?;
+        let diagnostics = db.diagnostics()?;
+        anyhow::Ok((checkpoint, diagnostics))
+    })
+    .await
+    .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+    .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "checkpoint": checkpoint,
+            "diagnostics": diagnostics,
+        })),
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -6488,6 +6545,137 @@ mod tests {
         assert_eq!(verify_json["verification"]["ok"], true);
         assert_eq!(verify_json["verification"]["key_ring_verified"], true);
 
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_db_diagnostics_checkpoint_and_concurrent_burst_work() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("aircd-http-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let db_path = dir.join("hub.sqlite3");
+        let sqlite_cfg = crate::db::SqlitePoolConfig {
+            read_pool_size: 4,
+            busy_timeout_ms: 4000,
+            synchronous: crate::db::SqliteSynchronous::Normal,
+            wal_autocheckpoint: 256,
+            cache_size_kib: 4096,
+            journal_size_limit_bytes: 16_777_216,
+        };
+        let db = store::open_with_config(&db_path, sqlite_cfg)?;
+        let server = Server::new(db);
+        let owner_secret = "owner-db-secret";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut info = build_runtime_info("127.0.0.1:6667", &addr.to_string(), None);
+        info.register_key = Some(owner_secret.to_string());
+        let app = router(server.clone(), info);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // Unauthenticated owner db calls are rejected.
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/owner/db"))
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Register several agents and fire concurrent reads + writes simulating a wake burst.
+        let mut tokens = Vec::new();
+        for i in 0..8 {
+            let resp: serde_json::Value = client
+                .post(format!("{base}/v1/register"))
+                .header("X-AirCD-Invite", owner_secret)
+                .json(&json!({ "nick": format!("burst-{i}") }))
+                .send()
+                .await?
+                .json()
+                .await?;
+            assert_eq!(resp["ok"], true);
+            tokens.push(resp["token"].as_str().unwrap().to_string());
+        }
+
+        let mut tasks = Vec::new();
+        for (idx, token) in tokens.into_iter().enumerate() {
+            let client = client.clone();
+            let base = base.clone();
+            tasks.push(tokio::spawn(async move {
+                let post_resp = client
+                    .post(format!("{base}/v1/messages"))
+                    .bearer_auth(&token)
+                    .json(&json!({ "channel": "#general", "body": format!("wake burst {idx}") }))
+                    .send()
+                    .await?;
+                assert_eq!(post_resp.status(), StatusCode::CREATED);
+
+                for _ in 0..3 {
+                    let list_resp = client
+                        .get(format!("{base}/v1/messages?channel=%23general&limit=20"))
+                        .bearer_auth(&token)
+                        .send()
+                        .await?;
+                    assert_eq!(list_resp.status(), StatusCode::OK);
+                    let inbox_resp = client
+                        .get(format!("{base}/v1/inbox"))
+                        .bearer_auth(&token)
+                        .send()
+                        .await?;
+                    assert_eq!(inbox_resp.status(), StatusCode::OK);
+                }
+                anyhow::Ok(())
+            }));
+        }
+        for task in tasks {
+            task.await??;
+        }
+
+        let db_json: serde_json::Value = client
+            .get(format!("{base}/v1/owner/db"))
+            .header("X-AirCD-Invite", owner_secret)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(db_json["ok"], true);
+        assert_eq!(db_json["diagnostics"]["pragmas"]["journal_mode"], "wal");
+        assert_eq!(db_json["diagnostics"]["pragmas"]["synchronous"], "normal");
+        assert_eq!(db_json["diagnostics"]["pragmas"]["busy_timeout_ms"], 4000);
+        assert_eq!(db_json["diagnostics"]["pragmas"]["reader_query_only"], true);
+        assert!(
+            db_json["diagnostics"]["pool"]["read_acquires"]
+                .as_u64()
+                .unwrap()
+                >= 48
+        );
+        assert!(
+            db_json["diagnostics"]["pool"]["write_acquires"]
+                .as_u64()
+                .unwrap()
+                >= 8
+        );
+
+        let cp_json: serde_json::Value = client
+            .post(format!("{base}/v1/owner/db/checkpoint"))
+            .header("X-AirCD-Invite", owner_secret)
+            .json(&json!({ "mode": "truncate" }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(cp_json["ok"], true);
+        assert_eq!(cp_json["checkpoint"]["mode"], "truncate");
+        assert_eq!(cp_json["checkpoint"]["busy"], 0);
+
+        handle.abort();
+        drop(server);
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

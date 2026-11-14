@@ -475,14 +475,14 @@ fn execute_snapshot_sync(
             .ok_or_else(|| anyhow!("snapshot DB path is not valid UTF-8"))?;
 
         if cfg.db_path == ":memory:" {
-            let conn = db.lock().expect("sqlite mutex poisoned");
+            let conn = db.write()?;
             conn.execute("VACUUM INTO ?1", params![staged_db_str])
                 .context("snapshot in-memory SQLite database via VACUUM INTO")?;
         } else {
             let source = Connection::open(&cfg.db_path).with_context(|| {
                 format!("open source SQLite database for snapshot: {}", cfg.db_path)
             })?;
-            source.busy_timeout(Duration::from_secs(5))?;
+            source.busy_timeout(db.config().busy_timeout())?;
             source
                 .execute("VACUUM INTO ?1", params![staged_db_str])
                 .context("snapshot SQLite database via VACUUM INTO")?;
@@ -613,6 +613,7 @@ fn copy_optional_key_file(
 fn inspect_snapshot_db(db_path: &Path) -> Result<(String, KeyRingSummary, SnapshotCounts)> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open snapshot DB for verification: {}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
 
     let mut stmt = conn
         .prepare("PRAGMA integrity_check")

@@ -29,3 +29,11 @@ open_registration = false
 # backup_interval_secs = 3600             # 0 disables periodic timer
 # backup_retention = 10
 # backup_on_startup = false               # true forces a snapshot on every startup
+
+# SQLite connection pooling and WAL tuning for high-concurrency wake bursts.
+# db_pool_size = 8                        # read-only WAL connections (1..=128)
+# db_busy_timeout_ms = 5000               # milliseconds to wait on SQLITE_BUSY
+# db_synchronous = "normal"               # off, normal, full, extra
+# db_wal_autocheckpoint = 1000            # WAL pages before auto-checkpoint (0 disables)
+# db_cache_size_kib = 16384               # per-connection page cache in KiB
+# db_journal_size_limit_bytes = 67108864  # WAL file size limit after checkpoint (-1 unlimited)
