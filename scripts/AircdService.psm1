@@ -74,6 +74,10 @@ function New-AircdServiceConfig {
         [string]$TlsCert = '',
         [string]$TlsKey = '',
         [string]$TlsBind = '127.0.0.1:6697',
+        [string]$TlsClientCa = '',
+        [string]$TlsClientAuth = '',
+        [string]$HttpTlsBind = '',
+        [switch]$TlsOnly,
         [switch]$WindowsEventLog,
         [string]$WindowsEventLogSource = '',
         [string]$SyslogTarget = '',
@@ -88,7 +92,7 @@ function New-AircdServiceConfig {
     )
 
     $Overrides = @{}
-    foreach ($Key in @('Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'WindowsEventLog', 'WindowsEventLogSource', 'SyslogTarget', 'SyslogFormat', 'SyslogFacility', 'BackupDir', 'BackupIntervalSecs', 'BackupRetention', 'BackupOnStartup', 'ExecutablePath')) {
+    foreach ($Key in @('Name', 'TaskPath', 'Bind', 'HttpBind', 'DbPath', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'TlsClientCa', 'TlsClientAuth', 'HttpTlsBind', 'TlsOnly', 'WindowsEventLog', 'WindowsEventLogSource', 'SyslogTarget', 'SyslogFormat', 'SyslogFacility', 'BackupDir', 'BackupIntervalSecs', 'BackupRetention', 'BackupOnStartup', 'ExecutablePath')) {
         if ($PSBoundParameters.ContainsKey($Key)) {
             $Overrides[$Key] = $PSBoundParameters[$Key]
         }
@@ -106,6 +110,10 @@ function New-AircdServiceConfig {
     $TlsCert = $ResolvedCfg.TlsCert
     $TlsKey = $ResolvedCfg.TlsKey
     $TlsBind = $ResolvedCfg.TlsBind
+    $TlsClientCa = $ResolvedCfg.TlsClientCa
+    $TlsClientAuth = $ResolvedCfg.TlsClientAuth
+    $HttpTlsBind = $ResolvedCfg.HttpTlsBind
+    $TlsOnly = [bool]$ResolvedCfg.TlsOnly
     $WindowsEventLog = [bool]$ResolvedCfg.WindowsEventLog
     $WindowsEventLogSource = $ResolvedCfg.WindowsEventLogSource
     $SyslogTarget = $ResolvedCfg.SyslogTarget
@@ -149,6 +157,26 @@ function New-AircdServiceConfig {
         if (-not (Test-Path -LiteralPath $FullTlsKey -PathType Leaf)) { throw "TLS private key not found: $FullTlsKey" }
         $null = Test-AircdNumericBind -Address $TlsBind -Label 'TLS'
         $ServerArgs += @('--tls-cert', $FullTlsCert, '--tls-key', $FullTlsKey, '--tls-bind', $TlsBind)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TlsClientCa)) {
+        if (-not $HasTlsCert) { throw 'Both -TlsCert and -TlsKey must be specified when -TlsClientCa is set.' }
+        $FullTlsClientCa = [IO.Path]::GetFullPath($TlsClientCa)
+        if (-not (Test-Path -LiteralPath $FullTlsClientCa -PathType Leaf)) { throw "TLS client CA certificate not found: $FullTlsClientCa" }
+        $ServerArgs += @('--tls-client-ca', $FullTlsClientCa)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TlsClientAuth)) {
+        $ServerArgs += @('--tls-client-auth', $TlsClientAuth)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($HttpTlsBind)) {
+        if (-not $HasTlsCert) { throw 'Both -TlsCert and -TlsKey must be specified when -HttpTlsBind is set.' }
+        $null = Test-AircdNumericBind -Address $HttpTlsBind -Label 'HTTPS'
+        $ServerArgs += @('--http-tls-bind', $HttpTlsBind)
+    }
+    if ($TlsOnly) {
+        if (-not $HasTlsCert -or [string]::IsNullOrWhiteSpace($HttpTlsBind)) {
+            throw '-TlsOnly requires -TlsCert, -TlsKey, and -HttpTlsBind.'
+        }
+        $ServerArgs += '--tls-only'
     }
     if ($WindowsEventLog) { $ServerArgs += '--windows-event-log' }
     if (-not [string]::IsNullOrWhiteSpace($WindowsEventLogSource)) { $ServerArgs += @('--windows-event-log-source', $WindowsEventLogSource) }

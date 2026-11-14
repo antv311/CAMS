@@ -8,6 +8,8 @@ use crate::db::{
 use crate::logging::{
     validate_event_log_source, LogConfig, SyslogFacility, SyslogFormat, SyslogTarget,
 };
+use crate::rate_limit::RateLimitConfig;
+use crate::tls::{ClientAuthMode, TlsServerConfigSpec};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -58,9 +60,14 @@ pub struct ServerConfig {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub tls_bind: String,
+    pub tls_client_ca: Option<String>,
+    pub tls_client_auth: Option<String>,
+    pub http_tls_bind: Option<String>,
+    pub tls_only: bool,
     pub register_key: Option<String>,
     pub open_registration: bool,
     pub auth: AuthConfig,
+    pub rate_limit: RateLimitConfig,
     pub windows_event_log: bool,
     pub windows_event_log_source: String,
     pub syslog_target: Option<String>,
@@ -89,9 +96,14 @@ impl Default for ServerConfig {
             tls_cert: None,
             tls_key: None,
             tls_bind: "127.0.0.1:6697".into(),
+            tls_client_ca: None,
+            tls_client_auth: None,
+            http_tls_bind: None,
+            tls_only: false,
             register_key: None,
             open_registration: false,
             auth: AuthConfig::default(),
+            rate_limit: RateLimitConfig::default(),
             windows_event_log: false,
             windows_event_log_source: "aircd".into(),
             syslog_target: None,
@@ -159,7 +171,40 @@ impl ServerConfig {
             owner_key_path: default_owner_key_path(&self.db),
             tls_cert_path: self.tls_cert.as_deref().map(PathBuf::from),
             tls_key_path: self.tls_key.as_deref().map(PathBuf::from),
+            tls_client_ca_path: self.tls_client_ca.as_deref().map(PathBuf::from),
         })
+    }
+
+    pub fn effective_tls_client_auth(&self) -> Result<ClientAuthMode> {
+        let mode = match self.tls_client_auth.as_deref() {
+            Some(raw) => Some(ClientAuthMode::parse(raw)?),
+            None => None,
+        };
+        match (mode, self.tls_client_ca.as_deref()) {
+            (Some(ClientAuthMode::None), Some(_)) => {
+                bail!("tls_client_auth cannot be 'none' when tls_client_ca is set");
+            }
+            (Some(ClientAuthMode::Optional | ClientAuthMode::Required), None) => {
+                bail!("tls_client_ca must be set when tls_client_auth is enabled");
+            }
+            (Some(explicit), _) => Ok(explicit),
+            (None, Some(_)) => Ok(ClientAuthMode::Required),
+            (None, None) => Ok(ClientAuthMode::None),
+        }
+    }
+
+    pub fn to_tls_config(&self) -> Result<Option<TlsServerConfigSpec>> {
+        let client_auth = self.effective_tls_client_auth()?;
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Ok(Some(TlsServerConfigSpec {
+                cert_path: PathBuf::from(cert),
+                key_path: PathBuf::from(key),
+                client_ca_path: self.tls_client_ca.as_deref().map(PathBuf::from),
+                client_auth,
+            })),
+            (None, None) => Ok(None),
+            _ => bail!("both tls_cert and tls_key must be set to enable TLS"),
+        }
     }
 
     pub fn to_sqlite_config(&self) -> Result<SqlitePoolConfig> {
@@ -185,19 +230,30 @@ impl ServerConfig {
         while let Some(arg) = iter.next() {
             let value = match arg.as_str() {
                 "--open-registration"
+                | "--tls-only"
                 | "--windows-event-log"
                 | "--backup-enabled"
-                | "--backup-on-startup" => "true",
-                "--no-backups" => "false",
+                | "--backup-on-startup"
+                | "--rate-limit-enabled"
+                | "--rate-limit-trust-proxy-headers" => "true",
+                "--no-backups" | "--no-rate-limit" => "false",
                 "--config"
                 | "--bind"
                 | "--http-bind"
+                | "--http-tls-bind"
                 | "--db"
                 | "--tls-cert"
                 | "--tls-key"
                 | "--tls-bind"
+                | "--tls-client-ca"
+                | "--tls-client-auth"
                 | "--register-key"
                 | "--token-ttl-seconds"
+                | "--rate-limit-ip-rps"
+                | "--rate-limit-ip-burst"
+                | "--rate-limit-principal-rps"
+                | "--rate-limit-principal-burst"
+                | "--rate-limit-max-buckets"
                 | "--windows-event-log-source"
                 | "--syslog-target"
                 | "--syslog-format"
@@ -248,6 +304,7 @@ impl ServerConfig {
                 for value in [
                     &mut config.tls_cert,
                     &mut config.tls_key,
+                    &mut config.tls_client_ca,
                     &mut config.backup_dir,
                 ]
                 .into_iter()
@@ -267,13 +324,27 @@ impl ServerConfig {
         for (name, flag) in [
             ("AIRCD_BIND", "--bind"),
             ("AIRCD_HTTP_BIND", "--http-bind"),
+            ("AIRCD_HTTP_TLS_BIND", "--http-tls-bind"),
             ("AIRCD_DB", "--db"),
             ("AIRCD_TLS_CERT", "--tls-cert"),
             ("AIRCD_TLS_KEY", "--tls-key"),
             ("AIRCD_TLS_BIND", "--tls-bind"),
+            ("AIRCD_TLS_CLIENT_CA", "--tls-client-ca"),
+            ("AIRCD_TLS_CLIENT_AUTH", "--tls-client-auth"),
+            ("AIRCD_TLS_ONLY", "--tls-only"),
             ("AIRCD_REGISTER_KEY", "--register-key"),
             ("AIRCD_OPEN_REGISTRATION", "--open-registration"),
             ("AIRCD_TOKEN_TTL_SECONDS", "--token-ttl-seconds"),
+            ("AIRCD_RATE_LIMIT_ENABLED", "--rate-limit-enabled"),
+            ("AIRCD_RATE_LIMIT_IP_RPS", "--rate-limit-ip-rps"),
+            ("AIRCD_RATE_LIMIT_IP_BURST", "--rate-limit-ip-burst"),
+            ("AIRCD_RATE_LIMIT_PRINCIPAL_RPS", "--rate-limit-principal-rps"),
+            ("AIRCD_RATE_LIMIT_PRINCIPAL_BURST", "--rate-limit-principal-burst"),
+            (
+                "AIRCD_RATE_LIMIT_TRUST_PROXY_HEADERS",
+                "--rate-limit-trust-proxy-headers",
+            ),
+            ("AIRCD_RATE_LIMIT_MAX_BUCKETS", "--rate-limit-max-buckets"),
             ("AIRCD_WINDOWS_EVENT_LOG", "--windows-event-log"),
             ("AIRCD_WINDOWS_EVENT_LOG_SOURCE", "--windows-event-log-source"),
             ("AIRCD_SYSLOG_TARGET", "--syslog-target"),
@@ -322,6 +393,9 @@ impl ServerConfig {
         for (name, value) in [
             ("tls_cert", &config.tls_cert),
             ("tls_key", &config.tls_key),
+            ("tls_client_ca", &config.tls_client_ca),
+            ("tls_client_auth", &config.tls_client_auth),
+            ("http_tls_bind", &config.http_tls_bind),
             ("register_key", &config.register_key),
             ("syslog_target", &config.syslog_target),
             ("syslog_facility", &config.syslog_facility),
@@ -331,9 +405,29 @@ impl ServerConfig {
                 bail!("server setting {name} must not be empty");
             }
         }
+        if config.tls_client_ca.is_some()
+            && (config.tls_cert.is_none() || config.tls_key.is_none())
+        {
+            bail!("tls_cert and tls_key must be set when tls_client_ca is configured");
+        }
+        if config.http_tls_bind.is_some()
+            && (config.tls_cert.is_none() || config.tls_key.is_none())
+        {
+            bail!("tls_cert and tls_key must be set when http_tls_bind is configured");
+        }
+        if config.tls_only {
+            if config.tls_cert.is_none() || config.tls_key.is_none() {
+                bail!("tls_cert and tls_key must be set when tls_only is enabled");
+            }
+            if config.http_tls_bind.is_none() {
+                bail!("http_tls_bind must be set when tls_only is enabled");
+            }
+        }
+        let _ = config.effective_tls_client_auth()?;
         if config.auth.token_ttl_seconds == Some(0) {
             bail!("server setting auth.token_ttl_seconds must be at least 1");
         }
+        config.rate_limit.validate()?;
         let _ = config.to_log_config()?;
         let _ = config.to_backup_config()?;
         let _ = config.to_sqlite_config()?;
@@ -345,10 +439,16 @@ impl ServerConfig {
             "--config" => {}
             "--bind" => self.bind = value.into(),
             "--http-bind" => self.http_bind = value.into(),
+            "--http-tls-bind" => self.http_tls_bind = Some(value.into()),
             "--db" => self.db = value.into(),
             "--tls-cert" => self.tls_cert = Some(value.into()),
             "--tls-key" => self.tls_key = Some(value.into()),
             "--tls-bind" => self.tls_bind = value.into(),
+            "--tls-client-ca" => self.tls_client_ca = Some(value.into()),
+            "--tls-client-auth" => self.tls_client_auth = Some(value.into()),
+            "--tls-only" => {
+                self.tls_only = parse_bool_setting("tls_only", value)?;
+            }
             "--register-key" => self.register_key = Some(value.into()),
             "--open-registration" => {
                 self.open_registration = parse_bool_setting("open_registration", value)?;
@@ -362,6 +462,41 @@ impl ServerConfig {
                     bail!("server setting auth.token_ttl_seconds must be at least 1");
                 }
                 self.auth.token_ttl_seconds = Some(ttl);
+            }
+            "--rate-limit-enabled" | "--no-rate-limit" => {
+                self.rate_limit.enabled = parse_bool_setting("rate_limit.enabled", value)?;
+            }
+            "--rate-limit-ip-rps" => {
+                self.rate_limit.ip_requests_per_sec = value.trim().parse::<f64>().with_context(|| {
+                    format!("rate_limit.ip_requests_per_sec must be a number, got '{value}'")
+                })?;
+            }
+            "--rate-limit-ip-burst" => {
+                self.rate_limit.ip_burst = value.trim().parse::<u32>().with_context(|| {
+                    format!("rate_limit.ip_burst must be a non-negative integer, got '{value}'")
+                })?;
+            }
+            "--rate-limit-principal-rps" => {
+                self.rate_limit.principal_requests_per_sec =
+                    value.trim().parse::<f64>().with_context(|| {
+                        format!(
+                            "rate_limit.principal_requests_per_sec must be a number, got '{value}'"
+                        )
+                    })?;
+            }
+            "--rate-limit-principal-burst" => {
+                self.rate_limit.principal_burst = value.trim().parse::<u32>().with_context(|| {
+                    format!("rate_limit.principal_burst must be a non-negative integer, got '{value}'")
+                })?;
+            }
+            "--rate-limit-trust-proxy-headers" => {
+                self.rate_limit.trust_proxy_headers =
+                    parse_bool_setting("rate_limit.trust_proxy_headers", value)?;
+            }
+            "--rate-limit-max-buckets" => {
+                self.rate_limit.max_buckets = value.trim().parse::<usize>().with_context(|| {
+                    format!("rate_limit.max_buckets must be a positive integer, got '{value}'")
+                })?;
             }
             "--windows-event-log" => {
                 self.windows_event_log = parse_bool_setting("windows_event_log", value)?;
@@ -831,6 +966,134 @@ mod tests {
             &path,
         )?;
         assert_eq!(cfg.auth.token_ttl_seconds, Some(900));
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limit_settings_respect_precedence_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "[rate_limit]\n\
+             enabled = true\n\
+             ip_requests_per_sec = 50.0\n\
+             ip_burst = 100\n\
+             principal_requests_per_sec = 12.5\n\
+             principal_burst = 25\n\
+             trust_proxy_headers = true\n\
+             max_buckets = 2048\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.ip_requests_per_sec, 50.0);
+        assert_eq!(cfg.rate_limit.ip_burst, 100);
+        assert_eq!(cfg.rate_limit.principal_requests_per_sec, 12.5);
+        assert_eq!(cfg.rate_limit.principal_burst, 25);
+        assert!(cfg.rate_limit.trust_proxy_headers);
+        assert_eq!(cfg.rate_limit.max_buckets, 2048);
+
+        let env = environment(&[
+            ("AIRCD_RATE_LIMIT_ENABLED", "false"),
+            ("AIRCD_RATE_LIMIT_IP_RPS", "75"),
+            ("AIRCD_RATE_LIMIT_PRINCIPAL_BURST", "40"),
+            ("AIRCD_RATE_LIMIT_TRUST_PROXY_HEADERS", "false"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--rate-limit-enabled".into(),
+                "--rate-limit-ip-burst".into(),
+                "150".into(),
+                "--rate-limit-principal-rps".into(),
+                "20".into(),
+                "--rate-limit-max-buckets".into(),
+                "4096".into(),
+            ],
+            &env,
+            &path,
+        )?;
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.ip_requests_per_sec, 75.0);
+        assert_eq!(cfg.rate_limit.ip_burst, 150);
+        assert_eq!(cfg.rate_limit.principal_requests_per_sec, 20.0);
+        assert_eq!(cfg.rate_limit.principal_burst, 40);
+        assert!(!cfg.rate_limit.trust_proxy_headers);
+        assert_eq!(cfg.rate_limit.max_buckets, 4096);
+
+        let cfg = ServerConfig::load_with(&["--no-rate-limit".into()], &env, &path)?;
+        assert!(!cfg.rate_limit.enabled);
+
+        for bad in [
+            "[rate_limit]\nip_requests_per_sec = -1",
+            "[rate_limit]\nip_burst = 0",
+            "[rate_limit]\nprincipal_requests_per_sec = -0.5",
+            "[rate_limit]\nprincipal_burst = 0",
+            "[rate_limit]\nmax_buckets = 0",
+            "[rate_limit]\nunknown_key = 1",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid config for {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mtls_and_https_settings_respect_precedence_and_validate() -> Result<()> {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "tls_cert = 'server.pem'\n\
+             tls_key = 'server.key'\n\
+             tls_client_ca = 'ca.pem'\n\
+             http_tls_bind = '127.0.0.1:6443'\n\
+             tls_only = true\n",
+        );
+        let cfg = ServerConfig::load_with(&[], |_| None, &path)?;
+        assert_eq!(
+            Path::new(cfg.tls_client_ca.as_deref().unwrap()),
+            fixture.0.join("ca.pem")
+        );
+        assert_eq!(cfg.http_tls_bind.as_deref(), Some("127.0.0.1:6443"));
+        assert!(cfg.tls_only);
+        assert_eq!(cfg.effective_tls_client_auth()?, ClientAuthMode::Required);
+        let tls_spec = cfg.to_tls_config()?.expect("tls spec");
+        assert_eq!(tls_spec.client_auth, ClientAuthMode::Required);
+        assert_eq!(tls_spec.client_ca_path, Some(fixture.0.join("ca.pem")));
+
+        let env = environment(&[
+            ("AIRCD_TLS_CLIENT_AUTH", "optional"),
+            ("AIRCD_TLS_ONLY", "false"),
+            ("AIRCD_HTTP_TLS_BIND", "0.0.0.0:7443"),
+        ]);
+        let cfg = ServerConfig::load_with(
+            &[
+                "--tls-client-auth".into(),
+                "required".into(),
+                "--tls-only".into(),
+            ],
+            &env,
+            &path,
+        )?;
+        assert_eq!(cfg.effective_tls_client_auth()?, ClientAuthMode::Required);
+        assert_eq!(cfg.http_tls_bind.as_deref(), Some("0.0.0.0:7443"));
+        assert!(cfg.tls_only);
+
+        for bad in [
+            "tls_client_ca = 'ca.pem'",
+            "tls_cert = 'c.pem'\ntls_key = 'k.pem'\ntls_client_auth = 'required'",
+            "tls_cert = 'c.pem'\ntls_key = 'k.pem'\ntls_client_ca = 'ca.pem'\ntls_client_auth = 'none'",
+            "tls_cert = 'c.pem'\ntls_key = 'k.pem'\ntls_client_ca = 'ca.pem'\ntls_client_auth = 'bogus'",
+            "tls_cert = 'c.pem'\ntls_key = 'k.pem'\ntls_client_ca = ' '",
+            "http_tls_bind = '127.0.0.1:6443'",
+            "tls_cert = 'c.pem'\ntls_key = 'k.pem'\ntls_only = true",
+            "tls_only = true",
+        ] {
+            let bad_path = fixture.write(bad);
+            assert!(
+                ServerConfig::load_with(&[], |_| None, &bad_path).is_err(),
+                "expected invalid mTLS config for {bad}"
+            );
+        }
         Ok(())
     }
 }

@@ -8,6 +8,10 @@ param(
     [string]$TlsCert = "",
     [string]$TlsKey = "",
     [string]$TlsBind = "127.0.0.1:6697",
+    [string]$TlsClientCa = "",
+    [string]$TlsClientAuth = "",
+    [string]$HttpTlsBind = "",
+    [switch]$TlsOnly,
     [switch]$WindowsEventLog,
     [string]$WindowsEventLogSource = "",
     [string]$SyslogTarget = "",
@@ -30,7 +34,7 @@ $ConfigModule = Join-Path $PSScriptRoot "AircdConfig.psm1"
 if (Test-Path -LiteralPath $ConfigModule -PathType Leaf) {
     Import-Module $ConfigModule -Force
     $Overrides = @{}
-    foreach ($Key in @("Bind", "HttpBind", "DbPath", "OpenRegistration", "RegisterKey", "TlsCert", "TlsKey", "TlsBind", "WindowsEventLog", "WindowsEventLogSource", "SyslogTarget", "SyslogFormat", "SyslogFacility", "BackupDir", "BackupIntervalSecs", "BackupRetention", "BackupOnStartup", "ExecutablePath")) {
+    foreach ($Key in @("Bind", "HttpBind", "DbPath", "OpenRegistration", "RegisterKey", "TlsCert", "TlsKey", "TlsBind", "TlsClientCa", "TlsClientAuth", "HttpTlsBind", "TlsOnly", "WindowsEventLog", "WindowsEventLogSource", "SyslogTarget", "SyslogFormat", "SyslogFacility", "BackupDir", "BackupIntervalSecs", "BackupRetention", "BackupOnStartup", "ExecutablePath")) {
         if ($PSBoundParameters.ContainsKey($Key)) {
             $Overrides[$Key] = $PSBoundParameters[$Key]
         }
@@ -45,6 +49,10 @@ if (Test-Path -LiteralPath $ConfigModule -PathType Leaf) {
     $TlsCert = $ResolvedCfg.TlsCert
     $TlsKey = $ResolvedCfg.TlsKey
     $TlsBind = $ResolvedCfg.TlsBind
+    $TlsClientCa = $ResolvedCfg.TlsClientCa
+    $TlsClientAuth = $ResolvedCfg.TlsClientAuth
+    $HttpTlsBind = $ResolvedCfg.HttpTlsBind
+    $TlsOnly = [bool]$ResolvedCfg.TlsOnly
     $WindowsEventLog = [bool]$ResolvedCfg.WindowsEventLog
     $WindowsEventLogSource = $ResolvedCfg.WindowsEventLogSource
     $SyslogTarget = $ResolvedCfg.SyslogTarget
@@ -112,6 +120,18 @@ if ($OpenRegistration) { $ArgList += "--open-registration" }
 if (-not [string]::IsNullOrWhiteSpace($RegisterKey)) { $ArgList += @("--register-key", $RegisterKey) }
 if ($HasTlsCert) {
     $ArgList += @("--tls-cert", [IO.Path]::GetFullPath($TlsCert), "--tls-key", [IO.Path]::GetFullPath($TlsKey), "--tls-bind", $TlsBind)
+}
+if (-not [string]::IsNullOrWhiteSpace($TlsClientCa)) {
+    $ArgList += @("--tls-client-ca", [IO.Path]::GetFullPath($TlsClientCa))
+}
+if (-not [string]::IsNullOrWhiteSpace($TlsClientAuth)) {
+    $ArgList += @("--tls-client-auth", $TlsClientAuth)
+}
+if (-not [string]::IsNullOrWhiteSpace($HttpTlsBind)) {
+    $ArgList += @("--http-tls-bind", $HttpTlsBind)
+}
+if ($TlsOnly) {
+    $ArgList += "--tls-only"
 }
 if ($WindowsEventLog) { $ArgList += "--windows-event-log" }
 if (-not [string]::IsNullOrWhiteSpace($WindowsEventLogSource)) { $ArgList += @("--windows-event-log-source", $WindowsEventLogSource) }

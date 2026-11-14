@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -15,6 +15,7 @@ use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
 use crate::history::{canonical_dm_channel, unix_timestamp, HistoryStore, StoredMessage};
 use crate::locks::{LockConflictError, LockStore, ResourceLock};
 use crate::logging::{EventForwarder, LogEvent, Severity};
+use crate::metrics::{MetricsRegistry, MetricsSnapshot};
 use crate::notes::NoteStore;
 use crate::projects::{Project, ProjectMember, ProjectStore, CHAT_ONLY_CHANNEL, MANAGER_ROLES};
 use crate::protocol::{parse_command, Command};
@@ -76,6 +77,7 @@ pub struct Server {
     groups: GroupStore,
     backups: BackupManager,
     logger: EventForwarder,
+    metrics: Arc<MetricsRegistry>,
     // Lock before db/inner: registration, command effects, reissue and cleanup
     // must agree on which session owns a principal across credential changes.
     session_gate: Arc<Mutex<()>>,
@@ -177,16 +179,21 @@ impl Server {
             .filter(|value| *value > 0)
             .unwrap_or(300);
 
+        let metrics = Arc::new(MetricsRegistry::new());
         let server = Self {
             auth: AuthStore::with_config(db.clone(), logger.clone(), token_ttl_seconds),
             history: HistoryStore::new(db.clone()),
-            tasks: TaskStore::new(db.clone(), lease_seconds),
+            tasks: TaskStore::with_metrics(db.clone(), lease_seconds, metrics.clone()),
             webhooks: WebhookStore::with_logger(db.clone(), logger.clone()),
             reports: ReportStore::new(db.clone()),
             gits: GitRepoStore::new(db.clone()),
             locks: LockStore::new(db.clone()),
             projects: ProjectStore::new(db.clone()),
-            wakes: WakeManager::with_logger(db.clone(), logger.clone()),
+            wakes: WakeManager::with_logger_and_metrics(
+                db.clone(),
+                logger.clone(),
+                metrics.clone(),
+            ),
             notes: NoteStore::new(db.clone()),
             attachments: AttachmentStore::new(db.clone()),
             rooms: RoomStore::new(db.clone()),
@@ -194,6 +201,7 @@ impl Server {
             groups: GroupStore::new(db.clone()),
             backups: BackupManager::new(db.clone(), backup_config, logger.clone()),
             logger: logger.clone(),
+            metrics,
             db,
             session_gate: Arc::new(Mutex::new(())),
             task_gate: Arc::new(Mutex::new(())),
@@ -308,6 +316,7 @@ impl Server {
             let _ = client
                 .shutdown_tx
                 .send("Credentials reissued by owner".into());
+            self.metrics.record_irc_session("revoked");
         }
         self.logger.log_security(
             Severity::Info,
@@ -355,6 +364,96 @@ impl Server {
 
     pub fn attachments(&self) -> &AttachmentStore {
         &self.attachments
+    }
+
+    pub fn metrics(&self) -> &Arc<MetricsRegistry> {
+        &self.metrics
+    }
+
+    pub fn metrics_snapshot(&self) -> Result<MetricsSnapshot> {
+        let irc_sessions = self
+            .inner
+            .lock()
+            .expect("server mutex poisoned")
+            .clients
+            .len();
+        let (wake_running_sessions, wake_pending_sessions, wake_quota_cooldowns_active) =
+            self.wakes.runtime_session_counts();
+        let db = self.db.read()?;
+        let wake_stored_sessions: i64 = db
+            .query_row("SELECT COUNT(*) FROM wake_sessions", [], |row| row.get(0))
+            .context("count wake sessions")?;
+        let principals_total: i64 = db
+            .query_row("SELECT COUNT(*) FROM principals", [], |row| row.get(0))
+            .context("count principals")?;
+        let messages_total: i64 = db
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .context("count messages")?;
+
+        let mut tasks_by_status = BTreeMap::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")
+                .context("prepare task status counts")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (status, count) = row?;
+                tasks_by_status.insert(status, count.max(0) as u64);
+            }
+        }
+
+        let mut task_events_by_action = BTreeMap::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT action, COUNT(*) FROM task_events GROUP BY action")
+                .context("prepare task event counts")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (action, count) = row?;
+                task_events_by_action.insert(action, count.max(0) as u64);
+            }
+        }
+
+        let mut webhook_deliveries_by_status = BTreeMap::new();
+        for status in ["pending", "delivered", "failed"] {
+            webhook_deliveries_by_status.insert(status.to_string(), 0u64);
+        }
+        {
+            let mut stmt = db
+                .prepare("SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status")
+                .context("prepare webhook delivery counts")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (status, count) = row?;
+                webhook_deliveries_by_status.insert(status, count.max(0) as u64);
+            }
+        }
+        drop(db);
+
+        Ok(MetricsSnapshot {
+            irc_sessions,
+            wake_running_sessions,
+            wake_pending_sessions,
+            wake_stored_sessions: wake_stored_sessions.max(0) as usize,
+            wake_quota_cooldowns_active,
+            principals_total: principals_total.max(0) as u64,
+            messages_total: messages_total.max(0) as u64,
+            tasks_by_status,
+            task_events_by_action,
+            webhook_deliveries_by_status,
+            db_pool: Some(self.db.pool_stats()),
+        })
+    }
+
+    pub fn render_prometheus_metrics(&self) -> Result<String> {
+        let snap = self.metrics_snapshot()?;
+        Ok(self.metrics.render_prometheus(&snap))
     }
 
     /// Run once for deterministic tests, or from the background worker.
@@ -416,7 +515,10 @@ impl Server {
             .await
             .with_context(|| format!("bind {bind_addr}"))?;
         println!("aircd listening on {bind_addr}");
+        self.listen_on(listener).await
+    }
 
+    pub(crate) async fn listen_on(self, listener: TcpListener) -> Result<()> {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let server = self.clone();
@@ -458,6 +560,22 @@ impl Server {
                         return;
                     }
                 };
+                if let Some(cert_info) = crate::tls::extract_client_cert_info(tls_stream.get_ref().1)
+                {
+                    server.logger.log(
+                        LogEvent::security_audit(
+                            crate::logging::Severity::Info,
+                            "irc.tls_client_verified",
+                            "success",
+                            format!(
+                                "IRC client certificate verified from {peer_addr} (sha256={}, chain={})",
+                                cert_info.sha256, cert_info.chain_len
+                            ),
+                        )
+                        .with_actor("tls")
+                        .with_target(peer_addr.to_string()),
+                    );
+                }
                 if let Err(error) = server.handle_stream(tls_stream).await {
                     server.logger.log(
                         LogEvent::server_error(
@@ -834,6 +952,7 @@ impl Server {
                     Some("irc"),
                     "IRC authentication failed: invalid or expired token",
                 );
+                self.metrics.record_irc_session("auth_failed");
                 session.send(format!(":{SERVER_NAME} 464 * :Password incorrect"));
                 return Ok(());
             }
@@ -864,6 +983,7 @@ impl Server {
                 let _ = old_client
                     .shutdown_tx
                     .send(format!("Replaced by a newer session for {}", principal.id));
+                self.metrics.record_irc_session("replaced");
                 self.logger.log_security(
                     Severity::Info,
                     "auth.irc_session_replaced",
@@ -883,6 +1003,7 @@ impl Server {
                     .insert(principal.id.clone());
             }
         }
+        self.metrics.record_irc_session("connected");
 
         session.send(format!(
             ":{SERVER_NAME} 001 {} :Welcome to aircd, {}{}",
@@ -1329,7 +1450,8 @@ impl Server {
             _ => None,
         };
         let ids = match (action, task.status.as_str()) {
-            ("create" | "assign" | "answer", _)
+            ("create" | "assign" | "answer" | "unblocked", _)
+            | ("priority", "assigned" | "in_progress" | "testing" | "changes_requested")
             | ("status", "changes_requested" | "merged" | "cancelled") => {
                 task.assignee.iter().cloned().collect()
             }
@@ -2720,7 +2842,7 @@ impl Server {
 
         self.join_channels(actor, std::slice::from_ref(&channel))?;
         let task = self.tasks.create_full(new)?;
-        let text = match &assignee_id {
+        let mut text = match &assignee_id {
             Some(assignee) => format!(
                 "TASK {} created by @{} and assigned to @{}: {}",
                 task.id, actor.nick, assignee, task.title
@@ -2730,6 +2852,9 @@ impl Server {
                 task.id, actor.nick, task.title
             ),
         };
+        if !task.blocked_by.is_empty() {
+            text.push_str(&format!(" (blocked_by: {})", task.blocked_by.join(", ")));
+        }
         self.broadcast_task_event(&task, "create", "success", &actor.nick, text)?;
         Ok(task)
     }
@@ -2821,6 +2946,166 @@ impl Server {
         };
         self.broadcast_task_event(&task, "assign", "success", &actor.nick, text)?;
         Ok(task)
+    }
+
+    /// Update the priority (`urgent`, `high`, `normal`, `low`) of an active task.
+    pub fn set_task_priority_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        priority: &str,
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        let parent = current
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        let is_lead = parent
+            .as_ref()
+            .is_some_and(|task| task.assignee.as_deref() == Some(actor.id.as_str()));
+        if !is_lead && !self.is_project_manager(actor, &current.channel)? {
+            return Err(anyhow!(
+                "only the parent task's assignee or a project manager can change task priority"
+            ));
+        }
+        let (task, changed) = self.tasks.set_priority(&current.id, priority, &actor.id)?;
+        if changed {
+            let text = format!(
+                "TASK {} priority set to {} by @{}: {}",
+                task.id, task.priority, actor.nick, task.title
+            );
+            self.broadcast_task_event(&task, "priority", "success", &actor.nick, text)?;
+        }
+        Ok(task)
+    }
+
+    fn require_dependency_manager(&self, actor: &Principal, current: &Task) -> Result<()> {
+        let parent = current
+            .parent_task_id
+            .as_deref()
+            .map(|id| self.get_task_api(id))
+            .transpose()?;
+        let is_lead = parent
+            .as_ref()
+            .is_some_and(|task| task.assignee.as_deref() == Some(actor.id.as_str()));
+        if !is_lead && !self.is_project_manager(actor, &current.channel)? {
+            return Err(anyhow!(
+                "only the parent task's assignee or a project manager can change task dependencies"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn set_task_dependencies_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        blocked_by: &[String],
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        self.require_dependency_manager(actor, &current)?;
+        let (task, changed) = self
+            .tasks
+            .set_dependencies(&current.id, blocked_by, &actor.id)?;
+        if changed {
+            let summary = if task.blocked_by.is_empty() {
+                "-".to_string()
+            } else {
+                task.blocked_by.join(", ")
+            };
+            let text = format!(
+                "TASK {} dependencies set to [{}] by @{}: {}",
+                task.id, summary, actor.nick, task.title
+            );
+            self.broadcast_task_event(&task, "dependencies", "success", &actor.nick, text)?;
+        }
+        Ok(task)
+    }
+
+    pub fn add_task_dependencies_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        blocked_by: &[String],
+    ) -> Result<Task> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        self.require_dependency_manager(actor, &current)?;
+        let (task, changed) = self
+            .tasks
+            .add_dependencies(&current.id, blocked_by, &actor.id)?;
+        if changed {
+            let text = format!(
+                "TASK {} dependencies updated ([{}]) by @{}: {}",
+                task.id,
+                task.blocked_by.join(", "),
+                actor.nick,
+                task.title
+            );
+            self.broadcast_task_event(&task, "dependencies", "success", &actor.nick, text)?;
+        }
+        Ok(task)
+    }
+
+    pub fn remove_task_dependency_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        depends_on_task_id: &str,
+    ) -> Result<(Task, bool)> {
+        let _guard = self.task_gate.lock().expect("task mutex poisoned");
+        let current = self.get_task_api(task_id)?;
+        self.require_dependency_manager(actor, &current)?;
+        let (task, removed) = self.tasks.remove_dependency(
+            &current.id,
+            depends_on_task_id,
+            &actor.id,
+        )?;
+        if removed {
+            let text = format!(
+                "TASK {} unlinked dependency {} by @{}: {}",
+                task.id,
+                depends_on_task_id.trim(),
+                actor.nick,
+                task.title
+            );
+            self.broadcast_task_event(&task, "dependencies", "success", &actor.nick, text)?;
+        }
+        Ok((task, removed))
+    }
+
+    fn notify_unblocked_dependents(&self, completed_task: &Task, actor_nick: &str) {
+        if !crate::tasks::is_dependency_resolved(&completed_task.status) {
+            return;
+        }
+        let Ok(dependents) = self.tasks.dependents(&completed_task.id) else {
+            return;
+        };
+        for dep in dependents {
+            let Ok(Some(dep_task)) = self.tasks.get(&dep.task_id) else {
+                continue;
+            };
+            if TERMINAL_STATUSES.contains(&dep_task.status.as_str()) {
+                continue;
+            }
+            if let Ok(remaining) = self.tasks.unresolved_blockers(&dep_task.id) {
+                if remaining.is_empty() {
+                    let _ = self.broadcast_task_event(
+                        &dep_task,
+                        "unblocked",
+                        "success",
+                        actor_nick,
+                        format!(
+                            "TASK {} unblocked by completion of {}: {}",
+                            dep_task.id, completed_task.id, dep_task.title
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     /// Move a task through its review workflow.
@@ -3000,6 +3285,7 @@ impl Server {
         }
         self.broadcast_task_event_to(&task, "status", "success", &actor.nick, text, recipients)?;
         self.broadcast_task_cascades(&task, update.cascaded, &actor.nick)?;
+        self.notify_unblocked_dependents(&task, &actor.nick);
         Ok(task)
     }
 
@@ -3136,6 +3422,13 @@ impl Server {
     /// each task belongs to. This is the one call an agent makes on wake-up.
     pub fn inbox_api(&self, actor: &Principal) -> Result<serde_json::Value> {
         let mine = self.tasks.inbox(&actor.id)?;
+        let mine_ids: Vec<String> = mine.iter().map(|t| t.id.clone()).collect();
+        let unresolved_map = self.tasks.unresolved_blockers_map(&mine_ids)?;
+        let dispatch_queue: Vec<&Task> = mine
+            .iter()
+            .filter(|t| unresolved_map.get(&t.id).is_none_or(|b| b.is_empty()))
+            .collect();
+        let blocked_task_count = mine.len() - dispatch_queue.len();
         let roles: HashMap<String, String> =
             self.projects.projects_of(&actor.id)?.into_iter().collect();
         let repos = self.gits.list()?;
@@ -3144,7 +3437,7 @@ impl Server {
             mine.iter().map(|t| t.channel.clone()).collect();
         channels.extend(roles.keys().cloned());
 
-        let mut projects = Vec::new();
+        let mut ranked_projects = Vec::new();
         let mut review_count = 0usize;
         let mut question_count = 0usize;
         for channel in channels {
@@ -3192,10 +3485,22 @@ impl Server {
             }
             review_count += to_review.len();
             question_count += questions.len();
+            let top_task_rank = tasks
+                .iter()
+                .filter(|t| unresolved_map.get(&t.id).is_none_or(|b| b.is_empty()))
+                .map(|t| crate::tasks::priority_rank(&t.priority))
+                .min()
+                .unwrap_or(u8::MAX);
+            let top_review_rank = to_review
+                .iter()
+                .map(|t| crate::tasks::priority_rank(&t.priority))
+                .min()
+                .unwrap_or(u8::MAX);
+            let best_rank = top_task_rank.min(top_review_rank);
             let channel_repos: Vec<&GitRepo> =
                 repos.iter().filter(|r| r.channel == channel).collect();
             let project = self.projects.get(&channel)?;
-            projects.push(serde_json::json!({
+            let entry = serde_json::json!({
                 "channel": channel,
                 "project": project.as_ref().map(|p| p.name.clone()),
                 "pm": project.and_then(|p| p.pm),
@@ -3204,8 +3509,14 @@ impl Server {
                 "tasks": tasks,
                 "to_review": to_review,
                 "questions": questions,
-            }));
+            });
+            ranked_projects.push((best_rank, top_task_rank, channel, entry));
         }
+
+        // Dispatch highest-priority project work first, breaking ties by channel name.
+        ranked_projects.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let projects: Vec<serde_json::Value> =
+            ranked_projects.into_iter().map(|(_, _, _, entry)| entry).collect();
 
         // What only the owner can decide, across every project.
         let needs_you = if Self::is_owner(actor) {
@@ -3217,8 +3528,12 @@ impl Server {
         Ok(serde_json::json!({
             "account": actor.id,
             "task_count": mine.len(),
+            "ready_task_count": dispatch_queue.len(),
+            "blocked_task_count": blocked_task_count,
             "review_count": review_count,
             "question_count": question_count,
+            "next_task": dispatch_queue.first().copied(),
+            "dispatch_queue": dispatch_queue,
             "needs_you": needs_you,
             "projects": projects,
         }))
@@ -3251,6 +3566,7 @@ impl Server {
                 task.id, actor.nick, task.title
             ),
         )?;
+        self.notify_unblocked_dependents(&task, &actor.nick);
         Ok(task)
     }
 
@@ -3691,6 +4007,12 @@ impl Server {
             .and_then(|task| task.get("repo"))
             .and_then(|repo| repo.as_str())
             .map(str::to_owned);
+        let task_priority = event
+            .task
+            .as_ref()
+            .and_then(|task| task.get("priority"))
+            .and_then(|priority| priority.as_str())
+            .map(str::to_owned);
 
         for principal_id in enabled {
             let lowered = principal_id.to_ascii_lowercase();
@@ -3740,6 +4062,7 @@ impl Server {
                 repo_path: self.repo_path_for(&event.channel, task_repo.as_deref()),
                 event: Some(event.event.clone()),
                 triggered_by: Some(event.from.clone()),
+                priority: task_priority.clone(),
             };
             if let Err(err) = self.wakes.request(ctx) {
                 self.logger
@@ -3799,6 +4122,7 @@ impl Server {
             task_id: None,
             event: Some("owner".to_string()),
             triggered_by: None,
+            priority: None,
         })
     }
 
@@ -3924,6 +4248,7 @@ impl Server {
         let Some(principal) = session.principal.as_ref() else {
             return Ok(());
         };
+        self.metrics.record_irc_session("disconnected");
 
         let should_mark_disconnected = {
             let mut inner = self.inner.lock().expect("server mutex poisoned");

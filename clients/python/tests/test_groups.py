@@ -126,9 +126,12 @@ class TaskPayloadTest(unittest.TestCase):
         sub = task_create_payload("#p", "t", parent=" task_1 ", reviewer="@lead")
         self.assertEqual(sub["parent_task_id"], "task_1")
         self.assertEqual(sub["reviewer"], "lead")
-        blank = task_create_payload("#p", "t", parent="  ", reviewer=" @ ")
+        blank = task_create_payload("#p", "t", parent="  ", reviewer=" @ ", blocked_by=["  ", " , "])
         self.assertNotIn("parent_task_id", blank)
         self.assertNotIn("reviewer", blank)
+        self.assertNotIn("blocked_by", blank)
+        deps = task_create_payload("#p", "t", blocked_by=[" task_1, task_2 ", "task_1"])
+        self.assertEqual(deps["blocked_by"], ["task_1", "task_2"])
 
 
 class GroupHttpClientTest(_HubCase):

@@ -1258,6 +1258,7 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
     let columns = [
         ("body", "TEXT"),
         ("kind", "TEXT NOT NULL DEFAULT 'task'"),
+        ("priority", "TEXT NOT NULL DEFAULT 'normal'"),
         ("assignee", "TEXT"),
         ("created_by", "TEXT"),
         ("repo", "TEXT"),
@@ -1289,12 +1290,29 @@ fn migrate_tasks(connection: &Connection) -> Result<()> {
         [],
     )?;
     connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority, created_at)",
+        [],
+    )?;
+    connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_reviewer ON tasks (reviewer, status)",
         [],
     )?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks (parent_task_id)",
         [],
+    )?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_dependencies (
+           task_id TEXT NOT NULL,
+           depends_on_task_id TEXT NOT NULL,
+           created_by TEXT,
+           created_at INTEGER NOT NULL,
+           PRIMARY KEY (task_id, depends_on_task_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_task_dependencies_task
+           ON task_dependencies (task_id);
+         CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on
+           ON task_dependencies (depends_on_task_id);",
     )?;
 
     Ok(())
@@ -1960,19 +1978,25 @@ mod tests {
         assert_eq!((legacy.created_at, legacy.updated_at), (10, 20));
         assert!(legacy.reviewer.is_none());
         assert!(legacy.parent_task_id.is_none());
+        assert_eq!(legacy.priority, "normal");
 
         let child = tasks.create_full(crate::tasks::NewTask {
             channel: "#one".to_string(),
             title: "Child".to_string(),
+            priority: Some("high".to_string()),
             assignee: Some("worker".to_string()),
             reviewer: Some("lead".to_string()),
             parent_task_id: Some("legacy".to_string()),
             ..Default::default()
         })?;
         let reloaded = tasks.get(&child.id)?.unwrap();
+        assert_eq!(reloaded.priority, "high");
         assert_eq!(reloaded.reviewer.as_deref(), Some("lead"));
         assert_eq!(reloaded.parent_task_id.as_deref(), Some("legacy"));
-        assert_eq!(tasks.inbox("worker")?.len(), 2);
+        let worker_inbox = tasks.inbox("worker")?;
+        assert_eq!(worker_inbox.len(), 2);
+        assert_eq!(worker_inbox[0].id, child.id);
+        assert_eq!(worker_inbox[1].id, "legacy");
         tasks.set_status(
             &child.id,
             "assigned",
@@ -1984,6 +2008,246 @@ mod tests {
         assert_eq!(
             tasks.review_queue("#one")?[0].reviewer.as_deref(),
             Some("lead")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_priority_queue_orders_inbox_list_and_review_queue() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        init_with(&connection, false)?;
+        let tasks = crate::tasks::TaskStore::new(SharedConnection::from_connection(connection), 60);
+
+        let low = tasks.create_full(crate::tasks::NewTask {
+            channel: "#alpha".into(),
+            title: "Low task".into(),
+            priority: Some("low".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let normal1 = tasks.create_full(crate::tasks::NewTask {
+            channel: "#alpha".into(),
+            title: "Normal 1".into(),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let high = tasks.create_full(crate::tasks::NewTask {
+            channel: "#beta".into(),
+            title: "High task".into(),
+            priority: Some("HIGH".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let urgent = tasks.create_full(crate::tasks::NewTask {
+            channel: "#gamma".into(),
+            title: "Urgent task".into(),
+            priority: Some("urgent".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+        let normal2 = tasks.create_full(crate::tasks::NewTask {
+            channel: "#alpha".into(),
+            title: "Normal 2".into(),
+            priority: Some("normal".into()),
+            assignee: Some("worker".into()),
+            ..Default::default()
+        })?;
+
+        assert!(tasks
+            .create_full(crate::tasks::NewTask {
+                channel: "#alpha".into(),
+                title: "Bad priority".into(),
+                priority: Some("critical".into()),
+                ..Default::default()
+            })
+            .is_err());
+
+        let inbox_ids: Vec<_> = tasks
+            .inbox("worker")?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            inbox_ids,
+            vec![
+                urgent.id.clone(),
+                high.id.clone(),
+                normal1.id.clone(),
+                normal2.id.clone(),
+                low.id.clone()
+            ]
+        );
+
+        let alpha_ids: Vec<_> = tasks
+            .list("#alpha")?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            alpha_ids,
+            vec![normal1.id.clone(), normal2.id.clone(), low.id.clone()]
+        );
+
+        let (bumped, changed) = tasks.set_priority(&low.id, "urgent", "pm")?;
+        assert!(changed);
+        assert_eq!(bumped.priority, "urgent");
+        let (_, changed_again) = tasks.set_priority(&low.id, "urgent", "pm")?;
+        assert!(!changed_again);
+
+        let inbox_after: Vec<_> = tasks
+            .inbox("worker")?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        // Both low (now urgent, created earlier) and urgent share urgent priority, ordered FIFO.
+        assert_eq!(
+            inbox_after,
+            vec![
+                low.id.clone(),
+                urgent.id.clone(),
+                high.id.clone(),
+                normal1.id.clone(),
+                normal2.id.clone()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_dependencies_store_enforces_cross_repo_dag_and_blocked_by_validation() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        init_with(&connection, false)?;
+        // Idempotent re-init keeps task_dependencies intact.
+        init_with(&connection, false)?;
+        let table_exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_dependencies'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(table_exists, 1);
+
+        let tasks = crate::tasks::TaskStore::new(SharedConnection::from_connection(connection), 60);
+
+        let t_backend = tasks.create_full(crate::tasks::NewTask {
+            channel: "#api".into(),
+            title: "Build backend schema".into(),
+            repo: Some("backend".into()),
+            assignee: Some("alice".into()),
+            ..Default::default()
+        })?;
+        let t_frontend = tasks.create_full(crate::tasks::NewTask {
+            channel: "#web".into(),
+            title: "Integrate frontend UI".into(),
+            repo: Some("frontend".into()),
+            assignee: Some("bob".into()),
+            blocked_by: vec![t_backend.id.clone(), format!("  {}  ", t_backend.id)],
+            ..Default::default()
+        })?;
+        assert_eq!(t_frontend.blocked_by, vec![t_backend.id.clone()]);
+
+        // Missing dependency rejected.
+        assert!(tasks
+            .create_full(crate::tasks::NewTask {
+                channel: "#web".into(),
+                title: "Bad dep".into(),
+                blocked_by: vec!["task_missing".into()],
+                ..Default::default()
+            })
+            .is_err());
+
+        // Self-dependency and cycles rejected.
+        assert!(tasks
+            .add_dependencies(&t_backend.id, std::slice::from_ref(&t_backend.id), "pm")
+            .is_err());
+        let cycle_err = tasks
+            .add_dependencies(&t_backend.id, std::slice::from_ref(&t_frontend.id), "pm")
+            .unwrap_err();
+        assert!(cycle_err.to_string().contains("circular"));
+
+        // 3-node transitive cycle rejected: t_mid -> t_frontend -> t_backend, then t_backend -> t_mid.
+        let t_mid = tasks.create_full(crate::tasks::NewTask {
+            channel: "#sdk".into(),
+            title: "Publish SDK".into(),
+            repo: Some("sdk".into()),
+            blocked_by: vec![t_frontend.id.clone()],
+            ..Default::default()
+        })?;
+        assert!(tasks
+            .set_dependencies(&t_backend.id, std::slice::from_ref(&t_mid.id), "pm")
+            .is_err());
+
+        // Cross-repo and cross-project flags populated.
+        let deps = tasks.dependencies(&t_frontend.id)?;
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].task_id, t_backend.id);
+        assert_eq!(deps[0].repo.as_deref(), Some("backend"));
+        assert!(!deps[0].resolved);
+        assert!(deps[0].cross_repo);
+        assert!(deps[0].cross_project);
+
+        let rev = tasks.dependents(&t_backend.id)?;
+        assert_eq!(rev.len(), 1);
+        assert_eq!(rev[0].task_id, t_frontend.id);
+
+        // Blocked task cannot advance to in_progress/testing/review/merged, nor be claimed.
+        let blocked_err = tasks
+            .set_status(&t_frontend.id, "assigned", "in_progress", "bob", None, None)
+            .unwrap_err();
+        assert!(blocked_err.to_string().contains(&t_backend.id));
+
+        let t_claimable = tasks.create_full(crate::tasks::NewTask {
+            channel: "#web".into(),
+            title: "Claimable after backend".into(),
+            repo: Some("frontend".into()),
+            blocked_by: vec![t_backend.id.clone()],
+            ..Default::default()
+        })?;
+        assert!(tasks.claim(&t_claimable.id, "bob").is_err());
+
+        // Filtering by repo and blocked state works.
+        assert_eq!(
+            tasks
+                .list_filtered_with_options("#web", None, Some("frontend"), Some(true))?
+                .len(),
+            2
+        );
+        assert!(tasks
+            .list_filtered_with_options("#web", None, Some("frontend"), Some(false))?
+            .is_empty());
+
+        // Completing the blocker unblocks dependents.
+        tasks.set_status(&t_backend.id, "assigned", "merged", "pm", Some("ok"), None)?;
+        assert!(tasks.unresolved_blockers(&t_frontend.id)?.is_empty());
+        let advanced = tasks.set_status(&t_frontend.id, "assigned", "in_progress", "bob", None, None)?;
+        assert_eq!(advanced.status, "in_progress");
+        let claimed = tasks.claim(&t_claimable.id, "bob")?;
+        assert_eq!(claimed.status, "claimed");
+
+        // Cancelling a blocker keeps dependents blocked unless unlinked, while cancelling a blocked task is allowed.
+        let t_to_cancel = tasks.create_full(crate::tasks::NewTask {
+            channel: "#api".into(),
+            title: "Cancelled prerequisite".into(),
+            ..Default::default()
+        })?;
+        let t_waiting = tasks.create_full(crate::tasks::NewTask {
+            channel: "#web".into(),
+            title: "Waiting on cancelled".into(),
+            assignee: Some("bob".into()),
+            blocked_by: vec![t_to_cancel.id.clone()],
+            ..Default::default()
+        })?;
+        tasks.set_status(&t_to_cancel.id, "open", "cancelled", "pm", Some("dropped"), None)?;
+        assert!(tasks
+            .set_status(&t_waiting.id, "assigned", "in_progress", "bob", None, None)
+            .is_err());
+        let (unlinked, removed) = tasks.remove_dependency(&t_waiting.id, &t_to_cancel.id, "pm")?;
+        assert!(removed);
+        assert!(unlinked.blocked_by.is_empty());
+        assert_eq!(
+            tasks
+                .set_status(&t_waiting.id, "assigned", "in_progress", "bob", None, None)?
+                .status,
+            "in_progress"
         );
         Ok(())
     }

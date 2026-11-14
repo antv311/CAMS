@@ -24,6 +24,25 @@ from aircd.bionic import BionicAgent, BionicConfig, BionicError, RunResult  # no
 logger = logging.getLogger("aircd")
 
 
+def build_ssl_context(
+    *,
+    tls_verify: bool = True,
+    tls_ca_path: Optional[str] = None,
+    tls_cert_path: Optional[str] = None,
+    tls_key_path: Optional[str] = None,
+) -> ssl.SSLContext:
+    """Create a client SSLContext supporting custom CA and mTLS client certificates."""
+    if tls_key_path and not tls_cert_path:
+        raise ValueError("tls_cert_path is required when tls_key_path is set")
+    ssl_ctx = ssl.create_default_context(cafile=tls_ca_path or None)
+    if not tls_verify:
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+    if tls_cert_path:
+        ssl_ctx.load_cert_chain(certfile=tls_cert_path, keyfile=tls_key_path or None)
+    return ssl_ctx
+
+
 @dataclass
 class Message:
     """A message received from the server."""
@@ -210,10 +229,14 @@ class AircdClient:
         tls: bool = False,
         tls_verify: bool = True,
         tls_ca_path: Optional[str] = None,
+        tls_cert_path: Optional[str] = None,
+        tls_key_path: Optional[str] = None,
         auto_reconnect: bool = True,
         reconnect_delay: float = 2.0,
         max_reconnect_delay: float = 60.0,
     ):
+        if tls_key_path and not tls_cert_path:
+            raise ValueError("tls_cert_path is required when tls_key_path is set")
         self.host = host
         self.port = port
         self.token = token
@@ -221,6 +244,8 @@ class AircdClient:
         self.tls = tls
         self.tls_verify = tls_verify
         self.tls_ca_path = tls_ca_path
+        self.tls_cert_path = tls_cert_path
+        self.tls_key_path = tls_key_path
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_delay = max_reconnect_delay
@@ -241,10 +266,12 @@ class AircdClient:
     async def _do_connect(self) -> None:
         ssl_ctx = None
         if self.tls:
-            ssl_ctx = ssl.create_default_context(cafile=self.tls_ca_path)
-            if not self.tls_verify:
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
+            ssl_ctx = build_ssl_context(
+                tls_verify=self.tls_verify,
+                tls_ca_path=self.tls_ca_path,
+                tls_cert_path=self.tls_cert_path,
+                tls_key_path=self.tls_key_path,
+            )
         reader, writer = await asyncio.open_connection(
             self.host, self.port, ssl=ssl_ctx,
         )
@@ -536,14 +563,34 @@ class AircdHttpClient:
         token: str = "",
         invite: str = "",
         timeout: float = 15.0,
+        tls_verify: bool = True,
+        tls_ca_path: Optional[str] = None,
+        tls_cert_path: Optional[str] = None,
+        tls_key_path: Optional[str] = None,
     ):
         base_url = base_url.strip().rstrip("/")
         if not base_url.startswith(("http://", "https://")):
             base_url = f"http://{base_url}"
+        if tls_key_path and not tls_cert_path:
+            raise ValueError("tls_cert_path is required when tls_key_path is set")
         self.base_url = base_url
         self.token = token
         self.invite = invite
         self.timeout = timeout
+        self.tls_verify = tls_verify
+        self.tls_ca_path = tls_ca_path
+        self.tls_cert_path = tls_cert_path
+        self.tls_key_path = tls_key_path
+        self._ssl_context: Optional[ssl.SSLContext] = (
+            build_ssl_context(
+                tls_verify=tls_verify,
+                tls_ca_path=tls_ca_path,
+                tls_cert_path=tls_cert_path,
+                tls_key_path=tls_key_path,
+            )
+            if base_url.startswith("https://")
+            else None
+        )
 
     # Templates
 
@@ -680,21 +727,54 @@ class AircdHttpClient:
         *,
         body: Optional[str] = None,
         kind: str = "task",
+        priority: Optional[str] = None,
         assignee: Optional[str] = None,
         repo: Optional[str] = None,
         branch: Optional[str] = None,
         issue_url: Optional[str] = None,
         parent: Optional[str] = None,
         reviewer: Optional[str] = None,
+        blocked_by: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Create a task and return it. ``parent`` makes it a subtask of that task
         id; ``reviewer`` names who reviews it (the hub defaults to the parent's
         assignee for subtasks, otherwise the project manager)."""
         payload = task_create_payload(
-            channel, title, body=body, kind=kind, assignee=assignee, repo=repo,
-            branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
+            channel, title, body=body, kind=kind, priority=priority, assignee=assignee,
+            repo=repo, branch=branch, issue_url=issue_url, parent=parent, reviewer=reviewer,
+            blocked_by=blocked_by,
         )
         return self._request("POST", "/v1/tasks", payload=payload)["task"]
+
+    def set_task_priority(self, task_id: str, priority: str) -> dict[str, Any]:
+        """Set the priority (``urgent``, ``high``, ``normal``, or ``low``) of a task."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/priority"
+        return self._request("POST", path, payload={"priority": priority})["task"]
+
+    def get_task_dependencies(self, task_id: str) -> dict[str, Any]:
+        """Return dependencies, dependents, and unresolved blockers for ``task_id``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/dependencies"
+        return self._request("GET", path)
+
+    def set_task_dependencies(self, task_id: str, blocked_by: list[str]) -> dict[str, Any]:
+        """Replace all ``blocked_by`` dependencies of ``task_id``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/dependencies"
+        return self._request("PUT", path, payload={"blocked_by": _clean_dep_ids(blocked_by)})
+
+    def add_task_dependency(self, task_id: str, depends_on_task_id: str) -> dict[str, Any]:
+        """Add a ``blocked_by`` dependency to ``task_id``."""
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/dependencies"
+        return self._request("POST", path, payload={"depends_on_task_id": depends_on_task_id.strip()})
+
+    def remove_task_dependency(self, task_id: str, depends_on_task_id: str) -> dict[str, Any]:
+        """Remove one ``blocked_by`` dependency from ``task_id``."""
+        path = (
+            "/v1/tasks/"
+            + urllib.parse.quote(task_id.strip(), safe="")
+            + "/dependencies/"
+            + urllib.parse.quote(depends_on_task_id.strip(), safe="")
+        )
+        return self._request("DELETE", path)
 
     def set_task_status(
         self,
@@ -779,7 +859,9 @@ class AircdHttpClient:
             f"{self.base_url}{path}", data=data, headers=headers, method=method
         )
         try:
-            with urllib.request.urlopen(req, timeout=max(self.timeout, 60)) as resp:
+            with urllib.request.urlopen(
+                req, timeout=max(self.timeout, 60), context=self._ssl_context
+            ) as resp:
                 return resp.read(), {k.lower(): v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as err:
             raw = err.read().decode("utf-8", errors="replace")
@@ -788,8 +870,10 @@ class AircdHttpClient:
             except Exception:
                 message = raw or str(err)
             raise AircdHttpError(f"HTTP {err.code} {method} {path}: {message}", err.code) from None
-        except urllib.error.URLError as err:
-            raise AircdHttpError(f"Cannot reach aircd at {self.base_url}: {err.reason}") from None
+        except (urllib.error.URLError, OSError) as err:
+            raise AircdHttpError(
+                f"Cannot reach aircd at {self.base_url}: {getattr(err, 'reason', err)}"
+            ) from None
 
     def _request(
         self,
@@ -814,7 +898,9 @@ class AircdHttpClient:
             f"{self.base_url}{path}", data=data, headers=headers, method=method
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(
+                req, timeout=self.timeout, context=self._ssl_context
+            ) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as err:
             raw = err.read().decode("utf-8", errors="replace")
@@ -823,8 +909,10 @@ class AircdHttpClient:
             except Exception:
                 message = raw or str(err)
             raise AircdHttpError(f"HTTP {err.code} {method} {path}: {message}", err.code) from None
-        except urllib.error.URLError as err:
-            raise AircdHttpError(f"Cannot reach aircd at {self.base_url}: {err.reason}") from None
+        except (urllib.error.URLError, OSError) as err:
+            raise AircdHttpError(
+                f"Cannot reach aircd at {self.base_url}: {getattr(err, 'reason', err)}"
+            ) from None
         return json.loads(raw) if raw.strip() else {"ok": True}
 
 
@@ -859,21 +947,36 @@ def _clean_nick(nick: Optional[str]) -> Optional[str]:
     return nick or None
 
 
+def _clean_dep_ids(raw: Optional[list[str]]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw or []:
+        for part in str(item).split(","):
+            cleaned = part.strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                out.append(cleaned)
+    return out
+
+
 def task_create_payload(
     channel: str,
     title: str,
     *,
     body: Optional[str] = None,
     kind: str = "task",
+    priority: Optional[str] = None,
     assignee: Optional[str] = None,
     repo: Optional[str] = None,
     branch: Optional[str] = None,
     issue_url: Optional[str] = None,
     parent: Optional[str] = None,
     reviewer: Optional[str] = None,
+    blocked_by: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """The POST /v1/tasks body. ``parent_task_id`` and ``reviewer`` are only sent
-    when set, so a hub without subtask support sees the same request as before."""
+    """The POST /v1/tasks body. ``parent_task_id``, ``reviewer``, ``priority``,
+    and ``blocked_by`` are only sent when set, so a hub without those features
+    sees the same request as before."""
     payload: dict[str, Any] = {
         "channel": channel,
         "title": title,
@@ -884,12 +987,18 @@ def task_create_payload(
         "branch": branch,
         "issue_url": issue_url,
     }
+    priority = (priority or "").strip().lower()
+    if priority:
+        payload["priority"] = priority
     parent = (parent or "").strip()
     if parent:
         payload["parent_task_id"] = parent
     reviewer = _clean_nick(reviewer)
     if reviewer:
         payload["reviewer"] = reviewer
+    cleaned_deps = _clean_dep_ids(blocked_by)
+    if cleaned_deps:
+        payload["blocked_by"] = cleaned_deps
     return payload
 
 

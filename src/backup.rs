@@ -48,6 +48,8 @@ pub struct BackupConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Optional TLS private key path.
     pub tls_key_path: Option<PathBuf>,
+    /// Optional TLS client CA certificate path (mTLS).
+    pub tls_client_ca_path: Option<PathBuf>,
 }
 
 impl Default for BackupConfig {
@@ -62,6 +64,7 @@ impl Default for BackupConfig {
             owner_key_path: None,
             tls_cert_path: None,
             tls_key_path: None,
+            tls_client_ca_path: None,
         }
     }
 }
@@ -521,6 +524,13 @@ fn execute_snapshot_sync(
             &keyring_dir,
             &mut key_files,
         )?;
+        copy_optional_key_file(
+            cfg.tls_client_ca_path.as_deref(),
+            "tls_client_ca",
+            "tls-client-ca.pem",
+            &keyring_dir,
+            &mut key_files,
+        )?;
         key_ring.files = key_files;
 
         let manifest = SnapshotManifest {
@@ -831,6 +841,7 @@ pub fn restore_snapshot(
             "owner_key" => target_owner_key,
             "tls_cert" => target_tls_cert,
             "tls_key" => target_tls_key,
+            "tls_client_ca" => None,
             _ => None,
         };
         if let Some(dest_path) = dest {
@@ -1092,6 +1103,7 @@ mod tests {
             owner_key_path: Some(owner_key_path.clone()),
             tls_cert_path: Some(tls_cert.clone()),
             tls_key_path: Some(tls_key.clone()),
+            ..BackupConfig::default()
         };
         let manager = BackupManager::new(db.clone(), cfg, EventForwarder::default());
         let run = manager.run_once("manual").await?;
@@ -1163,8 +1175,7 @@ mod tests {
             retention: 2,
             on_startup: false,
             owner_key_path: Some(owner_key_path),
-            tls_cert_path: None,
-            tls_key_path: None,
+            ..BackupConfig::default()
         };
         let manager = BackupManager::new(db, cfg, EventForwarder::default());
 
@@ -1204,9 +1215,7 @@ mod tests {
             interval_secs: 1,
             retention: 3,
             on_startup: true,
-            owner_key_path: None,
-            tls_cert_path: None,
-            tls_key_path: None,
+            ..BackupConfig::default()
         };
         let manager = BackupManager::new(db, cfg, EventForwarder::default());
         let handle = manager.spawn_worker();

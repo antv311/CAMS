@@ -23,6 +23,8 @@ HTTP_PORT="${AIRCD_HTTP_PORT:-7667}"
 TLS=0
 TLS_INSECURE=0
 TLS_CA="${AIRCD_TLS_CA:-}"
+TLS_CERT="${AIRCD_TLS_CLIENT_CERT:-}"
+TLS_KEY="${AIRCD_TLS_CLIENT_KEY:-}"
 VERBOSE=0
 SKIP_INSTALL=0
 
@@ -47,6 +49,8 @@ Options:
   --tls                   connect with TLS
   --tls-insecure          disable TLS certificate verification
   --tls-ca PATH           CA certificate path
+  --tls-cert PATH         client TLS certificate PEM for mutual TLS (mTLS)
+  --tls-key PATH          client TLS private key PEM for mutual TLS (mTLS)
   --skip-install          reuse existing clients/python/.venv without reinstalling
   -v, --verbose           enable verbose daemon logging
   -h, --help              show this help
@@ -109,6 +113,14 @@ while [[ $# -gt 0 ]]; do
             TLS_CA="$2"
             shift 2
             ;;
+        --tls-cert)
+            TLS_CERT="$2"
+            shift 2
+            ;;
+        --tls-key)
+            TLS_KEY="$2"
+            shift 2
+            ;;
         --skip-install)
             SKIP_INSTALL=1
             shift
@@ -167,6 +179,12 @@ if [[ "$TLS_INSECURE" -eq 1 ]]; then
 fi
 if [[ -n "$TLS_CA" ]]; then
     ARGS+=(--tls-ca "$TLS_CA")
+fi
+if [[ -n "$TLS_CERT" ]]; then
+    ARGS+=(--tls-cert "$TLS_CERT")
+fi
+if [[ -n "$TLS_KEY" ]]; then
+    ARGS+=(--tls-key "$TLS_KEY")
 fi
 if [[ "$VERBOSE" -eq 1 ]]; then
     ARGS+=(--verbose)

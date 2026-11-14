@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>aircd — Sprint Monitor Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar card">
+      <div class="topbar-main">
+        <div class="brand">
+          <h1>aircd <span class="brand-sep">/</span> Sprint Monitor</h1>
+          <div class="nav-links">
+            <a href="/">Welcome</a>
+            <a href="/metrics">Prometheus /metrics</a>
+            <a href="/healthz">Healthz</a>
+          </div>
+        </div>
+        <div class="auth-panel">
+          <span id="connBadge" class="badge badge-muted">Connecting...</span>
+          <div class="token-group">
+            <input id="tokenInput" type="password" placeholder="Bearer token (Read scope)" autocomplete="off" spellcheck="false">
+            <button id="toggleTokenBtn" type="button" class="btn-ghost" title="Show/hide token">Show</button>
+            <button id="connectBtn" type="button">Connect</button>
+            <button id="disconnectBtn" type="button" class="btn-ghost" hidden>Clear</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <label class="field">
+          <span>Project</span>
+          <select id="projectFilter">
+            <option value="">All Projects</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Sprint</span>
+          <select id="sprintFilter">
+            <option value="">All Sprints</option>
+          </select>
+        </label>
+        <label class="field field-grow">
+          <span>Search</span>
+          <input id="searchInput" type="search" placeholder="Filter by title, task id, @assignee, branch...">
+        </label>
+        <label class="check-field">
+          <input id="includeTerminal" type="checkbox" checked>
+          <span>Show completed</span>
+        </label>
+        <div class="segmented" role="group" aria-label="Task view mode">
+          <button id="viewBoardBtn" type="button" class="active">Board</button>
+          <button id="viewTableBtn" type="button">Table</button>
+        </div>
+        <label class="field">
+          <span>Auto</span>
+          <select id="refreshInterval">
+            <option value="0">Off</option>
+            <option value="3000">3s</option>
+            <option value="5000" selected>5s</option>
+            <option value="15000">15s</option>
+            <option value="30000">30s</option>
+          </select>
+        </label>
+        <button id="refreshBtn" type="button" class="btn-secondary">Refresh</button>
+        <span id="lastUpdated" class="muted meta-time">—</span>
+      </div>
+    </header>
+
+    <div id="banner" class="banner" hidden></div>
+
+    <section id="kpiGrid" class="kpi-grid" aria-label="Sprint and hub summary"></section>
+
+    <section id="sprintsSection" class="card" hidden>
+      <div class="section-head">
+        <h2>Sprint Rooms</h2>
+        <span id="sprintMeta" class="muted"></span>
+      </div>
+      <div id="sprintsGrid" class="sprints-grid"></div>
+    </section>
+
+    <section id="tasksSection" class="card" hidden>
+      <div class="section-head">
+        <div class="section-title-group">
+          <h2>Tasks</h2>
+          <span id="tasksMeta" class="muted"></span>
+        </div>
+        <div id="statusPills" class="pill-bar"></div>
+      </div>
+      <div id="tasksContent"></div>
+    </section>
+
+    <section id="agentsSection" class="card">
+      <div class="section-head">
+        <div class="section-title-group">
+          <h2>Agents &amp; Wake Runtime</h2>
+          <span id="agentsMeta" class="muted"></span>
+        </div>
+        <div id="agentFilterBadge" class="pill-bar"></div>
+      </div>
+      <div id="agentsContent"></div>
+    </section>
+
+    <section id="infraSection" class="card">
+      <div class="section-head">
+        <div class="segmented" role="tablist" aria-label="Infrastructure views">
+          <button id="tabRepos" type="button" class="active" data-tab="repos">Git Repos</button>
+          <button id="tabLocks" type="button" data-tab="locks">Locks</button>
+          <button id="tabChannels" type="button" data-tab="channels">Channels</button>
+        </div>
+        <span id="infraMeta" class="muted"></span>
+      </div>
+      <div id="infraContent"></div>
+    </section>
+  </div>
+
+  <div id="taskModal" class="modal-backdrop" hidden role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <div id="modalSubtitle" class="muted mono small"></div>
+          <h2 id="modalTitle">Task</h2>
+        </div>
+        <button id="closeModalBtn" type="button" class="btn-ghost">Close</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

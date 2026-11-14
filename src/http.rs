@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
@@ -9,15 +9,19 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::net::{IpAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use tokio::net::TcpListener;
 
 use crate::auth::{
     AuthContext, DuplicatePrincipalError, DuplicateTokenLabelError, Scope, TokenExpiredError,
 };
 use crate::gits::{sanitize_repo_name, verify_github_signature};
+use crate::history::{canonical_dm_channel, HistorySearchScope};
 use crate::locks::LockConflictError;
 use crate::logging::{LogEvent, Severity};
+use crate::rate_limit::{
+    normalize_ip, LimitScope, RateLimitConfig, RateLimitHeaders, RateLimitRejection, RateLimiter,
+};
 use crate::server::{Server, SpawnError};
 use crate::store::{
     ClientTemplate, ClientTemplateInput, GroupInput, GroupMember, GroupMembershipUpdate,
@@ -30,17 +34,24 @@ pub struct HttpRuntimeInfo {
     pub irc_port: u16,
     pub http_bind: String,
     pub http_port: u16,
+    pub http_tls_port: Option<u16>,
     pub tls_port: Option<u16>,
+    pub tls_client_auth: String,
+    pub tls_only: bool,
     pub detected_hosts: Vec<String>,
     /// Owner invite key. When set, `POST /v1/register` must present it.
     #[serde(skip)]
     pub register_key: Option<String>,
+    /// Token-bucket HTTP rate-limiting policy.
+    #[serde(skip)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Clone)]
 struct AppState {
     server: Server,
     info: HttpRuntimeInfo,
+    rate_limiter: RateLimiter,
 }
 
 #[derive(Debug)]
@@ -102,14 +113,241 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[derive(Clone)]
+enum CachedTokenAuth {
+    Ok(AuthContext),
+    Expired,
+    Invalid,
+}
+
+tokio::task_local! {
+    static REQUEST_TOKEN_AUTH: (String, CachedTokenAuth);
+}
+
+fn extract_client_ip(request: &Request, trust_proxy_headers: bool) -> IpAddr {
+    if trust_proxy_headers {
+        if let Some(forwarded) = request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(ip) = forwarded
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .find_map(|part| part.parse::<IpAddr>().ok())
+            {
+                return normalize_ip(ip);
+            }
+        }
+        if let Some(real_ip) = request
+            .headers()
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return normalize_ip(real_ip);
+        }
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| normalize_ip(ci.0.ip()))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn apply_rate_limit_headers(headers: &mut HeaderMap, rl: RateLimitHeaders) {
+    if let Ok(val) = HeaderValue::from_str(&rl.limit.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-limit"), val);
+    }
+    if let Ok(val) = HeaderValue::from_str(&rl.remaining.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-remaining"), val);
+    }
+    if let Ok(val) = HeaderValue::from_str(&rl.reset_after_secs.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-reset"), val);
+    }
+    headers.insert(
+        HeaderName::from_static("x-ratelimit-scope"),
+        HeaderValue::from_static(rl.scope.as_str()),
+    );
+}
+
+fn log_rate_limit_rejection(
+    state: &AppState,
+    rej: RateLimitRejection,
+    ip: IpAddr,
+    path: &str,
+    principal: Option<&crate::auth::Principal>,
+) {
+    let key = match rej.scope {
+        LimitScope::Ip => ip.to_string(),
+        LimitScope::Principal => principal
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| ip.to_string()),
+    };
+    let Some(suppressed) = state.rate_limiter.should_log_rejection(rej.scope, &key) else {
+        return;
+    };
+    let suppressed_note = if suppressed > 0 {
+        format!(" (suppressed {suppressed} prior rejections)")
+    } else {
+        String::new()
+    };
+    let actor = principal
+        .map(|p| p.id.clone())
+        .unwrap_or_else(|| ip.to_string());
+    let who = principal
+        .map(|p| format!("principal @{} ({ip})", p.nick))
+        .unwrap_or_else(|| format!("ip {ip}"));
+    state.server.logger().log_security(
+        Severity::Warning,
+        "http.rate_limited",
+        "failure",
+        Some(&actor),
+        Some(&ip.to_string()),
+        Some(path),
+        format!(
+            "HTTP rate limit exceeded (scope={}, {who}, path={path}, retry_after={}s){suppressed_note}",
+            rej.scope.as_str(),
+            rej.retry_after_secs
+        ),
+    );
+}
+
+fn rate_limit_response(
+    state: &AppState,
+    rej: RateLimitRejection,
+    principal: Option<&crate::auth::Principal>,
+) -> Response {
+    state
+        .server
+        .metrics()
+        .record_http_rate_limited(rej.scope.as_str());
+    let target = match rej.scope {
+        LimitScope::Ip => "client IP".to_string(),
+        LimitScope::Principal => principal
+            .map(|p| format!("principal @{}", p.nick))
+            .unwrap_or_else(|| "principal".to_string()),
+    };
+    let message = format!(
+        "rate limit exceeded for {target} (retry after {}s)",
+        rej.retry_after_secs
+    );
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        with_cors_headers(),
+        Json(json!({
+            "ok": false,
+            "error": message,
+            "limit_scope": rej.scope.as_str(),
+            "retry_after_seconds": rej.retry_after_secs,
+        })),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    if let Ok(val) = HeaderValue::from_str(&rej.retry_after_secs.to_string()) {
+        headers.insert(header::RETRY_AFTER, val);
+    }
+    apply_rate_limit_headers(
+        headers,
+        RateLimitHeaders {
+            scope: rej.scope,
+            limit: rej.limit,
+            remaining: 0,
+            reset_after_secs: rej.reset_after_secs,
+        },
+    );
+    response
+}
+
+async fn rate_limit_requests(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.rate_limiter.is_enabled() || request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
+    let ip = extract_client_ip(&request, state.rate_limiter.trust_proxy_headers());
+    let path = request.uri().path().to_string();
+    let raw_token = extract_bearer_token(request.headers()).map(str::to_owned);
+
+    if let Some(raw) = raw_token {
+        // Reject already-exhausted IPs before running Argon2 verification.
+        if let Err(rej) = state.rate_limiter.peek_ip(ip) {
+            log_rate_limit_rejection(&state, rej, ip, &path, None);
+            return rate_limit_response(&state, rej, None);
+        }
+
+        let auth_outcome = match state.server.auth().authenticate_context(&raw) {
+            Ok(ctx) => CachedTokenAuth::Ok(ctx),
+            Err(err) if err.downcast_ref::<TokenExpiredError>().is_some() => {
+                CachedTokenAuth::Expired
+            }
+            Err(_) => CachedTokenAuth::Invalid,
+        };
+
+        let rl_result = match &auth_outcome {
+            CachedTokenAuth::Ok(ctx) => {
+                state
+                    .rate_limiter
+                    .check_principal_and_ip(&ctx.principal.id, ip)
+            }
+            CachedTokenAuth::Expired | CachedTokenAuth::Invalid => state.rate_limiter.check_ip(ip),
+        };
+
+        let principal_ref = match &auth_outcome {
+            CachedTokenAuth::Ok(ctx) => Some(&ctx.principal),
+            _ => None,
+        };
+
+        let rl_headers = match rl_result {
+            Ok(headers) => headers,
+            Err(rej) => {
+                log_rate_limit_rejection(&state, rej, ip, &path, principal_ref);
+                return rate_limit_response(&state, rej, principal_ref);
+            }
+        };
+
+        let mut response = REQUEST_TOKEN_AUTH
+            .scope((raw, auth_outcome), next.run(request))
+            .await;
+        if let Some(rl) = rl_headers {
+            apply_rate_limit_headers(response.headers_mut(), rl);
+        }
+        return response;
+    }
+
+    let rl_headers = match state.rate_limiter.check_ip(ip) {
+        Ok(headers) => headers,
+        Err(rej) => {
+            log_rate_limit_rejection(&state, rej, ip, &path, None);
+            return rate_limit_response(&state, rej, None);
+        }
+    };
+    let mut response = next.run(request).await;
+    if let Some(rl) = rl_headers {
+        apply_rate_limit_headers(response.headers_mut(), rl);
+    }
+    response
+}
+
 async fn log_http_server_errors(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let _in_flight = state.server.metrics().inc_http_in_flight();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let response = next.run(request).await;
+    state.server.metrics().record_http_request(
+        method.as_str(),
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
     if response.status().is_server_error() {
         let detail = response
             .extensions()
@@ -137,9 +375,13 @@ pub fn build_runtime_info(
         irc_port: parse_port(irc_bind, 6667),
         http_bind: http_bind.to_string(),
         http_port: parse_port(http_bind, 6680),
+        http_tls_port: None,
         tls_port,
+        tls_client_auth: "none".to_string(),
+        tls_only: false,
         detected_hosts: reachable_hosts(http_bind),
         register_key: None,
+        rate_limit: RateLimitConfig::default(),
     }
 }
 
@@ -203,19 +445,63 @@ pub async fn serve(server: Server, bind_addr: &str, info: HttpRuntimeInfo) -> Re
     let mut runtime = info;
     runtime.http_port = actual_port;
     println!("aircd HTTP welcome & API listening on http://{bind_addr} (port {actual_port})");
-    axum::serve(listener, router(server, runtime))
+    axum::serve(
+        listener,
+        router(server, runtime).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve HTTP router")
+}
+
+pub async fn serve_tls(
+    server: Server,
+    bind_addr: &str,
+    info: HttpRuntimeInfo,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> Result<()> {
+    let tcp = TcpListener::bind(bind_addr)
         .await
-        .context("serve HTTP router")
+        .with_context(|| format!("bind HTTPS welcome/API listener on {bind_addr}"))?;
+    let actual_port = tcp.local_addr()?.port();
+    let mut runtime = info;
+    runtime.http_tls_port = Some(actual_port);
+    let logger = server.logger().clone();
+    use axum::serve::ListenerExt;
+    let tls_listener = crate::tls::TlsListener::from_tcp(tcp, acceptor, logger)
+        .with_context(|| format!("initialize HTTPS TLS listener on {bind_addr}"))?
+        .tap_io(|_| {});
+    println!(
+        "aircd HTTPS welcome & API listening on https://{bind_addr} (port {actual_port}, client_auth={})",
+        runtime.tls_client_auth
+    );
+    axum::serve(
+        tls_listener,
+        router(server, runtime).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve HTTPS router")
 }
 
 pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
-    let state = AppState { server, info };
+    let rate_limiter = RateLimiter::new(info.rate_limit.clone())
+        .expect("invalid HTTP rate limit configuration");
+    let state = AppState {
+        server,
+        info,
+        rate_limiter,
+    };
     Router::new()
         .route("/", get(welcome_root))
         .route("/welcome", get(welcome_root))
         .route("/instructions", get(welcome_root))
+        .route("/dashboard", get(dashboard_html))
+        .route("/dashboard/", get(dashboard_html))
+        .route("/dashboard/style.css", get(dashboard_css))
+        .route("/dashboard/app.js", get(dashboard_js))
         .route("/v1/welcome", get(welcome_json))
+        .route("/v1/dashboard", get(get_dashboard))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/agents", get(public_agents))
         .route("/v1/channels", get(public_channels))
         .route("/v1/gits", get(public_gits).post(register_git_repo))
@@ -258,6 +544,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         )
         .route("/v1/channels/join", post(join_channels))
         .route("/v1/messages", get(list_messages).post(post_message))
+        .route("/v1/messages/search", get(search_messages))
         .route("/v1/roles", get(list_roles).post(set_role))
         .route(
             "/v1/webhooks",
@@ -273,6 +560,17 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/tasks/{id}/release", post(release_task))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
+        .route("/v1/tasks/{id}/priority", post(set_task_priority))
+        .route(
+            "/v1/tasks/{id}/dependencies",
+            get(get_task_dependencies)
+                .post(add_task_dependencies)
+                .put(set_task_dependencies),
+        )
+        .route(
+            "/v1/tasks/{id}/dependencies/{dep_id}",
+            delete(remove_task_dependency),
+        )
         .route("/v1/tasks/{id}/status", post(set_task_status))
         .route("/v1/tasks/{id}/peer-review", post(peer_review_task))
         .route("/v1/tasks/{id}/ask", post(ask_task))
@@ -303,6 +601,10 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/v1/git/webhook", post(github_webhook_query))
         .route("/v1/git/webhook/{repo}", post(github_webhook_repo))
         .fallback(cors_preflight_or_404)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_requests,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             log_http_server_errors,
@@ -376,9 +678,105 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "service": "aircd",
             "irc_port": state.info.irc_port,
             "http_port": state.info.http_port,
+            "http_tls_port": state.info.http_tls_port,
             "tls_port": state.info.tls_port,
+            "tls_client_auth": state.info.tls_client_auth,
+            "tls_only": state.info.tls_only,
         })),
     )
+}
+
+async fn prometheus_metrics(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let server = state.server.clone();
+    let body = tokio::task::spawn_blocking(move || server.render_prometheus_metrics())
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+        .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        [(header::CONTENT_TYPE, crate::metrics::PROMETHEUS_CONTENT_TYPE)],
+        body,
+    ))
+}
+
+async fn dashboard_html() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        with_cors_headers(),
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::dashboard::DASHBOARD_HTML,
+    )
+}
+
+async fn dashboard_css() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        with_cors_headers(),
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::dashboard::DASHBOARD_CSS,
+    )
+}
+
+async fn dashboard_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        with_cors_headers(),
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::dashboard::DASHBOARD_JS,
+    )
+}
+
+#[derive(Deserialize)]
+struct DashboardQuery {
+    channel: Option<String>,
+    sprint: Option<String>,
+    include_terminal: Option<bool>,
+}
+
+async fn get_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DashboardQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let viewer =
+        authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/dashboard")?.principal;
+    let channel = q
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_http_channel);
+    let sprint = q
+        .sprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_http_channel);
+    let include_terminal = q.include_terminal.unwrap_or(true);
+    let server = state.server.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        crate::dashboard::build_dashboard_snapshot(
+            &server,
+            &viewer,
+            channel.as_deref(),
+            sprint.as_deref(),
+            include_terminal,
+        )
+    })
+    .await
+    .map_err(|err| ApiError::internal(anyhow::anyhow!(err)))?
+    .map_err(ApiError::internal)?;
+    Ok((StatusCode::OK, with_cors_headers(), Json(snapshot)))
 }
 
 async fn public_agents(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
@@ -1565,6 +1963,7 @@ async fn login_agent(
         )
     })?;
     let ctx = authenticate_token_context(&state, raw_token)?;
+    let ctx_for_refresh = ctx.clone();
     let principal = ctx.principal;
     let req = body.map(|b| b.0).unwrap_or_default();
     if req.ttl_seconds == Some(0) {
@@ -1613,7 +2012,7 @@ async fn login_agent(
         let (_, refreshed) = state
             .server
             .auth()
-            .refresh_token(raw_token, req.ttl_seconds, false)
+            .refresh_token_with_context(ctx_for_refresh, raw_token, req.ttl_seconds, false)
             .map_err(ApiError::internal)?;
         (
             None,
@@ -1825,28 +2224,12 @@ async fn refresh_token_api(
         return Err(ApiError::bad_request("ttl_seconds must be at least 1"));
     }
     let rotate = req.rotate.unwrap_or(false);
+    let ctx = authenticate_token_context(&state, raw_token)?;
     let (principal, refreshed) = state
         .server
         .auth()
-        .refresh_token(raw_token, req.ttl_seconds, rotate)
-        .map_err(|err| {
-            if err.downcast_ref::<TokenExpiredError>().is_some() {
-                ApiError::unauthorized("Bearer token has expired")
-            } else if err.to_string().contains("invalid token") {
-                state.server.logger().log_security(
-                    Severity::Warning,
-                    "auth.http_failed",
-                    "failure",
-                    None,
-                    None,
-                    Some("/v1/tokens/refresh"),
-                    "HTTP authentication failed: invalid bearer token",
-                );
-                ApiError::unauthorized("Invalid bearer token")
-            } else {
-                ApiError::bad_request(err.to_string())
-            }
-        })?;
+        .refresh_token_with_context(ctx, raw_token, req.ttl_seconds, rotate)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     state.server.logger().log_security(
         Severity::Info,
@@ -1979,6 +2362,7 @@ struct MessagesQuery {
     dm: Option<String>,
     peer: Option<String>,
     after_seq: Option<i64>,
+    from_seq: Option<i64>,
     limit: Option<i64>,
 }
 
@@ -2011,12 +2395,96 @@ async fn list_messages(
             .map_err(ApiError::internal)?
     } else {
         let chan = normalize_http_channel(q.channel.as_deref().unwrap_or("#general"));
-        state
-            .server
-            .history()
-            .tail(&chan, after_seq, limit)
-            .map_err(ApiError::internal)?
+        if let Some(from_seq) = q.from_seq {
+            state
+                .server
+                .history()
+                .after(&chan, from_seq.saturating_sub(1).max(0), limit)
+                .map_err(ApiError::internal)?
+        } else {
+            state
+                .server
+                .history()
+                .tail(&chan, after_seq, limit)
+                .map_err(ApiError::internal)?
+        }
     };
+
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "messages": messages })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SearchMessagesQuery {
+    q: Option<String>,
+    scope: Option<String>,
+    channel: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn search_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SearchMessagesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let principal = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/messages/search",
+    )?
+    .principal;
+
+    let query_text = q.q.unwrap_or_default();
+    let scope_str = q.scope.as_deref().unwrap_or("all").trim().to_ascii_lowercase();
+    let scope = match scope_str.as_str() {
+        "" | "all" => HistorySearchScope::All,
+        "sprints" | "sprint" => HistorySearchScope::Sprints,
+        "dms" | "dm" => HistorySearchScope::Dms,
+        "channel" | "room" => HistorySearchScope::Channel,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "Invalid search scope '{other}' (expected all, sprints, dms, or channel)"
+            )));
+        }
+    };
+
+    let resolved_channel = if let Some(raw_chan) = q.channel.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(peer) = raw_chan.strip_prefix('@') {
+            let resolved = state
+                .server
+                .auth()
+                .resolve_by_name(peer)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found(format!("Unknown agent '{peer}'")))?;
+            Some(canonical_dm_channel(&principal.id, &resolved.id))
+        } else {
+            Some(normalize_http_channel(raw_chan))
+        }
+    } else {
+        None
+    };
+
+    let effective_scope = if resolved_channel.is_some() && scope == HistorySearchScope::All {
+        HistorySearchScope::Channel
+    } else {
+        scope
+    };
+    let limit = q.limit.unwrap_or(100);
+    let messages = state
+        .server
+        .history()
+        .search(
+            &principal.id,
+            &query_text,
+            effective_scope,
+            resolved_channel.as_deref(),
+            limit,
+        )
+        .map_err(ApiError::internal)?;
 
     Ok((
         StatusCode::OK,
@@ -2348,18 +2816,31 @@ struct ChannelQuery {
     channel: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TaskListQuery {
+    channel: Option<String>,
+    priority: Option<String>,
+    repo: Option<String>,
+    blocked: Option<bool>,
+}
+
 async fn list_tasks(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<ChannelQuery>,
+    Query(q): Query<TaskListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let _ = authenticate_scoped_request(&state, &headers, Scope::Read, "/v1/tasks")?;
     let channel = normalize_http_channel(q.channel.as_deref().unwrap_or("#general"));
     let tasks = state
         .server
         .tasks()
-        .list(&channel)
-        .map_err(ApiError::internal)?;
+        .list_filtered_with_options(
+            &channel,
+            q.priority.as_deref(),
+            q.repo.as_deref(),
+            q.blocked,
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -2373,12 +2854,14 @@ struct CreateTaskReq {
     title: String,
     body: Option<String>,
     kind: Option<String>,
+    priority: Option<String>,
     assignee: Option<String>,
     repo: Option<String>,
     branch: Option<String>,
     issue_url: Option<String>,
     reviewer: Option<String>,
     parent_task_id: Option<String>,
+    blocked_by: Option<Vec<String>>,
 }
 
 async fn create_task(
@@ -2400,6 +2883,7 @@ async fn create_task(
                 title: req.title,
                 body: req.body,
                 kind: req.kind,
+                priority: req.priority,
                 assignee: req.assignee,
                 created_by: None,
                 repo: req.repo,
@@ -2408,6 +2892,7 @@ async fn create_task(
                 sprint: None,
                 reviewer: req.reviewer,
                 parent_task_id: req.parent_task_id,
+                blocked_by: req.blocked_by.unwrap_or_default(),
             },
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -2440,6 +2925,225 @@ async fn assign_task(
         StatusCode::OK,
         with_cors_headers(),
         Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SetTaskPriorityReq {
+    priority: String,
+}
+
+async fn set_task_priority(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTaskPriorityReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor =
+        authenticate_scoped_request(&state, &headers, Scope::Pm, "/v1/tasks/{id}/priority")?
+            .principal;
+    let task = state
+        .server
+        .set_task_priority_api(&actor, &id, &req.priority)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({ "ok": true, "task": task })),
+    ))
+}
+
+struct DependencyDetails {
+    dependencies: Vec<crate::tasks::TaskDependency>,
+    dependents: Vec<crate::tasks::TaskDependency>,
+    unresolved: Vec<crate::tasks::TaskDependency>,
+}
+
+fn dependency_payload(
+    server: &Server,
+    task: &crate::tasks::Task,
+) -> Result<DependencyDetails, ApiError> {
+    let dependencies = server
+        .tasks()
+        .dependencies(&task.id)
+        .map_err(ApiError::internal)?;
+    let dependents = server
+        .tasks()
+        .dependents(&task.id)
+        .map_err(ApiError::internal)?;
+    let unresolved = dependencies
+        .iter()
+        .filter(|d| !d.resolved)
+        .cloned()
+        .collect();
+    Ok(DependencyDetails {
+        dependencies,
+        dependents,
+        unresolved,
+    })
+}
+
+async fn get_task_dependencies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Read,
+        "/v1/tasks/{id}/dependencies",
+    )?;
+    let task = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task_id": task.id,
+            "blocked_by": task.blocked_by,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SetTaskDependenciesReq {
+    blocked_by: Vec<String>,
+}
+
+async fn set_task_dependencies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTaskDependenciesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Pm,
+        "/v1/tasks/{id}/dependencies",
+    )?
+    .principal;
+    let _ = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let task = state
+        .server
+        .set_task_dependencies_api(&actor, &id, &req.blocked_by)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task": task,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AddTaskDependenciesReq {
+    depends_on_task_id: Option<String>,
+    blocked_by: Option<Vec<String>>,
+}
+
+async fn add_task_dependencies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AddTaskDependenciesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Pm,
+        "/v1/tasks/{id}/dependencies",
+    )?
+    .principal;
+    let _ = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let mut ids = req.blocked_by.unwrap_or_default();
+    if let Some(single) = req.depends_on_task_id {
+        ids.push(single);
+    }
+    if ids.iter().all(|s| s.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "depends_on_task_id or blocked_by is required",
+        ));
+    }
+    let task = state
+        .server
+        .add_task_dependencies_api(&actor, &id, &ids)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task": task,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
+    ))
+}
+
+async fn remove_task_dependency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, dep_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = authenticate_scoped_request(
+        &state,
+        &headers,
+        Scope::Pm,
+        "/v1/tasks/{id}/dependencies/{dep_id}",
+    )?
+    .principal;
+    let _ = state
+        .server
+        .get_task_api(&id)
+        .map_err(|err| ApiError::not_found(err.to_string()))?;
+    let (task, removed) = state
+        .server
+        .remove_task_dependency_api(&actor, &id, &dep_id)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !removed {
+        return Err(ApiError::not_found(format!(
+            "dependency '{dep_id}' not found on task '{}'",
+            task.id
+        )));
+    }
+    let details = dependency_payload(&state.server, &task)?;
+    Ok((
+        StatusCode::OK,
+        with_cors_headers(),
+        Json(json!({
+            "ok": true,
+            "task": task,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty(),
+        })),
     ))
 }
 
@@ -2553,6 +3257,7 @@ async fn get_task(
         .attachments()
         .list(&task.id)
         .map_err(ApiError::internal)?;
+    let details = dependency_payload(&state.server, &task)?;
     Ok((
         StatusCode::OK,
         with_cors_headers(),
@@ -2562,7 +3267,11 @@ async fn get_task(
             "events": events,
             "question": question,
             "subtasks": subtasks,
-            "attachments": attachments
+            "attachments": attachments,
+            "dependencies": details.dependencies,
+            "dependents": details.dependents,
+            "unresolved_blockers": details.unresolved,
+            "is_blocked": !details.unresolved.is_empty()
         })),
     ))
 }
@@ -3553,6 +4262,28 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn authenticate_token_context(state: &AppState, raw: &str) -> Result<AuthContext, ApiError> {
+    if let Some(outcome) = REQUEST_TOKEN_AUTH
+        .try_with(|(cached_raw, outcome)| (cached_raw == raw).then(|| outcome.clone()))
+        .ok()
+        .flatten()
+    {
+        return match outcome {
+            CachedTokenAuth::Ok(ctx) => Ok(ctx),
+            CachedTokenAuth::Expired => Err(ApiError::unauthorized("Bearer token has expired")),
+            CachedTokenAuth::Invalid => {
+                state.server.logger().log_security(
+                    Severity::Warning,
+                    "auth.http_failed",
+                    "failure",
+                    None,
+                    None,
+                    None,
+                    "HTTP authentication failed: invalid bearer token",
+                );
+                Err(ApiError::unauthorized("Invalid bearer token"))
+            }
+        };
+    }
     state
         .server
         .auth()
@@ -3640,7 +4371,10 @@ fn build_welcome_payload(state: &AppState, base_host: &str) -> Result<Value, Api
             "http_url": base_http,
             "irc_host": base_host,
             "irc_port": state.info.irc_port,
+            "http_tls_port": state.info.http_tls_port,
             "tls_port": state.info.tls_port,
+            "tls_client_auth": state.info.tls_client_auth,
+            "tls_only": state.info.tls_only,
             "detected_hosts": state.info.detected_hosts,
             "reachable_welcome_urls": state.info.detected_hosts.iter().map(|h| format!("http://{}:{}", h, state.info.http_port)).collect::<Vec<_>>(),
         },
@@ -3846,7 +4580,7 @@ fn build_welcome_html(state: &AppState, base_host: &str) -> Result<String, ApiEr
     <h1>aircd — IRC + Webhook + Roles + Git Coordinator</h1>
     <p class="muted">Lightweight agent &amp; developer coordination bus. Connect via raw IRC (<code>{irc}</code>), the <code>airc</code> CLI, or HTTP REST API (<code>{http}</code>).</p>
     <ul>{reachable_urls}</ul>
-    <p class="muted">Machine-readable specs: <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a></p>
+    <p class="muted">Web &amp; machine-readable endpoints: <a style="color:var(--accent)" href="/dashboard">Sprint Dashboard</a> &middot; <a style="color:var(--accent)" href="/v1/welcome">/v1/welcome</a> (JSON) &middot; <a style="color:var(--accent)" href="/?format=md">/?format=md</a> (Markdown) &middot; <a style="color:var(--accent)" href="/healthz">/healthz</a> &middot; <a style="color:var(--accent)" href="/metrics">/metrics</a> (Prometheus)</p>
   </div>
 
   <div class="grid">
@@ -4074,6 +4808,9 @@ mod tests {
     include!("http_attachment_tests.rs");
     include!("http_group_activity_tests.rs");
     include!("http_task_cascade_tests.rs");
+    include!("http_rate_limit_tests.rs");
+    include!("http_metrics_tests.rs");
+    include!("http_dashboard_tests.rs");
 
     struct TemplateApi {
         server: Server,
@@ -5466,9 +6203,13 @@ mod tests {
             irc_port: 6667,
             http_bind: api_addr.to_string(),
             http_port: api_addr.port(),
+            http_tls_port: None,
             tls_port: None,
+            tls_client_auth: "none".to_string(),
+            tls_only: false,
             detected_hosts: vec!["127.0.0.1".to_string()],
             register_key: None,
+            rate_limit: RateLimitConfig::default(),
         };
         tokio::spawn(async move {
             let _ = axum::serve(api_listener, router(server, info)).await;
@@ -5625,6 +6366,8 @@ mod tests {
     ) -> Result<(u16, Value)> {
         let request = match method {
             "GET" => client.get(url),
+            "PUT" => client.put(url).json(&body),
+            "DELETE" => client.delete(url),
             _ => client.post(url).json(&body),
         };
         let response = request.bearer_auth(token).send().await?;
@@ -7271,6 +8014,7 @@ mod tests {
             owner_key_path: Some(owner_key_path.clone()),
             tls_cert_path: None,
             tls_key_path: None,
+            tls_client_ca_path: None,
         };
         let server = Server::with_logger_and_backup(
             db,
@@ -7905,6 +8649,698 @@ mod tests {
         handle.abort();
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_priority_queue_and_inbox_dispatch_order() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let base = &api.base;
+        let owner_tok = "human-token";
+        let pm_tok = tokens["pm"].as_str();
+        let worker_tok = tokens["worker"].as_str();
+        let lead_tok = tokens["lead"].as_str();
+
+        // Add worker to #two as well so we can verify cross-project priority ordering.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/projects/members"),
+            owner_tok,
+            json!({ "channel": "#two", "nick": "worker", "role": "member" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // Invalid priority is rejected.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "Invalid", "priority": "critical" }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // Create tasks across #one and #two with mixed priorities.
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "Low one", "priority": "low", "assignee": "worker" }),
+        )
+        .await?;
+        let t_low = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["priority"], "low");
+
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "Normal one", "assignee": "worker" }),
+        )
+        .await?;
+        let t_normal = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["priority"], "normal");
+
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({ "channel": "#two", "title": "Urgent two", "priority": "urgent", "assignee": "worker" }),
+        )
+        .await?;
+        let t_urgent = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["priority"], "urgent");
+
+        let (_, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({ "channel": "#one", "title": "High one", "priority": "high", "assignee": "worker" }),
+        )
+        .await?;
+        let t_high = body["task"]["id"].as_str().unwrap().to_string();
+
+        // GET /v1/tasks returns priority-ordered tasks and supports ?priority= filtering.
+        let (status, list_one) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=one"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let one_ids: Vec<&str> = list_one["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(one_ids, vec![t_high.as_str(), t_normal.as_str(), t_low.as_str()]);
+
+        let (status, list_high) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=one&priority=high"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(list_high["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(list_high["tasks"][0]["id"], t_high);
+
+        // GET /v1/inbox returns global priority-ordered dispatch_queue, next_task,
+        // and orders projects by highest-priority task first (#two urgent before #one high).
+        let (status, inbox_body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let inbox = &inbox_body["inbox"];
+        assert_eq!(inbox["next_task"]["id"], t_urgent);
+        let dispatch_ids: Vec<&str> = inbox["dispatch_queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dispatch_ids,
+            vec![
+                t_urgent.as_str(),
+                t_high.as_str(),
+                t_normal.as_str(),
+                t_low.as_str(),
+            ]
+        );
+        assert_eq!(inbox["projects"][0]["channel"], "#two");
+        assert_eq!(inbox["projects"][1]["channel"], "#one");
+        let one_inbox_ids: Vec<&str> = inbox["projects"][1]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            one_inbox_ids,
+            vec![t_high.as_str(), t_normal.as_str(), t_low.as_str()]
+        );
+
+        // Non-PM worker cannot change task priority (403 Scope::Pm or 400).
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_low}/priority"),
+            worker_tok,
+            json!({ "priority": "urgent" }),
+        )
+        .await?;
+        assert!(status == 403 || status == 400);
+
+        // Lead without PM role cannot change an unrelated task's priority.
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_low}/priority"),
+            lead_tok,
+            json!({ "priority": "urgent" }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // PM bumps t_low to urgent -> it moves ahead of t_urgent (created earlier, FIFO tie-break).
+        let (status, updated) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_low}/priority"),
+            pm_tok,
+            json!({ "priority": "urgent" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(updated["task"]["priority"], "urgent");
+
+        let (_, inbox_after) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        let dispatch_after: Vec<&str> = inbox_after["inbox"]["dispatch_queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dispatch_after,
+            vec![
+                t_low.as_str(),
+                t_urgent.as_str(),
+                t_high.as_str(),
+                t_normal.as_str(),
+            ]
+        );
+        assert_eq!(inbox_after["inbox"]["next_task"]["id"], t_low);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cross_repo_task_dependencies_and_blocked_by_validation() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let base = &api.base;
+        let owner_tok = "human-token";
+        let pm_tok = tokens["pm"].as_str();
+        let worker_tok = tokens["worker"].as_str();
+        let lead_tok = tokens["lead"].as_str();
+
+        // Register repos on #one (backend) and #two (frontend), and add worker + pm to #two.
+        for (name, channel, path) in [
+            ("backend", "#one", "/repos/backend"),
+            ("frontend", "#two", "/repos/frontend"),
+        ] {
+            let (status, _) = call(
+                &api.client,
+                "POST",
+                format!("{base}/v1/gits"),
+                owner_tok,
+                json!({ "name": name, "channel": channel, "local_path": path }),
+            )
+            .await?;
+            assert_eq!(status, 201);
+        }
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/projects/members"),
+            owner_tok,
+            json!({ "channel": "#two", "nick": "worker", "role": "member" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // Missing dependency rejected on create.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({
+                "channel": "#one",
+                "title": "Bad dep",
+                "blocked_by": ["task_nonexistent"]
+            }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+
+        // Create backend blocker task in #one (repo=backend).
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            pm_tok,
+            json!({
+                "channel": "#one",
+                "title": "Backend API endpoint",
+                "repo": "backend",
+                "assignee": "lead"
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_backend = body["task"]["id"].as_str().unwrap().to_string();
+
+        // Create urgent frontend task in #two (repo=frontend) blocked by #one's backend task.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({
+                "channel": "#two",
+                "title": "Frontend integration",
+                "repo": "frontend",
+                "priority": "urgent",
+                "assignee": "worker",
+                "blocked_by": [t_backend.clone()]
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_frontend = body["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["task"]["blocked_by"], json!([t_backend]));
+
+        // Create ready normal task in #two for worker.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({
+                "channel": "#two",
+                "title": "Frontend styling",
+                "repo": "frontend",
+                "priority": "normal",
+                "assignee": "worker"
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_ready = body["task"]["id"].as_str().unwrap().to_string();
+
+        // Create lease-based open task in #two blocked by t_backend.
+        let (status, body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks"),
+            owner_tok,
+            json!({
+                "channel": "#two",
+                "title": "Claimable frontend follow-up",
+                "repo": "frontend",
+                "blocked_by": [t_backend.clone()]
+            }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let t_claimable = body["task"]["id"].as_str().unwrap().to_string();
+
+        // GET /v1/tasks/{id} and GET /v1/tasks/{id}/dependencies expose cross-repo metadata.
+        let (status, shown) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks/{t_frontend}"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(shown["is_blocked"], true);
+        assert_eq!(shown["dependencies"][0]["task_id"], t_backend);
+        assert_eq!(shown["dependencies"][0]["repo"], "backend");
+        assert_eq!(shown["dependencies"][0]["cross_repo"], true);
+        assert_eq!(shown["dependencies"][0]["cross_project"], true);
+        assert_eq!(shown["dependencies"][0]["resolved"], false);
+
+        let (status, backend_deps) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks/{t_backend}/dependencies"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(backend_deps["is_blocked"], false);
+        assert_eq!(backend_deps["dependents"].as_array().unwrap().len(), 2);
+
+        // Filtering GET /v1/tasks by ?repo= and ?blocked=true|false.
+        let (_, blocked_list) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=two&repo=frontend&blocked=true"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        let blocked_ids: Vec<&str> = blocked_list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(blocked_ids, vec![t_frontend.as_str(), t_claimable.as_str()]);
+
+        let (_, ready_list) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks?channel=two&repo=frontend&blocked=false"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        let ready_ids: Vec<&str> = ready_list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ready_ids, vec![t_ready.as_str()]);
+
+        // Inbox excludes blocked urgent task from next_task / dispatch_queue while keeping ready task.
+        let (_, inbox) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(inbox["inbox"]["task_count"], 2);
+        assert_eq!(inbox["inbox"]["ready_task_count"], 1);
+        assert_eq!(inbox["inbox"]["blocked_task_count"], 1);
+        assert_eq!(inbox["inbox"]["next_task"]["id"], t_ready);
+        assert_eq!(inbox["inbox"]["dispatch_queue"].as_array().unwrap().len(), 1);
+
+        // Blocked task cannot advance to in_progress nor be claimed.
+        let (status, err_body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_frontend}/status"),
+            worker_tok,
+            json!({ "status": "in_progress" }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        assert!(err_body["error"].as_str().unwrap().contains(&t_backend));
+
+        let (status, claim_err) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_claimable}/claim"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 409);
+        assert!(claim_err["error"].as_str().unwrap().contains(&t_backend));
+
+        // Cycle and self-dependency validation on /dependencies endpoints.
+        let (status, cycle_body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_backend}/dependencies"),
+            pm_tok,
+            json!({ "depends_on_task_id": t_frontend }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+        assert!(cycle_body["error"].as_str().unwrap().contains("circular"));
+
+        let (status, _) = call(
+            &api.client,
+            "PUT",
+            format!("{base}/v1/tasks/{t_backend}/dependencies"),
+            pm_tok,
+            json!({ "blocked_by": [t_backend] }),
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // Non-PM worker cannot mutate task dependencies.
+        let (status, _) = call(
+            &api.client,
+            "DELETE",
+            format!("{base}/v1/tasks/{t_frontend}/dependencies/{t_backend}"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert!(status == 403 || status == 400);
+
+        // Complete backend task through testing -> review -> merged.
+        for (st, note) in [
+            ("in_progress", None),
+            ("testing", None),
+            ("review", Some("cargo test ok")),
+        ] {
+            let (status, _) = call(
+                &api.client,
+                "POST",
+                format!("{base}/v1/tasks/{t_backend}/status"),
+                lead_tok,
+                json!({ "status": st, "note": note }),
+            )
+            .await?;
+            assert_eq!(status, 200);
+        }
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_backend}/status"),
+            pm_tok,
+            json!({ "status": "merged", "note": "LGTM" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // Now t_frontend and t_claimable are unblocked, and t_frontend (urgent) leads inbox dispatch_queue!
+        let (status, deps_after) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/tasks/{t_frontend}/dependencies"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(deps_after["is_blocked"], false);
+        assert_eq!(deps_after["dependencies"][0]["resolved"], true);
+
+        let (_, inbox_after) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/inbox"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(inbox_after["inbox"]["ready_task_count"], 2);
+        assert_eq!(inbox_after["inbox"]["blocked_task_count"], 0);
+        assert_eq!(inbox_after["inbox"]["next_task"]["id"], t_frontend);
+
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_frontend}/status"),
+            worker_tok,
+            json!({ "status": "in_progress" }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        let (status, _) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/tasks/{t_claimable}/claim"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+
+        // PUT + DELETE /dependencies and 404 when removing non-linked dependency.
+        let (status, _) = call(
+            &api.client,
+            "PUT",
+            format!("{base}/v1/tasks/{t_ready}/dependencies"),
+            owner_tok,
+            json!({ "blocked_by": [t_backend] }),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "DELETE",
+            format!("{base}/v1/tasks/{t_ready}/dependencies/{t_backend}"),
+            owner_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let (status, _) = call(
+            &api.client,
+            "DELETE",
+            format!("{base}/v1/tasks/{t_ready}/dependencies/{t_backend}"),
+            owner_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 404);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_messages_endpoint_supports_scopes_dm_privacy_and_from_seq() -> Result<()> {
+        let (api, tokens) = task_workflow_api().await?;
+        let base = &api.base;
+        let owner_tok = "human-token";
+        let pm_tok = tokens["pm"].as_str();
+        let worker_tok = tokens["worker"].as_str();
+
+        // Open a sprint room under #one (#one-s1).
+        let (status, room_body) = call(
+            &api.client,
+            "POST",
+            format!("{base}/v1/rooms"),
+            pm_tok,
+            json!({ "project": "#one", "title": "Sprint One" }),
+        )
+        .await?;
+        assert_eq!(status, 201);
+        let sprint_chan = room_body["room"]["channel"].as_str().unwrap().to_string();
+
+        // Post messages to #general, sprint room, and private DMs.
+        for (tok, target, body) in [
+            (owner_tok, "#general", "hub deploy checklist"),
+            (pm_tok, sprint_chan.as_str(), "sprint deploy ready"),
+            (worker_tok, "@pm", "dm deploy question"),
+            (owner_tok, "@lead", "secret owner-lead deploy note"),
+        ] {
+            let (st, _) = call(
+                &api.client,
+                "POST",
+                format!("{base}/v1/messages"),
+                tok,
+                json!({ "target": target, "body": body }),
+            )
+            .await?;
+            assert_eq!(st, 201);
+        }
+
+        // Unauthenticated search is rejected.
+        let res = api
+            .client
+            .get(format!("{base}/v1/messages/search?q=deploy"))
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // PM sees #general, #one-s1, and worker<->pm DM, but NOT owner<->lead DM.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=all"),
+            pm_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs.iter().all(|m| !m["body"].as_str().unwrap().contains("secret owner-lead")));
+
+        // Sprint scope returns only #one-s1.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=sprints"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let sprint_msgs = body["messages"].as_array().unwrap();
+        assert_eq!(sprint_msgs.len(), 1);
+        assert_eq!(sprint_msgs[0]["channel"], sprint_chan);
+
+        // DMs scope for worker returns only worker<->pm DM.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=dms"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let dm_msgs = body["messages"].as_array().unwrap();
+        assert_eq!(dm_msgs.len(), 1);
+        assert_eq!(dm_msgs[0]["body"], "dm deploy question");
+
+        // Channel scope with @peer resolves the DM conversation.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=channel&channel=@pm"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+
+        // Invalid scope returns 400.
+        let (status, _) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages/search?q=deploy&scope=invalid"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 400);
+
+        // from_seq loads inclusively starting at seq=1.
+        let (status, body) = call(
+            &api.client,
+            "GET",
+            format!("{base}/v1/messages?channel=%23general&from_seq=1&limit=10"),
+            worker_tok,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let loaded = body["messages"].as_array().unwrap();
+        assert!(loaded.iter().any(|m| m["body"] == "hub deploy checklist"));
+
         Ok(())
     }
 }

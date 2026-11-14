@@ -9,7 +9,7 @@ $Config = $null
 $Unrelated = $null
 $Tui = $null
 $SavedEnv = @{}
-foreach ($EnvName in @('AIRCD_CONFIG_DIR', 'AIRCD_DATA_DIR', 'AIRCD_CONFIG', 'AIRCD_WINDOWS_CONFIG', 'AIRCD_EXECUTABLE', 'AIRCD_BIND', 'AIRCD_HTTP_BIND', 'AIRCD_DB', 'AIRCD_OPEN_REGISTRATION', 'AIRCD_REGISTER_KEY', 'AIRCD_TLS_CERT', 'AIRCD_TLS_KEY', 'AIRCD_TLS_BIND', 'AIRCD_PROFILE', 'AIRCD_STARTUP_DIR')) {
+foreach ($EnvName in @('AIRCD_CONFIG_DIR', 'AIRCD_DATA_DIR', 'AIRCD_CONFIG', 'AIRCD_WINDOWS_CONFIG', 'AIRCD_EXECUTABLE', 'AIRCD_BIND', 'AIRCD_HTTP_BIND', 'AIRCD_DB', 'AIRCD_OPEN_REGISTRATION', 'AIRCD_REGISTER_KEY', 'AIRCD_TLS_CERT', 'AIRCD_TLS_KEY', 'AIRCD_TLS_BIND', 'AIRCD_TLS_CLIENT_CA', 'AIRCD_TLS_CLIENT_AUTH', 'AIRCD_HTTP_TLS_BIND', 'AIRCD_TLS_ONLY', 'AIRCD_PROFILE', 'AIRCD_STARTUP_DIR')) {
     $Item = Get-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue
     $SavedEnv[$EnvName] = if ($null -ne $Item) { $Item.Value } else { $null }
     Remove-Item -LiteralPath "Env:\$EnvName" -ErrorAction SilentlyContinue

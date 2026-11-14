@@ -53,12 +53,16 @@ function New-AircdTrayConfig {
         [string]$TlsCert = '',
         [string]$TlsKey = '',
         [string]$TlsBind = '127.0.0.1:6697',
+        [string]$TlsClientCa = '',
+        [string]$TlsClientAuth = '',
+        [string]$HttpTlsBind = '',
+        [switch]$TlsOnly,
         [string]$ExecutablePath = '',
         [string]$StartupDirectory = ''
     )
 
     $Overrides = @{}
-    foreach ($Key in @('Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath', 'StartupDirectory')) {
+    foreach ($Key in @('Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'TlsClientCa', 'TlsClientAuth', 'HttpTlsBind', 'TlsOnly', 'ExecutablePath', 'StartupDirectory')) {
         if ($PSBoundParameters.ContainsKey($Key)) {
             $Overrides[$Key] = $PSBoundParameters[$Key]
         }
@@ -74,6 +78,10 @@ function New-AircdTrayConfig {
     $TlsCert = $ResolvedCfg.TlsCert
     $TlsKey = $ResolvedCfg.TlsKey
     $TlsBind = $ResolvedCfg.TlsBind
+    $TlsClientCa = $ResolvedCfg.TlsClientCa
+    $TlsClientAuth = $ResolvedCfg.TlsClientAuth
+    $HttpTlsBind = $ResolvedCfg.HttpTlsBind
+    $TlsOnly = [bool]$ResolvedCfg.TlsOnly
     $ExecutablePath = $ResolvedCfg.ExecutablePath
 
     foreach ($Address in @($Bind, $HttpBind)) {
@@ -107,6 +115,32 @@ function New-AircdTrayConfig {
             throw "Use a local numeric TLS bind address and port: $TlsBind"
         }
         $ServerArgs += @('--tls-cert', $FullTlsCert, '--tls-key', $FullTlsKey, '--tls-bind', $TlsBind)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TlsClientCa)) {
+        if (-not $HasTlsCert) { throw '-TlsClientCa requires -TlsCert and -TlsKey.' }
+        $FullClientCa = [IO.Path]::GetFullPath($TlsClientCa)
+        if (-not (Test-Path -LiteralPath $FullClientCa -PathType Leaf)) { throw "TLS client CA certificate not found: $FullClientCa" }
+        $ServerArgs += @('--tls-client-ca', $FullClientCa)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TlsClientAuth)) {
+        if ($TlsClientAuth -notin @('none', 'optional', 'required')) {
+            throw "Invalid -TlsClientAuth '$TlsClientAuth': expected none, optional, or required."
+        }
+        if ($TlsClientAuth -ne 'none' -and -not $HasTlsCert) { throw "-TlsClientAuth '$TlsClientAuth' requires -TlsCert and -TlsKey." }
+        if ($TlsClientAuth -ne 'none' -and [string]::IsNullOrWhiteSpace($TlsClientCa)) { throw "-TlsClientAuth '$TlsClientAuth' requires -TlsClientCa." }
+        $ServerArgs += @('--tls-client-auth', $TlsClientAuth)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($HttpTlsBind)) {
+        if (-not $HasTlsCert) { throw '-HttpTlsBind requires -TlsCert and -TlsKey.' }
+        if ($HttpTlsBind -notmatch '^(127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):([0-9]+)$' -or
+            [int]$Matches[2] -lt 1 -or [int]$Matches[2] -gt 65535) {
+            throw "Use a local numeric HTTP TLS bind address and port: $HttpTlsBind"
+        }
+        $ServerArgs += @('--http-tls-bind', $HttpTlsBind)
+    }
+    if ($TlsOnly) {
+        if (-not $HasTlsCert) { throw '-TlsOnly requires -TlsCert and -TlsKey.' }
+        $ServerArgs += '--tls-only'
     }
 
     $ResolvedExe = ''

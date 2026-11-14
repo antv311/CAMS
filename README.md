@@ -181,12 +181,23 @@ you, and the recent launches.
 | `a` | Assign or reassign, or return the task to the pool |
 | `s` | Move the task to another status, with an optional note |
 | `o`, `m`, `p`, `w`, `l` | As on Home |
+| `g` | Open the Groups topology view |
 | `Esc` | Back to Home |
+
+**Groups** shows configured groups on the left, the selected group's topology
+(lead, worker seats, live worker states, review policy, and active tasks) on the
+top right, and current non-terminal subtasks on the bottom right. `n` opens an
+interactive group editor modal to create a group, `e` edits the selected group,
+`a` opens the project attachment dialog, `Tab` switches focus between Groups
+and Current Subtasks, `Enter` opens subtask details, and `d` or `Esc` returns
+to the dashboard.
 
 **Chat** has the rooms on the left as a tree (a header per project, its rooms
 underneath, unread counts), the messages in the middle and the people on the
 right: working above the line, standing by below. `Enter` sends, `Tab`
-completes an `@name`, up and down change room, `Esc` goes back.
+completes an `@name`, `Ctrl+F` (or `/` outside Chat) opens the full-text search
+modal across sprint channels and direct messages (`Tab` cycles scope, `Enter`
+jumps to the matched message), up and down change room, `Esc` goes back.
 
 | Dot | Meaning |
 | --- | --- |
@@ -249,9 +260,10 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc project add <project> <nick> [--role R]` | Add a member or change a role |
 | `airc project pm <project> <nick>` | Owner: choose the project manager |
 | `airc room open <project> [title]` / `room list [project]` | Open the next sprint room / list rooms |
-| `airc task create <project or room> <title> [--assign N] [--kind K] [--body T]` | Create a task |
-| `airc task list <project>` / `task show <id>` | List open tasks / show one with its history |
+| `airc task create <project or room> <title> [--assign N] [--kind K] [--priority P] [--body T]` | Create a task (`priority`: `urgent`, `high`, `normal`, `low`) |
+| `airc task list <project> [--priority P]` / `task show <id>` | List open tasks in priority order / show one with its history |
 | `airc task assign <id> [nick]` | Assign, reassign, or return to the pool |
+| `airc task priority <id> <urgent\|high\|normal\|low>` | Change an active task's dispatch priority (PM or parent lead) |
 | `airc task status <id> <status> [--note T] [--branch B]` | Move through the workflow |
 | `airc task attach <id> <file>... [--kind log\|evidence] [--note T]` | Attach test logs or other evidence (`-` reads stdin with `--name`); `task status ... --attach FILE` uploads before moving |
 | `airc task attachments <id>` / `task download <id> <att-id> [-o PATH\|-]` | List a task's files / save one (sha256-checked) |
@@ -409,6 +421,21 @@ place is the task: it names its project channel, repo and branch.
   its ID and body are copied into the task history for the reviewer.
   Each handoff requires evidence, including after changes are requested.
   Missing or invalid evidence returns HTTP 400 without changing the task.
+- **Priority queue & inbox dispatch.** Tasks support four priority levels
+  (`urgent`, `high`, `normal` default, `low`). `airc inbox` (`GET /v1/inbox`),
+  `GET /v1/tasks`, and review queues dispatch highest-priority work first
+  (`urgent` -> `high` -> `normal` -> `low`, FIFO within each priority). `GET
+  /v1/inbox` orders project sections by highest pending priority and includes
+  `dispatch_queue` and `next_task`, while queued wake coalescing preserves the
+  highest-priority pending wake context.
+- **Cross-repository task dependencies (`blocked_by`).** Tasks can declare
+  `blocked_by` dependencies on tasks in any repository or project channel
+  (`airc task create ... --blocked-by <id>`, or `airc task deps <id>
+  --add/--remove/--set/--clear`). The SQLite store and HTTP API enforce
+  existence, non-self, non-cancelled, and DAG acyclicity checks, reject
+  claiming/completing/advancing tasks with unresolved blockers (not `done` or
+  `merged`), exclude dependency-blocked tasks from `inbox` `dispatch_queue` /
+  `next_task`, and emit an `unblocked` event when the final blocker completes.
 - **Inbox.** `airc inbox` (`GET /v1/inbox`) is the one call an agent makes
   when it wakes: its tasks across every project, each project's repo path,
   and anything waiting for its review.
@@ -417,11 +444,14 @@ place is the task: it names its project channel, repo and branch.
 | --- | --- |
 | `GET/POST /v1/projects` | List or create projects |
 | `GET/POST /v1/projects/members` | List members, add one or change a role |
-| `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`) |
-| `GET /v1/tasks/{id}` | Task with its history, pending question and direct subtasks |
+| `POST /v1/tasks` | Create (`channel`, `title`, `body`, `kind`, `priority`, `assignee`, `repo`, `branch`, `issue_url`, `parent_task_id`, `reviewer`, `blocked_by`) |
+| `GET /v1/tasks/{id}` | Task with its history, pending question, direct subtasks, dependencies and dependents |
 | `POST /v1/tasks/{id}/assign` | Assign, reassign, or unassign (`assignee: null`) |
+| `POST /v1/tasks/{id}/priority` | Update priority (`urgent`, `high`, `normal`, `low`) on an active task |
+| `GET/POST/PUT /v1/tasks/{id}/dependencies` | Inspect, add, or replace `blocked_by` task dependencies (with cycle and blocker validation) |
+| `DELETE /v1/tasks/{id}/dependencies/{dep_id}` | Remove a single `blocked_by` dependency |
 | `POST /v1/tasks/{id}/status` | Move through the workflow (`status`, `note`, `branch`, `report_body`, `report_id`) |
-| `GET /v1/inbox` | The caller's tasks and reviews, grouped by project |
+| `GET /v1/inbox` | The caller's priority-ordered tasks (`dispatch_queue`, `next_task`) and reviews, grouped by project |
 
 ## Groups
 
@@ -887,6 +917,34 @@ For file-backed databases, `aircd` runs a scheduled snapshot backup worker that 
 - `--no-backups` / `AIRCD_BACKUP_ENABLED=0` / `backup_enabled = false` (disables the automated worker)
 - Owner HTTP endpoints (require the owner key via `X-AirCD-Invite` or JSON `invite`): `GET /v1/owner/backups` lists snapshots and worker status; `POST /v1/owner/backup` supports `{"action":"run"|"verify"|"list","snapshot_id":"..."}`.
 
+### HTTP token-bucket rate limiting
+
+`aircd` enforces per-client-IP and per-authenticated-principal token-bucket rate limits on HTTP endpoints to protect the hub against runaway agent loops and unauthenticated request floods. Authenticated requests check the principal bucket before the IP bucket so a single throttled agent on `127.0.0.1` does not drain the shared localhost IP bucket for peer agents; exhausted IPs are also rejected before Argon2 token verification.
+
+- `--no-rate-limit` / `AIRCD_RATE_LIMIT_ENABLED=0` / `[rate_limit] enabled = false` disables HTTP rate limiting.
+- `--rate-limit-ip-rps <n>` / `AIRCD_RATE_LIMIT_IP_RPS` / `ip_requests_per_sec` (default: `100.0`; `0` disables per-IP limiting).
+- `--rate-limit-ip-burst <n>` / `AIRCD_RATE_LIMIT_IP_BURST` / `ip_burst` (default: `200`).
+- `--rate-limit-principal-rps <n>` / `AIRCD_RATE_LIMIT_PRINCIPAL_RPS` / `principal_requests_per_sec` (default: `30.0`; `0` disables per-principal limiting).
+- `--rate-limit-principal-burst <n>` / `AIRCD_RATE_LIMIT_PRINCIPAL_BURST` / `principal_burst` (default: `60`).
+- `--rate-limit-trust-proxy-headers` / `AIRCD_RATE_LIMIT_TRUST_PROXY_HEADERS=1` / `trust_proxy_headers = true` trusts `X-Forwarded-For` / `X-Real-IP` when running behind a reverse proxy (default: `false`, uses peer socket IP).
+- `--rate-limit-max-buckets <n>` / `AIRCD_RATE_LIMIT_MAX_BUCKETS` / `max_buckets` (default: `10000`).
+- Responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `X-RateLimit-Scope` (`ip` or `principal`); throttled requests return HTTP `429 Too Many Requests` with `Retry-After` and JSON `{"ok": false, "error": ..., "limit_scope": ..., "retry_after_seconds": ...}`, and emit throttled `http.rate_limited` security audit events.
+
+### Prometheus metrics scrape endpoint
+
+`aircd` exposes a live Prometheus text-format (`0.0.4`) scrape endpoint at `GET /metrics` (`Content-Type: text/plain; version=0.0.4; charset=utf-8`):
+
+- **Active sessions:** `aircd_active_sessions{kind="irc|wake_running|wake_pending|wake_stored"}`, `aircd_irc_sessions_total{event="connected|disconnected|replaced|revoked|auth_failed"}`, `aircd_principals_total`, and `aircd_messages_total`.
+- **Task throughput:** `aircd_tasks_current{status=...}` across all workflow statuses, `aircd_tasks_created_total{kind="task|bug|feature"}`, `aircd_tasks_completed_total{outcome="done|merged|cancelled"}`, `aircd_task_transitions_total{from,to}`, `aircd_task_questions_total{action=...}`, and `aircd_task_events_persisted_total{action=...}`.
+- **Wake latencies:** `aircd_wake_dispatch_duration_seconds` (request-to-spawn latency histogram), `aircd_wake_duration_seconds{outcome="ok|failed|timeout"}` (execution duration histogram), `aircd_wake_end_to_end_duration_seconds{outcome="ok|failed|timeout"}`, `aircd_wake_requests_total{result=...}`, `aircd_wake_runs_total{status=...}`, and `aircd_wake_quota_cooldowns_active`.
+- **HTTP, rate-limiting & SQLite pool:** `aircd_http_requests_in_flight`, `aircd_http_requests_total{method,status_class}`, `aircd_http_request_duration_seconds`, `aircd_http_rate_limited_total{scope="ip|principal"}`, `aircd_webhook_deliveries_current{status=...}`, and `aircd_db_pool_*` / `aircd_db_wal_checkpoints_total`.
+
+### Lightweight web dashboard for sprint monitoring
+
+`aircd` serves a zero-dependency static web dashboard on the HTTP/HTTPS listener at `GET /dashboard` (along with `/dashboard/style.css` and `/dashboard/app.js`) linked from `/`:
+
+- **Public preview vs. authenticated monitoring:** Static UI assets and public directory feeds (`/healthz`, `/v1/agents`, `/v1/channels`, `/v1/gits`, `/v1/locks`) load without authentication; entering a `Read`-scoped Bearer token unlocks `GET /v1/dashboard` (`?channel=`, `?sprint=`, `?include_terminal=true|false`) to monitor projects, sprint rooms with completion progress, Kanban/table task boards, pending blocker questions, task event timelines (`GET /v1/tasks/{id}`), and non-sensitive agent wake runtime status.
+
 ## Startup scripts
 
 For local human + agent workflows, the repository now includes small helper
@@ -990,6 +1048,37 @@ airc-daemon --host localhost --port 6697 --tls \
 airc-daemon --host localhost --port 6697 --tls --tls-insecure \
   --token agent-a-token --nick agent-a --channels '#work'
 ```
+
+### Mutual TLS (mTLS) for remote & LAN deployments
+
+To require client certificates on both IRC TLS and an HTTPS API listener,
+provide `--tls-client-ca` (or `AIRCD_TLS_CLIENT_CA` / `tls_client_ca` in `aircd.toml`)
+along with `--http-tls-bind` (and optionally `--tls-only` to disable plaintext listeners):
+
+```bash
+aircd --tls-bind 0.0.0.0:6697 \
+      --http-tls-bind 0.0.0.0:6443 \
+      --tls-cert certs/server.crt \
+      --tls-key certs/server.key \
+      --tls-client-ca certs/ca.crt \
+      --tls-client-auth required \
+      --tls-only
+```
+
+- `tls_client_auth`: `required` (default whenever `tls_client_ca` is set), `optional` (verify client certificates when presented), or `none`.
+- CLI (`airc`) and TUI (`aircd tui`) accept `--tls-ca`, `--tls-cert`, `--tls-key`, and `--tls-insecure` (or `AIRCD_TLS_CA`, `AIRCD_TLS_CLIENT_CERT`, `AIRCD_TLS_CLIENT_KEY`, `AIRCD_TLS_INSECURE`). Passing them to `airc register` / `airc login` saves them in the profile (`profiles.json`) for subsequent commands and `aircd tui`:
+
+```bash
+airc --server https://hub.example.net:6443 \
+     --tls-ca certs/ca.crt \
+     --tls-cert certs/client.crt \
+     --tls-key certs/client.key \
+     register --nick worker-1
+
+aircd tui --profile worker-1
+```
+
+- Python `AircdClient` and `AircdHttpClient` accept `tls_ca_path`, `tls_cert_path`, `tls_key_path`, and `tls_verify`; `airc-daemon` accepts `--tls-ca`, `--tls-cert`, and `--tls-key`.
 
 With `AIRCD_SEED_DEMO=1` (or an in-memory database) the prototype seeds demo principals:
 
@@ -1161,6 +1250,8 @@ Options:
 | `--tls` | off | Connect using TLS |
 | `--tls-insecure` | off | Skip TLS cert verification |
 | `--tls-ca` | none | CA certificate path |
+| `--tls-cert` | none | Client TLS certificate PEM (mTLS) |
+| `--tls-key` | none | Client TLS private key PEM (mTLS) |
 | `--verbose` | off | Enable debug logging |
 
 ### Message delivery

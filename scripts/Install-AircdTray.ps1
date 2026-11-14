@@ -11,6 +11,10 @@ param(
     [string]$TlsCert = '',
     [string]$TlsKey = '',
     [string]$TlsBind = '127.0.0.1:6697',
+    [string]$TlsClientCa = '',
+    [string]$TlsClientAuth = '',
+    [string]$HttpTlsBind = '',
+    [switch]$TlsOnly,
     [string]$ExecutablePath = '',
     [string]$StartupDirectory = ''
 )
@@ -18,7 +22,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AircdTray.psm1') -Force
 $CfgParams = @{ RepoRoot = (Split-Path -Parent $PSScriptRoot) }
-foreach ($Key in @('ConfigPath', 'Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'ExecutablePath', 'StartupDirectory')) {
+foreach ($Key in @('ConfigPath', 'Bind', 'HttpBind', 'DbPath', 'Profile', 'OpenRegistration', 'RegisterKey', 'TlsCert', 'TlsKey', 'TlsBind', 'TlsClientCa', 'TlsClientAuth', 'HttpTlsBind', 'TlsOnly', 'ExecutablePath', 'StartupDirectory')) {
     if ($PSBoundParameters.ContainsKey($Key)) {
         $CfgParams[$Key] = $PSBoundParameters[$Key]
     }
@@ -42,6 +46,10 @@ if ($PSBoundParameters.ContainsKey('RegisterKey') -and $RegisterKey) { $Argument
 if ($PSBoundParameters.ContainsKey('TlsCert') -and $TlsCert) { $Arguments += @('-TlsCert', $TlsCert) }
 if ($PSBoundParameters.ContainsKey('TlsKey') -and $TlsKey) { $Arguments += @('-TlsKey', $TlsKey) }
 if ($PSBoundParameters.ContainsKey('TlsBind') -and $TlsBind) { $Arguments += @('-TlsBind', $TlsBind) }
+if ($PSBoundParameters.ContainsKey('TlsClientCa') -and $TlsClientCa) { $Arguments += @('-TlsClientCa', $TlsClientCa) }
+if ($PSBoundParameters.ContainsKey('TlsClientAuth') -and $TlsClientAuth) { $Arguments += @('-TlsClientAuth', $TlsClientAuth) }
+if ($PSBoundParameters.ContainsKey('HttpTlsBind') -and $HttpTlsBind) { $Arguments += @('-HttpTlsBind', $HttpTlsBind) }
+if ($PSBoundParameters.ContainsKey('TlsOnly') -and $TlsOnly) { $Arguments += '-TlsOnly' }
 if ($Config.ExecutablePath) { $Arguments += @('-ExecutablePath', $Config.ExecutablePath) }
 $PowerShellExe = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
 $Shell = New-Object -ComObject WScript.Shell

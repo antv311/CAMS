@@ -12,12 +12,14 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
 use crate::logging::EventForwarder;
+use crate::metrics::MetricsRegistry;
 use crate::store::SharedConnection;
 
 pub const DEFAULT_PROMPT: &str = "You are @{nick} on the aircd coordination hub at {server}. \
@@ -157,6 +159,24 @@ pub struct WakeRun {
     pub log_tail: Option<String>,
 }
 
+/// Non-sensitive runtime wake status for an agent account (safe for Read-scoped views).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AgentWakeSummary {
+    pub launcher_configured: bool,
+    pub launcher_enabled: bool,
+    pub command_found: bool,
+    pub session_mode: Option<String>,
+    pub running: bool,
+    pub pending: bool,
+    pub quota_cooldown_until: Option<i64>,
+    pub last_run_status: Option<String>,
+    pub last_run_started_at: Option<i64>,
+    pub last_run_finished_at: Option<i64>,
+    pub last_run_channel: Option<String>,
+    pub last_run_task_id: Option<String>,
+    pub last_run_exit_code: Option<i64>,
+}
+
 /// Why and where an account is being woken.
 #[derive(Clone, Debug, Default)]
 pub struct WakeContext {
@@ -172,12 +192,23 @@ pub struct WakeContext {
     pub event: Option<String>,
     /// Account id that caused the triggering event (for example, the DM sender).
     pub triggered_by: Option<String>,
+    /// Priority of the task triggering this wake (`urgent`, `high`, `normal`, `low`).
+    pub priority: Option<String>,
+}
+
+fn wake_priority_rank(ctx: &WakeContext) -> u8 {
+    crate::tasks::priority_rank(ctx.priority.as_deref().unwrap_or("normal"))
+}
+
+struct PendingWake {
+    ctx: WakeContext,
+    queued_at: Instant,
 }
 
 #[derive(Default)]
 struct Slot {
     running: bool,
-    pending: Option<WakeContext>,
+    pending: Option<PendingWake>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -186,16 +217,37 @@ struct DmWakeState {
     woken_by: HashSet<String>,
 }
 
+struct ActiveWakeGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ActiveWakeGuard {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counter: Arc::clone(counter),
+        }
+    }
+}
+
+impl Drop for ActiveWakeGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct WakeManager {
     db: SharedConnection,
     slots: Arc<Mutex<HashMap<String, Slot>>>,
+    active_executions: Arc<AtomicUsize>,
     dm_states: Arc<Mutex<HashMap<String, DmWakeState>>>,
     server_url: Arc<Mutex<String>>,
     notifier: Arc<Mutex<Option<WakeNotifier>>>,
     /// Lowercased account id -> unix time its quota cooldown ends.
     quota_cooldowns: Arc<Mutex<HashMap<String, i64>>>,
     logger: EventForwarder,
+    metrics: Arc<MetricsRegistry>,
 }
 
 /// The line of a failed agent's output that says its provider is out of
@@ -449,15 +501,152 @@ impl WakeManager {
     }
 
     pub fn with_logger(db: SharedConnection, logger: EventForwarder) -> Self {
+        Self::with_logger_and_metrics(db, logger, Arc::new(MetricsRegistry::new()))
+    }
+
+    pub fn with_logger_and_metrics(
+        db: SharedConnection,
+        logger: EventForwarder,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Self {
         Self {
             db,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            active_executions: Arc::new(AtomicUsize::new(0)),
             dm_states: Arc::new(Mutex::new(HashMap::new())),
             server_url: Arc::new(Mutex::new("http://127.0.0.1:6680".to_string())),
             notifier: Arc::new(Mutex::new(None)),
             quota_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             logger,
+            metrics,
         }
+    }
+
+    /// Snapshot of `(running_executions, pending_queued, active_quota_cooldowns)`.
+    pub fn runtime_session_counts(&self) -> (usize, usize, usize) {
+        let running = self.active_executions.load(Ordering::Relaxed);
+        let pending = self
+            .slots
+            .lock()
+            .expect("wake slots mutex poisoned")
+            .values()
+            .filter(|slot| slot.pending.is_some())
+            .count();
+        let now = unix_timestamp();
+        let cooldowns = {
+            let mut guard = self
+                .quota_cooldowns
+                .lock()
+                .expect("quota cooldown mutex poisoned");
+            guard.retain(|_, until| *until > now);
+            guard.len()
+        };
+        (running, pending, cooldowns)
+    }
+
+    /// Snapshot of non-sensitive wake/launcher runtime state keyed by lowercase principal id.
+    pub fn agent_wake_summaries(&self) -> Result<HashMap<String, AgentWakeSummary>> {
+        let mut out: HashMap<String, AgentWakeSummary> = HashMap::new();
+
+        {
+            let slots = self.slots.lock().expect("wake slots mutex poisoned");
+            for (principal_id, slot) in slots.iter() {
+                if slot.running || slot.pending.is_some() {
+                    let entry = out
+                        .entry(principal_id.trim().to_ascii_lowercase())
+                        .or_default();
+                    entry.running = slot.running;
+                    entry.pending = slot.pending.is_some();
+                }
+            }
+        }
+
+        let now = unix_timestamp();
+        {
+            let mut cooldowns = self
+                .quota_cooldowns
+                .lock()
+                .expect("quota cooldown mutex poisoned");
+            cooldowns.retain(|_, until| *until > now);
+            for (principal_id, until) in cooldowns.iter() {
+                let entry = out
+                    .entry(principal_id.trim().to_ascii_lowercase())
+                    .or_default();
+                entry.quota_cooldown_until = Some(*until);
+            }
+        }
+
+        let db = self.db.read()?;
+        {
+            let mut stmt = db
+                .prepare("SELECT principal_id, command, enabled, session_mode FROM wake_configs")
+                .context("prepare wake config summaries")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (principal_id, command, enabled, session_mode) = row?;
+                let entry = out
+                    .entry(principal_id.trim().to_ascii_lowercase())
+                    .or_default();
+                entry.launcher_configured = true;
+                entry.launcher_enabled = enabled != 0;
+                entry.command_found = command_found(&command);
+                entry.session_mode = session_mode;
+            }
+        }
+
+        {
+            let mut stmt = db
+                .prepare(
+                    "SELECT r.principal_id, r.status, r.started_at, r.finished_at, r.channel, r.task_id, r.exit_code
+                     FROM wake_runs r
+                     INNER JOIN (
+                         SELECT principal_id, MAX(rowid) AS max_rowid
+                         FROM wake_runs
+                         GROUP BY principal_id
+                     ) latest ON r.rowid = latest.max_rowid",
+                )
+                .context("prepare latest wake run summaries")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    principal_id,
+                    status,
+                    started_at,
+                    finished_at,
+                    channel,
+                    task_id,
+                    exit_code,
+                ) = row?;
+                let entry = out
+                    .entry(principal_id.trim().to_ascii_lowercase())
+                    .or_default();
+                entry.last_run_status = Some(status);
+                entry.last_run_started_at = Some(started_at);
+                entry.last_run_finished_at = finished_at;
+                entry.last_run_channel = Some(channel);
+                entry.last_run_task_id = task_id;
+                entry.last_run_exit_code = exit_code;
+            }
+        }
+
+        Ok(out)
     }
 
     /// Where launch failures are reported.
@@ -867,40 +1056,59 @@ impl WakeManager {
     /// collapse into a single follow-up run.
     pub fn request(&self, ctx: WakeContext) -> Result<bool> {
         let Some(cfg) = self.get(&ctx.principal_id)?.filter(|cfg| cfg.enabled) else {
+            self.metrics.record_wake_request("disabled");
             return Ok(false);
         };
         if let Some(note) = self.quota_skip_note(&ctx) {
             let run_id = format!("wake_{}", Uuid::new_v4().simple());
             let now = unix_timestamp();
             self.insert_run(&run_id, &ctx, "skipped", now, Some(now), None, Some(&note))?;
+            self.metrics.record_wake_request("skipped");
+            self.metrics.record_wake_run_skipped();
             return Ok(false);
         }
         if let Some(note) = self.check_and_record_dm_wake(&ctx)? {
             let run_id = format!("wake_{}", Uuid::new_v4().simple());
             let now = unix_timestamp();
             self.insert_run(&run_id, &ctx, "skipped", now, Some(now), None, Some(&note))?;
+            self.metrics.record_wake_request("skipped");
+            self.metrics.record_wake_run_skipped();
             return Ok(false);
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return Ok(false);
         };
+        let queued_at = Instant::now();
         {
             let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
             let slot = slots.entry(ctx.principal_id.clone()).or_default();
             if slot.running {
-                slot.pending = Some(ctx);
+                let result = match slot.pending.as_ref() {
+                    Some(existing) => {
+                        if wake_priority_rank(&ctx) <= wake_priority_rank(&existing.ctx) {
+                            slot.pending = Some(PendingWake { ctx, queued_at });
+                        }
+                        "coalesced"
+                    }
+                    None => {
+                        slot.pending = Some(PendingWake { ctx, queued_at });
+                        "queued"
+                    }
+                };
+                self.metrics.record_wake_request(result);
                 return Ok(true);
             }
             slot.running = true;
+            self.metrics.record_wake_request("started");
         }
         let manager = self.clone();
-        handle.spawn(async move { manager.run_loop(cfg, ctx).await });
+        handle.spawn(async move { manager.run_loop(cfg, ctx, queued_at).await });
         Ok(true)
     }
 
-    async fn run_loop(&self, mut cfg: WakeConfig, mut ctx: WakeContext) {
+    async fn run_loop(&self, mut cfg: WakeConfig, mut ctx: WakeContext, mut queued_at: Instant) {
         loop {
-            if let Err(err) = self.run_once(&cfg, &ctx).await {
+            if let Err(err) = self.run_once_at(&cfg, &ctx, queued_at).await {
                 self.logger.log_error(
                     "wake.run_error",
                     format!("wake @{}: {err:#}", ctx.principal_id),
@@ -921,14 +1129,18 @@ impl WakeManager {
             };
             let Some(next) = next else { break };
             // Pick up configuration changes made while the agent was running.
-            match self.get(&next.principal_id) {
+            match self.get(&next.ctx.principal_id) {
                 Ok(Some(fresh)) if fresh.enabled => {
                     cfg = fresh;
-                    ctx = next;
+                    ctx = next.ctx;
+                    queued_at = next.queued_at;
                 }
                 _ => {
                     let mut slots = self.slots.lock().expect("wake slots mutex poisoned");
-                    slots.entry(next.principal_id.clone()).or_default().running = false;
+                    slots
+                        .entry(next.ctx.principal_id.clone())
+                        .or_default()
+                        .running = false;
                     break;
                 }
             }
@@ -1020,6 +1232,13 @@ impl WakeManager {
                     .unwrap_or_default(),
             ),
             (
+                "task_priority",
+                task.as_ref()
+                    .map(|task| task.priority.clone())
+                    .or_else(|| ctx.priority.clone())
+                    .unwrap_or_default(),
+            ),
+            (
                 "task_body",
                 task.as_ref()
                     .and_then(|task| task.body.clone())
@@ -1047,7 +1266,17 @@ impl WakeManager {
         Ok(vars)
     }
 
+    #[cfg(test)]
     async fn run_once(&self, cfg: &WakeConfig, ctx: &WakeContext) -> Result<()> {
+        self.run_once_at(cfg, ctx, Instant::now()).await
+    }
+
+    async fn run_once_at(
+        &self,
+        cfg: &WakeConfig,
+        ctx: &WakeContext,
+        queued_at: Instant,
+    ) -> Result<()> {
         let run_id = format!("wake_{}", Uuid::new_v4().simple());
         let started = unix_timestamp();
 
@@ -1062,6 +1291,7 @@ impl WakeManager {
                 None,
                 Some(&note),
             )?;
+            self.metrics.record_wake_run_skipped();
             return Ok(());
         }
 
@@ -1072,6 +1302,7 @@ impl WakeManager {
                 cfg.max_runs_per_hour
             );
             self.insert_run(&run_id, ctx, "skipped", started, Some(started), None, Some(&note))?;
+            self.metrics.record_wake_run_skipped();
             return Ok(());
         }
 
@@ -1094,6 +1325,8 @@ impl WakeManager {
                     None,
                     Some(&format!("could not resolve wake prompt: {err:#}")),
                 )?;
+                self.metrics
+                    .record_wake_completion("failed", 0.0, queued_at.elapsed().as_secs_f64());
                 return Ok(());
             }
         };
@@ -1153,12 +1386,21 @@ impl WakeManager {
             .kill_on_drop(true);
 
         self.insert_run(&run_id, ctx, "running", started, None, None, None)?;
+        let _active_guard = ActiveWakeGuard::enter(&self.active_executions);
+        let exec_started = Instant::now();
+        self.metrics
+            .record_wake_dispatch(exec_started.saturating_duration_since(queued_at).as_secs_f64());
 
         let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let note = format!("could not start '{}': {err}", cfg.command);
                 self.finish_run(&run_id, "failed", None, Some(&note))?;
+                self.metrics.record_wake_completion(
+                    "failed",
+                    exec_started.elapsed().as_secs_f64(),
+                    queued_at.elapsed().as_secs_f64(),
+                );
                 self.report_failure(ctx, failure_summary(&note, ""), None);
                 return Ok(());
             }
@@ -1167,6 +1409,8 @@ impl WakeManager {
         let limit = Duration::from_secs(cfg.timeout_seconds.max(1) as u64);
         match tokio::time::timeout(limit, child.wait_with_output()).await {
             Ok(Ok(output)) => {
+                let exec_secs = exec_started.elapsed().as_secs_f64();
+                let e2e_secs = queued_at.elapsed().as_secs_f64();
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let mut text = stdout.clone().into_owned();
@@ -1196,6 +1440,8 @@ impl WakeManager {
                     output.status.code().map(i64::from),
                     Some(tail(&text)),
                 )?;
+                self.metrics
+                    .record_wake_completion(status, exec_secs, e2e_secs);
                 if output.status.success() {
                     self.clear_quota_cooldown(&ctx.principal_id);
                 } else {
@@ -1221,12 +1467,22 @@ impl WakeManager {
             Ok(Err(err)) => {
                 let note = format!("wait failed: {err}");
                 self.finish_run(&run_id, "failed", None, Some(&note))?;
+                self.metrics.record_wake_completion(
+                    "failed",
+                    exec_started.elapsed().as_secs_f64(),
+                    queued_at.elapsed().as_secs_f64(),
+                );
                 self.report_failure(ctx, failure_summary(&note, ""), None);
             }
             Err(_) => {
                 // Dropping the wait future drops the child, which kills it.
                 let note = format!("killed after timeout_seconds={}", cfg.timeout_seconds);
                 self.finish_run(&run_id, "timeout", None, Some(&note))?;
+                self.metrics.record_wake_completion(
+                    "timeout",
+                    exec_started.elapsed().as_secs_f64(),
+                    queued_at.elapsed().as_secs_f64(),
+                );
                 self.report_failure(ctx, failure_summary(&note, ""), None);
             }
         }
@@ -1958,6 +2214,50 @@ mod tests {
         assert!(wakes.request(channel_ctx("agent-b", "agent-a", "#cams"))?);
         wait_until_idle(&wakes, "agent-a").await;
         assert!(!wakes.request(dm_ctx("agent-a", "agent-b"))?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_wake_coalescing_preserves_highest_priority() -> Result<()> {
+        let wakes = WakeManager::new(crate::store::open(":memory:")?);
+        wakes.upsert("agent-a", fast_launcher(true))?;
+
+        // Hold the slot running without spawning a long external process.
+        {
+            let mut slots = wakes.slots.lock().unwrap();
+            slots.entry("agent-a".into()).or_default().running = true;
+        }
+
+        let make_task_ctx = |task_id: &str, priority: &str| WakeContext {
+            principal_id: "agent-a".into(),
+            nick: "agent-a".into(),
+            reason: format!("task {task_id} ({priority})"),
+            channel: "#cams".into(),
+            task_id: Some(task_id.into()),
+            priority: Some(priority.into()),
+            ..Default::default()
+        };
+
+        assert!(wakes.request(make_task_ctx("task_low", "low"))?);
+        assert!(wakes.request(make_task_ctx("task_urgent", "urgent"))?);
+        // A later normal or low wake must not downgrade the pending urgent wake.
+        assert!(wakes.request(make_task_ctx("task_normal", "normal"))?);
+        assert!(wakes.request(make_task_ctx("task_low_2", "low"))?);
+
+        {
+            let slots = wakes.slots.lock().unwrap();
+            let pending = slots["agent-a"].pending.as_ref().unwrap();
+            assert_eq!(pending.ctx.task_id.as_deref(), Some("task_urgent"));
+            assert_eq!(pending.ctx.priority.as_deref(), Some("urgent"));
+        }
+
+        // Another urgent wake updates to the latest urgent context.
+        assert!(wakes.request(make_task_ctx("task_urgent_2", "urgent"))?);
+        {
+            let slots = wakes.slots.lock().unwrap();
+            let pending = slots["agent-a"].pending.as_ref().unwrap();
+            assert_eq!(pending.ctx.task_id.as_deref(), Some("task_urgent_2"));
+        }
         Ok(())
     }
 }

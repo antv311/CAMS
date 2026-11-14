@@ -1,10 +1,12 @@
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
+use crate::metrics::MetricsRegistry;
 use crate::store::SharedConnection;
 
 #[cfg(test)]
@@ -31,8 +33,18 @@ pub const ALL_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
+/// Default dispatch priority when omitted (`urgent`, `high`, `normal`, `low`).
+pub const DEFAULT_PRIORITY: &str = "normal";
+
+const PRIORITY_ORDER_SQL: &str = "CASE priority \
+    WHEN 'urgent' THEN 0 \
+    WHEN 'high' THEN 1 \
+    WHEN 'normal' THEN 2 \
+    WHEN 'low' THEN 3 \
+    ELSE 2 END ASC";
+
 const TASK_COLUMNS: &str = "id, channel, title, status, claimed_by, lease_expires_at, \
-     body, kind, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
+     body, kind, priority, assignee, created_by, repo, branch, issue_url, created_at, updated_at, sprint, \
      reviewer, parent_task_id, review_round_json";
 
 #[derive(Clone, Debug, Serialize)]
@@ -47,6 +59,8 @@ pub struct Task {
     pub body: Option<String>,
     /// `task`, `bug` or `feature`.
     pub kind: String,
+    /// `urgent`, `high`, `normal` or `low`.
+    pub priority: String,
     pub assignee: Option<String>,
     pub created_by: Option<String>,
     pub repo: Option<String>,
@@ -60,6 +74,21 @@ pub struct Task {
     pub reviewer: Option<String>,
     pub parent_task_id: Option<String>,
     pub review_round: Option<ReviewRound>,
+    /// Task IDs that must be `done` or `merged` before this task can proceed.
+    pub blocked_by: Vec<String>,
+}
+
+/// Summary of one dependency link (either a blocker or a dependent task).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TaskDependency {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub channel: String,
+    pub repo: Option<String>,
+    pub resolved: bool,
+    pub cross_repo: bool,
+    pub cross_project: bool,
 }
 
 /// A submission snapshot. A fresh revision is issued on every handoff, even
@@ -103,6 +132,7 @@ pub struct NewTask {
     pub title: String,
     pub body: Option<String>,
     pub kind: Option<String>,
+    pub priority: Option<String>,
     pub assignee: Option<String>,
     pub created_by: Option<String>,
     pub repo: Option<String>,
@@ -111,6 +141,7 @@ pub struct NewTask {
     pub sprint: Option<String>,
     pub reviewer: Option<String>,
     pub parent_task_id: Option<String>,
+    pub blocked_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -128,6 +159,7 @@ pub struct TaskEvent {
 pub struct TaskCascade {
     pub task: Task,
     pub action: &'static str,
+    pub previous_status: String,
     pub previous_holder: Option<String>,
 }
 
@@ -163,6 +195,7 @@ const QUESTION_COLUMNS: &str = "id, task_id, channel, asked_by, question, status
 pub struct TaskStore {
     db: SharedConnection,
     lease_seconds: i64,
+    metrics: Arc<MetricsRegistry>,
 }
 
 pub fn normalize_kind(raw: Option<&str>) -> Result<String> {
@@ -177,6 +210,68 @@ pub fn normalize_kind(raw: Option<&str>) -> Result<String> {
     }
 }
 
+pub fn normalize_priority(raw: Option<&str>) -> Result<String> {
+    let clean = raw.unwrap_or(DEFAULT_PRIORITY).trim().to_ascii_lowercase();
+    match clean.as_str() {
+        "" | "normal" => Ok("normal".to_string()),
+        "urgent" => Ok("urgent".to_string()),
+        "high" => Ok("high".to_string()),
+        "low" => Ok("low".to_string()),
+        other => Err(anyhow!(
+            "task priority must be urgent, high, normal or low (got '{other}')"
+        )),
+    }
+}
+
+/// Lower rank means higher urgency (`urgent=0` < `high=1` < `normal=2` < `low=3`).
+pub fn priority_rank(priority: &str) -> u8 {
+    match priority.trim().to_ascii_lowercase().as_str() {
+        "urgent" => 0,
+        "high" => 1,
+        "normal" | "" => 2,
+        "low" => 3,
+        _ => 2,
+    }
+}
+
+/// Whether a dependency status satisfies its `blocked_by` constraint.
+pub fn is_dependency_resolved(status: &str) -> bool {
+    matches!(status, "done" | "merged")
+}
+
+fn normalize_dep_ids(raw: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in raw {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let owned = trimmed.to_string();
+        if seen.insert(owned.clone()) {
+            out.push(owned);
+        }
+    }
+    out
+}
+
+fn format_blocked_error(task_id: &str, blockers: &[TaskDependency]) -> String {
+    let detail = blockers
+        .iter()
+        .map(|b| {
+            format!(
+                "{} [status={}, repo={}, channel={}]",
+                b.task_id,
+                b.status,
+                b.repo.as_deref().unwrap_or("-"),
+                b.channel
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("task {task_id} is blocked by unresolved dependencies: {detail}")
+}
+
 fn clean_opt(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
@@ -185,7 +280,19 @@ fn clean_opt(value: Option<String>) -> Option<String> {
 
 impl TaskStore {
     pub fn new(db: SharedConnection, lease_seconds: i64) -> Self {
-        Self { db, lease_seconds }
+        Self::with_metrics(db, lease_seconds, Arc::new(MetricsRegistry::new()))
+    }
+
+    pub fn with_metrics(
+        db: SharedConnection,
+        lease_seconds: i64,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Self {
+        Self {
+            db,
+            lease_seconds,
+            metrics,
+        }
     }
 
     pub fn create(&self, channel: &str, title: &str) -> Result<Task> {
@@ -200,15 +307,20 @@ impl TaskStore {
         let now = unix_timestamp();
         let id = format!("task_{}", Uuid::new_v4().simple());
         let kind = normalize_kind(new.kind.as_deref())?;
+        let priority = normalize_priority(new.priority.as_deref())?;
         let assignee = clean_opt(new.assignee);
+        let created_by = clean_opt(new.created_by);
         let status = if assignee.is_some() {
             "assigned"
         } else {
             "open"
         };
 
+        let blocked_by = normalize_dep_ids(&new.blocked_by);
+
         let mut db = self.db.write()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::validate_dependencies_locked(&tx, &id, &blocked_by, false)?;
         if let Some(parent_id) = clean_opt(new.parent_task_id.clone()) {
             let parent = Self::get_locked(&tx, &parent_id)?;
             if parent.channel != new.channel || TERMINAL_STATUSES.contains(&parent.status.as_str())
@@ -221,9 +333,9 @@ impl TaskStore {
         }
         tx.execute(
             "INSERT INTO tasks (id, channel, title, status, claimed_by, lease_expires_at,
-                                body, kind, assignee, created_by, repo, branch, issue_url,
+                                body, kind, priority, assignee, created_by, repo, branch, issue_url,
                                 created_at, updated_at, sprint, reviewer, parent_task_id)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16)",
             params![
                 id,
                 new.channel,
@@ -231,8 +343,9 @@ impl TaskStore {
                 status,
                 clean_opt(new.body),
                 kind,
+                priority,
                 assignee,
-                clean_opt(new.created_by),
+                created_by,
                 clean_opt(new.repo),
                 clean_opt(new.branch),
                 clean_opt(new.issue_url),
@@ -244,43 +357,75 @@ impl TaskStore {
         )
         .context("insert task")?;
 
+        for dep_id in &blocked_by {
+            tx.execute(
+                "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, dep_id, created_by, now],
+            )
+            .context("insert task dependency")?;
+        }
+        if !blocked_by.is_empty() {
+            let actor = created_by.as_deref().unwrap_or("system");
+            let note = format!("blocked_by={}", blocked_by.join(","));
+            Self::log_event_locked(
+                &tx,
+                &id,
+                actor,
+                "dependencies",
+                Some(status),
+                Some(status),
+                Some(&note),
+                now,
+            )?;
+        }
+
         let task = Self::get_locked(&tx, &id)?;
         tx.commit()?;
+        self.metrics.record_task_created(&kind);
         Ok(task)
     }
 
     pub fn get(&self, task_id: &str) -> Result<Option<Task>> {
         let db = self.db.read()?;
-        db.query_row(
-            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
-            params![task_id],
-            Self::from_row,
-        )
-        .optional()
-        .context("load task")
+        Self::get_locked_opt(&db, task_id)
     }
 
     /// Include completed children so a lead can account for the whole decomposition.
     pub fn children(&self, parent_id: &str) -> Result<Vec<Task>> {
         let db = self.db.read()?;
         let mut statement = db.prepare(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at, rowid"
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE parent_task_id = ?1 ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
         ))?;
-        let tasks = statement
+        let mut tasks = statement
             .query_map([parent_id], Self::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::attach_dependencies(&db, &mut tasks)?;
         Ok(tasks)
     }
 
     pub fn claim(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
         let lease_expires_at = now + self.lease_seconds;
-        let db = self.db.write()?;
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Self::get_locked_opt(&tx, task_id)?;
+        if let Some(ref task) = current {
+            let claimable = task.status == "open"
+                || (task.status == "claimed" && task.lease_expires_at.is_none_or(|exp| exp < now));
+            if claimable {
+                let blockers = Self::unresolved_blockers_locked(&tx, task)?;
+                if !blockers.is_empty() {
+                    return Err(anyhow!("{}", format_blocked_error(task_id, &blockers)));
+                }
+            }
+        }
+        let prev_status = current.as_ref().map(|t| t.status.clone());
 
-        Self::require_unblocked_locked(&db, task_id, true)?;
+        Self::require_unblocked_locked(&tx, task_id, true)?;
 
         // Only the lease-based flow is claimable; assigned work has an owner.
-        let changed = db
+        let changed = tx
             .execute(
                 "UPDATE tasks
                  SET status = 'claimed', claimed_by = ?1, lease_expires_at = ?2, updated_at = ?3
@@ -299,15 +444,28 @@ impl TaskStore {
             return Err(anyhow!("task is already claimed or done"));
         }
 
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        self.metrics
+            .record_task_transition(prev_status.as_deref().unwrap_or("open"), "claimed");
+        Ok(task)
     }
 
     pub fn done(&self, task_id: &str, principal_id: &str) -> Result<Task> {
         let now = unix_timestamp();
-        let db = self.db.write()?;
-        Self::require_unblocked_locked(&db, task_id, true)?;
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_unblocked_locked(&tx, task_id, true)?;
+        if let Some(current) = Self::get_locked_opt(&tx, task_id)? {
+            if current.claimed_by.as_deref() == Some(principal_id) && current.status == "claimed" {
+                let blockers = Self::unresolved_blockers_locked(&tx, &current)?;
+                if !blockers.is_empty() {
+                    return Err(anyhow!("{}", format_blocked_error(task_id, &blockers)));
+                }
+            }
+        }
 
-        let changed = db
+        let changed = tx
             .execute(
                 "UPDATE tasks
                  SET status = 'done', updated_at = ?1
@@ -320,7 +478,11 @@ impl TaskStore {
             return Err(anyhow!("task is not claimed by this principal"));
         }
 
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        self.metrics.record_task_transition("claimed", "done");
+        self.metrics.record_task_completed("done");
+        Ok(task)
     }
 
     pub fn release(&self, task_id: &str, principal_id: &str) -> Result<Task> {
@@ -341,7 +503,9 @@ impl TaskStore {
             return Err(anyhow!("task is not claimed by this principal"));
         }
 
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&db, task_id)?;
+        self.metrics.record_task_transition("claimed", "open");
+        Ok(task)
     }
 
     /// Give the task to `assignee`, or back to the pool when `None`. Work that
@@ -393,7 +557,54 @@ impl TaskStore {
             assignee.map(|a| format!("assignee={a}")).as_deref(),
             now,
         )?;
-        Self::get_locked(&db, task_id)
+        let task = Self::get_locked(&db, task_id)?;
+        if current.status != next_status {
+            self.metrics
+                .record_task_transition(&current.status, next_status);
+        }
+        Ok(task)
+    }
+
+    /// Update the priority (`urgent`, `high`, `normal`, `low`) of an active task.
+    pub fn set_priority(
+        &self,
+        task_id: &str,
+        priority: &str,
+        actor_id: &str,
+    ) -> Result<(Task, bool)> {
+        let normalized = normalize_priority(Some(priority))?;
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if TERMINAL_STATUSES.contains(&current.status.as_str()) {
+            return Err(anyhow!(
+                "task is {} and its priority cannot be changed",
+                current.status
+            ));
+        }
+        if current.priority == normalized {
+            return Ok((current, false));
+        }
+        tx.execute(
+            "UPDATE tasks SET priority = ?1, updated_at = ?2 WHERE id = ?3",
+            params![normalized, now, task_id],
+        )
+        .context("update task priority")?;
+        let note = format!("priority={} (was {})", normalized, current.priority);
+        Self::log_event_locked(
+            &tx,
+            task_id,
+            actor_id,
+            "priority",
+            Some(&current.status),
+            Some(&current.status),
+            Some(&note),
+            now,
+        )?;
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        Ok((task, true))
     }
 
     /// Write a status change. Permission and transition rules live in the
@@ -433,6 +644,20 @@ impl TaskStore {
         let current = Self::get_locked(&tx, task_id)?;
         if to != "cancelled" {
             Self::require_unblocked_locked(&tx, task_id, false)?;
+        }
+        if current.status != expected_from {
+            return Err(anyhow!(
+                "task status changed concurrently; reload and retry"
+            ));
+        }
+        if matches!(
+            to,
+            "in_progress" | "testing" | "review" | "super_review" | "merged" | "done"
+        ) {
+            let blockers = Self::unresolved_blockers_locked(&tx, &current)?;
+            if !blockers.is_empty() {
+                return Err(anyhow!("{}", format_blocked_error(task_id, &blockers)));
+            }
         }
         if round.is_some_and(|r| current.assignee.as_deref() != Some(r.assignee.as_str())) {
             return Err(anyhow!(
@@ -505,6 +730,11 @@ impl TaskStore {
         };
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        self.metrics.record_task_transition(expected_from, to);
+        if TERMINAL_STATUSES.contains(&to) {
+            self.metrics.record_task_completed(to);
+        }
+        self.record_cascade_metrics(&cascaded);
         Ok(TaskUpdate { task, cascaded })
     }
 
@@ -578,6 +808,9 @@ impl TaskStore {
         )?;
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        if current.status != to {
+            self.metrics.record_task_transition(&current.status, to);
+        }
         Ok(task)
     }
 
@@ -638,6 +871,10 @@ impl TaskStore {
         let task = Self::get_locked(&tx, task_id)?;
         let question = Self::question_locked(&tx, &id)?;
         tx.commit()?;
+        self.metrics
+            .record_task_transition(&current.status, "blocked");
+        self.metrics.record_task_question("asked");
+        self.record_cascade_metrics(&cascaded);
         Ok((TaskUpdate { task, cascaded }, question))
     }
 
@@ -690,6 +927,10 @@ impl TaskStore {
         let task = Self::get_locked(&tx, task_id)?;
         let question = Self::question_locked(&tx, &question.id)?;
         tx.commit()?;
+        self.metrics
+            .record_task_transition("blocked", &question.resume_status);
+        self.metrics.record_task_question("answered");
+        self.record_cascade_metrics(&cascaded);
         Ok((TaskUpdate { task, cascaded }, question))
     }
 
@@ -743,7 +984,13 @@ impl TaskStore {
             note,
             now,
         )?;
-        Self::question_locked(&db, &question.id)
+        let q = Self::question_locked(&db, &question.id)?;
+        self.metrics.record_task_question(if to == "escalated_pm" {
+            "escalated_pm"
+        } else {
+            "escalated"
+        });
+        Ok(q)
     }
 
     /// Questions with `status`, in one channel or everywhere.
@@ -760,6 +1007,16 @@ impl TaskStore {
             .query_map(params![status, channel], Self::question_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn record_cascade_metrics(&self, changes: &[TaskCascade]) {
+        for change in changes {
+            self.metrics
+                .record_task_transition(&change.previous_status, &change.task.status);
+            if TERMINAL_STATUSES.contains(&change.task.status.as_str()) {
+                self.metrics.record_task_completed(&change.task.status);
+            }
+        }
     }
 
     fn inherited_pause_locked(db: &Connection, task_id: &str) -> Result<Option<String>> {
@@ -892,6 +1149,7 @@ impl TaskStore {
                 changes.push(TaskCascade {
                     task: Self::get_locked(db, &child.id)?,
                     action,
+                    previous_status: child.status,
                     previous_holder: child.claimed_by,
                 });
             }
@@ -940,24 +1198,107 @@ impl TaskStore {
     }
 
     pub fn list(&self, channel: &str) -> Result<Vec<Task>> {
+        self.list_filtered(channel, None)
+    }
+
+    pub fn list_filtered(&self, channel: &str, priority: Option<&str>) -> Result<Vec<Task>> {
+        self.list_filtered_with_options(channel, priority, None, None)
+    }
+
+    pub fn list_filtered_with_options(
+        &self,
+        channel: &str,
+        priority: Option<&str>,
+        repo: Option<&str>,
+        blocked: Option<bool>,
+    ) -> Result<Vec<Task>> {
+        let normalized_priority = priority
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| normalize_priority(Some(p)))
+            .transpose()?;
+        let normalized_repo = repo.map(str::trim).filter(|r| !r.is_empty());
         let db = self.db.read()?;
         let mut statement = db
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
-                 WHERE channel = ?1 AND status NOT IN ('done', 'merged', 'cancelled')
-                 ORDER BY created_at ASC"
+                 WHERE channel = ?1
+                   AND status NOT IN ('done', 'merged', 'cancelled')
+                   AND (?2 IS NULL OR priority = ?2)
+                   AND (?3 IS NULL OR LOWER(COALESCE(repo, '')) = LOWER(?3))
+                 ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
             ))
             .context("prepare task list")?;
 
-        let tasks = statement
-            .query_map(params![channel], Self::from_row)?
+        let mut tasks = statement
+            .query_map(
+                params![channel, normalized_priority, normalized_repo],
+                Self::from_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::attach_dependencies(&db, &mut tasks)?;
+
+        if let Some(want_blocked) = blocked {
+            let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+            let unresolved = Self::unresolved_blockers_map_locked(&db, &ids)?;
+            tasks.retain(|t| {
+                let is_blocked = unresolved.get(&t.id).is_some_and(|b| !b.is_empty());
+                is_blocked == want_blocked
+            });
+        }
 
         Ok(tasks)
     }
 
-    /// Open work owned by `principal_id`, across every channel.
+    /// List tasks across all or one project/sprint, optionally including terminal statuses.
+    pub fn list_all(
+        &self,
+        channel: Option<&str>,
+        sprint: Option<&str>,
+        include_terminal: bool,
+    ) -> Result<Vec<Task>> {
+        let db = self.db.read()?;
+        let mut statement = db
+            .prepare(&format!(
+                "SELECT {TASK_COLUMNS}
+                 FROM tasks
+                 WHERE (?1 IS NULL OR channel = ?1)
+                   AND (?2 IS NULL OR sprint = ?2)
+                   AND (?3 = 1 OR status NOT IN ('done', 'merged', 'cancelled'))
+                 ORDER BY updated_at DESC, created_at DESC, rowid DESC"
+            ))
+            .context("prepare full task list")?;
+
+        let include_flag = if include_terminal { 1i64 } else { 0i64 };
+        let mut tasks = statement
+            .query_map(params![channel, sprint, include_flag], Self::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::attach_dependencies(&db, &mut tasks)?;
+
+        Ok(tasks)
+    }
+
+    /// All currently unanswered questions (`open`, `escalated_pm`, `escalated`),
+    /// optionally scoped to one project channel.
+    pub fn pending_questions_all(&self, channel: Option<&str>) -> Result<Vec<TaskQuestion>> {
+        let db = self.db.read()?;
+        let mut statement = db
+            .prepare(&format!(
+                "SELECT {QUESTION_COLUMNS} FROM task_questions
+                 WHERE status IN ('open', 'escalated_pm', 'escalated')
+                   AND (?1 IS NULL OR channel = ?1)
+                 ORDER BY created_at DESC, rowid DESC"
+            ))
+            .context("prepare pending questions")?;
+        let rows = statement
+            .query_map(params![channel], Self::question_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Open work owned by `principal_id`, across every channel, ordered by
+    /// priority (`urgent` -> `high` -> `normal` -> `low`) then FIFO.
     pub fn inbox(&self, principal_id: &str) -> Result<Vec<Task>> {
         let db = self.db.read()?;
         let mut statement = db
@@ -966,16 +1307,17 @@ impl TaskStore {
                  FROM tasks
                  WHERE status NOT IN ('done', 'merged', 'cancelled')
                    AND (assignee = ?1 OR (claimed_by = ?1 AND status = 'claimed'))
-                 ORDER BY channel ASC, created_at ASC"
+                 ORDER BY {PRIORITY_ORDER_SQL}, created_at ASC, rowid ASC"
             ))
             .context("prepare inbox")?;
-        let tasks = statement
+        let mut tasks = statement
             .query_map(params![principal_id], Self::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::attach_dependencies(&db, &mut tasks)?;
         Ok(tasks)
     }
 
-    /// Tasks waiting for review in `channel`.
+    /// Tasks waiting for review in `channel`, ordered by priority then FIFO.
     pub fn review_queue(&self, channel: &str) -> Result<Vec<Task>> {
         let db = self.db.read()?;
         let mut statement = db
@@ -983,13 +1325,191 @@ impl TaskStore {
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
                  WHERE channel = ?1 AND status IN ('review', 'super_review')
-                 ORDER BY updated_at ASC"
+                 ORDER BY {PRIORITY_ORDER_SQL}, updated_at ASC, rowid ASC"
             ))
             .context("prepare review queue")?;
-        let tasks = statement
+        let mut tasks = statement
             .query_map(params![channel], Self::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::attach_dependencies(&db, &mut tasks)?;
         Ok(tasks)
+    }
+
+    pub fn dependencies(&self, task_id: &str) -> Result<Vec<TaskDependency>> {
+        let db = self.db.read()?;
+        let task = Self::get_locked(&db, task_id)?;
+        Self::dependencies_locked(&db, &task)
+    }
+
+    pub fn dependents(&self, task_id: &str) -> Result<Vec<TaskDependency>> {
+        let db = self.db.read()?;
+        let task = Self::get_locked(&db, task_id)?;
+        Self::dependents_locked(&db, &task)
+    }
+
+    pub fn unresolved_blockers(&self, task_id: &str) -> Result<Vec<TaskDependency>> {
+        let db = self.db.read()?;
+        let task = Self::get_locked(&db, task_id)?;
+        Self::unresolved_blockers_locked(&db, &task)
+    }
+
+    pub fn unresolved_blockers_map(
+        &self,
+        task_ids: &[String],
+    ) -> Result<HashMap<String, Vec<TaskDependency>>> {
+        let db = self.db.read()?;
+        Self::unresolved_blockers_map_locked(&db, task_ids)
+    }
+
+    /// Replace all `blocked_by` dependencies for `task_id` atomically.
+    pub fn set_dependencies(
+        &self,
+        task_id: &str,
+        blocked_by: &[String],
+        actor_id: &str,
+    ) -> Result<(Task, bool)> {
+        let normalized = normalize_dep_ids(blocked_by);
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if TERMINAL_STATUSES.contains(&current.status.as_str()) {
+            return Err(anyhow!(
+                "task is {} and its dependencies cannot be changed",
+                current.status
+            ));
+        }
+        Self::validate_dependencies_locked(&tx, task_id, &normalized, true)?;
+        if current.blocked_by == normalized {
+            return Ok((current, false));
+        }
+        tx.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?1",
+            params![task_id],
+        )
+        .context("clear task dependencies")?;
+        for dep_id in &normalized {
+            tx.execute(
+                "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![task_id, dep_id, actor_id, now],
+            )
+            .context("insert task dependency")?;
+        }
+        let note = if normalized.is_empty() {
+            format!("blocked_by=- (was {})", current.blocked_by.join(","))
+        } else {
+            format!("blocked_by={}", normalized.join(","))
+        };
+        Self::log_event_locked(
+            &tx,
+            task_id,
+            actor_id,
+            "dependencies",
+            Some(&current.status),
+            Some(&current.status),
+            Some(&note),
+            now,
+        )?;
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        Ok((task, true))
+    }
+
+    /// Add one or more `blocked_by` dependencies to `task_id` atomically.
+    pub fn add_dependencies(
+        &self,
+        task_id: &str,
+        blocked_by: &[String],
+        actor_id: &str,
+    ) -> Result<(Task, bool)> {
+        let normalized = normalize_dep_ids(blocked_by);
+        if normalized.is_empty() {
+            return Err(anyhow!("at least one dependency task id is required"));
+        }
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if TERMINAL_STATUSES.contains(&current.status.as_str()) {
+            return Err(anyhow!(
+                "task is {} and its dependencies cannot be changed",
+                current.status
+            ));
+        }
+        Self::validate_dependencies_locked(&tx, task_id, &normalized, false)?;
+        let mut added = Vec::new();
+        for dep_id in &normalized {
+            if !current.blocked_by.contains(dep_id) {
+                tx.execute(
+                    "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![task_id, dep_id, actor_id, now],
+                )
+                .context("insert task dependency")?;
+                added.push(dep_id.clone());
+            }
+        }
+        if added.is_empty() {
+            return Ok((current, false));
+        }
+        let note = format!("added blocked_by={}", added.join(","));
+        Self::log_event_locked(
+            &tx,
+            task_id,
+            actor_id,
+            "dependencies",
+            Some(&current.status),
+            Some(&current.status),
+            Some(&note),
+            now,
+        )?;
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        Ok((task, true))
+    }
+
+    /// Remove a single `blocked_by` dependency from `task_id`.
+    pub fn remove_dependency(
+        &self,
+        task_id: &str,
+        depends_on_task_id: &str,
+        actor_id: &str,
+    ) -> Result<(Task, bool)> {
+        let dep_id = depends_on_task_id.trim();
+        let now = unix_timestamp();
+        let mut db = self.db.write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Self::get_locked(&tx, task_id)?;
+        if TERMINAL_STATUSES.contains(&current.status.as_str()) {
+            return Err(anyhow!(
+                "task is {} and its dependencies cannot be changed",
+                current.status
+            ));
+        }
+        let deleted = tx
+            .execute(
+                "DELETE FROM task_dependencies WHERE task_id = ?1 AND depends_on_task_id = ?2",
+                params![task_id, dep_id],
+            )
+            .context("delete task dependency")?;
+        if deleted == 0 {
+            return Ok((current, false));
+        }
+        let note = format!("removed blocked_by={dep_id}");
+        Self::log_event_locked(
+            &tx,
+            task_id,
+            actor_id,
+            "dependencies",
+            Some(&current.status),
+            Some(&current.status),
+            Some(&note),
+            now,
+        )?;
+        let task = Self::get_locked(&tx, task_id)?;
+        tx.commit()?;
+        Ok((task, true))
     }
 
     pub fn events(&self, task_id: &str) -> Result<Vec<TaskEvent>> {
@@ -1036,13 +1556,278 @@ impl TaskStore {
         Ok(())
     }
 
+    fn get_locked_opt(db: &Connection, task_id: &str) -> Result<Option<Task>> {
+        let mut task = db
+            .query_row(
+                &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+                params![task_id],
+                Self::from_row,
+            )
+            .optional()
+            .context("load task")?;
+        if let Some(ref mut t) = task {
+            t.blocked_by = Self::blocked_by_locked(db, &t.id)?;
+        }
+        Ok(task)
+    }
+
     fn get_locked(db: &Connection, task_id: &str) -> Result<Task> {
-        db.query_row(
-            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
-            params![task_id],
-            Self::from_row,
-        )
-        .context("load task")
+        let mut task = db
+            .query_row(
+                &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+                params![task_id],
+                Self::from_row,
+            )
+            .context("load task")?;
+        task.blocked_by = Self::blocked_by_locked(db, &task.id)?;
+        Ok(task)
+    }
+
+    fn blocked_by_locked(db: &Connection, task_id: &str) -> Result<Vec<String>> {
+        let mut stmt = db
+            .prepare(
+                "SELECT depends_on_task_id FROM task_dependencies
+                 WHERE task_id = ?1
+                 ORDER BY rowid ASC",
+            )
+            .context("prepare blocked_by")?;
+        let deps = stmt
+            .query_map(params![task_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(deps)
+    }
+
+    fn attach_dependencies(db: &Connection, tasks: &mut [Task]) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let wanted: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let mut stmt = db
+            .prepare("SELECT task_id, depends_on_task_id FROM task_dependencies ORDER BY rowid ASC")
+            .context("prepare all task_dependencies")?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (tid, dep_id) = row?;
+            if wanted.contains(tid.as_str()) {
+                map.entry(tid).or_default().push(dep_id);
+            }
+        }
+        for task in tasks {
+            if let Some(deps) = map.remove(&task.id) {
+                task.blocked_by = deps;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dependencies_locked(
+        db: &Connection,
+        task_id: &str,
+        dep_ids: &[String],
+        ignore_existing_edges_from_task: bool,
+    ) -> Result<()> {
+        for dep_id in dep_ids {
+            if dep_id == task_id {
+                return Err(anyhow!("a task cannot depend on itself"));
+            }
+            let dep_status: Option<String> = db
+                .query_row(
+                    "SELECT status FROM tasks WHERE id = ?1",
+                    params![dep_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("check dependency task")?;
+            let Some(status) = dep_status else {
+                return Err(anyhow!("dependency task '{dep_id}' not found"));
+            };
+            if status == "cancelled" {
+                return Err(anyhow!("cannot depend on cancelled task '{dep_id}'"));
+            }
+        }
+        if let Some(cycle) =
+            Self::would_create_cycle(db, task_id, dep_ids, ignore_existing_edges_from_task)?
+        {
+            return Err(anyhow!(
+                "circular task dependency detected: {}",
+                cycle.join(" -> ")
+            ));
+        }
+        Ok(())
+    }
+
+    fn would_create_cycle(
+        db: &Connection,
+        task_id: &str,
+        new_deps: &[String],
+        ignore_existing_edges_from_task: bool,
+    ) -> Result<Option<Vec<String>>> {
+        if new_deps.is_empty() {
+            return Ok(None);
+        }
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        let mut stmt = db
+            .prepare("SELECT task_id, depends_on_task_id FROM task_dependencies ORDER BY rowid ASC")
+            .context("load dependency graph")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (src, dst) = row?;
+            if ignore_existing_edges_from_task && src == task_id {
+                continue;
+            }
+            adj.entry(src).or_default().push(dst);
+        }
+
+        for start in new_deps {
+            let mut visited: HashSet<String> = HashSet::new();
+            let mut parent: HashMap<String, String> = HashMap::new();
+            let mut queue: VecDeque<String> = VecDeque::new();
+            visited.insert(start.clone());
+            queue.push_back(start.clone());
+            while let Some(node) = queue.pop_front() {
+                if node == task_id {
+                    let mut path = vec![task_id.to_string()];
+                    let mut cur = node;
+                    while let Some(prev) = parent.get(&cur) {
+                        path.push(prev.clone());
+                        cur = prev.clone();
+                    }
+                    path.push(task_id.to_string());
+                    path.reverse();
+                    return Ok(Some(path));
+                }
+                if let Some(neighbors) = adj.get(&node) {
+                    for next in neighbors {
+                        if visited.insert(next.clone()) {
+                            parent.insert(next.clone(), node.clone());
+                            queue.push_back(next.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn dependencies_locked(db: &Connection, task: &Task) -> Result<Vec<TaskDependency>> {
+        let mut stmt = db
+            .prepare(
+                "SELECT t.id, t.title, t.status, t.channel, t.repo
+                 FROM task_dependencies d
+                 JOIN tasks t ON t.id = d.depends_on_task_id
+                 WHERE d.task_id = ?1
+                 ORDER BY d.rowid ASC",
+            )
+            .context("prepare task dependencies")?;
+        let deps = stmt
+            .query_map(params![task.id], |row| {
+                let status: String = row.get(2)?;
+                let channel: String = row.get(3)?;
+                let repo: Option<String> = row.get(4)?;
+                Ok(TaskDependency {
+                    task_id: row.get(0)?,
+                    title: row.get(1)?,
+                    resolved: is_dependency_resolved(&status),
+                    status,
+                    cross_project: channel != task.channel,
+                    cross_repo: repo != task.repo,
+                    channel,
+                    repo,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(deps)
+    }
+
+    fn dependents_locked(db: &Connection, task: &Task) -> Result<Vec<TaskDependency>> {
+        let resolved = is_dependency_resolved(&task.status);
+        let mut stmt = db
+            .prepare(
+                "SELECT t.id, t.title, t.status, t.channel, t.repo
+                 FROM task_dependencies d
+                 JOIN tasks t ON t.id = d.task_id
+                 WHERE d.depends_on_task_id = ?1
+                 ORDER BY d.rowid ASC",
+            )
+            .context("prepare task dependents")?;
+        let deps = stmt
+            .query_map(params![task.id], |row| {
+                let channel: String = row.get(3)?;
+                let repo: Option<String> = row.get(4)?;
+                Ok(TaskDependency {
+                    task_id: row.get(0)?,
+                    title: row.get(1)?,
+                    status: row.get(2)?,
+                    resolved,
+                    cross_project: channel != task.channel,
+                    cross_repo: repo != task.repo,
+                    channel,
+                    repo,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(deps)
+    }
+
+    fn unresolved_blockers_locked(db: &Connection, task: &Task) -> Result<Vec<TaskDependency>> {
+        let deps = Self::dependencies_locked(db, task)?;
+        Ok(deps.into_iter().filter(|d| !d.resolved).collect())
+    }
+
+    fn unresolved_blockers_map_locked(
+        db: &Connection,
+        task_ids: &[String],
+    ) -> Result<HashMap<String, Vec<TaskDependency>>> {
+        let mut out: HashMap<String, Vec<TaskDependency>> = HashMap::new();
+        if task_ids.is_empty() {
+            return Ok(out);
+        }
+        let wanted: HashSet<&str> = task_ids.iter().map(String::as_str).collect();
+        let mut stmt = db
+            .prepare(
+                "SELECT d.task_id, src.channel, src.repo, dep.id, dep.title, dep.status, dep.channel, dep.repo
+                 FROM task_dependencies d
+                 JOIN tasks src ON src.id = d.task_id
+                 JOIN tasks dep ON dep.id = d.depends_on_task_id
+                 WHERE dep.status NOT IN ('done', 'merged')
+                 ORDER BY d.rowid ASC",
+            )
+            .context("prepare unresolved blockers map")?;
+        let rows = stmt.query_map([], |row| {
+            let tid: String = row.get(0)?;
+            let src_channel: String = row.get(1)?;
+            let src_repo: Option<String> = row.get(2)?;
+            let dep_id: String = row.get(3)?;
+            let dep_title: String = row.get(4)?;
+            let dep_status: String = row.get(5)?;
+            let dep_channel: String = row.get(6)?;
+            let dep_repo: Option<String> = row.get(7)?;
+            Ok((
+                tid,
+                TaskDependency {
+                    task_id: dep_id,
+                    title: dep_title,
+                    resolved: is_dependency_resolved(&dep_status),
+                    status: dep_status,
+                    cross_project: dep_channel != src_channel,
+                    cross_repo: dep_repo != src_repo,
+                    channel: dep_channel,
+                    repo: dep_repo,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (tid, dep) = row?;
+            if wanted.contains(tid.as_str()) {
+                out.entry(tid).or_default().push(dep);
+            }
+        }
+        Ok(out)
     }
 
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -1057,28 +1842,32 @@ impl TaskStore {
             kind: row
                 .get::<_, Option<String>>(7)?
                 .unwrap_or_else(|| "task".to_string()),
-            assignee: row.get(8)?,
-            created_by: row.get(9)?,
-            repo: row.get(10)?,
-            branch: row.get(11)?,
-            issue_url: row.get(12)?,
-            created_at: row.get(13)?,
-            updated_at: row.get(14)?,
-            sprint: row.get(15)?,
-            reviewer: row.get(16)?,
-            parent_task_id: row.get(17)?,
+            priority: row
+                .get::<_, Option<String>>(8)?
+                .unwrap_or_else(|| DEFAULT_PRIORITY.to_string()),
+            assignee: row.get(9)?,
+            created_by: row.get(10)?,
+            repo: row.get(11)?,
+            branch: row.get(12)?,
+            issue_url: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
+            sprint: row.get(16)?,
+            reviewer: row.get(17)?,
+            parent_task_id: row.get(18)?,
             review_round: row
-                .get::<_, Option<String>>(18)?
+                .get::<_, Option<String>>(19)?
                 .map(|raw| {
                     serde_json::from_str(&raw).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            18,
+                            19,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         )
                     })
                 })
                 .transpose()?,
+            blocked_by: Vec::new(),
         })
     }
 }

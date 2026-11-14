@@ -269,3 +269,56 @@ fn concurrent_child_creation_and_parent_cancellation_cannot_leave_active_orphans
     }
     Ok(())
 }
+
+#[test]
+fn cascade_preserves_dependency_priority_and_records_only_committed_metrics() -> Result<()> {
+    let db = crate::store::open(":memory:")?;
+    let metrics = std::sync::Arc::new(crate::metrics::MetricsRegistry::new());
+    let store = TaskStore::with_metrics(db.clone(), 60, metrics.clone());
+    let root = task(&store, None, Some("lead"))?;
+    let dependency = store.create_full(NewTask {
+        channel: "#other".into(),
+        title: "External prerequisite".into(),
+        assignee: Some("other-worker".into()),
+        ..Default::default()
+    })?;
+    let child = store.create_full(NewTask {
+        channel: "#one".into(),
+        title: "Urgent child".into(),
+        assignee: Some("worker".into()),
+        parent_task_id: Some(root.id.clone()),
+        priority: Some("urgent".into()),
+        blocked_by: vec![dependency.id.clone()],
+        ..Default::default()
+    })?;
+    db.write()?.execute_batch(
+        "CREATE TRIGGER reject_cascade BEFORE INSERT ON task_events
+        WHEN NEW.action LIKE 'parent_%' BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+    )?;
+    assert!(store.ask(&root.id, "lead", "Roll back").is_err());
+    let scrape = || metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
+    assert!(!scrape()
+        .lines()
+        .any(|l| l.starts_with("aircd_task_transitions_total{")));
+    db.write()?.execute("DROP TRIGGER reject_cascade", [])?;
+    store.ask(&root.id, "lead", "Pause")?;
+    assert!(scrape().contains("aircd_task_transitions_total{from=\"assigned\",to=\"blocked\"} 2\n"));
+    store.answer(&root.id, "pm", "Resume")?;
+    let resumed = store.get(&child.id)?.unwrap();
+    assert_eq!(resumed.priority, "urgent");
+    assert_eq!(resumed.blocked_by, vec![dependency.id.clone()]);
+    assert_eq!(resumed.status, "assigned");
+    assert!(store
+        .set_status(&child.id, "assigned", "in_progress", "worker", None, None)
+        .is_err());
+    assert!(scrape().contains("aircd_task_transitions_total{from=\"blocked\",to=\"assigned\"} 2\n"));
+    store.set_status(&dependency.id, "assigned", "merged", "pm", None, None)?;
+    store.set_status(&child.id, "assigned", "in_progress", "worker", None, None)?;
+    store.set_status(&root.id, "assigned", "cancelled", "pm", None, None)?;
+    assert!(scrape().contains("aircd_tasks_completed_total{outcome=\"cancelled\"} 2\n"));
+    assert_eq!(
+        store.get(&child.id)?.unwrap().blocked_by,
+        vec![dependency.id]
+    );
+    Ok(())
+}

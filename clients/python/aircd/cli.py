@@ -11,6 +11,7 @@ import os
 import shlex
 import shutil
 import socketserver
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -22,12 +23,22 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from aircd.client import REVIEW_NEEDS_REPORT, AircdHttpClient, AircdHttpError, Group, GroupMember, task_create_payload
+from aircd.client import (
+    REVIEW_NEEDS_REPORT,
+    AircdHttpClient,
+    AircdHttpError,
+    Group,
+    GroupMember,
+    _clean_dep_ids,
+    build_ssl_context,
+    task_create_payload,
+)
 
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:6680"
 ALLOWED_REPORT_STATUSES = ("info", "ok", "completed", "needs_input", "failed", "warning")
 MANAGED_HOOK_MARKER = "# aircd-hook-managed"
+_ACTIVE_SSL_CONTEXT: ssl.SSLContext | None = None
 
 
 class CliError(Exception):
@@ -72,7 +83,84 @@ def save_profiles(data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def _parse_env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return None
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    raise CliError(f"Invalid {name} value: {raw!r} (expected true/false or 1/0)")
+
+
+def _resolve_tls_settings(args: argparse.Namespace, prof: dict[str, Any]) -> dict[str, Any]:
+    def _pick_path(flag: str, env_name: str, prof_key: str) -> str | None:
+        raw = (
+            getattr(args, flag, None)
+            or os.environ.get(env_name, "").strip()
+            or prof.get(prof_key)
+            or ""
+        ).strip()
+        if not raw:
+            return None
+        return os.path.abspath(os.path.expanduser(raw))
+
+    tls_ca = _pick_path("tls_ca", "AIRCD_TLS_CA", "tls_ca")
+    tls_cert = _pick_path("tls_cert", "AIRCD_TLS_CLIENT_CERT", "tls_cert")
+    tls_key = _pick_path("tls_key", "AIRCD_TLS_CLIENT_KEY", "tls_key")
+    if tls_key and not tls_cert:
+        raise CliError("--tls-cert is required when --tls-key is specified")
+    env_insecure = _parse_env_bool("AIRCD_TLS_INSECURE")
+    if getattr(args, "tls_insecure", False):
+        tls_insecure = True
+    elif env_insecure is not None:
+        tls_insecure = env_insecure
+    else:
+        tls_insecure = bool(prof.get("tls_insecure", False))
+    return {
+        "tls_ca": tls_ca,
+        "tls_cert": tls_cert,
+        "tls_key": tls_key,
+        "tls_insecure": tls_insecure,
+    }
+
+
+def _profile_tls_patch(prof: dict[str, Any]) -> dict[str, Any]:
+    tls = prof.get("_tls") or {}
+    patch: dict[str, Any] = {}
+    for key in ("tls_ca", "tls_cert", "tls_key"):
+        if tls.get(key):
+            patch[key] = tls[key]
+    if tls.get("tls_insecure"):
+        patch["tls_insecure"] = True
+    return patch
+
+
+def _http_client_from_prof(
+    server: str,
+    token: str,
+    prof: dict[str, Any],
+    *,
+    invite: str = "",
+) -> AircdHttpClient:
+    tls = prof.get("_tls") or {}
+    try:
+        return AircdHttpClient(
+            server,
+            token=token,
+            invite=invite,
+            tls_verify=not bool(tls.get("tls_insecure", False)),
+            tls_ca_path=tls.get("tls_ca"),
+            tls_cert_path=tls.get("tls_cert"),
+            tls_key_path=tls.get("tls_key"),
+        )
+    except (OSError, ssl.SSLError, ValueError) as err:
+        raise CliError(f"Invalid TLS client configuration: {err}") from None
+
+
 def resolve_connection(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
+    global _ACTIVE_SSL_CONTEXT
     store = load_profiles()
     profile_name = (
         getattr(args, "profile", None)
@@ -97,7 +185,21 @@ def resolve_connection(args: argparse.Namespace) -> tuple[str, str, dict[str, An
         or prof.get("token")
         or ""
     )
+    tls_settings = _resolve_tls_settings(args, prof)
+    if server.startswith("https://"):
+        try:
+            _ACTIVE_SSL_CONTEXT = build_ssl_context(
+                tls_verify=not tls_settings["tls_insecure"],
+                tls_ca_path=tls_settings["tls_ca"],
+                tls_cert_path=tls_settings["tls_cert"],
+                tls_key_path=tls_settings["tls_key"],
+            )
+        except (OSError, ssl.SSLError, ValueError) as err:
+            raise CliError(f"Invalid TLS client configuration: {err}") from None
+    else:
+        _ACTIVE_SSL_CONTEXT = None
     prof["_profile_name"] = profile_name
+    prof["_tls"] = tls_settings
     return server, token, prof
 
 
@@ -120,6 +222,7 @@ def http_json(
     token: str = "",
     payload: Any = None,
     timeout: float = 15.0,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> dict[str, Any]:
     url = f"{server.rstrip('/')}{path}"
     headers = {"Accept": "application/json"}
@@ -131,8 +234,9 @@ def http_json(
         data_bytes = json.dumps(payload).encode("utf-8")
 
     req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+    ctx = ssl_context if ssl_context is not None else (_ACTIVE_SSL_CONTEXT if url.startswith("https://") else None)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return json.loads(raw) if raw.strip() else {"ok": True}
     except urllib.error.HTTPError as err:
@@ -143,18 +247,25 @@ def http_json(
         except Exception:
             msg = raw or str(err)
         raise CliError(f"HTTP {err.code} {method} {path}: {msg}") from None
-    except urllib.error.URLError as err:
-        raise CliError(f"Cannot reach aircd at {server}: {err.reason}") from None
+    except (urllib.error.URLError, OSError) as err:
+        raise CliError(f"Cannot reach aircd at {server}: {getattr(err, 'reason', err)}") from None
 
 
-def http_text(server: str, path: str, timeout: float = 10.0) -> str:
+def http_text(
+    server: str,
+    path: str,
+    timeout: float = 10.0,
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+) -> str:
     url = f"{server.rstrip('/')}{path}"
     req = urllib.request.Request(url, method="GET")
+    ctx = ssl_context if ssl_context is not None else (_ACTIVE_SSL_CONTEXT if url.startswith("https://") else None)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as err:
-        raise CliError(f"Cannot reach aircd at {server}: {err.reason}") from None
+    except (urllib.error.URLError, OSError) as err:
+        raise CliError(f"Cannot reach aircd at {server}: {getattr(err, 'reason', err)}") from None
 
 
 def require_token(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
@@ -181,16 +292,19 @@ def http_bytes(
     data: bytes | None = None,
     content_type: str | None = None,
     timeout: float = 60.0,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> tuple[bytes, dict[str, str]]:
     """Send or fetch a raw body (file attachments). Errors read like http_json's."""
+    url = f"{server.rstrip('/')}{path}"
     headers = {"Accept": "application/json, */*"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if data is not None:
         headers["Content-Type"] = content_type or "application/octet-stream"
-    req = urllib.request.Request(f"{server.rstrip('/')}{path}", data=data, headers=headers, method=method)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    ctx = ssl_context if ssl_context is not None else (_ACTIVE_SSL_CONTEXT if url.startswith("https://") else None)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             return resp.read(), {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as err:
         raw = err.read().decode("utf-8", errors="replace")
@@ -199,8 +313,8 @@ def http_bytes(
         except Exception:
             msg = raw or str(err)
         raise CliError(f"HTTP {err.code} {method} {path}: {msg}") from None
-    except urllib.error.URLError as err:
-        raise CliError(f"Cannot reach aircd at {server}: {err.reason}") from None
+    except (urllib.error.URLError, OSError) as err:
+        raise CliError(f"Cannot reach aircd at {server}: {getattr(err, 'reason', err)}") from None
 
 
 def format_size(size: float) -> str:
@@ -348,6 +462,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             "role": data["principal"]["role"],
             "irc_host": data.get("irc_host"),
             "irc_port": data.get("irc_port"),
+            **_profile_tls_patch(prof),
         },
         make_default=not args.no_default,
     )
@@ -439,7 +554,7 @@ def cmd_owner_wake(args: argparse.Namespace) -> int:
 
 
 def cmd_owner_reissue(args: argparse.Namespace) -> int:
-    server, _token, _prof = resolve_connection(args)
+    server, _token, prof = resolve_connection(args)
     invite = args.invite or os.environ.get("AIRC_INVITE")
     if not invite:
         raise SystemExit("owner reissue needs the owner key: pass --invite or set AIRC_INVITE")
@@ -458,6 +573,7 @@ def cmd_owner_reissue(args: argparse.Namespace) -> int:
             "nick": data["principal"]["nick"],
             "id": data["principal"]["id"],
             "role": data["principal"]["role"],
+            **_profile_tls_patch(prof),
         },
         make_default=args.make_default,
     )
@@ -498,6 +614,7 @@ def cmd_login(args: argparse.Namespace) -> int:
             "nick": data["principal"]["nick"],
             "id": data["principal"]["id"],
             "role": data["principal"]["role"],
+            **_profile_tls_patch(prof),
         },
         make_default=True,
     )
@@ -763,21 +880,26 @@ def cmd_task(args: argparse.Namespace) -> int:
                 " ".join(args.title),
                 body=args.body,
                 kind=args.kind,
+                priority=args.priority,
                 assignee=args.assign,
                 repo=args.repo,
                 branch=args.branch,
                 issue_url=args.issue,
                 parent=args.parent,
                 reviewer=args.reviewer,
+                blocked_by=getattr(args, "blocked_by", None),
             ),
         )
         t = data["task"]
         owner = f" -> @{t['assignee']}" if t.get("assignee") else ""
-        lines = [f"Created {t['kind']} {t['id']} in {t['channel']}{owner}: {t['title']}"]
+        prio = f" [{t['priority']}]" if t.get("priority") and t["priority"] != "normal" else ""
+        lines = [f"Created {t['kind']} {t['id']}{prio} in {t['channel']}{owner}: {t['title']}"]
         if t.get("parent_task_id"):
             lines.append(f"  subtask of {t['parent_task_id']}")
         if t.get("reviewer"):
             lines.append(f"  reviewer @{t['reviewer']}")
+        if t.get("blocked_by"):
+            lines.append(f"  blocked_by {', '.join(t['blocked_by'])}")
         print_out(args, data, lines)
         return 0
     if args.task_cmd == "assign":
@@ -790,6 +912,69 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         t = data["task"]
         print_out(args, data, [f"Task {t['id']} -> {t['status']} (assignee={t.get('assignee') or '-'})"])
+        return 0
+    if args.task_cmd == "priority":
+        data = http_json(
+            server,
+            "POST",
+            f"/v1/tasks/{urllib.parse.quote(args.id)}/priority",
+            token=token,
+            payload={"priority": args.priority},
+        )
+        t = data["task"]
+        print_out(args, data, [f"Task {t['id']} priority -> {t.get('priority', 'normal')}"])
+        return 0
+    if args.task_cmd == "deps":
+        quoted_id = urllib.parse.quote(args.id, safe="")
+        data: dict[str, Any]
+        if getattr(args, "clear", False):
+            data = http_json(
+                server, "PUT", f"/v1/tasks/{quoted_id}/dependencies", token=token, payload={"blocked_by": []}
+            )
+        elif getattr(args, "set_deps", None) is not None:
+            data = http_json(
+                server,
+                "PUT",
+                f"/v1/tasks/{quoted_id}/dependencies",
+                token=token,
+                payload={"blocked_by": _clean_dep_ids(args.set_deps)},
+            )
+        elif getattr(args, "add", None) or getattr(args, "remove", None):
+            data = {}
+            add_ids = _clean_dep_ids(getattr(args, "add", None))
+            if add_ids:
+                data = http_json(
+                    server,
+                    "POST",
+                    f"/v1/tasks/{quoted_id}/dependencies",
+                    token=token,
+                    payload={"blocked_by": add_ids},
+                )
+            for dep_id in _clean_dep_ids(getattr(args, "remove", None)):
+                data = http_json(
+                    server,
+                    "DELETE",
+                    f"/v1/tasks/{quoted_id}/dependencies/{urllib.parse.quote(dep_id, safe='')}",
+                    token=token,
+                )
+        else:
+            data = http_json(server, "GET", f"/v1/tasks/{quoted_id}/dependencies", token=token)
+        deps = data.get("dependencies") or []
+        dependents = data.get("dependents") or []
+        blocked_flag = "blocked" if data.get("is_blocked") else "ready"
+        lines = [f"Task {args.id} ({blocked_flag}): {len(deps)} dependency(ies), {len(dependents)} dependent(s)"]
+        for d in deps:
+            state = "resolved" if d.get("resolved") else "BLOCKING"
+            cross = " [cross-repo]" if d.get("cross_repo") else ""
+            lines.append(
+                f"  blocked_by {d['task_id']} [{d['status']}/{state}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+            )
+        for d in dependents:
+            cross = " [cross-repo]" if d.get("cross_repo") else ""
+            lines.append(
+                f"  blocks {d['task_id']} [{d['status']}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+            )
+        print_out(args, data, lines)
         return 0
     if args.task_cmd == "status":
         note = review_note(server, token, args) if args.status == "review" else args.note
@@ -846,11 +1031,25 @@ def cmd_task(args: argparse.Namespace) -> int:
         t = data["task"]
         lines = [
             f"{t['id']} [{t['kind']}/{t['status']}] {t['channel']}: {t['title']}",
-            f"assignee={t.get('assignee') or '-'} repo={t.get('repo') or '-'} "
+            f"assignee={t.get('assignee') or '-'} priority={t.get('priority') or 'normal'} repo={t.get('repo') or '-'} "
             f"branch={t.get('branch') or '-'} issue={t.get('issue_url') or '-'} sprint={t.get('sprint') or '-'}",
         ]
         if t.get("parent_task_id") or t.get("reviewer"):
             lines.append(f"parent={t.get('parent_task_id') or '-'} reviewer={t.get('reviewer') or '-'}")
+        if data.get("dependencies"):
+            for d in data["dependencies"]:
+                state = "resolved" if d.get("resolved") else "BLOCKING"
+                cross = " [cross-repo]" if d.get("cross_repo") else ""
+                lines.append(
+                    f"  blocked_by {d['task_id']} [{d['status']}/{state}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+                )
+        elif t.get("blocked_by"):
+            lines.append(f"blocked_by={','.join(t['blocked_by'])}")
+        for d in data.get("dependents") or []:
+            cross = " [cross-repo]" if d.get("cross_repo") else ""
+            lines.append(
+                f"  blocks {d['task_id']} [{d['status']}] repo={d.get('repo') or '-'} {d['channel']}{cross}: {d['title']}"
+            )
         if t.get("review_round"):
             r = t["review_round"]
             lines.append(f"peer revision={r['revision']} commit={r['commit']} quorum={r['quorum']} peers={','.join(r['peer_reviewers'])}")
@@ -928,12 +1127,24 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         return 0
     if args.task_cmd == "list":
-        qs = urllib.parse.urlencode({"channel": args.channel})
+        params = {"channel": args.channel}
+        if getattr(args, "priority", None):
+            params["priority"] = args.priority
+        if getattr(args, "repo", None):
+            params["repo"] = args.repo
+        if getattr(args, "blocked", False):
+            params["blocked"] = "true"
+        elif getattr(args, "ready", False):
+            params["blocked"] = "false"
+        qs = urllib.parse.urlencode(params)
         data = http_json(server, "GET", f"/v1/tasks?{qs}", token=token)
-        lines = [
-            f"{t['id']} [{t['status']}] claimed_by={t.get('claimed_by') or '-'}: {t['title']}"
-            for t in data.get("tasks", [])
-        ]
+        lines = []
+        for t in data.get("tasks", []):
+            deps = f" blocked_by={','.join(t['blocked_by'])}" if t.get("blocked_by") else ""
+            lines.append(
+                f"{t['id']} [{t.get('priority') or 'normal'}/{t['status']}] "
+                f"assignee={t.get('assignee') or t.get('claimed_by') or '-'}{deps}: {t['title']}"
+            )
         print_out(args, data, lines or [f"No tasks in {args.channel}."])
         return 0
     if args.task_cmd in ("claim", "done", "release"):
@@ -1204,11 +1415,11 @@ def review_note(server: str, token: str, args: argparse.Namespace) -> str:
 
 def group_client(args: argparse.Namespace) -> AircdHttpClient:
     """Reads use the account token; writes also send the owner key when given."""
-    server, token, _prof = resolve_connection(args)
+    server, token, prof = resolve_connection(args)
     invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
     if not token and not invite:
         raise CliError("airc group needs an account token (airc register/login) or the owner key (--invite or AIRC_INVITE)")
-    return AircdHttpClient(server, token=token, invite=invite)
+    return _http_client_from_prof(server, token, prof, invite=invite)
 
 
 def group_from_args(args: argparse.Namespace) -> Group:
@@ -1332,8 +1543,8 @@ def cmd_group(args: argparse.Namespace) -> int:
 
 
 def cmd_group_memory(args: argparse.Namespace) -> int:
-    server, token, _prof = require_token(args)
-    hub = AircdHttpClient(server, token=token)
+    server, token, prof = require_token(args)
+    hub = _http_client_from_prof(server, token, prof)
     action = args.memory_cmd
     try:
         if action == "show":
@@ -1368,8 +1579,8 @@ def cmd_group_memory(args: argparse.Namespace) -> int:
 
 
 def cmd_group_activity(args: argparse.Namespace) -> int:
-    server, token, _prof = require_token(args)
-    hub = AircdHttpClient(server, token=token)
+    server, token, prof = require_token(args)
+    hub = _http_client_from_prof(server, token, prof)
     try:
         if args.group_cmd == "heartbeat":
             data = hub.group_heartbeat(args.name)
@@ -1401,12 +1612,13 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         for repo in proj.get("repos", []):
             lines.append(f"  repo {repo['name']}: {repo['local_path']}")
         for t in proj.get("tasks", []):
+            deps = f" blocked_by={','.join(t['blocked_by'])}" if t.get("blocked_by") else ""
             lines.append(
-                f"  {t['id']} [{t['kind']}/{t['status']}] sprint={t.get('sprint') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
+                f"  {t['id']} [{t['kind']}/{t['status']}] priority={t.get('priority') or 'normal'} sprint={t.get('sprint') or '-'} branch={t.get('branch') or '-'}{deps}: {t['title']}"
             )
         for t in proj.get("to_review", []):
             lines.append(
-                f"  REVIEW {t['id']} [{t.get('status', 'review')}] by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
+                f"  REVIEW {t['id']} [{t.get('status', 'review')}] priority={t.get('priority') or 'normal'} by @{t.get('assignee') or '-'} branch={t.get('branch') or '-'}: {t['title']}"
             )
             if t.get("review_round"):
                 r = t["review_round"]
@@ -2344,19 +2556,19 @@ def template_client(args: argparse.Namespace, *, owner: bool) -> AircdHttpClient
     """Reads need an account token; changes and model listing need the owner key.
     spawn takes the owner key when given, else the profile's token."""
     if args.template_cmd == "spawn":
-        server, token, _prof = resolve_connection(args)
+        server, token, prof = resolve_connection(args)
         invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
         if not invite and not token:
             raise CliError("template spawn needs a manager's token (airc register/login) or the owner key (--invite or AIRC_INVITE)")
-        return AircdHttpClient(server, token=token, invite=invite)
+        return _http_client_from_prof(server, token, prof, invite=invite)
     if owner:
-        server, token, _prof = resolve_connection(args)
+        server, token, prof = resolve_connection(args)
         invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
         if not invite:
             raise CliError(f"template {args.template_cmd} needs the owner key: pass --invite or set AIRC_INVITE")
-        return AircdHttpClient(server, token=token, invite=invite)
-    server, token, _prof = require_token(args)
-    return AircdHttpClient(server, token=token)
+        return _http_client_from_prof(server, token, prof, invite=invite)
+    server, token, prof = require_token(args)
+    return _http_client_from_prof(server, token, prof)
 
 
 def template_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -2487,6 +2699,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server", help=f"aircd HTTP URL (default {DEFAULT_SERVER_URL})")
     parser.add_argument("--token", help="Bearer auth token (overrides saved profile)")
     parser.add_argument("--profile", help="Saved local profile name")
+    parser.add_argument("--tls-ca", help="CA certificate PEM for verifying HTTPS hub (env AIRCD_TLS_CA)")
+    parser.add_argument("--tls-cert", help="Client TLS certificate PEM for mutual TLS (env AIRCD_TLS_CLIENT_CERT)")
+    parser.add_argument("--tls-key", help="Client TLS private key PEM for mutual TLS (env AIRCD_TLS_CLIENT_KEY)")
+    parser.add_argument("--tls-insecure", action="store_true", help="Disable HTTPS server certificate verification")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -2730,18 +2946,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("title", nargs="+")
     p_tc.add_argument("--body", help="Full description; enough that a new assignee need not read the chat")
     p_tc.add_argument("--kind", choices=["task", "bug", "feature"], default="task")
+    p_tc.add_argument("--priority", choices=["urgent", "high", "normal", "low"], help="Dispatch priority (default normal)")
     p_tc.add_argument("--assign", metavar="NICK", help="Project member to give the task to")
     p_tc.add_argument("--repo")
     p_tc.add_argument("--branch")
     p_tc.add_argument("--issue", metavar="URL", help="Linked GitHub issue")
     p_tc.add_argument("--parent", metavar="TASK_ID", help="Make this a subtask of TASK_ID (a group lead splitting work)")
     p_tc.add_argument("--reviewer", metavar="NICK", help="Who reviews it (default: the parent's assignee, else the PM)")
+    p_tc.add_argument("--blocked-by", action="append", metavar="TASK_ID", help="Dependency task ID (cross-repo supported; repeatable or comma-separated)")
     p_tc.set_defaults(func=cmd_task)
 
     p_tas = task_sub.add_parser("assign", help="Assign or reassign a task; omit NICK to return it to the pool")
     p_tas.add_argument("id")
     p_tas.add_argument("nick", nargs="?")
     p_tas.set_defaults(func=cmd_task)
+
+    p_tpr_set = task_sub.add_parser("priority", help="Set a task's dispatch priority")
+    p_tpr_set.add_argument("id")
+    p_tpr_set.add_argument("priority", choices=["urgent", "high", "normal", "low"])
+    p_tpr_set.set_defaults(func=cmd_task)
+
+    p_tdep = task_sub.add_parser("deps", help="Show or update cross-repo blocked-by dependencies for a task")
+    p_tdep.add_argument("id")
+    p_tdep.add_argument("--add", action="append", metavar="TASK_ID", help="Add a blocked-by dependency (repeatable)")
+    p_tdep.add_argument("--remove", action="append", metavar="TASK_ID", help="Remove a blocked-by dependency (repeatable)")
+    p_tdep.add_argument("--set", dest="set_deps", nargs="+", metavar="TASK_ID", help="Replace all blocked-by dependencies")
+    p_tdep.add_argument("--clear", action="store_true", help="Remove all blocked-by dependencies")
+    p_tdep.set_defaults(func=cmd_task)
 
     p_tst = task_sub.add_parser("status", help="Move a task: in_progress, testing, review (needs --note with your test report), changes_requested, merged, cancelled")
     p_tst.add_argument("id")
@@ -2796,6 +3027,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_tl = task_sub.add_parser("list")
     p_tl.add_argument("channel", nargs="?", default="#general")
+    p_tl.add_argument("--priority", choices=["urgent", "high", "normal", "low"], help="Filter by priority")
+    p_tl.add_argument("--repo", help="Filter by repository name")
+    p_tl_blk = p_tl.add_mutually_exclusive_group()
+    p_tl_blk.add_argument("--blocked", action="store_true", help="Only tasks with unresolved dependencies")
+    p_tl_blk.add_argument("--ready", action="store_true", help="Only tasks with no unresolved dependencies")
     p_tl.set_defaults(func=cmd_task)
 
     for action in ("claim", "done", "release"):
@@ -3012,6 +3248,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _ACTIVE_SSL_CONTEXT
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -3019,6 +3256,8 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1
+    finally:
+        _ACTIVE_SSL_CONTEXT = None
 
 
 if __name__ == "__main__":
