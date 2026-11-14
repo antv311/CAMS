@@ -249,6 +249,10 @@ class BionicConfig:
     task_id: Optional[str] = None
     #: Send per-turn usage to the hub when ``task_id`` is set.
     report_usage: bool = True
+    #: Snapshot the git workspace before each mutating tool call and restore it
+    #: when the call fails or is rejected (``--rollback``; see
+    #: :mod:`aircd.bionic_rollback`).
+    rollback: bool = False
 
 
 @dataclass
@@ -461,6 +465,10 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
     if report_usage is None:
         report_usage = not (getattr(args, "no_report_usage", False) or _parse_bool_env("BIONIC_NO_USAGE_REPORT"))
 
+    rollback = getattr(args, "rollback", None)
+    if rollback is None:
+        rollback = _parse_bool_env("BIONIC_ROLLBACK")
+
     return BionicConfig(
         base_url=base_url,
         api_key=api_key,
@@ -489,6 +497,7 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
         token_budget=int(token_budget) if token_budget is not None else None,
         task_id=task_id,
         report_usage=bool(report_usage),
+        rollback=bool(rollback),
     )
 
 
@@ -1988,6 +1997,16 @@ class StreamRenderer:
             self._end_line()
             if event.get("error"):
                 self._write(f"[tool] {event.get('name')} failed: {event['error']}\n")
+        elif kind == "rollback":
+            self._end_line()
+            if event.get("restored"):
+                saved = f"; discarded changes at {event['saved_ref']}" if event.get("saved_ref") else ""
+                self._write(
+                    f"[rollback] {event.get('name')}: workspace restored "
+                    f"({len(event.get('changed') or [])} path(s), {event.get('reason')}){saved}\n"
+                )
+            for warning in event.get("warnings") or []:
+                self._write(f"[rollback] warning: {warning}\n")
         elif kind == "done":
             self._end_line()
 
@@ -2249,6 +2268,40 @@ def system_prompt_for(config: BionicConfig, tool_schemas: list[dict[str, Any]]) 
     )
 
 
+def _is_mutating_call(name: str, args: Any, registry: Any) -> bool:
+    """Whether a tool call can change the workspace (and so needs a rollback snapshot)."""
+    if name in BUILTIN_TOOL_NAMES:
+        if name == "apply_patch" and isinstance(args, dict) and bool(args.get("dry_run")):
+            return False
+        return name in MUTATING_TOOLS
+    plugin = registry.get(name) if registry is not None else None
+    return bool(plugin is not None and plugin.mutating)
+
+
+def rollback_guard_for(
+    config: BionicConfig,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+    review: Optional[Callable[[str, Any, str], bool]] = None,
+    notify: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> Any:
+    """The :class:`aircd.bionic_rollback.RollbackGuard` for a run, or ``None``.
+
+    ``None`` when ``config.rollback`` is off, in ``read-only`` mode (nothing can
+    change), or when the workspace is not a git work tree (logged as a warning).
+    """
+    if not config.rollback or config.approval == "read-only":
+        return None
+    from aircd.bionic_rollback import RollbackGuard
+
+    guard = RollbackGuard(config.workspace_root or config.cwd, log=log, review=review, notify=notify)
+    if not guard.available:
+        if log is None:  # running unprotected must never be silent
+            print(f"[rollback] disabled: {guard.unavailable_reason}", file=sys.stderr)
+        return None
+    return guard
+
+
 def run_agent(
     prompt: str,
     config: BionicConfig,
@@ -2260,6 +2313,7 @@ def run_agent(
     before_tool: Optional["ToolHook"] = None,
     usage_reporter: Optional[UsageReporter] = None,
     ledger: Optional[TokenLedger] = None,
+    review_tool: Optional[Callable[[str, Any, str], bool]] = None,
 ) -> RunResult:
     """Run the OpenAI tool-calling loop until a final response or ``max_turns``.
 
@@ -2285,6 +2339,12 @@ def run_agent(
     via ``step.execute()``, or return a string to use as the tool result
     instead of executing. Returning ``None`` executes the tool normally.
     Raising :class:`RunAborted` stops the run.
+
+    With ``config.rollback`` the workspace (a git work tree) is snapshotted
+    before every mutating tool call and restored when the call fails, is
+    denied, or ``review_tool(name, arguments, result)`` returns False; the
+    tool result then carries ``rolled_back`` and a ``rollback`` report, and
+    ``snapshot`` / ``rollback`` events are emitted.
     """
 
     def notify(event: dict[str, Any]) -> None:
@@ -2304,6 +2364,7 @@ def run_agent(
         log(f"[plugins] loaded {len(registry)} tool(s) from {', '.join(registry.dirs)}: {', '.join(registry.tools)}")
     system_prompt = system_prompt_for(config, tool_schemas)
     chat_url = normalize_base_url(config.base_url) + "/chat/completions"
+    guard = rollback_guard_for(config, log=log, review=review_tool, notify=notify)
 
     active_session_id = config.session_id
     session_file: Optional[Path] = None
@@ -2465,7 +2526,7 @@ def run_agent(
                     else:
                         parsed_args = raw_args
 
-                    def _execute(args: Any, _name: str = name) -> str:
+                    def _exec(args: Any, _name: str = name) -> str:
                         return exec_tool(
                             _name,
                             args,
@@ -2478,6 +2539,11 @@ def run_agent(
                             approver=approver,
                             registry=registry,
                         )
+
+                    def _execute(args: Any, _name: str = name) -> str:
+                        if guard is not None and _is_mutating_call(_name, args, registry):
+                            return guard.run(_name, args, _exec)
+                        return _exec(args)
 
                     override: Optional[str] = None
                     if before_tool is not None:
@@ -2577,6 +2643,7 @@ class BionicAgent:
         on_event: Optional[EventHandler] = None,
         log: Optional[Callable[[str], None]] = None,
         keep_session: bool = False,
+        review_tool: Optional[Callable[[str, Any, str], bool]] = None,
         **options: Any,
     ) -> None:
         if config is not None and options:
@@ -2585,6 +2652,9 @@ class BionicAgent:
         self._approver = approver
         self._on_event = on_event
         self._log = log
+        #: With ``rollback=True``: ``review_tool(name, arguments, result)``
+        #: returning False rolls a mutating tool call back.
+        self._review_tool = review_tool
         self._resolved_model: Optional[str] = None
         self.keep_session = keep_session
         self.session_id: Optional[str] = self._config.session_id
@@ -2624,6 +2694,7 @@ class BionicAgent:
             on_event=self._on_event,
             log=self._log,
             keep_session=keep_session,
+            review_tool=self._review_tool,
         )
         if self._resolved_model is not None and clone._config.model == self._config.model and (
             clone._config.base_url == self._config.base_url
@@ -2700,6 +2771,7 @@ class BionicAgent:
             log=self._log,
             approver=approver or self._approver,
             on_event=dispatch if handlers else None,
+            review_tool=self._review_tool,
         )
         if self.keep_session and session_id is None:
             self.session_id = result.session_id
@@ -2842,6 +2914,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-report-usage",
         action="store_true",
         help="Do not send token usage to the hub task (env: BIONIC_NO_USAGE_REPORT=1)",
+    )
+    parser.add_argument(
+        "--rollback",
+        action="store_true",
+        default=None,
+        help=(
+            "Snapshot the git workspace before each mutating tool call and restore it when the call "
+            "fails or is denied; discarded changes are kept under refs/bionic/rollbacks/ (env: BIONIC_ROLLBACK=1)"
+        ),
     )
     parser.add_argument("--system-prompt", help="Override default system prompt (env: BIONIC_SYSTEM_PROMPT)")
     parser.add_argument("--system-prompt-file", help="Read system prompt override from a UTF-8 file")

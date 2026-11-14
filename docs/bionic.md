@@ -85,6 +85,7 @@ No paths, model IDs, or hostnames outside `localhost` are hardcoded.
 | `--token-budget` | `BIONIC_TOKEN_BUDGET` | *(unset)* | Stop before a new turn once the run has spent this many total tokens (see [Token budgets](#token-budgets-and-task-cost-accounting)) |
 | `--task` | `BIONIC_TASK_ID`, then `AIRCD_WAKE_TASK` | *(the woken task)* | Hub task billed for every turn; its budget (and its parents') is enforced |
 | `--no-report-usage` | `BIONIC_NO_USAGE_REPORT` | `false` | Do not send token usage to the hub task |
+| `--rollback` | `BIONIC_ROLLBACK` | `false` | Snapshot the git workspace before each mutating tool call and restore it when the call fails (see [Rollback](#workspace-snapshots-and-auto-rollback---rollback)) |
 | `--system-prompt` | `BIONIC_SYSTEM_PROMPT` | *(generated)* | Override default system prompt (or `--system-prompt-file`) |
 | `--session-id` | — | *(none)* | Persist/resume message history for a session ID |
 | `--session-dir` | `BIONIC_SESSION_DIR` | `<tempdir>/aircd-bionic-sessions` | Directory where session JSON files are stored |
@@ -214,6 +215,58 @@ ledger snapshot: `token_budget`, `spent`, `remaining`, `limited_by`
 (`run` or `task <id>`), `estimated_turns`, and for hub tasks `task_id`,
 `reported_turns` and `task_total_tokens`. With `--stream-format jsonl` a
 `budget` event follows each turn.
+
+### Workspace snapshots and auto-rollback (`--rollback`)
+
+With `--rollback` (or `BIONIC_ROLLBACK=1`, or `rollback=True` in the SDK),
+`airc-bionic` takes a git snapshot of the workspace before every mutating tool
+call: `run_command`, `write_file`, `edit_file`, a non-dry-run `apply_patch`, and
+plugin tools marked `mutating`. The workspace is put back exactly as it was
+before the call when the call:
+
+- returns an `error` (including a command timeout or a jail denial),
+- exits with a non-zero `exit_code`, or
+- is rejected by a `review_tool(name, arguments, result) -> bool` callback
+  (`run_agent(..., review_tool=...)` or `BionicAgent(review_tool=...)`). It runs
+  after each successful mutating call, and returning `False` undoes the call.
+
+An approval rejection (`--approval prompt`) never runs the tool, so it has
+nothing to undo. Calls that succeed keep their changes.
+
+When a call is rolled back, the model sees `"rolled_back": true` and a
+`rollback` report in the tool result. The report holds `reason`, the reverted
+`changed` paths, `snapshot` and `saved_ref`. `--stream` prints a
+`[rollback] ...` line, and `--stream-format jsonl` emits `snapshot` and
+`rollback` events.
+
+```bash
+airc-bionic --rollback -p "Upgrade the dependency and make the tests pass"
+git stash show -p refs/bionic/rollbacks/<id>               # what a rollback threw away
+git stash show -p --binary refs/bionic/rollbacks/<id> | git apply   # bring it back
+```
+
+How the snapshot works:
+
+- **Coverage.** A snapshot covers every file git sees under the workspace
+  root: tracked files plus untracked files that aren't ignored. This includes
+  your own uncommitted edits. Ignored files such as build output are neither
+  saved nor restored. Files outside `--workspace-root` are never touched.
+- **What it leaves alone.** Your branch, your index and the shared
+  `git stash` list stay as they are. The snapshot is hashed through a private
+  index file in `.git`. CRLF conversion and `.gitattributes` filters are
+  turned off for it, so restores are byte-exact. The newest snapshot is kept
+  at `refs/bionic/snapshot`.
+- **Before restoring.** The state about to be discarded is stored as a
+  stash-shaped commit on top of the snapshot, at `refs/bionic/rollbacks/<id>`.
+- **Restoring.** Files the tool created are deleted, and modified or deleted
+  files are rewritten. If the tool committed or staged files, `HEAD` (on the
+  same branch) and the index are reset to their earlier state. A tool that
+  switched branches gets a warning instead.
+- **Outside a git work tree.** Rollback is unavailable there. The run says so
+  on stderr and goes on without protection. `read-only` mode never snapshots.
+
+Prune old rollback refs with
+`git for-each-ref --format='%(refname)' refs/bionic/rollbacks | xargs -n1 git update-ref -d`.
 
 ### Interactive REPL and debug mode (`--repl`, `--debug`)
 
