@@ -12,6 +12,9 @@ use crate::tokens;
 mod group_memory;
 pub use group_memory::GroupMemoryError;
 
+#[path = "group_activity.rs"]
+mod group_activity;
+
 /// A reusable seat definition. Counts describe workers; the lead has one seat.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupMember {
@@ -38,6 +41,9 @@ pub struct GroupInput {
     pub worker_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_policy: Option<GroupReviewPolicy>,
+    /// Opt in to automatic task takeover; absent/null disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactivity_timeout_secs: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +150,14 @@ impl GroupStore {
             validate_group_member(worker)?;
         }
         validate_review_policy(&mut input)?;
+        if input
+            .inactivity_timeout_secs
+            .is_some_and(|seconds| seconds <= 0)
+        {
+            return Err(anyhow!(
+                "inactivity_timeout_secs must be a positive integer or null"
+            ));
+        }
         for text in [&input.description, &input.lead_prompt, &input.worker_prompt]
             .into_iter()
             .flatten()
@@ -158,13 +172,14 @@ impl GroupStore {
         db.execute(
             "INSERT INTO groups
                (name, description, lead_json, workers_json, lead_prompt, worker_prompt,
-                created_at, updated_at, review_policy_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
+                created_at, updated_at, review_policy_json, inactivity_timeout_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
              ON CONFLICT(name) DO UPDATE SET
                description = excluded.description, lead_json = excluded.lead_json,
                workers_json = excluded.workers_json, lead_prompt = excluded.lead_prompt,
                worker_prompt = excluded.worker_prompt, updated_at = excluded.updated_at,
-               review_policy_json = excluded.review_policy_json",
+               review_policy_json = excluded.review_policy_json,
+               inactivity_timeout_secs = excluded.inactivity_timeout_secs",
             params![
                 input.name,
                 input.description,
@@ -178,6 +193,7 @@ impl GroupStore {
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?,
+                input.inactivity_timeout_secs,
             ],
         )
         .context("save group")?;
@@ -362,6 +378,10 @@ impl GroupStore {
         let db = self.db.write()?;
         let tx = db.unchecked_transaction()?;
         tx.execute("DELETE FROM group_memory WHERE group_name = ?1", [name])?;
+        tx.execute(
+            "DELETE FROM group_reassignments WHERE group_name = ?1",
+            [name],
+        )?;
         tx.execute("DELETE FROM group_projects WHERE group_name = ?1", [name])?;
         let changed = tx.execute("DELETE FROM groups WHERE name = ?1", [name])?;
         tx.commit()?;
@@ -372,7 +392,8 @@ impl GroupStore {
         let group = db
             .query_row(
                 "SELECT name, description, lead_json, workers_json, lead_prompt,
-                        worker_prompt, created_at, updated_at, review_policy_json FROM groups WHERE name = ?1",
+                        worker_prompt, created_at, updated_at, review_policy_json,
+                        inactivity_timeout_secs FROM groups WHERE name = ?1",
                 [name],
                 |row| {
                     let lead: String = row.get(2)?;
@@ -393,9 +414,13 @@ impl GroupStore {
                                 .map_err(|e| decode_error(3, e))?,
                             lead_prompt: row.get(4)?,
                             worker_prompt: row.get(5)?,
-                            review_policy: row.get::<_, Option<String>>(8)?
-                                .map(|raw| serde_json::from_str(&raw).map_err(|e| decode_error(8, e)))
+                            review_policy: row
+                                .get::<_, Option<String>>(8)?
+                                .map(|raw| {
+                                    serde_json::from_str(&raw).map_err(|e| decode_error(8, e))
+                                })
                                 .transpose()?,
+                            inactivity_timeout_secs: row.get(9)?,
                         },
                         projects: Vec::new(),
                         created_at: row.get(6)?,
@@ -1165,6 +1190,17 @@ fn migrate_groups(connection: &Connection) -> Result<()> {
     if !exists {
         connection.execute("ALTER TABLE groups ADD COLUMN review_policy_json TEXT", [])?;
     }
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('groups') WHERE name = 'inactivity_timeout_secs')",
+        [], |row| row.get(0),
+    )?;
+    if !exists {
+        connection.execute(
+            "ALTER TABLE groups ADD COLUMN inactivity_timeout_secs INTEGER",
+            [],
+        )?;
+    }
+    group_activity::migrate(connection)?;
     Ok(())
 }
 

@@ -1179,6 +1179,24 @@ def cmd_group_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_group_activity(args: argparse.Namespace) -> int:
+    server, token, _prof = require_token(args)
+    hub = AircdHttpClient(server, token=token)
+    try:
+        if args.group_cmd == "heartbeat":
+            data = hub.group_heartbeat(args.name)
+            lines = [f"Recorded activity for @{data['principal_id']} in {args.name}."]
+        else:
+            events = hub.group_events(args.name)
+            data = {"ok": True, "events": events}
+            lines = [f"{e['task_id']}: @{e['old_assignee']} -> @{e['new_assignee']} at {e['created_at']}" for e in events]
+            lines = lines or ["No automatic reassignments."]
+    except AircdHttpError as err:
+        raise CliError(str(err)) from None
+    print_out(args, data, lines)
+    return 0
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
     """Everything this account has to do, grouped by project."""
     server, token, _prof = require_token(args)
@@ -2608,6 +2626,10 @@ def build_parser() -> argparse.ArgumentParser:
         group_parser.set_defaults(func=cmd_group)
 
     p_gm = group_sub.add_parser("memory", help="Shared group notes and scratchpad (named members only)")
+    for action in ("heartbeat", "events"):
+        p_activity = group_sub.add_parser(action, help="Group activity and automatic takeover history (named members only)")
+        p_activity.add_argument("name")
+        p_activity.set_defaults(func=cmd_group_activity)
     memory_sub = p_gm.add_subparsers(dest="memory_cmd", required=True)
     for action in ("show", "set", "add", "clear"):
         p_mem = memory_sub.add_parser(action)

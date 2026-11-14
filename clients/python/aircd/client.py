@@ -123,6 +123,7 @@ class Group:
     worker_prompt: Optional[str] = None
     projects: list[str] = field(default_factory=list)
     review_policy: Optional[dict[str, Any]] = None
+    inactivity_timeout_secs: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Group":
@@ -138,6 +139,7 @@ class Group:
             worker_prompt=data.get("worker_prompt") or None,
             projects=list(data.get("projects") or data.get("channels") or []),
             review_policy=data.get("review_policy"),
+            inactivity_timeout_secs=data.get("inactivity_timeout_secs"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -155,6 +157,10 @@ class Group:
             out["worker_prompt"] = self.worker_prompt
         if self.review_policy is not None:
             out["review_policy"] = self.review_policy
+        if self.inactivity_timeout_secs is not None:
+            if type(self.inactivity_timeout_secs) is not int or self.inactivity_timeout_secs <= 0:
+                raise AircdHttpError("inactivity_timeout_secs must be a positive integer or null")
+            out["inactivity_timeout_secs"] = self.inactivity_timeout_secs
         return out
 
     @property
@@ -637,6 +643,14 @@ class AircdHttpClient:
             "POST", _group_path(name) + "/attach", payload={"channel": channel}, owner=bool(self.invite)
         )
         return Group.from_dict(data["group"])
+
+    def group_heartbeat(self, name: str) -> dict[str, Any]:
+        """Refresh this account's activity as a current named group member."""
+        return self._request("POST", _group_path(name) + "/heartbeat", payload={})
+
+    def group_events(self, name: str) -> list[dict[str, Any]]:
+        """Latest 100 automatic takeovers, newest first; requires named membership."""
+        return self._request("GET", _group_path(name) + "/events")["events"]
 
     # Shared group context
 

@@ -450,6 +450,46 @@ Python callers use `AircdHttpClient.group_memory(name, kind="notes")` and
 `write_group_memory(name, text, kind="notes", append=False, expected_revision=N)`.
 These calls use the account token even when the client has an owner invite key.
 
+Groups can opt into automatic task reassignment with `"inactivity_timeout_secs": 300`
+in their full definition (`POST /v1/groups` or `airc group create NAME --file group.json`).
+Omitting the field or setting it to `null` disables the policy; enabled values must
+be positive whole seconds. Full replacement changes the policy; membership edits
+preserve it. Definition changes grant existing tasks a fresh timeout.
+
+The hub checks once per second. Only `assigned`, `in_progress`, and
+`changes_requested` tasks owned by current named workers in an attached project
+are eligible. Leaders and tasks in testing, review, super review, blocked, or
+terminal states stay in place. A chat message (including DMs), a task update, or
+an explicit heartbeat refreshes the account's activity across projects. Both
+the task's last update and the account's last activity must be at least one
+timeout old. Newly assigned work gets a full timeout even if the account was
+previously inactive. Before the first recorded activity, the task timestamp
+provides the grace period.
+
+The replacement is the first idle named worker by account ID in the same
+group/project with an enabled launcher and no nonterminal assigned or claimed
+tasks in that project. Ambiguous roster bindings and workers already stalled in
+the sweep are excluded. If no worker is idle, the task waits for a later check.
+The roster and lead remain intact. Reassignment preserves task context,
+reviewer and branch, clears leases and prior review votes, and restarts work as
+`assigned` (or retains `changes_requested`). Task history and a persistent group
+log record the old/new assignees and timeout in the same transaction. A sprint
+notice (project channel when no sprint is set) wakes the new assignee through
+the normal task notification path and its launcher limits.
+
+Current named members can send `POST /v1/groups/{name}/heartbeat` with their
+bearer token; the server supplies the caller ID and activity timestamp. The
+owner key does not grant membership. `GET /v1/groups/{name}/events` returns the
+latest 100 automatic reassignments, newest first, for current named members.
+These commands and Python methods use the same member authentication:
+
+```sh
+airc --profile worker group heartbeat dev
+airc --profile worker group events dev
+```
+
+Python: `AircdHttpClient.group_heartbeat(name)` and `group_events(name)`.
+
 Groups can opt into peer consensus with `review_policy` in the group JSON passed
 to `airc group create NAME --file group.json --invite <owner-key>` or
 `POST /v1/groups`. For example, a group whose named roster includes `lead`,
