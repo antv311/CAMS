@@ -223,6 +223,11 @@ class BionicConfig:
     auto_pull: bool = False
     lms_path: str = ""
     pull_timeout: float = DEFAULT_PULL_TIMEOUT_SECONDS
+    #: Extra plugin tool directories (absolute paths), loaded in addition to
+    #: ``<workspace_root>/.aircd/tools``; see :mod:`aircd.bionic_plugins`.
+    tools_dirs: list[str] = field(default_factory=list)
+    #: Load user-defined plugin tools at all (``--no-plugins`` turns this off).
+    plugins: bool = True
 
 
 @dataclass
@@ -400,6 +405,23 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
     elif pull_timeout <= 0:
         raise BionicError(f"--pull-timeout must be > 0, got {pull_timeout}")
 
+    raw_tools_dirs = getattr(args, "tools_dirs", None)
+    if raw_tools_dirs is None:
+        env_dirs = os.environ.get("BIONIC_TOOLS_DIR", "")
+        raw_tools_dirs = [d for d in env_dirs.split(os.pathsep) if d.strip()]
+    elif isinstance(raw_tools_dirs, str):
+        raw_tools_dirs = [raw_tools_dirs]
+    tools_dirs: list[str] = []
+    for raw_dir in raw_tools_dirs:
+        dir_path = Path(str(raw_dir).strip()).expanduser().resolve()
+        if not dir_path.is_dir():
+            raise BionicError(f"tools directory does not exist: {dir_path}")
+        if str(dir_path) not in tools_dirs:
+            tools_dirs.append(str(dir_path))
+    plugins = getattr(args, "plugins", None)
+    if plugins is None:
+        plugins = not (getattr(args, "no_plugins", False) or _parse_bool_env("BIONIC_NO_PLUGINS"))
+
     return BionicConfig(
         base_url=base_url,
         api_key=api_key,
@@ -423,6 +445,8 @@ def resolve_config(args: argparse.Namespace) -> BionicConfig:
         auto_pull=auto_pull,
         lms_path=lms_path,
         pull_timeout=float(pull_timeout),
+        tools_dirs=tools_dirs,
+        plugins=bool(plugins),
     )
 
 
@@ -902,11 +926,70 @@ def tty_approver(name: str, args: dict[str, Any]) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def tools_for_approval(approval: str) -> list[dict[str, Any]]:
-    """Return the tool schemas the model should see for an approval mode."""
+BUILTIN_TOOL_NAMES = frozenset(t["function"]["name"] for t in TOOLS)
+
+
+def tools_for_approval(approval: str, registry: Any = None) -> list[dict[str, Any]]:
+    """Return the tool schemas the model should see for an approval mode.
+
+    ``registry`` (a :class:`aircd.bionic_plugins.ToolRegistry`) appends plugin
+    tools; ``read-only`` keeps only the non-mutating ones.
+    """
     if approval == "read-only":
-        return [t for t in TOOLS if t["function"]["name"] not in MUTATING_TOOLS]
-    return TOOLS
+        tools = [t for t in TOOLS if t["function"]["name"] not in MUTATING_TOOLS]
+    else:
+        tools = list(TOOLS)
+    if registry is not None:
+        tools.extend(registry.schemas(approval))
+    return tools
+
+
+def plugin_tool_dirs(config: BionicConfig) -> list[str]:
+    """Directories whose plugins a run loads: ``<workspace_root>/.aircd/tools`` (when it
+    exists) followed by ``config.tools_dirs``.
+
+    The implicit workspace directory is skipped in ``read-only`` mode, so a
+    review run never imports code that lives in the repository it inspects;
+    directories passed explicitly are always loaded. Empty when plugins are off.
+    """
+    if not config.plugins:
+        return []
+    dirs: list[str] = []
+    if config.approval != "read-only":
+        default_dir = Path(config.workspace_root or config.cwd or os.getcwd()) / ".aircd" / "tools"
+        if default_dir.is_dir():
+            dirs.append(str(default_dir.resolve()))
+    for extra in config.tools_dirs:
+        if extra not in dirs:
+            dirs.append(extra)
+    return dirs
+
+
+def load_tool_registry(config: BionicConfig) -> Any:
+    """Load and validate the plugin tools for ``config``; raises ``PluginError`` on a bad plugin."""
+    from aircd.bionic_plugins import load_registry
+
+    return load_registry(plugin_tool_dirs(config), builtin_names=BUILTIN_TOOL_NAMES)
+
+
+def describe_tools(config: BionicConfig, registry: Any = None) -> list[dict[str, Any]]:
+    """Summaries of every tool a run would offer the model (``--list-tools`` output)."""
+    if registry is None:
+        registry = load_tool_registry(config)
+    out: list[dict[str, Any]] = []
+    for schema in tools_for_approval(config.approval, registry):
+        fn = schema["function"]
+        plugin = registry.get(fn["name"]) if fn["name"] not in BUILTIN_TOOL_NAMES else None
+        out.append(
+            {
+                "name": fn["name"],
+                "description": fn["description"],
+                "source": plugin.source if plugin else "builtin",
+                "mutating": plugin.mutating if plugin else fn["name"] in MUTATING_TOOLS,
+                "parameters": fn["parameters"],
+            }
+        )
+    return out
 
 
 def _decode_output(data: str | bytes | None) -> str:
@@ -928,13 +1011,16 @@ def exec_tool(
     workspace_root: Optional[str] = None,
     approval: str = "auto",
     approver: Optional[Callable[[str, dict[str, Any]], bool]] = None,
+    registry: Any = None,
 ) -> str:
     """Execute one agent tool call and serialize its result as text/JSON.
 
     Every file path and command argument is confined to ``workspace_root``
     (default: ``cwd``). ``approval`` controls mutating tools: ``auto`` runs
     them, ``read-only`` refuses them, and ``prompt`` asks ``approver``
-    (default: :func:`tty_approver`) before each one.
+    (default: :func:`tty_approver`) before each one. Names not built in are
+    looked up in ``registry`` (plugin tools), whose ``mutating`` flag gets
+    the same approval treatment.
     """
     if not isinstance(args, dict):
         return json.dumps({"error": f"Tool {name} arguments must be a JSON object"})
@@ -945,6 +1031,19 @@ def exec_tool(
         return json.dumps({"error": f"Working directory {cwd} is outside workspace root {root}"})
 
     try:
+        plugin = registry.get(name) if registry is not None and name not in BUILTIN_TOOL_NAMES else None
+        if plugin is not None:
+            return _exec_plugin_tool(
+                plugin,
+                args,
+                cwd,
+                root,
+                command_timeout=command_timeout,
+                max_output_chars=max_output_chars,
+                log=log,
+                approval=approval,
+                approver=approver,
+            )
         return _exec_tool_jailed(
             name,
             args,
@@ -960,6 +1059,42 @@ def exec_tool(
         if log:
             log(f"[jail] denied {name}: {err}")
         return json.dumps({"error": f"Denied: {err}", "denied": True})
+
+
+def _exec_plugin_tool(
+    plugin: Any,
+    args: dict[str, Any],
+    cwd: str,
+    root: str,
+    *,
+    command_timeout: float,
+    max_output_chars: int,
+    log: Optional[Callable[[str], None]],
+    approval: str,
+    approver: Optional[Callable[[str, dict[str, Any]], bool]],
+) -> str:
+    from aircd.bionic_plugins import ToolArgumentError, ToolContext, run_plugin_tool, validate_arguments
+
+    if plugin.mutating:
+        if approval == "read-only":
+            return json.dumps({"error": f"Denied: {plugin.name} is disabled in read-only approval mode", "denied": True})
+        if approval == "prompt":
+            try:
+                validate_arguments(plugin, args)  # don't ask the operator about a call that cannot run
+            except ToolArgumentError as err:
+                return json.dumps({"error": str(err)})
+            if not (approver or tty_approver)(plugin.name, args):
+                if log:
+                    log(f"[approval] rejected {_describe_tool_call(plugin.name, args)}")
+                return json.dumps({"error": f"Denied: operator rejected {plugin.name}", "denied": True})
+    ctx = ToolContext(
+        cwd=cwd,
+        workspace_root=root,
+        command_timeout=command_timeout,
+        max_output_chars=max_output_chars,
+        log=log,
+    )
+    return run_plugin_tool(plugin, args, ctx)
 
 
 def _exec_tool_jailed(
@@ -1642,16 +1777,24 @@ def build_system_prompt(
     *,
     workspace_root: Optional[str] = None,
     approval: str = "auto",
+    plugin_tools: Optional[list[str]] = None,
 ) -> str:
-    """Build the system prompt for the Bionic coding agent."""
+    """Build the system prompt for the Bionic coding agent.
+
+    ``plugin_tools`` names the user-defined tools offered alongside the built-ins.
+    """
     if custom_prompt is not None:
         return custom_prompt
     os_name = platform.system() or os.name
     root = workspace_root or cwd
+    extra = ", ".join(plugin_tools or [])
     if approval == "read-only":
         tool_line = (
             "You are in read-only mode: only the read_file tool is available, so inspect "
             "files and report findings without attempting changes."
+            if not extra
+            else f"You are in read-only mode: only read_file and the read-only project tools ({extra}) "
+            "are available, so inspect files and report findings without attempting changes."
         )
     else:
         tool_line = (
@@ -1659,6 +1802,8 @@ def build_system_prompt(
             "to inspect files, make changes, run coordination commands (such as `airc`), "
             "and verify tests before replying."
         )
+        if extra:
+            tool_line += f" Project-specific tools are also available: {extra}."
     parts = [
         f"You are an autonomous coding agent running on {os_name}.",
         f"Your working directory is {cwd}.",
@@ -1824,17 +1969,24 @@ def run_agent(
         if on_event is not None:
             on_event(event)
 
+    # Load plugins first so a broken plugin fails before any server traffic.
+    registry = load_tool_registry(config)
     if config.auto_pull:
         report = ensure_model_ready(config, log=log)
         notify({"type": "health", "report": report})
         model = str(report["model"])
     else:
         model = resolve_model(config)
+    tool_schemas = tools_for_approval(config.approval, registry)
+    plugin_names = [t["function"]["name"] for t in tool_schemas if t["function"]["name"] not in BUILTIN_TOOL_NAMES]
+    if log and len(registry):
+        log(f"[plugins] loaded {len(registry)} tool(s) from {', '.join(registry.dirs)}: {', '.join(registry.tools)}")
     system_prompt = build_system_prompt(
         config.cwd,
         config.system_prompt,
         workspace_root=config.workspace_root or config.cwd,
         approval=config.approval,
+        plugin_tools=plugin_names,
     )
     chat_url = normalize_base_url(config.base_url) + "/chat/completions"
 
@@ -1862,7 +2014,7 @@ def run_agent(
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "tools": tools_for_approval(config.approval),
+            "tools": tool_schemas,
             "tool_choice": "auto",
         }
         if config.temperature is not None:
@@ -1959,6 +2111,7 @@ def run_agent(
                         workspace_root=config.workspace_root or config.cwd,
                         approval=config.approval,
                         approver=approver,
+                        registry=registry,
                     )
                 except Exception as exc:
                     result = json.dumps({"error": str(exc)})
@@ -2117,6 +2270,13 @@ class BionicAgent:
         if report["ok"] and report.get("model") and self._resolved_model is None:
             self._resolved_model = str(report["model"])
         return report
+
+    def tools(self) -> list[dict[str, Any]]:
+        """Describe the built-in and plugin tools a run would offer (same as ``--list-tools``).
+
+        Raises :class:`aircd.bionic_plugins.PluginError` when a plugin is invalid.
+        """
+        return describe_tools(self._config)
 
     def new_session(self) -> None:
         """Forget the current conversation; the next ``keep_session`` run starts fresh."""
@@ -2350,6 +2510,26 @@ def build_parser() -> argparse.ArgumentParser:
             f"(env: BIONIC_PULL_TIMEOUT, default: {int(DEFAULT_PULL_TIMEOUT_SECONDS)})"
         ),
     )
+    parser.add_argument(
+        "--tools-dir",
+        dest="tools_dirs",
+        action="append",
+        metavar="DIR",
+        help=(
+            "Load user-defined tool plugins (*.py) from DIR in addition to <workspace-root>/.aircd/tools; "
+            f"repeatable (env: BIONIC_TOOLS_DIR, {os.pathsep!r}-separated)"
+        ),
+    )
+    parser.add_argument(
+        "--no-plugins",
+        action="store_true",
+        help="Do not load any tool plugins, including .aircd/tools (env: BIONIC_NO_PLUGINS)",
+    )
+    parser.add_argument(
+        "--list-tools",
+        action="store_true",
+        help="Validate plugins and print the tools the model would be offered as JSON, then exit",
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON result to stdout")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log tool calls to stderr")
     return parser
@@ -2372,6 +2552,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps({"data": models}))
             return 0
 
+        if args.list_tools:
+            registry = load_tool_registry(config)
+            print(json.dumps({"dirs": registry.dirs, "tools": describe_tools(config, registry)}))
+            return 0
+
         if args.health:
             log = (lambda msg: print(msg, file=sys.stderr)) if config.verbose else None
             report = check_health(config, probe=not args.no_probe, auto_pull=config.auto_pull, log=log)
@@ -2382,7 +2567,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         if not args.prompt:
-            parser.error("-p/--prompt is required unless --list-models or --health is specified")
+            parser.error("-p/--prompt is required unless --list-models, --list-tools or --health is specified")
 
         prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
         if not prompt.strip():
@@ -2416,4 +2601,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ``python -m aircd.bionic`` runs this file as ``__main__`` while
+    # ``aircd.bionic_plugins`` imports ``aircd.bionic``; run the package copy so
+    # both share one set of classes (BionicError, WorkspaceViolation, ...).
+    from aircd.bionic import main as _package_main
+
+    raise SystemExit(_package_main())

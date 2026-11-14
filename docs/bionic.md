@@ -19,6 +19,9 @@ and exposes five tools to any tool-capable local model:
 - `edit_file` — perform unique search-and-replace edits on existing files.
 - `apply_patch` — apply a unified diff to one or more files (see below).
 
+Projects can add their own tools as Python plugins; see
+[Custom tools](#custom-tools-plugins).
+
 ### Patch tool
 
 `apply_patch` takes a unified diff in `patch` (the `diff -u` / `git diff`
@@ -88,6 +91,9 @@ No paths, model IDs, or hostnames outside `localhost` are hardcoded.
 | `--auto-pull` | `BIONIC_AUTO_PULL` | `false` | Download/load the model with `lms` and confirm it answers before the first turn |
 | `--lms` | `BIONIC_LMS` | `lms` on `PATH` | Path to the LM Studio `lms` CLI used by `--auto-pull` |
 | `--pull-timeout` | `BIONIC_PULL_TIMEOUT` | `1800` | Timeout in seconds for each `lms get` / `lms load` |
+| `--tools-dir` (repeatable) | `BIONIC_TOOLS_DIR` (`os.pathsep`-separated) | *(none)* | Extra plugin tool directories, loaded after `<workspace-root>/.aircd/tools` |
+| `--no-plugins` | `BIONIC_NO_PLUGINS` | `false` | Load no plugin tools at all |
+| `--list-tools` | — | — | Validate plugins, print the offered tools as JSON, and exit |
 
 ### Readiness check (`--health`) and auto-pull (`--auto-pull`)
 
@@ -212,6 +218,8 @@ for event in agent.stream("Explain src/main.rs"):  # SSE streaming, events as th
   to approve mutating tool calls in code; without one, the terminal is asked.
 - `agent.with_options(max_turns=5, approval="auto")` returns a re-validated copy
   that keeps handlers, the session and the cached model.
+- **Plugins**: `tools_dirs=[...]` and `plugins=False` mirror `--tools-dir` and
+  `--no-plugins`; `agent.tools()` returns the `--list-tools` descriptions.
 
 See `clients/python/examples/bionic_workflow.py` for a runnable example.
 
@@ -222,6 +230,98 @@ usage. Streamed requests ask for usage with `"stream_options": {"include_usage":
 `--json` output includes `usage`. When a run runs out of turns it raises
 `MaxTurnsError` (a `BionicError`), which carries `turns`, `tool_calls`, `usage`
 and `turn_usage` for the work done so far.
+
+## Custom tools (plugins)
+
+A plugin is a Python file that adds tools the model can call next to the five
+built-ins. `airc-bionic` loads every `*.py` file in
+`<workspace-root>/.aircd/tools/` (when that directory exists) and then in each
+`--tools-dir` / `BIONIC_TOOLS_DIR` directory. Files whose names start with `_`
+or `.` are skipped, so they can hold shared helpers. Plugins are loaded again at
+the start of every run.
+
+Each file defines either `TOOLS`, a list of tool definitions, or `TOOL`, a
+single definition:
+
+```python
+# .aircd/tools/word_count.py
+def count_words(args, ctx):
+    text = ctx.resolve(args["path"]).read_text(encoding="utf-8")
+    return {"path": args["path"], "words": len(text.split())}
+
+TOOLS = [
+    {
+        "name": "count_words",
+        "description": "Count whitespace-separated words in a workspace file.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "minLength": 1}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        "handler": count_words,
+        "mutating": False,
+    }
+]
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | Function name, matching `^[A-Za-z0-9_-]{1,64}$`. It must not clash with a built-in tool or another plugin. |
+| `description` | yes | Non-empty text shown to the model. |
+| `parameters` | yes | JSON Schema with `"type": "object"` for the arguments (supported subset below). |
+| `handler` | yes | `handler(args, ctx)`, called with the validated arguments dict and a `ToolContext`. |
+| `mutating` | no (default `true`) | Whether the tool changes anything. Mutating tools are hidden and refused in `read-only` mode and are asked about in `prompt` mode, like `write_file`. |
+
+**Strict validation at load time.** The whole load fails, and the run stops
+before it contacts the server, if any plugin breaks one of these rules. The
+error names the file:
+
+- the file can't be imported, raises an error, or calls `exit()`
+- it defines neither `TOOLS` nor `TOOL`, or both, or `TOOLS` is empty
+- a definition has unknown or missing keys, a bad or duplicate name, or a
+  handler that can't take `(args, ctx)`
+- `parameters` isn't plain JSON, or uses a keyword outside the supported subset
+
+The supported keywords are listed below; anything else, such as `oneOf`,
+`$ref` or `format`, is refused instead of being silently ignored.
+
+| Type | Keywords |
+| --- | --- |
+| any | `type` (required, one string), `description`, `title`, `enum`, `default` |
+| `string` | `minLength`, `maxLength`, `pattern` |
+| `integer` / `number` | `minimum`, `maximum` |
+| `array` | `items`, `minItems`, `maxItems` |
+| `object` | `properties`, `required` (names must be declared), `additionalProperties` (`true`/`false`) |
+
+`enum` values and `default` must match the declared type, and schemas can nest
+at most 16 levels deep. Run `airc-bionic --list-tools` to check your plugins.
+It prints `{"dirs": [...], "tools": [{"name", "description", "source", "mutating", "parameters"}, ...]}`
+for the current approval mode and exits with code 1 and the error if a plugin is invalid.
+
+**Argument validation at call time.** Before a handler runs, the arguments the
+model sent are checked against `parameters`. The checks cover types (`true` is
+not an integer, and `3.0` counts as one), required properties, `enum`,
+lengths, ranges, `pattern`, array items, and `additionalProperties: false`.
+Extra properties are allowed unless you set it, as in JSON Schema. An invalid
+call returns `{"error": "invalid arguments for <tool>: $.path is required; ..."}`
+to the model so it can retry. The handler is not called, and in `prompt` mode
+the operator is not asked.
+
+**Handler contract.**
+
+- `ctx.cwd`, `ctx.workspace_root`, `ctx.command_timeout`, `ctx.max_output_chars`
+  and `ctx.log` describe the run.
+- `ctx.resolve(path)` resolves a path inside the workspace jail. A path outside
+  the root is reported to the model as a denied call, the same way built-in
+  tools report it.
+- A `str` return value is sent to the model unchanged. Any other value is sent
+  JSON-encoded. Output longer than `--max-output-chars` is truncated.
+- An exception, including `SystemExit`, becomes `{"error": "<tool> failed: <Type>: <message>"}`.
+  A value that can't be JSON-encoded is reported the same way.
+
+The system prompt lists the plugin tool names. `--verbose` logs which
+directories and tools were loaded.
 
 ## Benchmark and multi-turn evaluation (`airc-bionic-bench`)
 
@@ -424,5 +524,19 @@ run the worker as a restricted OS user or inside a container.
 | `prompt` | Before each `run_command`, `write_file`, `edit_file` or `apply_patch`, asks `Allow ...? [y/N]` on the controlling terminal (`/dev/tty` or `CONIN$`). If no terminal is attached, the call is denied. Reads never prompt. |
 | `read-only` | Only `read_file` is offered to the model; mutating tools are refused. Use for review or analysis seats. |
 
+Plugin tools follow their `mutating` flag in every mode. In `read-only` mode,
+`airc-bionic` doesn't load `<workspace-root>/.aircd/tools` at all, so a review
+seat never imports code from the repository it is reviewing. Directories passed
+with `--tools-dir` / `BIONIC_TOOLS_DIR` are still loaded, and only their
+non-mutating tools are offered.
+
 Set the mode per template with `"env": {"BIONIC_APPROVAL": "read-only"}` or by
 adding `--approval <mode>` to `args`.
+
+### Plugin trust
+
+A plugin is ordinary Python. It runs inside the runner process with the
+runner's permissions as soon as the file is imported. Only the paths a handler
+passes through `ctx.resolve` are jailed; a handler that opens files or starts
+processes directly is not. Treat `.aircd/tools/` like any other executable code
+in the repository. Use `--no-plugins` for repositories you don't trust.
