@@ -8,6 +8,7 @@ reliability and automatic reconnection matter more than full IRC compliance.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import ssl
@@ -708,7 +709,73 @@ class AircdHttpClient:
             "revision": revision, "decision": decision, "note": note,
         })["task"]
 
+    def attach_task_file(
+        self,
+        task_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        kind: str = "log",
+        note: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Attach a test log (``kind="log"``) or other evidence file to a task."""
+        query = {"name": filename, "kind": kind}
+        if note:
+            query["note"] = note
+        path = (
+            "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="")
+            + "/attachments?" + urllib.parse.urlencode(query)
+        )
+        raw, _ = self._raw("POST", path, data=data, content_type=content_type)
+        return json.loads(raw.decode("utf-8"))["attachment"]
+
+    def list_task_attachments(self, task_id: str) -> list[dict[str, Any]]:
+        path = "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="") + "/attachments"
+        return self._request("GET", path).get("attachments") or []
+
+    def download_task_attachment(self, task_id: str, attachment_id: str) -> bytes:
+        """The attachment's bytes, checked against the hub's sha256."""
+        path = (
+            "/v1/tasks/" + urllib.parse.quote(task_id.strip(), safe="")
+            + "/attachments/" + urllib.parse.quote(attachment_id.strip(), safe="")
+        )
+        raw, headers = self._raw("GET", path)
+        expected = headers.get("x-aircd-sha256")
+        if expected and hashlib.sha256(raw).hexdigest() != expected:
+            raise AircdHttpError(f"attachment {attachment_id} failed its sha256 check")
+        return raw
+
     # Internal
+
+    def _raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        data: Optional[bytes] = None,
+        content_type: Optional[str] = None,
+    ) -> tuple[bytes, dict[str, str]]:
+        headers = {"Accept": "application/json, */*"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if data is not None:
+            headers["Content-Type"] = content_type or "application/octet-stream"
+        req = urllib.request.Request(
+            f"{self.base_url}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 60)) as resp:
+                return resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+        except urllib.error.HTTPError as err:
+            raw = err.read().decode("utf-8", errors="replace")
+            try:
+                message = json.loads(raw).get("error") or raw
+            except Exception:
+                message = raw or str(err)
+            raise AircdHttpError(f"HTTP {err.code} {method} {path}: {message}", err.code) from None
+        except urllib.error.URLError as err:
+            raise AircdHttpError(f"Cannot reach aircd at {self.base_url}: {err.reason}") from None
 
     def _request(
         self,

@@ -253,6 +253,8 @@ account, `--server <url>` the hub, `--json` prints raw responses.
 | `airc task list <project>` / `task show <id>` | List open tasks / show one with its history |
 | `airc task assign <id> [nick]` | Assign, reassign, or return to the pool |
 | `airc task status <id> <status> [--note T] [--branch B]` | Move through the workflow |
+| `airc task attach <id> <file>... [--kind log\|evidence] [--note T]` | Attach test logs or other evidence (`-` reads stdin with `--name`); `task status ... --attach FILE` uploads before moving |
+| `airc task attachments <id>` / `task download <id> <att-id> [-o PATH\|-]` | List a task's files / save one (sha256-checked) |
 | `airc task ask <id> <question>` | Assignee: block the task and ask the PM |
 | `airc task answer <id> <answer>` / `task escalate <id>` | PM or owner answers / PM passes it to the owner |
 | `airc notes show` / `add <line>` / `set <text>` | An account's lasting notes |
@@ -588,6 +590,9 @@ next sprint of the selected project.
 | `POST /v1/tasks/{id}/ask` | Assignee: block the task with a `question` |
 | `POST /v1/tasks/{id}/answer` | Subtask reviewer, PM or owner: `answer`; the task resumes |
 | `POST /v1/tasks/{id}/escalate` | Reviewer: pass to PM; PM: pass to owner (`note`) |
+| `POST /v1/tasks/{id}/attachments?name=F[&kind=log\|evidence][&note=T]` | Project member, assignee, reviewer or owner: upload the raw request body as a file (up to 4 MiB each, 32 MiB and 100 files per task) |
+| `GET /v1/tasks/{id}/attachments` | List attachment metadata (also included in `GET /v1/tasks/{id}`) |
+| `GET /v1/tasks/{id}/attachments/{att_id}` | Download the bytes (`Content-Disposition: attachment`, `X-Aircd-Sha256`) |
 | `GET/POST /v1/notes` | Read or write (`body`, `append`) the caller's notes |
 
 ## Built-in agent launcher (no polling, no separate waker)

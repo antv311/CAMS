@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_rustls::TlsAcceptor;
 
+use crate::attachments::{AttachmentStore, NewAttachment, TaskAttachment};
 use crate::auth::{AuthStore, Principal};
 use crate::backup::{BackupConfig, BackupManager};
 use crate::gits::{sanitize_repo_name, GitRepo, GitRepoStore};
@@ -69,6 +70,7 @@ pub struct Server {
     projects: ProjectStore,
     wakes: WakeManager,
     notes: NoteStore,
+    attachments: AttachmentStore,
     rooms: RoomStore,
     templates: ClientTemplateStore,
     groups: GroupStore,
@@ -168,6 +170,7 @@ impl Server {
             projects: ProjectStore::new(db.clone()),
             wakes: WakeManager::with_logger(db.clone(), logger.clone()),
             notes: NoteStore::new(db.clone()),
+            attachments: AttachmentStore::new(db.clone()),
             rooms: RoomStore::new(db.clone()),
             templates: ClientTemplateStore::new(db.clone()),
             groups: GroupStore::new(db.clone()),
@@ -318,6 +321,10 @@ impl Server {
 
     pub fn groups(&self) -> &GroupStore {
         &self.groups
+    }
+
+    pub fn attachments(&self) -> &AttachmentStore {
+        &self.attachments
     }
 
     pub fn notes(&self) -> &NoteStore {
@@ -2570,6 +2577,41 @@ impl Server {
         self.tasks
             .get(task_id.trim())?
             .ok_or_else(|| anyhow!("task '{}' not found", task_id.trim()))
+    }
+
+    /// Attach a test log or other evidence file to a task. The assignee, the
+    /// reviewer, any member of the task's project and the owner may attach.
+    pub fn attach_task_file_api(
+        &self,
+        actor: &Principal,
+        task_id: &str,
+        filename: &str,
+        content_type: Option<&str>,
+        kind: Option<&str>,
+        note: Option<&str>,
+        data: &[u8],
+    ) -> Result<TaskAttachment> {
+        let task = self.get_task_api(task_id)?;
+        let project = self.project_of(&task.channel);
+        let allowed = Self::is_owner(actor)
+            || task.assignee.as_deref() == Some(actor.id.as_str())
+            || task.reviewer.as_deref() == Some(actor.id.as_str())
+            || self.projects.role_of(&project, &actor.id)?.is_some();
+        if !allowed {
+            return Err(anyhow!(
+                "only members of {project}, the task's assignee or reviewer, or the owner can attach files to {}",
+                task.id
+            ));
+        }
+        self.attachments.add(NewAttachment {
+            task_id: &task.id,
+            filename,
+            content_type,
+            kind,
+            note,
+            uploaded_by: &actor.id,
+            data,
+        })
     }
 
     /// Assign, reassign or (with `None`) return a task to the pool.
