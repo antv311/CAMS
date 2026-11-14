@@ -200,6 +200,7 @@ impl Server {
             .unwrap_or(300);
 
         let metrics = Arc::new(MetricsRegistry::new());
+        logger.attach_metrics(metrics.clone());
         let webhooks = WebhookStore::with_logger(db.clone(), logger.clone());
         let alerts = AlertManager::new(
             AlertConfig::default(),
@@ -211,7 +212,12 @@ impl Server {
         let server = Self {
             auth: AuthStore::with_config(db.clone(), logger.clone(), token_ttl_seconds),
             history: HistoryStore::new(db.clone()),
-            tasks: TaskStore::with_metrics(db.clone(), lease_seconds, metrics.clone()),
+            tasks: TaskStore::with_metrics_and_logger(
+                db.clone(),
+                lease_seconds,
+                metrics.clone(),
+                logger.clone(),
+            ),
             webhooks,
             reports: ReportStore::new(db.clone()),
             gits: GitRepoStore::new(db.clone()),
@@ -912,6 +918,24 @@ impl Server {
         let events = self.groups.reassign_inactive(now)?;
         for event in &events {
             let task = self.get_task_api(&event.task_id)?;
+            self.logger.log_task_state(
+                Severity::Warning,
+                "task.auto_reassign",
+                &task.id,
+                Some("aircd"),
+                Some(&task.channel),
+                Some(&task.status),
+                Some(&task.status),
+                Some(serde_json::json!({
+                    "group": event.group,
+                    "old_assignee": event.old_assignee,
+                    "new_assignee": event.new_assignee,
+                })),
+                format!(
+                    "Task {} automatically reassigned from @{} to @{} after inactivity in group {}",
+                    task.id, event.old_assignee, event.new_assignee, event.group
+                ),
+            );
             self.broadcast_task_event(
                 &task, "assign", "success", SERVER_NAME,
                 format!("TASK {} automatically reassigned from @{} to @{} after inactivity in group {}: {}",
@@ -3500,13 +3524,36 @@ impl Server {
                 task.id
             ));
         }
-        self.token_usage.record(NewUsage {
+        let report = self.token_usage.record(NewUsage {
             task_id: &task.id,
             recorded_by: &actor.id,
             session_id,
             model,
             tokens,
-        })
+        })?;
+        if report.exceeded {
+            self.logger.log_task_state(
+                Severity::Warning,
+                "task.token_budget_exceeded",
+                &task.id,
+                Some(&actor.id),
+                Some(&task.channel),
+                Some(&task.status),
+                Some(&task.status),
+                Some(serde_json::json!({
+                    "limited_by": report.limited_by,
+                    "remaining": report.remaining,
+                    "total_tokens": report.total.total_tokens,
+                })),
+                format!(
+                    "Task {} exceeded token budget (limited_by={}, remaining={:?})",
+                    task.id,
+                    report.limited_by.as_deref().unwrap_or(&task.id),
+                    report.remaining
+                ),
+            );
+        }
+        Ok(report)
     }
 
     /// Set or clear a task's token budget. Like dependencies, this is for a
@@ -3530,7 +3577,25 @@ impl Server {
             ));
         }
         self.token_usage.set_budget(&task.id, budget, &actor.id)?;
-        self.token_usage.report(&task.id)
+        let report = self.token_usage.report(&task.id)?;
+        self.logger.log_task_state(
+            Severity::Info,
+            "task.token_budget",
+            &task.id,
+            Some(&actor.id),
+            Some(&task.channel),
+            Some(&task.status),
+            Some(&task.status),
+            Some(serde_json::json!({
+                "token_budget": budget,
+                "remaining": report.remaining,
+            })),
+            format!(
+                "Task {} token budget updated by @{}: {:?}",
+                task.id, actor.nick, budget
+            ),
+        );
+        Ok(report)
     }
 
     /// Assign, reassign or (with `None`) return a task to the pool.

@@ -18,7 +18,7 @@ use crate::auth::{
 use crate::gits::{sanitize_repo_name, verify_github_signature};
 use crate::history::{canonical_dm_channel, HistorySearchScope};
 use crate::locks::LockConflictError;
-use crate::logging::{LogEvent, Severity};
+use crate::logging::{AuditEvent, AuditStreamFilter, LogEvent, Severity};
 use crate::rate_limit::{
     normalize_ip, LimitScope, RateLimitConfig, RateLimitHeaders, RateLimitRejection, RateLimiter,
 };
@@ -556,6 +556,7 @@ pub fn router(server: Server, info: HttpRuntimeInfo) -> Router {
         .route("/metrics", get(prometheus_metrics))
         .route("/metrics/alerts/rules", get(prometheus_alert_rules))
         .route("/v1/alerts", get(get_alerts_status))
+        .route("/v1/audit/stream", get(stream_audit_logs))
         .route("/v1/agents", get(public_agents))
         .route("/v1/channels", get(public_channels))
         .route("/v1/gits", get(public_gits).post(register_git_repo))
@@ -849,6 +850,260 @@ async fn get_alerts_status(
         with_cors_headers(),
         Json(json!({ "ok": true, "alerts": status })),
     ))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuditStreamFormat {
+    Sse,
+    Ndjson,
+}
+
+#[derive(Deserialize, Default)]
+struct AuditStreamQuery {
+    format: Option<String>,
+    category: Option<String>,
+    severity: Option<String>,
+    action: Option<String>,
+    actor: Option<String>,
+    channel: Option<String>,
+    task_id: Option<String>,
+    since_seq: Option<u64>,
+    replay: Option<usize>,
+    limit: Option<usize>,
+    keepalive_secs: Option<u64>,
+}
+
+struct ByteReceiverStream(
+    tokio::sync::mpsc::Receiver<Result<Bytes, std::convert::Infallible>>,
+);
+
+impl futures_core::Stream for ByteReceiverStream {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+fn resolve_audit_stream_format(
+    query_format: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<AuditStreamFormat, ApiError> {
+    if let Some(raw) = query_format.map(str::trim).filter(|s| !s.is_empty()) {
+        return match raw.to_ascii_lowercase().as_str() {
+            "sse" | "event-stream" | "text/event-stream" => Ok(AuditStreamFormat::Sse),
+            "ndjson" | "jsonl" | "json" | "chunked" | "application/x-ndjson" => {
+                Ok(AuditStreamFormat::Ndjson)
+            }
+            other => Err(ApiError::bad_request(format!(
+                "unsupported audit stream format '{other}': expected sse or ndjson"
+            ))),
+        };
+    }
+    if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
+        let lower = accept.to_ascii_lowercase();
+        if (lower.contains("application/x-ndjson") || lower.contains("application/ndjson"))
+            && !lower.contains("text/event-stream")
+        {
+            return Ok(AuditStreamFormat::Ndjson);
+        }
+    }
+    Ok(AuditStreamFormat::Sse)
+}
+
+fn format_audit_stream_frame(format: AuditStreamFormat, event: &AuditEvent) -> Option<Bytes> {
+    let json = serde_json::to_string(event).ok()?;
+    let text = match format {
+        AuditStreamFormat::Sse => format!(
+            "id: {}\nevent: {}\ndata: {}\n\n",
+            event.seq, event.category, json
+        ),
+        AuditStreamFormat::Ndjson => format!("{json}\n"),
+    };
+    Some(Bytes::from(text))
+}
+
+async fn stream_audit_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditStreamQuery>,
+) -> Result<Response, ApiError> {
+    if headers.contains_key("x-aircd-invite") {
+        require_owner(&state, &headers, None)?;
+    } else {
+        let _ = authenticate_scoped_request(&state, &headers, Scope::Admin, "/v1/audit/stream")?;
+    }
+
+    let format = resolve_audit_stream_format(query.format.as_deref(), &headers)?;
+    if query.limit == Some(0) {
+        return Err(ApiError::bad_request("limit must be at least 1"));
+    }
+
+    let since_seq = match query.since_seq {
+        Some(seq) => Some(seq),
+        None => match headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+                ApiError::bad_request(format!("invalid Last-Event-ID header '{raw}'"))
+            })?),
+            None => None,
+        },
+    };
+
+    let mut filter = AuditStreamFilter::default();
+    if let Some(raw) = query.category.as_deref() {
+        filter
+            .parse_categories(raw)
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    }
+    if let Some(raw) = query.severity.as_deref() {
+        filter
+            .parse_severities(raw)
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    }
+    if let Some(raw) = query.action.as_deref() {
+        filter.parse_actions(raw);
+    }
+    if let Some(raw) = query.actor.as_deref() {
+        filter.set_actor(raw);
+    }
+    if let Some(raw) = query.channel.as_deref() {
+        filter.set_channel(raw);
+    }
+    if let Some(raw) = query.task_id.as_deref() {
+        filter.set_task_id(raw);
+    }
+
+    let keepalive_secs = query.keepalive_secs.unwrap_or(15);
+    let (initial, mut rx, current_seq) = state
+        .server
+        .logger()
+        .audit_subscribe(since_seq, query.replay);
+    let subscriber_guard = state.server.metrics().subscribe_audit_guard();
+    let metrics = state.server.metrics().clone();
+    let mut stop_rx = state.server.shutdown().stop_accepting_rx();
+    let limit = query.limit;
+
+    let (tx, stream_rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(128);
+
+    tokio::spawn(async move {
+        let _guard = subscriber_guard;
+        let mut sent = 0usize;
+
+        if format == AuditStreamFormat::Sse {
+            let banner = Bytes::from(format!(": stream-open seq={current_seq}\n\n"));
+            if tx.send(Ok(banner)).await.is_err() {
+                return;
+            }
+        }
+
+        for event in initial {
+            if !filter.matches(&event) {
+                continue;
+            }
+            if let Some(frame) = format_audit_stream_frame(format, &event) {
+                if tx.send(Ok(frame)).await.is_err() {
+                    return;
+                }
+                sent += 1;
+                if limit.is_some_and(|max| sent >= max) {
+                    return;
+                }
+            }
+        }
+
+        if *stop_rx.borrow() {
+            return;
+        }
+
+        let mut keepalive_timer = (format == AuditStreamFormat::Sse && keepalive_secs > 0).then(
+            || {
+                let period = std::time::Duration::from_secs(keepalive_secs);
+                let mut interval =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval
+            },
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                res = stop_rx.changed() => {
+                    if res.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(event) => {
+                            if !filter.matches(&event) {
+                                continue;
+                            }
+                            if let Some(frame) = format_audit_stream_frame(format, &event) {
+                                if tx.send(Ok(frame)).await.is_err() {
+                                    break;
+                                }
+                                sent += 1;
+                                if limit.is_some_and(|max| sent >= max) {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            metrics.record_audit_lagged(skipped);
+                            if format == AuditStreamFormat::Sse {
+                                let notice = Bytes::from(format!(": lagged skipped={skipped}\n\n"));
+                                if tx.send(Ok(notice)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = async {
+                    if let Some(timer) = keepalive_timer.as_mut() {
+                        timer.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if tx.send(Ok(Bytes::from_static(b": keepalive\n\n"))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let content_type = match format {
+        AuditStreamFormat::Sse => "text/event-stream; charset=utf-8",
+        AuditStreamFormat::Ndjson => "application/x-ndjson; charset=utf-8",
+    };
+
+    let mut response = Response::new(axum::body::Body::from_stream(ByteReceiverStream(stream_rx)));
+    *response.status_mut() = StatusCode::OK;
+    let headers_mut = response.headers_mut();
+    for (name, val) in with_cors_headers() {
+        headers_mut.insert(name, HeaderValue::from_static(val));
+    }
+    headers_mut.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers_mut.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers_mut.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(response)
 }
 
 async fn dashboard_html() -> impl IntoResponse {
@@ -4058,6 +4313,25 @@ async fn upload_task_attachment(
                 ApiError::bad_request(message)
             }
         })?;
+    state.server.logger().log_task_state(
+        Severity::Info,
+        "task.attach",
+        &task.id,
+        Some(&actor.id),
+        Some(&task.channel),
+        Some(&task.status),
+        Some(&task.status),
+        Some(json!({
+            "attachment_id": attachment.id,
+            "filename": attachment.filename,
+            "kind": attachment.kind,
+            "size": attachment.size,
+        })),
+        format!(
+            "Task {} attachment '{}' uploaded by @{} ({} bytes)",
+            task.id, attachment.filename, actor.nick, attachment.size
+        ),
+    );
     Ok((
         StatusCode::CREATED,
         with_cors_headers(),
@@ -5536,7 +5810,7 @@ fn with_cors_headers() -> [(header::HeaderName, &'static str); 3] {
         (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
         (
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            "Authorization, Content-Type, X-Aircd-Token, X-AirCD-Invite",
+            "Authorization, Content-Type, X-Aircd-Token, X-AirCD-Invite, Last-Event-ID",
         ),
         (
             header::ACCESS_CONTROL_ALLOW_METHODS,
@@ -5573,6 +5847,7 @@ mod tests {
     include!("http_rate_limit_tests.rs");
     include!("http_metrics_tests.rs");
     include!("http_alerts_tests.rs");
+    include!("http_audit_stream_tests.rs");
     include!("http_dashboard_tests.rs");
 
     struct TemplateApi {

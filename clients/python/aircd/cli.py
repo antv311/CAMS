@@ -2964,6 +2964,71 @@ def cmd_template(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_audit_line(event: dict[str, Any]) -> str:
+    seq = event.get("seq", "-")
+    ts = event.get("timestamp_iso") or str(event.get("timestamp", ""))
+    cat = event.get("category", "")
+    sev = event.get("severity", "")
+    act = event.get("action", "")
+    actor = event.get("actor") or "-"
+    channel = event.get("channel") or "-"
+    task_id = event.get("task_id")
+    transition = ""
+    if event.get("from_status") or event.get("to_status"):
+        transition = f" ({event.get('from_status') or '-'}->{event.get('to_status') or '-'})"
+    task_part = f" task={task_id}{transition}" if task_id else ""
+    msg = event.get("message", "")
+    return f"#{seq} [{ts}] {cat}/{sev} {act} actor={actor} ch={channel}{task_part} | {msg}"
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    action = args.audit_cmd
+    if action != "stream":
+        raise CliError(f"Unsupported audit subcommand: {action}")
+    server, token, prof = resolve_connection(args)
+    invite = (getattr(args, "invite", None) or os.environ.get("AIRC_INVITE", "")).strip()
+    if not invite and not token:
+        raise CliError(
+            "audit stream needs an admin token (airc register/login) or the owner key (--invite or AIRC_INVITE)"
+        )
+    hub = _http_client_from_prof(server, token, prof, invite=invite)
+    fmt = args.format
+    if getattr(args, "json", False) and fmt == "pretty":
+        fmt = "ndjson"
+    wire_format = "sse" if fmt == "sse" else "ndjson"
+    try:
+        for event in hub.stream_audit_logs(
+            stream_format=wire_format,
+            category=args.category,
+            severity=args.severity,
+            action=args.action,
+            actor=args.actor,
+            channel=args.channel,
+            task_id=args.task_id,
+            since_seq=args.since_seq,
+            replay=args.replay,
+            limit=args.limit,
+            keepalive_secs=args.keepalive_secs,
+            owner=bool(invite),
+        ):
+            if fmt == "sse":
+                print(
+                    f"id: {event.get('seq', '')}\n"
+                    f"event: {event.get('category', 'audit')}\n"
+                    f"data: {json.dumps(event)}\n",
+                    flush=True,
+                )
+            elif fmt == "ndjson":
+                print(json.dumps(event), flush=True)
+            else:
+                print(_format_audit_line(event), flush=True)
+    except KeyboardInterrupt:
+        return 0
+    except AircdHttpError as err:
+        raise CliError(str(err)) from None
+    return 0
+
+
 # ── Argument parser ───────────────────────────────────────────
 
 
@@ -3565,6 +3630,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_gp.add_argument("--body", default="")
     p_gp.add_argument("--channel")
     p_gp.set_defaults(func=cmd_git)
+
+    p_audit = sub.add_parser("audit", help="Stream structured audit logs from the hub")
+    audit_sub = p_audit.add_subparsers(dest="audit_cmd", required=True)
+    p_audit_stream = audit_sub.add_parser(
+        "stream",
+        help="Stream live security, auth, server_error, and task_state audit events",
+    )
+    p_audit_stream.add_argument(
+        "--format",
+        choices=["pretty", "ndjson", "sse"],
+        default="pretty",
+        help="Output format (default: pretty; --json defaults to ndjson)",
+    )
+    p_audit_stream.add_argument("--category", help="Comma-separated categories (security_audit,task_state,server_error)")
+    p_audit_stream.add_argument("--severity", help="Comma-separated severities (info,warning,error,critical)")
+    p_audit_stream.add_argument("--action", help="Comma-separated action names or prefixes (e.g. auth.,task.status)")
+    p_audit_stream.add_argument("--actor", help="Filter by actor principal id or substring")
+    p_audit_stream.add_argument("--channel", help="Filter by project/channel name")
+    p_audit_stream.add_argument("--task-id", help="Filter by task id")
+    p_audit_stream.add_argument("--since-seq", type=int, help="Replay buffered events with seq > since-seq")
+    p_audit_stream.add_argument(
+        "--replay",
+        type=int,
+        default=0,
+        help="Replay up to N recent buffered events before live streaming (default: 0)",
+    )
+    p_audit_stream.add_argument("--limit", type=int, help="Stop after receiving N events")
+    p_audit_stream.add_argument("--keepalive-secs", type=int, help="Keepalive interval in seconds")
+    p_audit_stream.add_argument("--invite", help="Owner invite key (or set AIRC_INVITE)")
+    p_audit_stream.set_defaults(func=cmd_audit)
 
     return parser
 

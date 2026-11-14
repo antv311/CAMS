@@ -6,6 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::history::unix_timestamp;
+use crate::logging::{EventForwarder, Severity};
 use crate::metrics::MetricsRegistry;
 use crate::store::SharedConnection;
 
@@ -232,6 +233,7 @@ pub struct TaskStore {
     lease_seconds: i64,
     timeouts: TaskTimeoutConfig,
     metrics: Arc<MetricsRegistry>,
+    logger: EventForwarder,
 }
 
 pub fn normalize_kind(raw: Option<&str>) -> Result<String> {
@@ -324,12 +326,47 @@ impl TaskStore {
         lease_seconds: i64,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
+        Self::with_metrics_and_logger(db, lease_seconds, metrics, EventForwarder::default())
+    }
+
+    pub fn with_metrics_and_logger(
+        db: SharedConnection,
+        lease_seconds: i64,
+        metrics: Arc<MetricsRegistry>,
+        logger: EventForwarder,
+    ) -> Self {
         Self {
             db,
             lease_seconds,
             timeouts: TaskTimeoutConfig::default(),
             metrics,
+            logger,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_task_audit(
+        &self,
+        severity: Severity,
+        action: &str,
+        task: &Task,
+        actor: Option<&str>,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        details: Option<serde_json::Value>,
+        message: impl Into<String>,
+    ) {
+        self.logger.log_task_state(
+            severity,
+            action,
+            &task.id,
+            actor,
+            Some(&task.channel),
+            from_status,
+            to_status,
+            details,
+            message,
+        );
     }
 
     pub fn create(&self, channel: &str, title: &str) -> Result<Task> {
@@ -372,6 +409,24 @@ impl TaskStore {
         self.record_cascade_metrics(&settled);
         for task in &tasks {
             self.metrics.record_task_created(&task.kind);
+            self.emit_task_audit(
+                Severity::Info,
+                "task.created",
+                task,
+                task.created_by.as_deref().or(Some("system")),
+                None,
+                Some(&task.status),
+                Some(serde_json::json!({
+                    "kind": task.kind,
+                    "priority": task.priority,
+                    "title": task.title,
+                    "sprint": task.sprint,
+                    "assignee": task.assignee,
+                    "parent_task_id": task.parent_task_id,
+                    "blocked_by": task.blocked_by,
+                })),
+                format!("Task {} created ({}, status={}): {}", task.id, task.kind, task.status, task.title),
+            );
         }
         Ok(tasks)
     }
@@ -566,8 +621,38 @@ impl TaskStore {
         }
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
-        self.metrics
-            .record_task_transition(prev_status.as_deref().unwrap_or("open"), "claimed");
+        let from_status = prev_status.as_deref().unwrap_or("open");
+        if let Some(old) = current.as_ref().filter(|t| t.status == "claimed") {
+            self.emit_task_audit(
+                Severity::Warning,
+                "task.timeout",
+                &task,
+                Some("aircd"),
+                Some("claimed"),
+                Some("claimed"),
+                Some(serde_json::json!({
+                    "previous_holder": old.claimed_by,
+                    "reclaimed_by": principal_id,
+                })),
+                format!(
+                    "Task {} expired lease reclaimed by @{} (previous_holder={})",
+                    task.id,
+                    principal_id,
+                    old.claimed_by.as_deref().unwrap_or("-")
+                ),
+            );
+        }
+        self.metrics.record_task_transition(from_status, "claimed");
+        self.emit_task_audit(
+            Severity::Info,
+            "task.claimed",
+            &task,
+            Some(principal_id),
+            Some(from_status),
+            Some("claimed"),
+            None,
+            format!("Task {} claimed by @{}", task.id, principal_id),
+        );
         Ok(task)
     }
 
@@ -631,6 +716,17 @@ impl TaskStore {
         self.metrics.record_task_transition("claimed", "done");
         self.metrics.record_task_completed("done");
         self.record_cascade_metrics(&cascaded);
+        self.emit_task_audit(
+            Severity::Info,
+            "task.done",
+            &task,
+            Some(principal_id),
+            Some("claimed"),
+            Some("done"),
+            None,
+            format!("Task {} marked done by @{}", task.id, principal_id),
+        );
+        self.emit_cascade_audit(principal_id, &task.id, &cascaded);
         Ok(TaskUpdate { task, cascaded })
     }
 
@@ -654,6 +750,16 @@ impl TaskStore {
 
         let task = Self::get_locked(&db, task_id)?;
         self.metrics.record_task_transition("claimed", "open");
+        self.emit_task_audit(
+            Severity::Info,
+            "task.released",
+            &task,
+            Some(principal_id),
+            Some("claimed"),
+            Some("open"),
+            None,
+            format!("Task {} released by @{}", task.id, principal_id),
+        );
         Ok(task)
     }
 
@@ -712,6 +818,31 @@ impl TaskStore {
             self.metrics
                 .record_task_transition(&current.status, next_status);
         }
+        let action = if assignee.is_some() {
+            "task.assign"
+        } else {
+            "task.unassign"
+        };
+        let msg = match assignee {
+            Some(who) => format!(
+                "Task {} assigned to @{} by @{} ({} -> {})",
+                task.id, who, actor_id, current.status, next_status
+            ),
+            None => format!(
+                "Task {} unassigned by @{} ({} -> {})",
+                task.id, actor_id, current.status, next_status
+            ),
+        };
+        self.emit_task_audit(
+            Severity::Info,
+            action,
+            &task,
+            Some(actor_id),
+            Some(&current.status),
+            Some(next_status),
+            Some(serde_json::json!({ "assignee": assignee })),
+            msg,
+        );
         Ok(task)
     }
 
@@ -754,6 +885,19 @@ impl TaskStore {
         )?;
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        self.emit_task_audit(
+            Severity::Info,
+            "task.priority",
+            &task,
+            Some(actor_id),
+            Some(&current.status),
+            Some(&current.status),
+            Some(serde_json::json!({
+                "priority": normalized,
+                "previous_priority": current.priority,
+            })),
+            format!("Task {} {}: {}", task.id, note, task.title),
+        );
         Ok((task, true))
     }
 
@@ -802,6 +946,7 @@ impl TaskStore {
         )?;
         tx.commit()?;
         self.record_status_metrics(expected_from, &update);
+        self.emit_status_audit(actor_id, expected_from, note, &update);
         Ok(update)
     }
 
@@ -872,6 +1017,12 @@ impl TaskStore {
         tx.commit()?;
         for (change, update) in changes.iter().zip(&updates) {
             self.record_status_metrics(&change.current.status, update);
+            self.emit_status_audit(
+                actor_id,
+                &change.current.status,
+                change.note.as_deref(),
+                update,
+            );
         }
         Ok(updates)
     }
@@ -883,6 +1034,65 @@ impl TaskStore {
             self.metrics.record_task_completed(&update.task.status);
         }
         self.record_cascade_metrics(&update.cascaded);
+    }
+
+    fn emit_status_audit(
+        &self,
+        actor_id: &str,
+        from_status: &str,
+        note: Option<&str>,
+        update: &TaskUpdate,
+    ) {
+        let task = &update.task;
+        let details = serde_json::json!({
+            "branch": task.branch,
+            "note": note,
+            "kind": task.kind,
+            "sprint": task.sprint,
+            "assignee": task.assignee,
+        });
+        let msg = match note.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) => format!(
+                "Task {} status {} -> {} by @{actor_id}: {n}",
+                task.id, from_status, task.status
+            ),
+            None => format!(
+                "Task {} status {} -> {} by @{actor_id}",
+                task.id, from_status, task.status
+            ),
+        };
+        self.emit_task_audit(
+            Severity::Info,
+            "task.status",
+            task,
+            Some(actor_id),
+            Some(from_status),
+            Some(&task.status),
+            Some(details),
+            msg,
+        );
+        self.emit_cascade_audit(actor_id, &task.id, &update.cascaded);
+    }
+
+    fn emit_cascade_audit(&self, actor_id: &str, root_task_id: &str, changes: &[TaskCascade]) {
+        for change in changes {
+            self.emit_task_audit(
+                Severity::Info,
+                &format!("task.{}", change.action),
+                &change.task,
+                Some(actor_id),
+                Some(&change.previous_status),
+                Some(&change.task.status),
+                Some(serde_json::json!({
+                    "ancestor_task": root_task_id,
+                    "previous_holder": change.previous_holder,
+                })),
+                format!(
+                    "Task {} cascaded {} -> {} (ancestor={root_task_id})",
+                    change.task.id, change.previous_status, change.task.status
+                ),
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1075,6 +1285,23 @@ impl TaskStore {
         if current.status != to {
             self.metrics.record_task_transition(&current.status, to);
         }
+        self.emit_task_audit(
+            Severity::Info,
+            "task.peer_review",
+            &task,
+            Some(actor_id),
+            Some(&current.status),
+            Some(to),
+            Some(serde_json::json!({
+                "revision": revision,
+                "decision": decision,
+                "note": note.trim(),
+            })),
+            format!(
+                "Task {} peer review decision '{}' by @{} ({} -> {})",
+                task.id, decision, actor_id, current.status, to
+            ),
+        );
         Ok(task)
     }
 
@@ -1144,6 +1371,20 @@ impl TaskStore {
             .record_task_transition(&current.status, "blocked");
         self.metrics.record_task_question("asked");
         self.record_cascade_metrics(&cascaded);
+        self.emit_task_audit(
+            Severity::Info,
+            "task.ask",
+            &task,
+            Some(actor_id),
+            Some(&current.status),
+            Some("blocked"),
+            Some(serde_json::json!({ "question_id": question.id })),
+            format!(
+                "Task {} blocked with question by @{}: {}",
+                task.id, actor_id, question.question
+            ),
+        );
+        self.emit_cascade_audit(actor_id, &task.id, &cascaded);
         Ok((TaskUpdate { task, cascaded }, question))
     }
 
@@ -1202,6 +1443,23 @@ impl TaskStore {
             .record_task_transition("blocked", &question.resume_status);
         self.metrics.record_task_question("answered");
         self.record_cascade_metrics(&cascaded);
+        self.emit_task_audit(
+            Severity::Info,
+            "task.answer",
+            &task,
+            Some(actor_id),
+            Some("blocked"),
+            Some(&task.status),
+            Some(serde_json::json!({ "question_id": question.id })),
+            format!(
+                "Task {} answered by @{} (resumed {}): {}",
+                task.id,
+                actor_id,
+                task.status,
+                question.answer.as_deref().unwrap_or("")
+            ),
+        );
+        self.emit_cascade_audit(actor_id, &task.id, &cascaded);
         Ok((TaskUpdate { task, cascaded }, question))
     }
 
@@ -1256,11 +1514,30 @@ impl TaskStore {
             now,
         )?;
         let q = Self::question_locked(&db, &question.id)?;
+        let task = Self::get_locked(&db, task_id)?;
         self.metrics.record_task_question(if to == "escalated_pm" {
             "escalated_pm"
         } else {
             "escalated"
         });
+        let action = if to == "escalated_pm" {
+            "task.escalate_pm"
+        } else {
+            "task.escalate"
+        };
+        self.emit_task_audit(
+            Severity::Warning,
+            action,
+            &task,
+            Some(actor_id),
+            Some("blocked"),
+            Some("blocked"),
+            Some(serde_json::json!({ "question_id": q.id, "note": note })),
+            format!(
+                "Task {} question escalated ({to}) by @{}",
+                task.id, actor_id
+            ),
+        );
         Ok(q)
     }
 
@@ -1696,6 +1973,16 @@ impl TaskStore {
         )?;
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        self.emit_task_audit(
+            Severity::Info,
+            "task.dependencies",
+            &task,
+            Some(actor_id),
+            Some(&current.status),
+            Some(&current.status),
+            Some(serde_json::json!({ "blocked_by": task.blocked_by })),
+            format!("Task {} dependencies updated: {}", task.id, note),
+        );
         Ok((task, true))
     }
 
@@ -1749,6 +2036,16 @@ impl TaskStore {
         )?;
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        self.emit_task_audit(
+            Severity::Info,
+            "task.dependencies",
+            &task,
+            Some(actor_id),
+            Some(&current.status),
+            Some(&current.status),
+            Some(serde_json::json!({ "added": added, "blocked_by": task.blocked_by })),
+            format!("Task {} dependencies updated: {}", task.id, note),
+        );
         Ok((task, true))
     }
 
@@ -1792,6 +2089,16 @@ impl TaskStore {
         )?;
         let task = Self::get_locked(&tx, task_id)?;
         tx.commit()?;
+        self.emit_task_audit(
+            Severity::Info,
+            "task.dependencies",
+            &task,
+            Some(actor_id),
+            Some(&current.status),
+            Some(&current.status),
+            Some(serde_json::json!({ "removed": dep_id, "blocked_by": task.blocked_by })),
+            format!("Task {} dependencies updated: {}", task.id, note),
+        );
         Ok((task, true))
     }
 

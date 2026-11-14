@@ -1,6 +1,9 @@
 //! Server error and security audit log forwarding to Windows Application Event Log and syslog.
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
@@ -9,11 +12,16 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+
+use crate::metrics::MetricsRegistry;
 
 const QUEUE_CAPACITY: usize = 1024;
+pub const AUDIT_STREAM_RING_CAPACITY: usize = 2048;
+const AUDIT_BROADCAST_CAPACITY: usize = 2048;
 const SYSLOG_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EVENT_MESSAGE_CHARS: usize = 8192;
@@ -23,6 +31,7 @@ const DEFAULT_EVENT_SOURCE: &str = "aircd";
 pub enum LogCategory {
     ServerError,
     SecurityAudit,
+    TaskState,
 }
 
 impl LogCategory {
@@ -30,6 +39,7 @@ impl LogCategory {
         match self {
             Self::ServerError => "server_error",
             Self::SecurityAudit => "security_audit",
+            Self::TaskState => "task_state",
         }
     }
 
@@ -37,6 +47,7 @@ impl LogCategory {
         match self {
             Self::ServerError => 1,
             Self::SecurityAudit => 2,
+            Self::TaskState => 3,
         }
     }
 }
@@ -54,6 +65,15 @@ impl Severity {
             Self::Error => "error",
             Self::Warning => "warning",
             Self::Info => "info",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "error" | "err" => Ok(Self::Error),
+            "warning" | "warn" => Ok(Self::Warning),
+            "info" => Ok(Self::Info),
+            other => bail!("unsupported severity '{other}': expected info, warning, or error"),
         }
     }
 
@@ -265,6 +285,10 @@ pub struct LogEvent {
     pub actor: Option<String>,
     pub target: Option<String>,
     pub channel: Option<String>,
+    pub task_id: Option<String>,
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
+    pub details: Option<Value>,
     pub message: String,
     pub timestamp_secs: u64,
 }
@@ -279,6 +303,10 @@ impl LogEvent {
             actor: None,
             target: None,
             channel: None,
+            task_id: None,
+            from_status: None,
+            to_status: None,
+            details: None,
             message: message.into(),
             timestamp_secs: unix_now_secs(),
         }
@@ -298,6 +326,36 @@ impl LogEvent {
             actor: None,
             target: None,
             channel: None,
+            task_id: None,
+            from_status: None,
+            to_status: None,
+            details: None,
+            message: message.into(),
+            timestamp_secs: unix_now_secs(),
+        }
+    }
+
+    pub fn task_state(
+        severity: Severity,
+        action: impl Into<String>,
+        outcome: impl Into<String>,
+        task_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let task_id_str = task_id.into();
+        let target = (!task_id_str.trim().is_empty()).then(|| task_id_str.clone());
+        Self {
+            category: LogCategory::TaskState,
+            severity,
+            action: action.into(),
+            outcome: Some(outcome.into()),
+            actor: None,
+            target,
+            channel: None,
+            task_id: (!task_id_str.trim().is_empty()).then_some(task_id_str),
+            from_status: None,
+            to_status: None,
+            details: None,
             message: message.into(),
             timestamp_secs: unix_now_secs(),
         }
@@ -323,6 +381,25 @@ impl LogEvent {
         let value = channel.into();
         if !value.trim().is_empty() {
             self.channel = Some(value);
+        }
+        self
+    }
+
+    pub fn with_transition(mut self, from_status: Option<&str>, to_status: Option<&str>) -> Self {
+        self.from_status = from_status
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        self.to_status = to_status
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        self
+    }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        if !details.is_null() {
+            self.details = Some(details);
         }
         self
     }
@@ -358,6 +435,7 @@ impl LogEvent {
             "auth.irc_session_replaced" => 2010,
             "http.rate_limited" => 2011,
             "irc.tls_client_verified" | "http.tls_client_verified" => 2012,
+            _ if self.category == LogCategory::TaskState => 3000,
             _ => 2099,
         }
     }
@@ -379,8 +457,296 @@ impl LogEvent {
         if let Some(channel) = &self.channel {
             meta.push(format!("channel={}", sanitize_inline(channel)));
         }
+        if let Some(from) = &self.from_status {
+            meta.push(format!("from_status={}", sanitize_inline(from)));
+        }
+        if let Some(to) = &self.to_status {
+            meta.push(format!("to_status={}", sanitize_inline(to)));
+        }
         let msg = truncate_chars(&sanitize_inline(&self.message), MAX_EVENT_MESSAGE_CHARS);
         format!("[{}] {} | {}", self.category.as_str(), meta.join(" "), msg)
+    }
+}
+
+/// Structured JSON audit event streamed on `GET /v1/audit/stream`.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AuditEvent {
+    pub seq: u64,
+    pub timestamp: u64,
+    pub timestamp_iso: String,
+    pub category: String,
+    pub severity: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    pub message: String,
+}
+
+impl AuditEvent {
+    pub fn from_log_event(seq: u64, event: &LogEvent) -> Self {
+        let category = classify_audit_category(event.category, &event.action);
+        Self {
+            seq,
+            timestamp: event.timestamp_secs,
+            timestamp_iso: format_rfc3339_utc(event.timestamp_secs),
+            category: category.to_string(),
+            severity: event.severity.as_str().to_string(),
+            action: event.action.clone(),
+            outcome: event.outcome.clone(),
+            actor: event.actor.clone(),
+            target: event.target.clone(),
+            channel: event.channel.clone(),
+            task_id: event.task_id.clone(),
+            from_status: event.from_status.clone(),
+            to_status: event.to_status.clone(),
+            details: event.details.clone(),
+            message: truncate_chars(&sanitize_inline(&event.message), MAX_EVENT_MESSAGE_CHARS),
+        }
+    }
+}
+
+fn is_auth_action(action: &str) -> bool {
+    action.starts_with("auth.")
+        || action.starts_with("token.")
+        || action == "account.created"
+        || action == "owner.auth_denied"
+}
+
+fn classify_audit_category(category: LogCategory, action: &str) -> &'static str {
+    match category {
+        LogCategory::TaskState => "task_state",
+        LogCategory::ServerError => "server_error",
+        LogCategory::SecurityAudit => {
+            if is_auth_action(action) {
+                "auth"
+            } else {
+                "security"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AuditStreamFilter {
+    pub categories: BTreeSet<String>,
+    pub severities: BTreeSet<String>,
+    pub actions: Vec<String>,
+    pub actor: Option<String>,
+    pub channel: Option<String>,
+    pub task_id: Option<String>,
+}
+
+impl AuditStreamFilter {
+    pub fn parse_categories(&mut self, raw: &str) -> Result<()> {
+        for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match part.to_ascii_lowercase().as_str() {
+                "auth" => {
+                    self.categories.insert("auth".to_string());
+                }
+                "security" => {
+                    self.categories.insert("security".to_string());
+                }
+                "security_audit" => {
+                    self.categories.insert("security".to_string());
+                    self.categories.insert("auth".to_string());
+                }
+                "task_state" | "task-state" | "task" | "tasks" => {
+                    self.categories.insert("task_state".to_string());
+                }
+                "server_error" | "server-error" | "error" | "errors" => {
+                    self.categories.insert("server_error".to_string());
+                }
+                other => {
+                    bail!(
+                        "unsupported audit category '{other}': expected auth, security, task_state, server_error, or security_audit"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn parse_severities(&mut self, raw: &str) -> Result<()> {
+        for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let sev = Severity::parse(part)?;
+            self.severities.insert(sev.as_str().to_string());
+        }
+        Ok(())
+    }
+
+    pub fn parse_actions(&mut self, raw: &str) {
+        for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            self.actions.push(part.to_ascii_lowercase());
+        }
+    }
+
+    pub fn set_actor(&mut self, raw: &str) {
+        let clean = raw.trim().trim_start_matches('@');
+        if !clean.is_empty() {
+            self.actor = Some(clean.to_string());
+        }
+    }
+
+    pub fn set_channel(&mut self, raw: &str) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.starts_with('/') || trimmed.starts_with('#') || trimmed == "irc" {
+            self.channel = Some(trimmed.to_string());
+        } else {
+            self.channel = Some(format!("#{trimmed}"));
+        }
+    }
+
+    pub fn set_task_id(&mut self, raw: &str) {
+        let clean = raw.trim();
+        if !clean.is_empty() {
+            self.task_id = Some(clean.to_string());
+        }
+    }
+
+    pub fn matches(&self, event: &AuditEvent) -> bool {
+        if !self.categories.is_empty() && !self.categories.contains(&event.category) {
+            return false;
+        }
+        if !self.severities.is_empty() && !self.severities.contains(&event.severity) {
+            return false;
+        }
+        if !self.actions.is_empty() {
+            let act_lower = event.action.to_ascii_lowercase();
+            let matched = self.actions.iter().any(|pattern| {
+                if let Some(prefix) = pattern.strip_suffix('*') {
+                    act_lower.starts_with(prefix)
+                } else if pattern.ends_with('.') {
+                    act_lower.starts_with(pattern)
+                } else {
+                    act_lower == *pattern
+                }
+            });
+            if !matched {
+                return false;
+            }
+        }
+        if let Some(actor) = &self.actor {
+            let ev_actor = event
+                .actor
+                .as_deref()
+                .map(|a| a.trim_start_matches('@'))
+                .unwrap_or("");
+            if !ev_actor.eq_ignore_ascii_case(actor) {
+                return false;
+            }
+        }
+        if let Some(channel) = &self.channel {
+            if event.channel.as_deref() != Some(channel.as_str()) {
+                return false;
+            }
+        }
+        if let Some(task_id) = &self.task_id {
+            if event.task_id.as_deref() != Some(task_id.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+struct AuditRing {
+    next_seq: u64,
+    ring: VecDeque<AuditEvent>,
+}
+
+struct AuditHub {
+    ring: Mutex<AuditRing>,
+    tx: broadcast::Sender<AuditEvent>,
+    metrics: OnceLock<Arc<MetricsRegistry>>,
+}
+
+impl AuditHub {
+    fn new() -> Self {
+        let (tx, _) = broadcast::channel(AUDIT_BROADCAST_CAPACITY);
+        Self {
+            ring: Mutex::new(AuditRing {
+                next_seq: 1,
+                ring: VecDeque::with_capacity(AUDIT_STREAM_RING_CAPACITY),
+            }),
+            tx,
+            metrics: OnceLock::new(),
+        }
+    }
+
+    fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    fn publish(&self, event: &LogEvent) -> AuditEvent {
+        let mut guard = self.ring.lock().expect("audit stream ring mutex poisoned");
+        let seq = guard.next_seq;
+        guard.next_seq = guard.next_seq.saturating_add(1);
+        let audit_event = AuditEvent::from_log_event(seq, event);
+        if guard.ring.len() >= AUDIT_STREAM_RING_CAPACITY {
+            guard.ring.pop_front();
+        }
+        guard.ring.push_back(audit_event.clone());
+        let _ = self.tx.send(audit_event.clone());
+        drop(guard);
+        if let Some(metrics) = self.metrics.get() {
+            metrics.record_audit_event(&audit_event.category);
+        }
+        audit_event
+    }
+
+    fn subscribe(
+        &self,
+        since_seq: Option<u64>,
+        replay: Option<usize>,
+    ) -> (Vec<AuditEvent>, broadcast::Receiver<AuditEvent>, u64) {
+        let guard = self.ring.lock().expect("audit stream ring mutex poisoned");
+        let rx = self.tx.subscribe();
+        let current_seq = guard.next_seq.saturating_sub(1);
+        let mut initial = if let Some(since) = since_seq {
+            let mut filtered: Vec<AuditEvent> = guard
+                .ring
+                .iter()
+                .filter(|ev| ev.seq > since)
+                .cloned()
+                .collect();
+            if let Some(limit) = replay {
+                let keep = limit.min(AUDIT_STREAM_RING_CAPACITY);
+                if filtered.len() > keep {
+                    filtered = filtered.split_off(filtered.len() - keep);
+                }
+            }
+            filtered
+        } else if let Some(limit) = replay {
+            let keep = limit.min(AUDIT_STREAM_RING_CAPACITY);
+            let skip = guard.ring.len().saturating_sub(keep);
+            guard.ring.iter().skip(skip).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        initial.shrink_to_fit();
+        (initial, rx, current_seq)
+    }
+
+    fn current_seq(&self) -> u64 {
+        let guard = self.ring.lock().expect("audit stream ring mutex poisoned");
+        guard.next_seq.saturating_sub(1)
     }
 }
 
@@ -400,6 +766,7 @@ struct ForwarderInner {
     tx: Option<SyncSender<WorkerCommand>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     queue_full_warned: AtomicBool,
+    audit: AuditHub,
 }
 
 impl Default for EventForwarder {
@@ -439,6 +806,7 @@ impl EventForwarder {
                 tx,
                 worker: Mutex::new(worker),
                 queue_full_warned: AtomicBool::new(false),
+                audit: AuditHub::new(),
             }),
         })
     }
@@ -448,9 +816,30 @@ impl EventForwarder {
         &self.inner.config
     }
 
+    pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        self.inner.audit.attach_metrics(metrics);
+    }
+
+    pub fn audit_subscribe(
+        &self,
+        since_seq: Option<u64>,
+        replay: Option<usize>,
+    ) -> (Vec<AuditEvent>, broadcast::Receiver<AuditEvent>, u64) {
+        self.inner.audit.subscribe(since_seq, replay)
+    }
+
+    #[allow(dead_code)]
+    pub fn audit_current_seq(&self) -> u64 {
+        self.inner.audit.current_seq()
+    }
+
     pub fn log(&self, event: LogEvent) {
+        self.inner.audit.publish(&event);
         if self.inner.config.stderr_errors && event.category == LogCategory::ServerError {
             eprintln!("{}", event.message);
+        }
+        if event.category == LogCategory::TaskState {
+            return;
         }
         let Some(tx) = &self.inner.tx else {
             return;
@@ -490,6 +879,33 @@ impl EventForwarder {
         }
         if let Some(channel) = channel {
             event = event.with_channel(channel);
+        }
+        self.log(event);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_task_state(
+        &self,
+        severity: Severity,
+        action: &str,
+        task_id: &str,
+        actor: Option<&str>,
+        channel: Option<&str>,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        details: Option<Value>,
+        message: impl Into<String>,
+    ) {
+        let mut event = LogEvent::task_state(severity, action, "success", task_id, message)
+            .with_transition(from_status, to_status);
+        if let Some(actor) = actor {
+            event = event.with_actor(actor);
+        }
+        if let Some(channel) = channel {
+            event = event.with_channel(channel);
+        }
+        if let Some(details) = details {
+            event = event.with_details(details);
         }
         self.log(event);
     }
@@ -740,7 +1156,7 @@ pub fn format_syslog_message(
 ) -> String {
     let facility = facility_override.unwrap_or(match event.category {
         LogCategory::ServerError => SyslogFacility::Daemon,
-        LogCategory::SecurityAudit => SyslogFacility::Auth,
+        LogCategory::SecurityAudit | LogCategory::TaskState => SyslogFacility::Auth,
     });
     let pri = (facility.code() as u16) * 8 + (event.severity.syslog_code() as u16);
     let safe_host = sanitize_syslog_token(hostname, 255);
@@ -1195,6 +1611,92 @@ mod tests {
             1000,
             "aircd unit test error event",
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn audit_stream_classifies_filters_and_replays_without_duplicates() -> Result<()> {
+        let forwarder = EventForwarder::default();
+        forwarder.log_security(
+            Severity::Warning,
+            "auth.http_failed",
+            "failure",
+            Some("alice"),
+            None,
+            Some("/v1/me"),
+            "invalid token",
+        );
+        forwarder.log_security(
+            Severity::Info,
+            "role.changed",
+            "success",
+            Some("owner"),
+            Some("bob"),
+            Some("#cams"),
+            "role updated",
+        );
+        forwarder.log_task_state(
+            Severity::Info,
+            "task.status",
+            "task_123",
+            Some("alice"),
+            Some("#cams"),
+            Some("in_progress"),
+            Some("testing"),
+            Some(serde_json::json!({"branch": "feat/x"})),
+            "moved to testing",
+        );
+        forwarder.log_error("http.internal_error", "db unavailable");
+
+        assert_eq!(forwarder.audit_current_seq(), 4);
+
+        let (replayed, mut rx, seq_now) = forwarder.audit_subscribe(Some(1), None);
+        assert_eq!(seq_now, 4);
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].category, "security");
+        assert_eq!(replayed[1].category, "task_state");
+        assert_eq!(replayed[1].task_id.as_deref(), Some("task_123"));
+        assert_eq!(replayed[1].from_status.as_deref(), Some("in_progress"));
+        assert_eq!(replayed[1].to_status.as_deref(), Some("testing"));
+        assert_eq!(replayed[2].category, "server_error");
+
+        // Live event after subscribe arrives with seq 5.
+        forwarder.log_security(
+            Severity::Info,
+            "token.issued",
+            "success",
+            Some("owner"),
+            Some("alice"),
+            Some("/v1/tokens"),
+            "issued token",
+        );
+        let live = rx.try_recv()?;
+        assert_eq!(live.seq, 5);
+        assert_eq!(live.category, "auth");
+
+        // Filter tests: categories, action prefix, actor, channel, task_id.
+        let (all, _, _) = forwarder.audit_subscribe(None, Some(10));
+        assert_eq!(all.len(), 5);
+
+        let mut f_auth = AuditStreamFilter::default();
+        f_auth.parse_categories("auth")?;
+        let auth_only: Vec<_> = all.iter().filter(|e| f_auth.matches(e)).collect();
+        assert_eq!(auth_only.len(), 2);
+
+        let mut f_sec_audit = AuditStreamFilter::default();
+        f_sec_audit.parse_categories("security_audit")?;
+        assert_eq!(all.iter().filter(|e| f_sec_audit.matches(e)).count(), 3);
+
+        let mut f_task = AuditStreamFilter::default();
+        f_task.parse_categories("task")?;
+        f_task.set_channel("cams");
+        f_task.set_actor("@ALICE");
+        f_task.set_task_id("task_123");
+        f_task.parse_actions("task.*");
+        assert_eq!(all.iter().filter(|e| f_task.matches(e)).count(), 1);
+
+        assert!(f_task.parse_categories("bogus").is_err());
+        assert!(f_task.parse_severities("bogus").is_err());
         Ok(())
     }
 }

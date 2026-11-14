@@ -40,6 +40,7 @@ const QUESTION_ACTIONS: &[&str] = &["asked", "answered", "escalated", "escalated
 const RATE_LIMIT_SCOPES: &[&str] = &["ip", "principal"];
 pub const ALERT_RULE_KEYS: &[&str] = &["wake_failure_rate", "queue_backlog", "disk_pressure"];
 const ALERT_DELIVERY_STATUSES: &[&str] = &["delivered", "failed"];
+const AUDIT_STREAM_CATEGORIES: &[&str] = &["auth", "security", "task_state", "server_error"];
 const MAX_WAKE_COMPLETION_HISTORY: usize = 50_000;
 const MAX_WAKE_COMPLETION_AGE: Duration = Duration::from_secs(86_400);
 
@@ -205,6 +206,9 @@ pub struct MetricsRegistry {
     shutdown_lease_checkpoints_total: AtomicU64,
     shutdown_detached_workers_total: AtomicU64,
     shutdown_cancelled_wakes_total: AtomicU64,
+    audit_stream_events_total: BTreeMap<&'static str, AtomicU64>,
+    audit_stream_active_subscribers: AtomicI64,
+    audit_stream_lagged_total: AtomicU64,
 }
 
 impl Default for MetricsRegistry {
@@ -238,6 +242,9 @@ impl MetricsRegistry {
             shutdown_lease_checkpoints_total: AtomicU64::new(0),
             shutdown_detached_workers_total: AtomicU64::new(0),
             shutdown_cancelled_wakes_total: AtomicU64::new(0),
+            audit_stream_events_total: counter_map(AUDIT_STREAM_CATEGORIES),
+            audit_stream_active_subscribers: AtomicI64::new(0),
+            audit_stream_lagged_total: AtomicU64::new(0),
         }
     }
 
@@ -448,6 +455,25 @@ impl MetricsRegistry {
         let key = if delivered { "delivered" } else { "failed" };
         if let Some(counter) = self.alert_webhook_deliveries_total.get(key) {
             counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_audit_event(&self, category: &str) {
+        if let Some(counter) = self.audit_stream_events_total.get(category) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_audit_lagged(&self, skipped: u64) {
+        self.audit_stream_lagged_total
+            .fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    pub fn subscribe_audit_guard(self: &std::sync::Arc<Self>) -> AuditStreamSubscriberGuard {
+        self.audit_stream_active_subscribers
+            .fetch_add(1, Ordering::Relaxed);
+        AuditStreamSubscriberGuard {
+            registry: self.clone(),
         }
     }
 
@@ -1157,7 +1183,64 @@ impl MetricsRegistry {
             self.shutdown_cancelled_wakes_total.load(Ordering::Relaxed),
         );
 
+        // 7. Audit log stream
+        write_header(
+            &mut out,
+            "aircd_audit_stream_events_total",
+            "counter",
+            "Total structured audit events published to the audit stream since server start by category.",
+        );
+        for category in AUDIT_STREAM_CATEGORIES {
+            let val = self.audit_stream_events_total[category].load(Ordering::Relaxed);
+            write_sample(
+                &mut out,
+                "aircd_audit_stream_events_total",
+                &[("category", category)],
+                val,
+            );
+        }
+
+        write_header(
+            &mut out,
+            "aircd_audit_stream_active_subscribers",
+            "gauge",
+            "Current number of active /v1/audit/stream HTTP subscribers.",
+        );
+        write_sample(
+            &mut out,
+            "aircd_audit_stream_active_subscribers",
+            &[],
+            self.audit_stream_active_subscribers
+                .load(Ordering::Relaxed)
+                .max(0) as u64,
+        );
+
+        write_header(
+            &mut out,
+            "aircd_audit_stream_lagged_total",
+            "counter",
+            "Total audit stream events dropped for slow subscribers due to broadcast lag.",
+        );
+        write_sample(
+            &mut out,
+            "aircd_audit_stream_lagged_total",
+            &[],
+            self.audit_stream_lagged_total.load(Ordering::Relaxed),
+        );
+
         out
+    }
+}
+
+pub struct AuditStreamSubscriberGuard {
+    registry: std::sync::Arc<MetricsRegistry>,
+}
+
+impl Drop for AuditStreamSubscriberGuard {
+    fn drop(&mut self) {
+        self.registry
+            .audit_stream_active_subscribers
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 

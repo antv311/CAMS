@@ -100,6 +100,22 @@ impl TaskStore {
         )?;
         let task = Self::get_locked(&tx, id)?;
         tx.commit()?;
+        self.emit_task_audit(
+            Severity::Info,
+            "task.timeout_policy",
+            &task,
+            Some(actor),
+            Some(&current.status),
+            Some(&current.status),
+            Some(serde_json::json!({ "timeout_seconds": seconds })),
+            format!(
+                "Task {} timeout policy updated by @{actor}: timeout_seconds={}",
+                task.id,
+                seconds
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "inherit".into())
+            ),
+        );
         Ok(task)
     }
 
@@ -136,6 +152,19 @@ impl TaskStore {
             params![id, now, deadline])?;
         let task = Self::get_locked(&tx, id)?;
         tx.commit()?;
+        self.emit_task_audit(
+            Severity::Info,
+            "task.heartbeat",
+            &task,
+            Some(actor),
+            Some(&current.status),
+            Some(&current.status),
+            Some(serde_json::json!({
+                "heartbeat_at": now,
+                "lease_expires_at": task.lease_expires_at,
+            })),
+            format!("Task {} heartbeat renewed by @{actor}", task.id),
+        );
         Ok(task)
     }
 
@@ -189,6 +218,19 @@ impl TaskStore {
             // Timeout events are committed before in-memory counters change.
             self.metrics
                 .record_task_transition(&event.previous_status, &event.task.status);
+            self.emit_task_audit(
+                Severity::Warning,
+                "task.timeout",
+                &event.task,
+                Some("aircd"),
+                Some(&event.previous_status),
+                Some(&event.task.status),
+                Some(serde_json::json!({ "previous_holder": event.previous_holder })),
+                format!(
+                    "Task {} recovered after timeout ({} -> {}): {}",
+                    event.task.id, event.previous_status, event.task.status, event.note
+                ),
+            );
         }
         Ok(recovered)
     }
@@ -246,6 +288,21 @@ impl TaskStore {
             checkpointed.push(Self::get_locked(&tx, &current.id)?);
         }
         tx.commit()?;
+        for task in &checkpointed {
+            self.emit_task_audit(
+                Severity::Info,
+                "task.lease_checkpoint",
+                task,
+                Some("aircd"),
+                Some(&task.status),
+                Some(&task.status),
+                Some(serde_json::json!({
+                    "lease_expires_at": task.lease_expires_at,
+                    "execution_heartbeat_at": task.execution_heartbeat_at,
+                })),
+                format!("Task {} lease checkpointed during hub shutdown", task.id),
+            );
+        }
         Ok(checkpointed)
     }
 }
