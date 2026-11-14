@@ -1143,6 +1143,7 @@ impl Server {
                 }
             }
             let _ = writer.flush().await;
+            let _ = writer.shutdown().await;
         });
 
         let mut session = Session {
