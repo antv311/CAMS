@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -48,7 +49,8 @@ Conversation
   /reset              start an empty conversation
   /save FILE          write the conversation (OpenAI messages JSON) to FILE
   /load FILE          replace the conversation with one saved by /save or a session file
-  /usage              token totals for this REPL session
+  /usage              token totals for this REPL session (cached_tokens = prompt tokens reused from the KV cache)
+  /warm               pre-fill the server's prompt cache with the system prompt and tools
 
 Tools and debugging
   /tools              list the tools the model is offered
@@ -142,6 +144,9 @@ class BionicRepl:
         self._stepping = False
         self._registry: Any = None
         self._session_file: Optional[Path] = None
+        self._warm_thread: Optional[threading.Thread] = None
+        #: Report of the last cache pre-warm (:func:`aircd.bionic_cache.prewarm`).
+        self.warm_report: Optional[dict[str, Any]] = None
         if self.config.session_id:
             self._session_file = bionic._resolve_session_file(self.config.session_id, self.config.session_dir)
             self.messages = bionic._load_session_messages(self._session_file) or []
@@ -281,8 +286,48 @@ class BionicRepl:
 
     # --- running prompts ------------------------------------------------------------------------
 
+    # --- prompt cache pre-warming ----------------------------------------------------------------
+
+    def _warm(self) -> dict[str, Any]:
+        from aircd.bionic_cache import prewarm
+
+        try:
+            report = prewarm(dataclasses.replace(self.config))
+        except Exception as err:  # e.g. no model set or a broken plugin
+            report = {"ok": False, "error": str(err)}
+        self.warm_report = report
+        return report
+
+    def _describe_warm(self, report: dict[str, Any]) -> str:
+        if not report.get("ok"):
+            return f"[cache] pre-warm failed: {report.get('error')}"
+        return (
+            f"[cache] pre-warmed {report.get('prompt_tokens') or '?'} prompt tokens for {report.get('model')} "
+            f"in {report.get('seconds')}s (mode {report.get('mode')})"
+        )
+
+    def start_warm(self) -> None:
+        """Pre-fill the prompt cache in the background while the user types the first prompt."""
+        if self._warm_thread is not None and self._warm_thread.is_alive():
+            return
+        if not self.config.model:
+            self.say("[cache] no model set; skipping pre-warm")
+            return
+        self._warm_thread = threading.Thread(target=self._warm, name="bionic-warm", daemon=True)
+        self._warm_thread.start()
+
+    def wait_warm(self) -> None:
+        """Let a background pre-warm finish so the next request reuses its cache instead of racing it."""
+        thread, self._warm_thread = self._warm_thread, None
+        if thread is None:
+            return
+        thread.join()
+        if self.warm_report is not None and (self.config.verbose or not self.warm_report.get("ok")):
+            self.say(self._describe_warm(self.warm_report))
+
     def send(self, prompt: str) -> bool:
         """Send one prompt; on failure the conversation is rolled back. Returns success."""
+        self.wait_warm()
         mark = len(self.messages)
         self._stepping = self.step
         renderer = StreamRenderer("text", out=self.out)
@@ -514,6 +559,9 @@ class BionicRepl:
             self.say(json.dumps(self.usage) if self.usage else "no usage reported yet")
             if self.ledger is not None:
                 self.say("budget: " + json.dumps(self.ledger.snapshot()))
+        elif cmd == "warm":
+            self.wait_warm()
+            self.say(self._describe_warm(self._warm()))
         elif cmd == "tools":
             self.cmd_tools()
         elif cmd == "tool":
@@ -565,8 +613,10 @@ class BionicRepl:
         )
         self.say("/help for commands, /exit to quit")
 
-    def loop(self, initial_prompt: Optional[str] = None) -> int:
+    def loop(self, initial_prompt: Optional[str] = None, *, warm_cache: bool = False) -> int:
         self.banner()
+        if warm_cache:
+            self.start_warm()
         if initial_prompt and initial_prompt.strip():
             self.send(initial_prompt)
         while True:
@@ -600,8 +650,13 @@ def run_repl(
     initial_prompt: Optional[str] = None,
     input_fn: Callable[[str], str] = input,
     out: Any = None,
+    warm_cache: bool = False,
 ) -> int:
-    """Entry point for ``airc-bionic --repl`` / ``--debug``."""
+    """Entry point for ``airc-bionic --repl`` / ``--debug``.
+
+    ``warm_cache`` pre-fills the server's prompt cache in the background while
+    the first prompt is typed.
+    """
     if config.auto_pull:
         # Make the model ready once up front instead of before every prompt.
         report = bionic.ensure_model_ready(config, log=lambda msg: print(msg, file=sys.stderr))
@@ -611,4 +666,4 @@ def run_repl(
             import readline  # noqa: F401  (line editing and history where available)
         except ImportError:
             pass
-    return BionicRepl(config, step=step, input_fn=input_fn, out=out).loop(initial_prompt)
+    return BionicRepl(config, step=step, input_fn=input_fn, out=out).loop(initial_prompt, warm_cache=warm_cache)
